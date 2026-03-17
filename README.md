@@ -1,5 +1,5 @@
 <div>
-  <img src="https://raw.githubusercontent.com/msr5464/Basic-Automation-Framework/refs/heads/master/ThanosLogo.png" title="Powered by Thanos and created by Mukesh Rajput" height="50">
+  <img src="https://raw.githubusercontent.com/msr5464/Basic-Automation-Framework/refs/heads/master/Logo-full.png" title="Powered by Thanos and created by Mukesh Rajput" height="50">
 
   # QA AI Agent
 
