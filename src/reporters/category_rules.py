@@ -77,10 +77,14 @@ class PageLoadTimeoutRule(CategoryRule):
             re.search(r"['\"]([^'\"]+Page[^'\"]*)['\"]\s+(?:NOT|not)\s+loaded\s+even\s+after", execution_log, re.IGNORECASE)
         )
         
-        # Pattern 2: Element visibility timeout - "Element 'PageName:element' is NOT visible even after waiting for X seconds"
+        # Pattern 2: Element visibility/hidden timeout - "Element 'PageName:element' is NOT visible even after waiting for X seconds"
+        # Generalized to handle "is NOT hidden", "is NOT shown", etc.
         is_element_visibility_timeout = (
-            re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", root_cause, re.IGNORECASE) or
-            re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", execution_log, re.IGNORECASE) or
+            re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+(\w+)\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", root_cause, re.IGNORECASE) or
+            re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+(\w+)\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", execution_log, re.IGNORECASE) or
+            # Flexible pattern: "<abc> is NOT <xyz> even after waiting for <N> seconds"
+            re.search(r"['\"]?([^'\"]+)['\"]?\s+is\s+(?:NOT|not)\s+(\w+)\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", root_cause, re.IGNORECASE) or
+            re.search(r"['\"]?([^'\"]+)['\"]?\s+is\s+(?:NOT|not)\s+(\w+)\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", execution_log, re.IGNORECASE) or
             re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+and\s+clickable\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", root_cause, re.IGNORECASE) or
             re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+and\s+clickable\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", execution_log, re.IGNORECASE)
         )
@@ -112,24 +116,24 @@ class ElementLocatorExceptionRule(CategoryRule):
         is_element_locator_issue = (
             "staleelementreferenceexception" in combined_text or
             "staleelementreferenceexception" in execution_log or
-            ("nullpointerexception" in combined_text and (
+            (("nullpointerexception" in combined_text) and (
                 "webelement" in combined_text or 
                 "getpageelement" in combined_text or 
                 "gettext()" in combined_text or 
                 ".gettext()" in combined_text
             )) or
-            ("nullpointerexception" in execution_log and (
+            (("nullpointerexception" in execution_log) and (
                 "webelement" in execution_log or 
                 "getpageelement" in execution_log or 
                 "gettext()" in execution_log or 
                 ".gettext()" in execution_log
             )) or
-            ("indexoutofboundsexception" in combined_text and (
+            (("indexoutofboundsexception" in combined_text) and (
                 "length 0" in combined_text or 
                 "index 0" in combined_text or 
                 "out of bounds for length 0" in combined_text
             )) or
-            ("indexoutofboundsexception" in execution_log and (
+            (("indexoutofboundsexception" in execution_log) and (
                 "length 0" in execution_log or 
                 "index 0" in execution_log or 
                 "out of bounds for length 0" in execution_log
@@ -138,7 +142,14 @@ class ElementLocatorExceptionRule(CategoryRule):
             "stringindexoutofboundsexception" in combined_text or
             "stringindexoutofboundsexception" in execution_log or
             "StringIndexOutOfBoundsException" in root_cause or
-            "StringIndexOutOfBoundsException" in cache.get_combined_log(failure.test_name)
+            "StringIndexOutOfBoundsException" in cache.get_combined_log(failure.test_name) or
+            # DefaultElementLocator / Proxy element patterns (e.g. "Expected condition failed:
+            # waiting for element to be clickable: Proxy element for: DefaultElementLocator ...")
+            # These are element locator issues, not timeouts.
+            ("defaultelementlocator" in combined_text) or
+            ("defaultelementlocator" in execution_log) or
+            ("proxy element" in combined_text and "waiting for element to be clickable" in combined_text) or
+            ("proxy element" in execution_log and "waiting for element to be clickable" in execution_log)
         )
         
         return bool(is_element_locator_issue)
@@ -187,8 +198,8 @@ class NonPageLoadTimeoutFilterRule(CategoryRule):
             ("not loaded" in root_cause_lower and ("seconds" in root_cause_lower or "timeout" in root_cause_lower)) or
             re.search(r"['\"]([^'\"]+Page[^'\"]*)['\"]\s+not\s+loaded", root_cause_lower, re.IGNORECASE) or
             # Element visibility timeout patterns
-            re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", root_cause, re.IGNORECASE) or
-            re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", execution_log, re.IGNORECASE) or
+            re.search(r"is\s+(?:NOT|not)\s+(\w+)\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", root_cause, re.IGNORECASE) or
+            re.search(r"is\s+(?:NOT|not)\s+(\w+)\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", execution_log, re.IGNORECASE) or
             re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+and\s+clickable\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", root_cause, re.IGNORECASE) or
             re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+and\s+clickable\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", execution_log, re.IGNORECASE) or
             # TimeoutException for element clickable/visible
@@ -261,6 +272,195 @@ class AssertionFailureFilterRule(CategoryRule):
         return not bool(is_valid_assertion)
 
 
+class AssertionFailurePriorityRule(CategoryRule):
+    """
+    High priority rule to catch clear assertion failures that might be misclassified 
+    as ELEMENT_NOT_FOUND or other categories because they contain element-related text.
+    """
+    priority = 20  # Very High Priority (checks before everything else)
+    category = 'ASSERTION_FAILURE'
+
+    def matches(self, failure: FailureClassification, cache: TestDataCache) -> bool:
+        root_cause = (failure.root_cause or "").lower()
+        execution_log = (cache.get_combined_log(failure.test_name) or "").lower()
+        text = f"{root_cause} {execution_log}"
+
+        # Strong assertion patterns that should override other categories
+        is_strong_assertion = (
+            # Pattern: "Expected 'X' was :-'Y'. But actual is 'Z'"
+            re.search(r"expected\s+['\"]?[^'\"]+['\"]?\s+was\s*[:-]\s*['\"]?[^'\"]+['\"]?\s*\.?\s*but\s+actual\s+is", text, re.IGNORECASE) or
+            # Pattern: "Expected ... but found ..."
+            re.search(r"expected\s+.*but\s+found", text, re.IGNORECASE) or
+            # Pattern: "Expected ... but actual ..."
+            re.search(r"expected\s+.*but\s+actual", text, re.IGNORECASE) or
+            # Pattern: "Missing key/field"
+            re.search(r"missing\s+(?:key|field)\s*:", text, re.IGNORECASE) or
+             # Pattern: "Actual JSON doesn't contain all expected keys"
+            re.search(r"actual\s+json\s+doesn'?t\s+contain\s+all\s+expected\s+keys", text, re.IGNORECASE) or
+            # Pattern: "The following asserts failed"
+            re.search(r"the\s+following\s+asserts\s+failed", text, re.IGNORECASE) or
+            # Pattern: toast message mismatch "Expected toast ... but found"
+            ("toast message" in text and "expected" in text and ("found" in text or "actual" in text)) or
+            # Pattern: Status code mismatch
+            re.search(r"expected\s+status\s+code\s+\d+\s+but\s+found\s+\d+", text, re.IGNORECASE) or
+             # Pattern: "Value mismatch" explicit mention
+            "value mismatch" in text
+        )
+
+        return bool(is_strong_assertion)
+
+
+class OtherToElementNotFoundRule(CategoryRule):
+    """When AI returned OTHER, reclassify to ELEMENT_NOT_FOUND if we see element/locator exception patterns."""
+    priority = 4
+    category = 'ELEMENT_NOT_FOUND'
+
+    def matches(self, failure: FailureClassification, cache: TestDataCache) -> bool:
+        current = getattr(failure, 'root_cause_category', 'OTHER')
+        if current not in ('OTHER', 'ASSERTION_FAILURE'):
+            return False
+        root_cause = (failure.root_cause or "").lower()
+        execution_log = cache.get_combined_log(failure.test_name).lower()
+        text = f"{root_cause} {execution_log}"
+        return (
+            "nosuchelementexception" in text or
+            "staleelementreferenceexception" in text or
+            "elementclickinterceptedexception" in text or
+            ("nullpointerexception" in text and ("getpageelement" in text or "gettext()" in text or "webelement" in text)) or
+            ("indexoutofboundsexception" in text and ("length 0" in text or "out of bounds for length")) or
+            ("illegalargumentexception" in text and ("bound must be positive" in text or "element" in text or "locator" in text)) or
+            "element" in root_cause and "not found" in root_cause or
+            "locator" in root_cause and "not found" in root_cause or
+            "is not clickable" in text or
+            "waiting for element to be clickable" in text or
+            "proxyelement" in text or
+            "defaultelementlocator" in text
+        )
+
+
+class OtherToTimeoutRule(CategoryRule):
+    """When AI returned OTHER, reclassify to TIMEOUT if we see timeout patterns."""
+    priority = 4
+    category = 'TIMEOUT'
+
+    def matches(self, failure: FailureClassification, cache: TestDataCache) -> bool:
+        current = getattr(failure, 'root_cause_category', 'OTHER')
+        if current not in ('OTHER', 'ASSERTION_FAILURE'):
+            return False
+        root_cause = failure.root_cause or ""
+        execution_log = cache.get_combined_log(failure.test_name)
+        return bool(
+            re.search(r"['\"]([^'\"]+Page[^'\"]*)['\"]\s+(?:NOT|not)\s+loaded\s+even\s+after", root_cause, re.IGNORECASE) or
+            re.search(r"['\"]([^'\"]+Page[^'\"]*)['\"]\s+(?:NOT|not)\s+loaded\s+even\s+after", execution_log, re.IGNORECASE) or
+            re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+even\s+after\s+waiting", root_cause, re.IGNORECASE) or
+            re.search(r"Element\s+['\"]([^'\"]+)['\"]\s+is\s+(?:NOT|not)\s+visible\s+even\s+after\s+waiting", execution_log, re.IGNORECASE) or
+            # Generalized to handle "is NOT hidden", "is NOT shown", etc.
+            re.search(r"is\s+(?:NOT|not)\s+(\w+)\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", root_cause, re.IGNORECASE) or
+            re.search(r"is\s+(?:NOT|not)\s+(\w+)\s+even\s+after\s+waiting\s+for\s+\d+\s+seconds", execution_log, re.IGNORECASE) or
+            re.search(r"TimeoutException.*waiting\s+for\s+element\s+to\s+be\s+(?:clickable|visible)", root_cause, re.IGNORECASE) or
+            re.search(r"TimeoutException.*waiting\s+for\s+element\s+to\s+be\s+(?:clickable|visible)", execution_log, re.IGNORECASE) or
+            ("not loaded even after" in root_cause.lower()) or
+            ("not loaded even after" in (execution_log or "").lower())
+        )
+
+
+class OtherToAssertionRule(CategoryRule):
+    """When AI returned OTHER, reclassify to ASSERTION_FAILURE if we see assertion patterns."""
+    priority = 4
+    category = 'ASSERTION_FAILURE'
+
+    def matches(self, failure: FailureClassification, cache: TestDataCache) -> bool:
+        current = getattr(failure, 'root_cause_category', 'OTHER')
+        if current not in ('OTHER', 'ASSERTION_FAILURE'):
+            return False
+        root_cause = (failure.root_cause or "").lower()
+        execution_log = (cache.get_combined_log(failure.test_name) or "").lower()
+        text = f"{root_cause} {execution_log}"
+        return (
+            (re.search(r"expected\s+.*but\s+actual", text, re.IGNORECASE) or re.search(r"actual\s+.*expected", text, re.IGNORECASE)) or
+            re.search(r"missing\s+(?:key|field)\s*:", text, re.IGNORECASE) or
+            re.search(r"classes\s+of\s+actual\s+and\s+expected\s+key", text, re.IGNORECASE) or
+            re.search(r"actual\s+json\s+doesn'?t\s+contain\s+all\s+expected\s+keys", text, re.IGNORECASE) or
+            re.search(r"key\s*/\s*value\s+is\s+null", text, re.IGNORECASE) or
+            re.search(r"the\s+following\s+asserts\s+failed", text, re.IGNORECASE) or
+            ("assertion" in text and ("failed" in text or "error" in text)) or
+            ("expected" in text and "actual" in text) or
+            # Failure reason patterns for StringIndexOutOfBoundsException
+            re.search(r"failure\s+reason\s*:\s*begin\s+\d+\s*,\s*end\s+[-\d]+\s*,\s*length\s+\d+", text, re.IGNORECASE) or
+            re.search(r"StringIndexOutOfBoundsException", text, re.IGNORECASE)
+        )
+
+
+class OtherToEnvironmentRule(CategoryRule):
+    """When AI returned OTHER, reclassify to ENVIRONMENT_ISSUE if we see environment/network patterns."""
+    priority = 4
+    category = 'ENVIRONMENT_ISSUE'
+
+    def matches(self, failure: FailureClassification, cache: TestDataCache) -> bool:
+        current = getattr(failure, 'root_cause_category', 'OTHER')
+        if current not in ('OTHER', 'ASSERTION_FAILURE', 'ENVIRONMENT_ISSUE'):
+            return False
+        root_cause = (failure.root_cause or "").lower()
+        execution_log = (cache.get_combined_log(failure.test_name) or "").lower()
+        text = f"{root_cause} {execution_log}"
+        return (
+            "503" in text or "502" in text or "504" in text or
+            "connection refused" in text or "connection reset" in text or
+            "service unavailable" in text or "bad gateway" in text or "gateway timeout" in text or
+            "unknown host" in text or "dns" in text and "error" in text or
+            "connection timed out" in text or "connect timed out" in text
+        )
+
+class OtherToCodeIssueRule(CategoryRule):
+    """When AI returned OTHER or ENVIRONMENT, reclassify to CODE_ISSUE if we see non-Selenium NPE patterns."""
+    priority = 5  # Higher than OtherToEnvironmentRule
+    category = 'CODE_ISSUE'
+
+    def matches(self, failure: FailureClassification, cache: TestDataCache) -> bool:
+        current = getattr(failure, 'root_cause_category', 'OTHER')
+        if current not in ('OTHER', 'ENVIRONMENT_ISSUE', 'ASSERTION_FAILURE'):
+            return False
+            
+        root_cause = (failure.root_cause or "").lower()
+        execution_log = (cache.get_combined_log(failure.test_name) or "").lower()
+        text = f"{root_cause} {execution_log}"
+        
+        # Check for modern Java NullPointerException messages that aren't about Selenium elements
+        npe_match = re.search(r"cannot invoke\s+['\"]?[^'\"]+['\"]?\s+because\s+['\"]?[^'\"]+['\"]?\s+is\s+null", text, re.IGNORECASE)
+        
+        if npe_match:
+            # Filter out Selenium-related NPEs which belong to ELEMENT_NOT_FOUND
+            selenium_patterns = ["webelement", "getpageelement", "gettext()", "selenium", "locator", "org.openqa.selenium"]
+            if any(p in text.lower() for p in selenium_patterns):
+                return False
+            return True
+            
+        return False
+
+
+class OtpIsProductBugRule(CategoryRule):
+    """OTP-related failures (e.g. matching OTP not found, OTP delivery) are product/test-flow issues, not environment."""
+    priority = 8  # Override ENVIRONMENT_ISSUE when OTP pattern detected
+    category = 'ASSERTION_FAILURE'
+
+    def matches(self, failure: FailureClassification, cache: TestDataCache) -> bool:
+        current = getattr(failure, 'root_cause_category', 'OTHER')
+        # Allow matching even if current category is ASSERTION_FAILURE to prevent downgrade by other rules
+        if current not in ('ENVIRONMENT_ISSUE', 'OTHER', 'ASSERTION_FAILURE'):
+            return False
+        root_cause = (failure.root_cause or "").lower()
+        execution_log = (cache.get_combined_log(failure.test_name) or "").lower()
+        text = f"{root_cause} {execution_log}"
+        if "otp" not in text:
+            return False
+        return (
+            "matching otp not found" in text or "otp not found" in text or
+            "otp not received" in text or "otp delivery" in text or
+            "otp generation" in text or "otp validation" in text or
+            "invalid otp" in text or "wrong otp" in text
+        )
+
+
 class CategoryRuleEngine:
     """Engine to apply category classification rules"""
     
@@ -269,10 +469,18 @@ class CategoryRuleEngine:
         self.rules = [
             ElementClickInterceptedRule(),
             PageLoadTimeoutRule(),
+            AssertionFailurePriorityRule(),  # High priority check
             ElementLocatorExceptionRule(),
             IllegalArgumentExceptionRule(),
+            OtpIsProductBugRule(),  # OTP-related → product (ASSERTION_FAILURE), not environment
             NonPageLoadTimeoutFilterRule(),
             AssertionFailureFilterRule(),
+            # When AI returned OTHER, try to upgrade to a specific category from text patterns
+            OtherToElementNotFoundRule(),
+            OtherToTimeoutRule(),
+            OtherToAssertionRule(),
+            OtherToCodeIssueRule(),
+            OtherToEnvironmentRule(),
         ]
         # Sort by priority (highest first)
         self.rules.sort(key=lambda r: r.priority, reverse=True)
@@ -300,7 +508,8 @@ class CategoryRuleEngine:
         category_priority = {
             'TIMEOUT': 15,
             'ELEMENT_NOT_FOUND': 12,
-            'ASSERTION_FAILURE': 8,
+            'CODE_ISSUE': 10,
+            'ASSERTION_FAILURE': 20, # Increased priority to respect AssertionFailurePriorityRule
             'ENVIRONMENT_ISSUE': 6,
             'OTHER': 1
         }
@@ -322,6 +531,9 @@ class CategoryRuleEngine:
             ), reverse=True)
             category = matching_rules[0].category
             logger.debug(f"Selected highest priority category for {failure.test_name}: {category} (from {len(matching_rules)} matching rules)")
+        
+        # Update the failure object with the final category
+        failure.root_cause_category = category
         
         return category
 

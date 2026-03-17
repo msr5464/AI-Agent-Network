@@ -90,6 +90,13 @@ def db_row_to_test_result(db_row: Dict, execution_log: Optional[str] = None, dur
         status = TestStatus.PASS
         logger.warning(f"Unknown status '{status_str}' for test {testcase_name}, defaulting to PASS")
     
+    # Extract known failure (Jira ticket ID)
+    known_failure = db_row.get('knownFailure', '') or None
+    if known_failure:
+        known_failure = str(known_failure).strip()
+        if not known_failure or known_failure.upper() in ['NULL', 'NONE', '']:
+            known_failure = None
+    
     # Extract error information
     failure_reason = db_row.get('failureReason', '')
     error_message = None
@@ -145,7 +152,8 @@ def db_row_to_test_result(db_row: Dict, execution_log: Optional[str] = None, dur
         stack_trace=stack_trace,
         platform=platform,
         execution_log=execution_log,
-        description=None  # Will be filled from HTML if available
+        description=None,  # Will be filled from HTML if available
+        known_failure=known_failure  # Jira ticket ID if test passed due to known failure
     )
 
 
@@ -439,34 +447,11 @@ def get_full_report_data_from_db(report_dir: str, db_results: List[Dict], execut
     
     logger.info(f"Created {len(test_results)} unique TestResult objects from database (with HTML logs merged)")
     
-    # Build fallback HTML links if none were extracted (e.g., missing html/ directory)
-    effective_links = html_links or {}
-    if not effective_links:
-        try:
-            from ..settings import Config
-            from ..utils import ReportUrlBuilder
-            normalized_dir = ReportUrlBuilder.normalize_path(report_dir)
-            report_name = Path(normalized_dir).name
-            project_name, job_name = ReportUrlBuilder.extract_project_job_from_path(normalized_dir)
-            fallback_link = ReportUrlBuilder.build_dashboard_url(
-                Config.DASHBOARD_BASE_URL,
-                report_name,
-                "html/index.html",
-                project_name,
-                job_name
-            )
-            # Map every test to the fallback link so UI still renders clickable links
-            effective_links = {tr.full_name: fallback_link for tr in test_results}
-            logger.info(f"No HTML links found; using fallback link for {len(effective_links)} tests")
-        except Exception as e:
-            logger.warning(f"Failed to build fallback HTML links: {e}")
-            effective_links = {}
-    
     return {
         'test_results': test_results,
         'summary': summary,
         'report_dir': report_dir,
-        'html_links': effective_links
+        'html_links': html_links or {}
     }
 
 

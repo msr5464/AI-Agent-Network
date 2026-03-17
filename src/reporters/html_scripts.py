@@ -4,28 +4,32 @@ Extracted from report_generator.py for better maintainability.
 """
 
 
-def get_html_scripts(dashboard_base_url: str, project_name: str, job_name: str) -> str:
+def get_html_scripts(dashboard_base_url: str, project_name: str, job_name: str, jira_base_url: str = '') -> str:
     """
     Generate JavaScript code for the HTML report.
-    
+
     Args:
         dashboard_base_url: Base URL for the dashboard (e.g., "https://dashboard.qa.example.com")
         project_name: Project name for building URLs
-        
+        job_name: Job name for building URLs
+        jira_base_url: Base URL for Jira (e.g., "https://jira.example.com") for known-failure ticket links
+
     Returns:
         JavaScript code as a string
     """
     # Escape single quotes in the values to prevent JavaScript errors
     dashboard_base_url_escaped = dashboard_base_url.replace("'", "\\'")
     project_name_escaped = project_name.replace("'", "\\'")
-    job_name_escaped = (job_name or "").replace("'", "\\'")
-    
+    job_name_escaped = job_name.replace("'", "\\'")
+    jira_base_url_escaped = (jira_base_url or '').rstrip('/').replace("'", "\\'")
+
     # Use triple quotes with string concatenation to avoid issues with JavaScript braces
     return (
         """            // Configuration from server
             const DASHBOARD_BASE_URL = '""" + dashboard_base_url_escaped + """';
             const PROJECT_NAME = '""" + project_name_escaped + """';
             const JOB_NAME = '""" + job_name_escaped + """';
+            const JIRA_BASE_URL = '""" + jira_base_url_escaped + """';
             const newlineChar = '\\n';
             
             // Handle expand icon click to toggle details and update animation
@@ -444,12 +448,13 @@ def get_html_scripts(dashboard_base_url: str, project_name: str, job_name: str) 
                 const execStatus = dot.getAttribute('data-execution-status') || 'N/A';
                 const historyStatus = dot.getAttribute('data-history-status') || ''; // 'pass' or 'fail'
                 
-                // Determine if this is a pass or fail
+                // Determine if this is a pass, fail, or known failure
                 // Priority: 1. history-status attribute, 2. execStatus, 3. dot color
+                const isKnownFailure = historyStatus === 'known_failure';
                 const isFailure = historyStatus === 'fail' || 
-                                 execStatus.toUpperCase().includes('FAIL') || 
-                                 execStatus.toUpperCase().includes('ERROR');
-                const isPass = historyStatus === 'pass' || (!isFailure && historyStatus !== 'fail');
+                                 (execStatus.toUpperCase().includes('FAIL') || 
+                                  execStatus.toUpperCase().includes('ERROR')) && !isKnownFailure;
+                const isPass = (historyStatus === 'pass' || (!isFailure && historyStatus !== 'fail' && !isKnownFailure));
                 
                 // Find the details row - it's the next sibling of the parent row
                 const parentRow = dot.closest('tr');
@@ -486,14 +491,24 @@ def get_html_scripts(dashboard_base_url: str, project_name: str, job_name: str) 
                 }
                 
                 // Show details - determine status based on dot color and execStatus
-                const statusColor = isFailure ? '#dc3545' : '#28a745';
-                const statusText = isFailure ? '❌ Failed' : '✅ Passed';
+                let statusColor, statusText;
+                if (isKnownFailure) {
+                    statusColor = '#ffc107';
+                    statusText = '⚠️ FAILED due to known issue, but marked as PASSED!';
+                } else if (isFailure) {
+                    statusColor = '#dc3545';
+                    statusText = '❌ Failed';
+                } else {
+                    statusColor = '#28a745';
+                    statusText = '✅ Passed';
+                }
                 
-                // Build error message row only if it's a failure and has error message
+                // Build error message row if it's a failure OR known failure and has error message
+                // Known failures also have failureReason data that should be displayed
                 // Trim leading/trailing whitespace and normalize excessive whitespace
                 let cleanedError = execError || '';
                 let errorMessageRow = '';
-                if (isFailure && cleanedError && cleanedError !== 'N/A' && cleanedError.trim() !== '') {
+                if ((isFailure || isKnownFailure) && cleanedError && cleanedError !== 'N/A' && cleanedError.trim() !== '') {
                     try {
                         // Decode HTML entities first to work with actual text
                         const tempDiv = document.createElement('div');
@@ -511,10 +526,12 @@ def get_html_scripts(dashboard_base_url: str, project_name: str, job_name: str) 
                         // Re-escape for HTML display
                         cleanedError = decodedError.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
                         
+                        // Use different border color for known failures (yellow) vs actual failures (red)
+                        const borderColor = isKnownFailure ? '#ffc107' : '#dc3545';
                         errorMessageRow = '<tr>' +
                             '<td style="padding: 4px; font-weight: 600; color: #6c757d; vertical-align: top; text-align: left;">Error Message:</td>' +
                             '<td style="padding: 4px; text-align: left;">' +
-                            '<div style="background-color: #fff; padding: 5px 5px 5px 5px; border-radius: 3px; border-left: 2px solid #dc3545; font-family: monospace; font-size: 11px; max-height: 240px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; text-align: left; margin: 0;">' +
+                            '<div style="background-color: #fff; padding: 5px 5px 5px 5px; border-radius: 3px; border-left: 2px solid ' + borderColor + '; font-family: monospace; font-size: 11px; max-height: 240px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; text-align: left; margin: 0;">' +
                             cleanedError +
                             '</div>' +
                             '</td>' +
@@ -522,10 +539,11 @@ def get_html_scripts(dashboard_base_url: str, project_name: str, job_name: str) 
                     } catch (e) {
                         console.error('Error processing error message:', e);
                         // Fallback: use original error message
+                        const borderColor = isKnownFailure ? '#ffc107' : '#dc3545';
                         errorMessageRow = '<tr>' +
                             '<td style="padding: 4px; font-weight: 600; color: #6c757d; vertical-align: top; text-align: left;">Error Message:</td>' +
                             '<td style="padding: 4px; text-align: left;">' +
-                            '<div style="background-color: #fff; padding: 5px 5px 5px 5px; border-radius: 3px; border-left: 2px solid #dc3545; font-family: monospace; font-size: 11px; max-height: 240px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; text-align: left; margin: 0;">' +
+                            '<div style="background-color: #fff; padding: 5px 5px 5px 5px; border-radius: 3px; border-left: 2px solid ' + borderColor + '; font-family: monospace; font-size: 11px; max-height: 240px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; text-align: left; margin: 0;">' +
                             (execError || 'Error message unavailable') +
                             '</div>' +
                             '</td>' +
@@ -576,7 +594,26 @@ def get_html_scripts(dashboard_base_url: str, project_name: str, job_name: str) 
                     `;
                 }
                 
-                // Only show error message for failures
+                // Show known failure info if applicable (JIRA_BASE_URL from Config, injected by report generator)
+                const knownFailureTicket = dot.getAttribute('data-known-failure') || '';
+                if (isKnownFailure && knownFailureTicket && knownFailureTicket.trim() !== '') {
+                    const jiraBase = (JIRA_BASE_URL || '').trim();
+                    const jiraUrl = jiraBase ? (jiraBase + '/browse/' + knownFailureTicket) : '';
+                    const ticketHtml = jiraUrl
+                        ? `<a href="${jiraUrl}" target="_blank" style="color: #ff9800; text-decoration: none; font-weight: 600;">${knownFailureTicket}</a>`
+                        : `<span style="color: #ff9800; font-weight: 600;">${knownFailureTicket}</span>`;
+                    tableRows += `
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; color: #6c757d; font-size: 12px; text-align: left;">Known Issue Ticket:</td>
+                            <td style="padding: 4px; font-size: 12px; text-align: left;">
+                                ${ticketHtml}
+                                <span style="color: #6c757d; font-size: 11px; margin-left: 8px;">(Test failed but marked as passed due to this known issue)</span>
+                            </td>
+                        </tr>
+                    `;
+                }
+                
+                // Show error message for failures and known failures (both have failureReason data)
                 if (errorMessageRow) {
                     tableRows += errorMessageRow;
                 }

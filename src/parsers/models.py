@@ -29,6 +29,7 @@ class TestResult:
     platform: Optional[str] = None  # WEB, API, MOBILE
     execution_log: Optional[str] = None  # NEW: Complete execution log from HTML
     description: Optional[str] = None  # English description of what the test case does
+    known_failure: Optional[str] = None  # Jira ticket ID if test passed due to known failure
     
     @property
     def full_name(self) -> str:

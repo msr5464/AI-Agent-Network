@@ -17,20 +17,26 @@ class FailureClassification:
     """Result of AI failure classification"""
     
     def __init__(self, test_name: str, classification: str, confidence: str, 
-                 root_cause: str, recommended_action: str, root_cause_category: str = "OTHER"):
+                 root_cause: str, recommended_action: str, root_cause_category: str = "OTHER",
+                 failure_signature: str = None):
         self.test_name = test_name
         self.classification = classification  # PRODUCT_BUG or AUTOMATION_ISSUE
         self.confidence = confidence  # HIGH, MEDIUM, LOW
         self.root_cause = root_cause
         self.recommended_action = recommended_action
         self.root_cause_category = root_cause_category  # ELEMENT_NOT_FOUND, TIMEOUT, etc.
+        self.failure_signature = failure_signature or "Unspecified Failure"
     
     def is_product_bug(self) -> bool:
         """Check if classified as product bug"""
+        if self.root_cause_category == "CODE_ISSUE":
+            return False
         return self.classification == "PRODUCT_BUG"
     
     def is_automation_issue(self) -> bool:
         """Check if classified as automation issue"""
+        if self.root_cause_category == "CODE_ISSUE":
+            return True
         return self.classification == "AUTOMATION_ISSUE"
     
     def __repr__(self) -> str:
@@ -53,6 +59,8 @@ class TestAnalyzer:
         
         if self.llm_provider == 'openai':
             self._init_openai()
+        elif self.llm_provider == 'gemini':
+            self._init_gemini()
         else:
             self._init_ollama()
     
@@ -94,7 +102,31 @@ class TestAnalyzer:
         except Exception as e:
             logger.error(f"Failed to initialize OpenAI: {e}")
             raise
-    
+
+    def _init_gemini(self):
+        """Initialize Google Gemini LLM"""
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+        except ImportError:
+            logger.error("Gemini provider selected but langchain-google-genai is not installed.")
+            raise
+        try:
+            api_key = Config.GEMINI_API_KEY
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY not found in environment variables")
+
+            self.model = Config.GEMINI_MODEL
+
+            self.llm = ChatGoogleGenerativeAI(
+                model=self.model,
+                google_api_key=api_key,
+                temperature=0.3
+            )
+            logger.info(f"✅ Gemini LLM initialized: {self.model}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini: {e}")
+            raise
+
     def classify_failure(self, test_result: TestResult) -> FailureClassification:
         """
         Classify a single test failure using AI.
@@ -139,7 +171,7 @@ class TestAnalyzer:
                 test_name=cleaned_full_name,
                 classification="UNKNOWN",
                 confidence="LOW",
-                root_cause=f"Classification failed: {str(e)}",
+                root_cause=f"AI Classification Error: {str(e)}\nOriginal Error: {test_result.error_message[:500] if test_result.error_message else 'No error message'}",
                 recommended_action="Manual review required",
                 root_cause_category="OTHER"
             )
@@ -167,6 +199,7 @@ PRODUCT_BUG indicators:
   * Missing keys in API responses (e.g., "Missing Key: debitAccountUuid")
   * Class type mismatches (e.g., "Classes of actual and expected key 'remark' are different")
   * Null values where non-null expected (e.g., "Key/Value is null while putting run time property")
+  * OTP-related failures (ALWAYS PRODUCT_BUG with root_cause_category ASSERTION_FAILURE): "matching OTP not found", "Matching OTP Not Found", OTP not received, OTP delivery/validation failure—these are application or test-flow issues, not environment/infrastructure.
 - Unexpected application behavior
 - API returning wrong data or status codes
 - UI displaying incorrect values
@@ -185,6 +218,7 @@ AUTOMATION_ISSUE indicators:
 - WebDriver connection/session issues
 - Test data setup/cleanup failures
 - Synchronization problems
+- Code-level logic issues or NullPointerExceptions (e.g., Cannot invoke "String.split(String)" because "otp" is null - ALWAYS classify as AUTOMATION_ISSUE with root_cause_category CODE_ISSUE)
 
 Test Details:
 - Test: {test_result.full_name}
@@ -193,16 +227,34 @@ Test Details:
 - Error Message: {test_result.error_message}
 - Execution Log (isolated for this test case only, from start to end): {execution_context or 'N/A'}
 
-Respond in JSON format:
-{{
-  "classification": "PRODUCT_BUG" or "AUTOMATION_ISSUE",
-  "confidence": "HIGH" or "MEDIUM" or "LOW",
-  "root_cause": "EXTRACT EXACT DETAILS. Do not summarize. Must include: API Name, Status Code, Missing Key, Locator Name, or Exception Message. Example: 'POST /api/v1/user returned 500' or 'Missing key: phoneNumber' or 'Locator: #submit-btn not found'",
-  "root_cause_category": "ELEMENT_NOT_FOUND" or "TIMEOUT" or "ASSERTION_FAILURE" or "ENVIRONMENT_ISSUE" or "OTHER",
-  "recommended_action": "Specific next step to take"
-}}
+        Respond in JSON format:
+        {{
+          "classification": "PRODUCT_BUG" or "AUTOMATION_ISSUE",
+          "confidence": "HIGH" or "MEDIUM" or "LOW",
+          "root_cause": "Detailed explanation of the failure. Must include: API Name, Status Code, Missing Key, Locator Name, or Exception Message.",
+          "failure_signature": "Concise (3-6 words) grouping key. Format: [Type]: [Short Details]. NO IDs/Timestamps/Narratives. Examples: 'API Error: POST /login 500', 'Element Missing: #submit-btn', 'Assertion: Status Code 404', 'Timeout: TransferPage load'",
+          "root_cause_category": "ELEMENT_NOT_FOUND" or "TIMEOUT" or "ASSERTION_FAILURE" or "ENVIRONMENT_ISSUE" or "CODE_ISSUE" or "OTHER",
+          "recommended_action": "Specific next step to take"
+        }}
+
+        IMPORTANT RULES FOR ROOT CAUSE:
+        1. NO NARRATIVES: Do NOT start with "The test...", "This test...", "Verified that...", "It appears that...".
+        2. NO VALIDATION DESCRIPTIONS: Do NOT explain what the test does. Only state what went wrong.
+        3. BE CONCISE: Use less than 15 words if possible.
+        4. SPECIFICITY: Include the exact key name, status code, locator, or exception.
+        5. BAD EXAMPLES (DO NOT USE):
+           - "The test validates that after approving a pending transfer, it should not be present..." (Too verbose)
+           - "The test failed because the API returned an error" (Too generic)
+           - "Element was not found on the page" (Missing locator)
+        6. GOOD EXAMPLES:
+           - "POST /debit/transfer returned 500 Internal Server Error"
+           - "Missing Key: 'transferId' in response"
+           - "Locator: 'button.submit-transfer' not found"
+           - "Value mismatch: Expected 'APPROVED' but got 'PENDING'"
 
 Root Cause Category Guidelines (with examples):
+
+IMPORTANT: Prefer a specific category (ELEMENT_NOT_FOUND, TIMEOUT, ASSERTION_FAILURE, ENVIRONMENT_ISSUE, CODE_ISSUE) whenever the failure message or stack trace has a matching pattern. Use OTHER only when the failure clearly does not fit any of the categories.
 
 ELEMENT_NOT_FOUND - Use this for element locator and WebElement access issues:
 - ElementClickInterceptedException (e.g., "element click intercepted: Element <button> is not clickable")
@@ -251,8 +303,16 @@ ENVIRONMENT_ISSUE - Use this for environment, infrastructure, and network-relate
 - Network timeout
 - 502 Bad Gateway
 - Any environment or network-related failures
+- Do NOT use ENVIRONMENT_ISSUE for OTP-related failures. OTP issues (e.g. "matching OTP not found", OTP not received, OTP delivery/validation failure) are PRODUCT_BUG with root_cause_category ASSERTION_FAILURE—they indicate application/test-flow behavior (OTP generation, delivery, or validation), not infrastructure.
+- Do NOT use ENVIRONMENT_ISSUE for Java NullPointerExceptions that look like logic errors (e.g., Cannot invoke "String.split(String)" because "otp" is null). Use CODE_ISSUE instead.
 
-OTHER: Anything that doesn't fit above (e.g., compilation error, unknown error)
+CODE_ISSUE - Use this for Java logic errors and NullPointerExceptions that are not related to Selenium elements:
+- General NullPointerExceptions (e.g., "Cannot invoke \"String.split(String)\" because \"otp\" is null")
+- NullPointerExceptions on business objects or data (e.g., "Cannot invoke \"java.lang.Integer.intValue()\" because \"user.id\" is null")
+- Any NullPointerException that is clearly a coding or logic flaw in the automation or application code, but not a simple "element not found".
+- ALWAYS classify as AUTOMATION_ISSUE.
+
+OTHER: Use ONLY when the failure clearly does not match any of the categories above (e.g., compilation error, unknown error). If you see exception names (NoSuchElementException, TimeoutException, etc.), expected/actual text, or HTTP/connection errors, choose the matching specific category instead of OTHER.
 
 Confidence Guidelines:
 - HIGH: Clear, unambiguous indicators (e.g., NoSuchElementException, API 500 error, missing required keys, clear assertion mismatch with specific values)
@@ -295,7 +355,8 @@ Respond ONLY with valid JSON, no additional text."""
                 confidence=data.get('confidence', 'LOW'),
                 root_cause=data.get('root_cause', 'No explanation provided'),
                 recommended_action=data.get('recommended_action', 'Manual review required'),
-                root_cause_category=data.get('root_cause_category', 'OTHER')
+                root_cause_category=data.get('root_cause_category', 'OTHER'),
+                failure_signature=data.get('failure_signature', 'Unspecified Failure')
             )
             
         except json.JSONDecodeError as e:
@@ -317,7 +378,8 @@ Respond ONLY with valid JSON, no additional text."""
                 confidence='LOW',
                 root_cause=response[:200] if response else 'No explanation',
                 recommended_action='Manual review required',
-                root_cause_category='OTHER'
+                root_cause_category='OTHER',
+                failure_signature='Parse Error'
             )
     
     def classify_multiple_failures(self, test_results: List[TestResult]) -> List[FailureClassification]:
@@ -373,9 +435,10 @@ Respond ONLY with valid JSON, no additional text."""
                     test_name=failure.full_name,
                     classification="UNKNOWN",
                     confidence="LOW",
-                    root_cause=f"Classification error: {str(e)}",
+                    root_cause=f"AI Classification Error: {str(e)}\nOriginal Error: {failure.error_message[:500] if failure.error_message else 'No error message'}",
                     recommended_action="Manual review required",
-                    root_cause_category="OTHER"
+                    root_cause_category="OTHER",
+                    failure_signature="Classification Failed"
                 ))
             
             logger.info("")  # Empty line for readability

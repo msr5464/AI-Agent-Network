@@ -44,7 +44,9 @@ class Database:
             # Use pymysql with proper parameter names
             config_with_timeout = self.db_config.copy()
             # pymysql uses 'connect_timeout' not 'connection_timeout'
-            config_with_timeout['connect_timeout'] = 5
+            config_with_timeout['connect_timeout'] = 10
+            config_with_timeout['read_timeout'] = 15
+            config_with_timeout['write_timeout'] = 15
             if 'connection_timeout' in config_with_timeout:
                 del config_with_timeout['connection_timeout']
             

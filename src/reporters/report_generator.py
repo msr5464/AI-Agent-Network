@@ -20,13 +20,14 @@ from ..utils import (
     remove_duplicate_class_name,
     extract_class_and_method,
     ReportUrlBuilder,
-    normalize_root_cause
+    normalize_root_cause,
+    FailureClassificationUtils
 )
 from ..settings import Config
-from .category_rules import CategoryRuleEngine
 from .data_validator import validate_report_data, validate_post_report
 from .html_styles import get_html_styles
 from .html_scripts import get_html_scripts
+from .signal_extractor import FailureSignalExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +84,13 @@ class ReportGenerator:
         trend: Optional[str] = None,
         report_dir: Optional[str] = None,
         test_results: Optional[List[TestResult]] = None,
-        test_html_links: Optional[Dict[str, str]] = None
+        test_html_links: Optional[Dict[str, str]] = None,
+        environment: Optional[str] = None,
+        output_dir: Optional[str] = None,
     ) -> tuple[str, Dict[str, List[str]]]:
         """
         Generate HTML report content.
-        
+
         Args:
             summary: TestSummary object
             classifications: List of failure classifications
@@ -97,12 +100,15 @@ class ReportGenerator:
             trend: Trend indicator
             report_dir: Path to report directory for HTML links
             test_results: List of test results for descriptions
-            
+            output_dir: Directory where the report will be saved; when set, screenshot
+                URLs are relative so opening the report from disk loads images locally.
+
         Returns:
             HTML content as string
         """
         html_content, test_api_map = self._generate_html(
-            summary, classifications, report_name, ai_summary, recurring_failures, trend, report_dir, test_results, test_html_links
+            summary, classifications, report_name, ai_summary, recurring_failures, trend,
+            report_dir, test_results, test_html_links, environment, output_dir
         )
         return html_content, test_api_map
     
@@ -129,6 +135,63 @@ class ReportGenerator:
         except Exception as e:
             logger.error(f"Failed to save report: {e}")
             raise
+    
+    def save_autofix_tests_file(
+        self,
+        classifications: List[FailureClassification],
+        output_dir: str,
+        report_name: str
+    ) -> Optional[str]:
+        """
+        Generate and save a file containing all auto-fixable test names (AUTOMATION_ISSUE, not PRODUCT_BUG).
+        This file can be used with --autofix-tests-file for selective auto-fix.
+        
+        Args:
+            classifications: List of failure classifications
+            output_dir: Output directory for the file
+            report_name: Report name for filename
+            
+        Returns:
+            Path to saved file or None if no auto-fixable tests
+        """
+        # Filter to auto-fixable tests (AUTOMATION_ISSUE with HIGH/MEDIUM confidence)
+        auto_fixable = [
+            c for c in classifications
+            if c.classification == "AUTOMATION_ISSUE" and c.confidence in ["HIGH", "MEDIUM"]
+        ]
+        
+        if not auto_fixable:
+            logger.debug("No auto-fixable tests found, skipping autofix tests file generation")
+            return None
+        
+        # Sanitize report_name for filename
+        safe_report_name = "".join(c for c in report_name if c.isalnum() or c in ('-', '_', ' ')).strip().replace(' ', '-')
+        
+        # Create output file path
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        tests_file = output_path / f"autofix_tests_{safe_report_name}.txt"
+        
+        try:
+            # Write test names, one per line
+            with open(tests_file, 'w', encoding='utf-8') as f:
+                # Write header comment
+                f.write("# Auto-fixable test names (AUTOMATION_ISSUE with HIGH/MEDIUM confidence)\n")
+                f.write(f"# Generated from report: {report_name}\n")
+                f.write(f"# Total tests: {len(auto_fixable)}\n")
+                f.write("# Use with: --autofix-tests-file <this-file>\n")
+                f.write("#\n")
+                
+                # Write test names (sorted for consistency)
+                test_names = sorted([c.test_name for c in auto_fixable])
+                for test_name in test_names:
+                    f.write(f"{test_name}\n")
+            
+            logger.info(f"📝 Auto-fix tests file saved: {tests_file} ({len(auto_fixable)} tests)")
+            return str(tests_file.absolute())
+        except Exception as e:
+            logger.error(f"Failed to save autofix tests file: {e}")
+            return None
     
     def _find_test_html_link(self, class_name: str, method_name: str, report_dir: Optional[str], report_name: str, test_html_links: Optional[Dict[str, str]] = None) -> Optional[str]:
         """
@@ -216,8 +279,21 @@ class ReportGenerator:
                             suite_file = suite['results_file']
                             
                             if report_name:
-                                html_link = self._build_dashboard_url(report_name, f"html/{suite_file}")
-                                return html_link
+                                # Use ReportUrlBuilder directly
+                                from ..utils import ReportUrlBuilder
+                                from ..settings import Config
+                                
+                                # Extract project and job names for accurate URL building
+                                project_name = ReportUrlBuilder.extract_project_name(report_name)
+                                # For ProdSanity, we want the project name to be ProdSanity, but the URL structure might be specific
+                                # ReportUrlBuilder.build_dashboard_url handles ProdSanity special case (no job name in path)
+                                
+                                return ReportUrlBuilder.build_dashboard_url(
+                                    Config.DASHBOARD_BASE_URL, 
+                                    report_name, 
+                                    f"html/{suite_file}",
+                                    project_name=project_name
+                                )
                             
                             # Fallback: use relative path if report_name not available
                             return f"html/{suite_file}"
@@ -227,23 +303,31 @@ class ReportGenerator:
             
             # Fallback: return overview if specific test not found
             if report_name:
-                return self._build_dashboard_url(report_name, "html/overview.html")
+                from ..utils import ReportUrlBuilder
+                from ..settings import Config
+                project_name = ReportUrlBuilder.extract_project_name(report_name)
+                return ReportUrlBuilder.build_dashboard_url(
+                    Config.DASHBOARD_BASE_URL, 
+                    report_name, 
+                    "html/overview.html", 
+                    project_name=project_name
+                )
             return "html/overview.html"
             
         except Exception as e:
             logger.debug(f"Could not find HTML link for {class_name}.{method_name}: {e}")
             return None
     
-    def _parse_automation_group_and_branch(self, report_dir: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    def _parse_automation_group_and_branch(self, report_dir: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """
-        Parse automation group and branch from overview.html header.
-        Example: "regression cases on develop branch" -> ("regression", "develop")
+        Parse automation group, branch, and (if present) environment from overview.html header.
+        Example: "regression cases on develop branch" -> ("regression", "develop", None)
         
         Returns:
-            Tuple of (automation_group, automation_branch) or (None, None) if not found
+            Tuple of (automation_group, automation_branch, environment) or (None, None, None) if not found
         """
         if not report_dir:
-            return None, None
+            return None, None, None
         
         try:
             from pathlib import Path
@@ -251,7 +335,7 @@ class ReportGenerator:
             
             overview_path = Path(report_dir) / 'html' / 'overview.html'
             if not overview_path.exists():
-                return None, None
+                return None, None, None
             
             with open(overview_path, 'r', encoding='utf-8') as f:
                 soup = BeautifulSoup(f.read(), 'lxml')
@@ -259,7 +343,7 @@ class ReportGenerator:
             # Find the header suite row that contains the text
             header_row = soup.find('th', class_='header suite')
             if not header_row:
-                return None, None
+                return None, None, None
             
             # Remove the suiteLinks div to get only the actual text
             suite_links_div = header_row.find('div', class_='suiteLinks')
@@ -274,17 +358,37 @@ class ReportGenerator:
             import re
             pattern = r'(\w+)\s+cases\s+on\s+(\w+)\s+branch'
             match = re.search(pattern, header_text, re.IGNORECASE)
+
+            environment = None
+            env_match = re.search(r'(qa-1|qa-2|prod|production|staging)', header_text, re.IGNORECASE)
+            if env_match:
+                environment = env_match.group(1).lower()
             
             if match:
                 automation_group = match.group(1).lower()
                 automation_branch = match.group(2).lower()
-                return automation_group, automation_branch
+                return automation_group, automation_branch, environment
             
-            return None, None
+            return None, None, environment
         except Exception as e:
             logger.debug(f"Could not parse automation group and branch: {e}")
-            return None, None
+            return None, None, None
     
+    def _build_meta_line(self, automation_group: Optional[str], automation_branch: Optional[str], environment: Optional[str]) -> str:
+        """
+        Build the header meta line showing group/branch/environment when available.
+        """
+        parts = []
+        if automation_group:
+            parts.append(f"Group: {automation_group}")
+        if automation_branch:
+            parts.append(f"Branch: {automation_branch}")
+        if environment:
+            parts.append(f"Environment: {environment}")
+        if not parts:
+            return ''
+        return f'<div class="report-meta" style="margin-top: 4px; font-size: 12px;">{" • ".join(parts)}</div>'
+
     def _get_test_info(self, test_name: str, test_results: Optional[List[TestResult]], report_dir: Optional[str] = None) -> Tuple[str, str, str]:
         """
         Get test class name, actual method name, and description from test results.
@@ -1381,6 +1485,33 @@ class ReportGenerator:
         if additional_error_text:
             search_text = search_text + additional_error_text
         
+        # PROIRITIZE RAW LOGS (User Request): Try to extract specific error from execution_log to replace AI root_cause
+        if execution_log:
+            raw_error = None
+            # Check for common error patterns in log
+            error_patterns = [
+                 r"(Caused by:\s+.+)",
+                 r"(java\.lang\.\w+Exception:\s+.+)",
+                 r"(Error:\s+.+)",
+                 r"(Exception:\s+.+)",
+                 r"(Failure:\s+.+)",
+                 r"(Expected\s+.+but found\s+.+)"
+            ]
+            for pattern in error_patterns:
+                match = re.search(pattern, execution_log, re.IGNORECASE)
+                if match:
+                    raw_error = match.group(1).strip()
+                    # If it's very long, maybe truncate? But user asked for "as is".
+                    # Let's keep it reasonable (500 chars)
+                    if len(raw_error) > 500:
+                        raw_error = raw_error[:497] + "..."
+                    break
+            
+            if raw_error:
+                root_cause = raw_error
+                # Update search_text with new root cause
+                search_text = root_cause + "\n\n" + execution_log
+        
         # Extract structured details FIRST to get the corrected API endpoint
         # Pass execution_log separately so API extraction can find the failure point in full logs
         # Also pass test_name to help identify TestDashAmlApis tests that fail due to dashboard/businesses
@@ -1400,7 +1531,43 @@ class ReportGenerator:
         
         # Extract one-liner summary - use combined text to catch exceptions in all sources
         # CRITICAL: Pass details_info so summary can use the corrected API endpoint instead of root_cause
-        summary = html_escape.escape(self._extract_one_liner_summary(search_text, details_info=details_info))
+        summary = self._extract_one_liner_summary(search_text, details_info=details_info)
+        
+        # SAFETY NET: Strip common narrative prefixes if AI still generates them
+        # This handles cases where AI ignores the prompt "NO NARRATIVES"
+        narrative_prefixes = [
+            r"^The test\s+(validates|checks|verifies|failed|scenario).+?[-:]\s*",
+            r"^This test\s+(validates|checks|verifies|failed).+?[-:]\s*",
+            r"^Verified that\s+.+?[-:]\s*",
+            r"^It appears that\s+.+?[-:]\s*",
+            r"^The following asserts failed[:\s]*",
+            r"^Assertion failed[:\s]*",
+        ]
+        
+        cleaned_summary = summary
+        for prefix in narrative_prefixes:
+            # Check if summary starts with narrative prefix
+            match = re.match(prefix, cleaned_summary, re.IGNORECASE | re.DOTALL)
+            if match:
+                # Remove the prefix
+                cleaned_summary = cleaned_summary[match.end():].strip()
+                # If nothing left, revert (shouldn't happen often)
+                if not cleaned_summary:
+                    cleaned_summary = summary
+                
+                # If result starts with "because", remove it too
+                if cleaned_summary.lower().startswith("because "):
+                    cleaned_summary = cleaned_summary[8:].strip()
+                
+                # If result still very long, it might be the rest of the sentence
+                # Try to take just the first relevant part
+                if len(cleaned_summary) > 100:
+                    parts = re.split(r'[.;]', cleaned_summary)
+                    if parts:
+                        cleaned_summary = parts[0].strip()
+                break
+        
+        summary = html_escape.escape(cleaned_summary)
         
         # ENHANCEMENT: Try to enhance expected_vs_actual if we have missing_keys and API info but no comparison yet
         # Search in both root_cause and execution_log for Expected/Actual patterns
@@ -1588,12 +1755,7 @@ class ReportGenerator:
             timeout_html = f"<b>Timeout:</b> {html_escape.escape(details_info['timeout_info']['duration'])} {html_escape.escape(details_info['timeout_info']['unit'])}s"
             details_sections.append(f"<div style='margin-bottom: 8px;'>{timeout_html}</div>")
         
-        # Stack Trace
-        if details_info['stack_trace']:
-            stack_trace_html = "<div style='margin-bottom: 8px;'><b>Stack Trace (Top 5 lines):</b><pre style='background: #f8f9fa; padding: 5px; border-radius: 3px; max-height: 150px; overflow-y: auto; font-size: 11px; color: #dc3545; border-left: 3px solid #dc3545;'><code>"
-            stack_trace_html += html_escape.escape('\n'.join(details_info['stack_trace']))
-            stack_trace_html += "</code></pre></div>"
-            details_sections.append(stack_trace_html)
+        # Stack Trace - Removed full stacktrace, only showing "Likely location" in _format_condensed_details
         
         # Error Messages
         if details_info['error_messages']:
@@ -1642,7 +1804,15 @@ class ReportGenerator:
         formatted_action = escaped_action
         
         # Build final HTML
-        details_html = ''.join(details_sections) if details_sections else f"<div style='color: #495057; line-height: 1.6; font-size: 12px; white-space: pre-wrap;'>{html_escape.escape(root_cause)}</div>"
+        details_parts = []
+        if stack_hint:
+            details_parts.append(
+                f"<div style='margin-bottom: 8px; color: #0d6efd; font-weight: 600;'>Likely location: {html_escape.escape(stack_hint)}</div>"
+            )
+        details_parts.append(
+            ''.join(details_sections) if details_sections else f"<div style='color: #495057; line-height: 1.6; font-size: 12px; white-space: pre-wrap;'>{html_escape.escape(root_cause)}</div>"
+        )
+        details_html = ''.join(details_parts)
         
         return f"""
             <div style="margin-bottom: 12px;">
@@ -1655,6 +1825,7 @@ class ReportGenerator:
                     {details_html}
                 </div>
             </div>
+            {f"<div style='margin-top: 10px; margin-bottom: 12px;'><div style='font-weight: 600; color: #2c3e50; margin-bottom: 6px; font-size: 13px;'>Screenshot:</div><div style='display: inline-block; max-width: min(320px, 100%);'><img src='{html_escape.escape(screenshot_url)}' alt='screenshot' style='max-width: 100%; max-height: 240px; width: auto; height: auto; object-fit: contain; border-radius: 6px; border: 1px solid #e5e7eb; display: block;' loading='lazy'/></div></div>" if screenshot_url else ""}
             <div style="margin-top: 12px; padding-top: 12px; border-top: 2px solid #28a745;">
                 <div style="font-weight: 600; color: #28a745; margin-bottom: 8px; font-size: 13px;">Recommended Action:</div>
                 <div style="color: #155724; line-height: 1.6; font-size: 12px; padding: 10px; background: #d4edda; border-radius: 4px; border-left: 3px solid #28a745;">
@@ -1662,8 +1833,100 @@ class ReportGenerator:
                 </div>
             </div>
         """
+
+    def _extract_top_stack_frame(self, log_text: str) -> Optional[str]:
+        """
+        Extract the first stack frame (file:line) from a log/stack trace for quick localization.
+        """
+        if not log_text:
+            return None
+        import re
+        # Match patterns like: at com.example.Class.method(File.java:123)
+        pattern = r'at\s+[\w.$]+\(([^:()]+):(\d+)\)'
+        match = re.search(pattern, log_text)
+        if match:
+            file_name = match.group(1)
+            line_no = match.group(2)
+            return f"{file_name}:{line_no}"
+        return None
     
-    def _format_condensed_details(self, root_cause: str, action: str, execution_log: Optional[str] = None, category: Optional[str] = None) -> str:
+    def _extract_stack_frames(self, log_text: str, max_lines: int = 80) -> str:
+        """
+        Extract stack frames (lines starting with 'at ...java:line') from a log blob.
+        Returns joined lines, limited to max_lines.
+        """
+        if not log_text:
+            return ""
+        frames = []
+        import re
+        pattern = re.compile(r'^\s*at\s+[\w.$]+\([^:()]+:\d+\)', re.MULTILINE)
+        for line in log_text.splitlines():
+            if pattern.search(line):
+                frames.append(line.strip())
+                if len(frames) >= max_lines:
+                    break
+        return "\n".join(frames)
+    
+    def _find_screenshot(self, report_dir: Optional[str], test_name: str) -> Optional[str]:
+        """
+        Find the first screenshot matching the test name in the Screenshots directory.
+        Returns the relative path from the report root (e.g. "Screenshots/TestClass.testMethod_1.png")
+        so the caller can build a dashboard URL or relative URL.
+        """
+        if not report_dir or not test_name:
+            return None
+        try:
+            base = test_name.strip()
+            report_path = Path(report_dir)
+            ss_dir = report_path / "Screenshots"
+            if not ss_dir.exists():
+                return None
+            matches = sorted(ss_dir.glob(f"{base}*.png"))
+            if not matches:
+                return None
+            rel = Path(matches[0]).relative_to(report_path)
+            return str(rel).replace("\\", "/")
+        except (ValueError, Exception):
+            return None
+
+    def _build_screenshot_url(
+        self,
+        report_dir: Optional[str],
+        screenshot_rel: Optional[str],
+        report_name: str,
+        project_name: Optional[str],
+        job_name: Optional[str],
+        output_dir: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Build the URL to use for a screenshot in the report.
+        - When output_dir is provided: use a path relative to the report file so that opening
+          the report from disk (file://) loads screenshots from the local testdata/.../Screenshots.
+        - Otherwise: use dashboard absolute URL (requires DASHBOARD_BASE_URL and correct project/job
+          matching how the dashboard serves artifacts; may 404 if dashboard path structure differs).
+        """
+        if not screenshot_rel or not report_dir:
+            return None
+        if output_dir:
+            try:
+                report_dir_path = Path(report_dir)
+                screenshot_abs = (report_dir_path / screenshot_rel).resolve()
+                output_dir_path = Path(output_dir).resolve()
+                rel = os.path.relpath(str(screenshot_abs), str(output_dir_path))
+                return rel.replace("\\", "/")
+            except (ValueError, OSError):
+                pass
+        if report_name and getattr(Config, "DASHBOARD_BASE_URL", None):
+            return ReportUrlBuilder.build_dashboard_url(
+                Config.DASHBOARD_BASE_URL,
+                report_name,
+                screenshot_rel,
+                project_name,
+                job_name,
+            )
+        return None
+    
+    def _format_condensed_details(self, root_cause: str, action: str, execution_log: Optional[str] = None, category: Optional[str] = None, screenshot_url: Optional[str] = None) -> str:
         """
         Format condensed version of root cause and action (reduced content for popup).
         
@@ -1677,6 +1940,7 @@ class ReportGenerator:
         """
         # CRITICAL: Extract category-appropriate root cause from execution logs
         # This ensures root cause text matches the category (e.g., don't show "page not loading" for ASSERTION_FAILURE)
+        stack_hint = self._extract_top_stack_frame(execution_log or "") if execution_log else ""
         if execution_log:
             # For TIMEOUT category: extract page load timeout message
             if category == 'TIMEOUT':
@@ -1768,7 +2032,7 @@ class ReportGenerator:
                     r"(Expected\s+[^\n]+But\s+actual[^\n]*)",  # Expected vs Actual pattern
                     r"(Missing Key[^\n]+)",  # Missing Key pattern
                     r"(Classes of actual and expected[^\n]+Expected is:[^\n]+but Actual is:[^\n]*)",  # Class mismatch pattern
-                    r"(The following asserts failed[^\n]+)",  # Multiple asserts failed
+                    r"(The following asserts failed:[^\n]*(?:\n\t[^\n]*)*)",  # Multiple asserts failed (multi-line with tab-indented details)
                 ]
                 
                 extracted_assertion_message = None
@@ -1821,6 +2085,22 @@ class ReportGenerator:
                 # If we found environment message, use it; otherwise keep AI-generated root_cause
                 if extracted_env_message:
                     root_cause = extracted_env_message
+            
+            # For CODE_ISSUE or others: Extract generic exceptions/errors
+            elif category == 'CODE_ISSUE' or True: # Fallback for all others
+                 # Extract common Java exceptions or errors
+                 code_issue_patterns = [
+                     r"(java\.lang\.\w+Exception:\s+.+)",
+                     r"(Caused by:\s+.+)",
+                     r"(NullPointerException.*)",
+                     r"(IllegalArgumentException.*)",
+                     r"(Error:\s+.+)"
+                 ]
+                 for pattern in code_issue_patterns:
+                     match = re.search(pattern, execution_log, re.IGNORECASE)
+                     if match:
+                         root_cause = match.group(1).strip()[:300]
+                         break
         
         # Remove "API Name: ..." from root_cause text since API is already shown separately and may be incorrect
         cleaned_root_cause = root_cause
@@ -1837,6 +2117,7 @@ class ReportGenerator:
         # Extract key information only
         root_cause_escaped = html_escape.escape(cleaned_root_cause[:300] + ("..." if len(cleaned_root_cause) > 300 else ""))
         action_escaped = html_escape.escape(action[:200] + ("..." if len(action) > 200 else ""))
+        # Only extract top stack frame for "Likely location", not full stacktrace
         
         # CRITICAL: For ELEMENT_NOT_FOUND and TIMEOUT categories, NEVER show API, only Page URL
         # For other categories, show API if available, otherwise Page URL
@@ -1902,11 +2183,61 @@ class ReportGenerator:
             exception_type = exception_match.group(1)
             exception_info = f'<div style="margin-bottom: 8px;"><b>Exception:</b> <span style="color: #dc3545;">{html_escape.escape(exception_type)}</span></div>'
         
+        details_parts = []
+        # Add "Likely location" as first item under Root Cause if available
+        likely_location_html = ""
+        if stack_hint:
+            likely_location_html = f"<div style='margin-bottom: 8px; color: #0d6efd; font-weight: 600; font-size: 12px;'>Likely location: {html_escape.escape(stack_hint)}</div>"
+        
+        details_parts.append(
+            f"{page_or_api_info}{exception_info}<div style='margin-bottom: 8px;'><b>Root Cause:</b><br/>{likely_location_html}{root_cause_escaped}</div>"
+        )
+        details_html = ''.join(details_parts)
+
+        screenshot_block = ""
+        if screenshot_url:
+            screenshot_block = (
+                f"<div style='margin-top: 10px; margin-bottom: 12px;'>"
+                f"<div style='font-weight: 600; color: #2c3e50; margin-bottom: 6px; font-size: 13px;'>Screenshot:</div>"
+                f"<div style='display: inline-block; max-width: min(320px, 100%);'>"
+                f"<img src='{html_escape.escape(screenshot_url)}' alt='screenshot' "
+                f"style='max-width: 100%; max-height: 240px; width: auto; height: auto; object-fit: contain; border-radius: 6px; border: 1px solid #e5e7eb; cursor: zoom-in; display: block;' "
+                f"loading='lazy' onclick=\"(function(img){{"
+                f"const existing = document.getElementById('screenshot-overlay');"
+                f"if(existing) existing.remove();"
+                f"const overlay = document.createElement('div');"
+                f"overlay.id = 'screenshot-overlay';"
+                f"overlay.style.position = 'fixed';"
+                f"overlay.style.top = '0';"
+                f"overlay.style.left = '0';"
+                f"overlay.style.width = '100vw';"
+                f"overlay.style.height = '100vh';"
+                f"overlay.style.background = 'rgba(0,0,0,0.7)';"
+                f"overlay.style.zIndex = '9999';"
+                f"overlay.style.display = 'flex';"
+                f"overlay.style.alignItems = 'center';"
+                f"overlay.style.justifyContent = 'center';"
+                f"const closeOverlay = function() {{ overlay.remove(); document.removeEventListener('keydown', closeOnEsc); }};"
+                f"const closeOnEsc = function(e) {{ if (e.key === 'Escape') closeOverlay(); }};"
+                f"document.addEventListener('keydown', closeOnEsc);"
+                f"overlay.onclick = closeOverlay;"
+                f"const large = document.createElement('img');"
+                f"large.src = img.src;"
+                f"large.style.maxWidth = '90vw';"
+                f"large.style.maxHeight = '90vh';"
+                f"large.style.borderRadius = '8px';"
+                f"large.style.boxShadow = '0 10px 30px rgba(0,0,0,0.4)';"
+                f"overlay.appendChild(large);"
+                f"document.body.appendChild(overlay);"
+                f"}})(this)\"/>"
+                f"</div>"
+                f"</div>"
+            )
+
         html_output = f"""
             <div style="font-size: 12px; line-height: 1.6;">
-                {page_or_api_info}
-                {exception_info}
-                <div style="margin-bottom: 8px;"><b>Root Cause:</b><br/>{root_cause_escaped}</div>
+                {details_html}
+                {screenshot_block}
                 {f'<div style="margin-bottom: 8px;"><b>Recommended Action:</b><br/><span style="color: #28a745;">{action_escaped}</span></div>' if action else ''}
             </div>
         """
@@ -1922,64 +2253,28 @@ class ReportGenerator:
         trend: Optional[str],
         report_dir: Optional[str] = None,
         test_results: Optional[List[TestResult]] = None,
-        test_html_links: Optional[Dict[str, str]] = None
+        test_html_links: Optional[Dict[str, str]] = None,
+        environment: Optional[str] = None,
+        output_dir: Optional[str] = None,
     ) -> str:
-        """Generate modern HTML report content"""
+        """Generate modern HTML report content. output_dir is used to build relative screenshot URLs for local viewing."""
         
         # Initialize TestDataCache for efficient data access
         # This eliminates redundant execution log fetching
         test_data_cache = TestDataCache(test_results, test_html_links)
         
-        # Initialize CategoryRuleEngine for clean category classification
-        rule_engine = CategoryRuleEngine()
+        # NOTE: CategoryRuleEngine is no longer instantiated here.
+        # Rules are applied once in main.py before classifications reach this method.
+        
+        # Initialize FailureSignalExtractor for concise signals
+        signal_extractor = FailureSignalExtractor(test_data_cache)
         
         # Parse automation group and branch from HTML report
-        automation_group, automation_branch = self._parse_automation_group_and_branch(report_dir)
+        automation_group, automation_branch, automation_environment = self._parse_automation_group_and_branch(report_dir)
         
-        # Data Preparation - Deduplicate classifications by test_name
-        # A test might appear multiple times if it's in multiple test suites
-        # Use a dictionary to track by normalized test name
-        seen_tests = {}
-        deduplicated_classifications = []
-        duplicate_count = 0
-        
-        # First, count occurrences of each test
-        test_counts = {}
-        for classification in classifications:
-            test_name_normalized = classification.test_name.strip()
-            test_counts[test_name_normalized] = test_counts.get(test_name_normalized, 0) + 1
-        
-        # Log tests that appear multiple times
-        for test_name, count in test_counts.items():
-            if count > 1:
-                logger.warning(f"⚠️ Test '{test_name}' appears {count} times in classifications!")
-        
-        # Now deduplicate
-        for classification in classifications:
-            test_name = classification.test_name
-            # Normalize test name (remove any whitespace differences, case-insensitive comparison)
-            test_name_normalized = test_name.strip()
-            
-            # Keep the first occurrence, or replace if we find a better one (higher confidence)
-            if test_name_normalized not in seen_tests:
-                seen_tests[test_name_normalized] = classification
-                deduplicated_classifications.append(classification)
-            else:
-                # Duplicate found
-                duplicate_count += 1
-                existing = seen_tests[test_name_normalized]
-                confidence_order = {'HIGH': 3, 'MEDIUM': 2, 'LOW': 1}
-                existing_conf = confidence_order.get(existing.confidence, 0)
-                new_conf = confidence_order.get(classification.confidence, 0)
-                
-                if new_conf > existing_conf:
-                    # Replace with higher confidence one
-                    index = deduplicated_classifications.index(existing)
-                    deduplicated_classifications[index] = classification
-                    seen_tests[test_name_normalized] = classification
-                    logger.warning(f"⚠️ Duplicate '{test_name_normalized}' - Replaced with higher confidence ({classification.confidence} > {existing.confidence})")
-                else:
-                    logger.warning(f"⚠️ Duplicate '{test_name_normalized}' - Skipping (keeping existing with {existing.confidence} confidence)")
+        # Data Preparation - Deduplicate classifications by test_name using centralized utility
+        deduplicated_classifications = FailureClassificationUtils.deduplicate(classifications)
+        duplicate_count = len(classifications) - len(deduplicated_classifications)
         
         if duplicate_count > 0:
             logger.warning(f"⚠️ Found {duplicate_count} duplicate classifications. Deduplicated: {len(classifications)} -> {len(deduplicated_classifications)}")
@@ -1992,7 +2287,13 @@ class ReportGenerator:
             test_html_links
         )
         
-        # Use deduplicated classifications
+        # NOTE: rule_engine.classify() is NOT called here because main.py already applies
+        # rules to the deduplicated classifications before passing them to generate_html_report().
+        # Applying rules twice caused the "Miscellaneous Issues" discrepancy: tests classified as
+        # OTHER after the first pass could be reclassified into a specific category on the
+        # second pass, making the summary and breakdown cards disagree.
+
+        # Use deduplicated and rule-processed classifications
         product_bugs = [c for c in deduplicated_classifications if c.is_product_bug()]
         automation_issues = [c for c in deduplicated_classifications if c.is_automation_issue()]
         
@@ -2036,23 +2337,35 @@ class ReportGenerator:
         # Extract project and job name for correct links
         project_name_from_path, job_name_from_path = ReportUrlBuilder.extract_project_job_from_path(report_dir)
         
-        # Resolve project/job for URLs and JS (job must come from path/input, no config fallback)
+        # Resolve project/job for URLs and JS
         project_name_for_js = project_name_from_path if project_name_from_path else ReportUrlBuilder.extract_project_name(report_name)
-        job_name_for_url = job_name_from_path  # None if not derivable
-        js_scripts = get_html_scripts(Config.DASHBOARD_BASE_URL, project_name_for_js, job_name_for_url)
+        job_name_for_url = job_name_from_path if job_name_from_path else Config.DASHBOARD_JOB_NAME
+        js_scripts = get_html_scripts(
+            Config.DASHBOARD_BASE_URL,
+            project_name_for_js,
+            job_name_for_url,
+            jira_base_url=Config.JIRA_BASE_URL or ''
+        )
         
         # Build HTML - use f-string for most content, but concatenate JavaScript separately
+        report_format_version = getattr(Config, 'REPORT_FORMAT_VERSION', '2')
+        report_version_escaped = html_escape.escape(str(report_format_version))
         html = f"""<!DOCTYPE html>
+        <!-- QA AI Agent Report | format-version: {report_version_escaped} | regenerate to get latest template -->
         <html>
         <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+            <meta http-equiv="Pragma" content="no-cache">
+            <meta http-equiv="Expires" content="0">
+            <meta name="report-format-version" content="{report_version_escaped}">
             <style>
 {css_styles}
             </style>
         </head>
         <body>
-            <div class="container">
+            <div class="container" data-report-version="{report_version_escaped}">
                 <!-- Header -->
                 <div class="header">
                     <img src="https://raw.githubusercontent.com/msr5464/Basic-Automation-Framework/refs/heads/master/ThanosLogo.png" alt="Thanos Logo" class="header-logo">
@@ -2061,23 +2374,28 @@ class ReportGenerator:
                         <strong>{report_name}</strong>
                         {'<a href="' + ReportUrlBuilder.build_dashboard_url(Config.DASHBOARD_BASE_URL, report_name, "html/index.html", project_name_from_path, job_name_for_url) + '" target="_blank" style="color: #ffffff; opacity: 0.9; text-decoration: none; display: inline-flex; align-items: center; line-height: 1;"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1-2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></a>' if report_name else ''}
                     </div>
-                    {'<div class="report-meta" style="margin-top: 4px; font-size: 12px;">Group: ' + str(automation_group) + ' • Branch: ' + str(automation_branch) + '</div>' if automation_group and automation_branch else ''}
+                    {self._build_meta_line(automation_group, automation_branch, environment or automation_environment)}
                 </div>
                 
                 <!-- Key Metrics -->
                 <div class="dashboard">
-                    <div class="card success">
+                    <div class="card success" style="background: linear-gradient(135deg, #f0fdf4 0%, #bbf7d0 100%); border-left: 4px solid #28a745;">
                         <div class="metric-label">Pass Rate</div>
                         <div class="metric-value" style="color: {status_color}">{pass_rate:.1f}%</div>
                         <div class="metric-detail" style="font-weight: 600;">{status_text}</div>
                         {trend_html}
                     </div>
-                    <div class="card danger">
+                    <div class="card" style="background: linear-gradient(135deg, #fff8f0 0%, #ffe0b2 100%); border-left: 4px solid #ff9800;">
+                        <div class="metric-label">Known Failures</div>
+                        <div class="metric-value" style="color: #ff9800;">{len([t for t in (test_results or []) if t.known_failure])}</div>
+                        <div class="metric-detail">Failed but marked as passed</div>
+                    </div>
+                    <div class="card danger" style="background: linear-gradient(135deg, #fff5f5 0%, #fecaca 100%); border-left: 4px solid #dc3545;">
                         <div class="metric-label">Failures</div>
                         <div class="metric-value">{summary.failed}</div>
                         <div class="metric-detail">{len(product_bugs)} Potential Bugs, {len(automation_issues)} Automation Issues</div>
                     </div>
-                    <div class="card">
+                    <div class="card" style="background: linear-gradient(135deg, #f0f9ff 0%, #bae6fd 100%); border-left: 4px solid #17a2b8;">
                         <div class="metric-label">Total Tests</div>
                         <div class="metric-value">{summary.total}</div>
                         <div class="metric-detail">{summary.passed} Passed</div>
@@ -2093,8 +2411,8 @@ class ReportGenerator:
         category_failures = {}
         
         for failure in deduplicated_classifications:
-            # Use rule engine to classify failure into category
-            category = rule_engine.classify(failure, test_data_cache)
+            # Use already classified category from failure object
+            category = failure.root_cause_category
             
             if category not in category_counts:
                 category_counts[category] = 0
@@ -2129,7 +2447,7 @@ class ReportGenerator:
                 text = text.strip()
                 return text if len(text) <= limit else text[:limit - 1] + "…"
             
-            categories_order = ['ELEMENT_NOT_FOUND', 'TIMEOUT', 'ASSERTION_FAILURE', 'ENVIRONMENT_ISSUE', 'OTHER']
+            categories_order = ['ELEMENT_NOT_FOUND', 'TIMEOUT', 'CODE_ISSUE', 'ASSERTION_FAILURE', 'ENVIRONMENT_ISSUE', 'OTHER']
             sorted_categories = sorted(
                 category_counts.keys(),
                 key=lambda x: (-category_counts[x], categories_order.index(x) if x in categories_order else 99)
@@ -2166,6 +2484,16 @@ class ReportGenerator:
                     'tag': 'Potential Bug',
                     'pill_bg': 'rgba(220, 38, 38, 0.15)',
                     'pill_color': '#991b1b'
+                },
+                'CODE_ISSUE': {
+                    'color': '#6366f1',
+                    'icon': '💻',
+                    'label': 'Code Issues',
+                    'gradient': 'linear-gradient(135deg, #eef2ff, #e0e7ff)',
+                    'hint': 'Logic error or null variable',
+                    'tag': 'Automation Issue',
+                    'pill_bg': 'rgba(99, 102, 241, 0.15)',
+                    'pill_color': '#4338ca'
                 },
                 'ENVIRONMENT_ISSUE': {
                     'color': '#8b5cf6',
@@ -2277,8 +2605,17 @@ class ReportGenerator:
                     
                     # Create condensed version of root cause and action (reduced content)
                     execution_log = test_data_cache.get_combined_log(failure_entry.test_name) or ""
+                    screenshot_rel = self._find_screenshot(report_dir, failure_entry.test_name)
+                    screenshot_url = self._build_screenshot_url(
+                        report_dir,
+                        screenshot_rel,
+                        report_name,
+                        project_name_from_path,
+                        job_name_for_url,
+                        output_dir=output_dir,
+                    )
                     condensed_content = self._format_condensed_details(
-                        root_cause, recommended_action, execution_log, category=category
+                        root_cause, recommended_action, execution_log, category=category, screenshot_url=screenshot_url
                     )
                     
                     # Create unique ID for this test's details
@@ -2391,286 +2728,17 @@ class ReportGenerator:
                                     search_text,
                                     re.IGNORECASE
                                 )
-                                if element_match:
-                                    element_pattern = element_match.group(1).strip()
-                                    element_patterns[element_pattern] = element_patterns.get(element_pattern, 0) + 1
-                                    matched = True
-                                else:
-                                    # Priority 2: Extract page load timeout patterns
-                                    # Pattern: "'DashReviewPage' NOT loaded even after :- 40.071 seconds."
-                                    page_match = re.search(r"['\"]([^'\"]+Page[^'\"]*)['\"]\s+(?:NOT|not)\s+loaded\s+even\s+after", search_text, re.IGNORECASE)
-                                    if page_match:
-                                        page_name = page_match.group(1)
-                                        page_counts[page_name] = page_counts.get(page_name, 0) + 1
-                                        matched = True
-                                    else:
-                                        # Priority 3: Try alternative pattern: PageName NOT loaded even after (without quotes)
-                                        alt_match = re.search(r"(\w+Page\w*)\s+(?:NOT|not)\s+loaded\s+even\s+after", search_text, re.IGNORECASE)
-                                        if alt_match:
-                                            page_name = alt_match.group(1)
-                                            page_counts[page_name] = page_counts.get(page_name, 0) + 1
-                                            matched = True
-                                        else:
-                                            # Priority 4: Try TimeoutException patterns for element clickable
-                                            timeout_exception_match = re.search(
-                                                r"TimeoutException.*waiting\s+for\s+element\s+to\s+be\s+(?:clickable|visible).*?['\"]([^'\"]+)['\"]",
-                                                search_text,
-                                                re.IGNORECASE | re.DOTALL
-                                            )
-                                            if timeout_exception_match:
-                                                # Extract element selector or description if available
-                                                element_desc = timeout_exception_match.group(1).strip()
-                                                if element_desc:
-                                                    # Check if it's a CSS selector pattern
-                                                    if re.match(r'^By\.(cssSelector|xpath|id|name|className|tagName|linkText|partialLinkText)', element_desc, re.IGNORECASE):
-                                                        # Store CSS selector patterns separately
-                                                        css_selector_patterns[element_desc] = css_selector_patterns.get(element_desc, 0) + 1
-                                                    else:
-                                                        # Meaningful element pattern
-                                                        element_patterns[element_desc] = element_patterns.get(element_desc, 0) + 1
-                                                    matched = True
-                            
-                            if not matched:
-                                unmatched_count += 1
-                        
-                        # Combine element patterns and page counts for display
-                        meaningful_patterns = []
-                        
-                        # Add element patterns first (more specific)
-                        if element_patterns:
-                            sorted_elements = sorted(element_patterns.items(), key=lambda x: (-x[1], x[0]))
-                            for element_pattern, pattern_count in sorted_elements:
-                                meaningful_patterns.append(f"'{element_pattern}' ({pattern_count})")
-                        
-                        # Add page load patterns
-                        if page_counts:
-                            sorted_pages = sorted(page_counts.items(), key=lambda x: (-x[1], x[0]))
-                            for page_name, page_count in sorted_pages:
-                                meaningful_patterns.append(f"{page_name} ({page_count})")
-                        
-                        # Add CSS selector patterns as "other patterns" if any
-                        if css_selector_patterns:
-                            css_selector_total = sum(css_selector_patterns.values())
-                            meaningful_patterns.append(f"other patterns ({css_selector_total})")
-                        
-                        # Add unmatched count if any (but only if we have no other patterns)
-                        if unmatched_count > 0 and not meaningful_patterns:
-                            meaningful_patterns.append(f"Unknown page ({unmatched_count})")
-                        
-                        if meaningful_patterns:
-                            # Format the display text
-                            if len(meaningful_patterns) <= 5:
-                                patterns_text = ", ".join(meaningful_patterns)
-                            else:
-                                patterns_text = ", ".join(meaningful_patterns[:4]) + f", and {len(meaningful_patterns) - 4} other pattern(s)"
-                            
-                            root_cause_note_html = f"""
-                                <div class="root-cause-note-title">Representative signals</div>
-                                <div style="color: #1f2933; font-size: 12px; line-height: 1.5;">{html_escape.escape(patterns_text)}</div>
-                            """
-                        else:
-                            root_cause_note_html = "No patterns extracted from timeout failures."
-                    elif category == 'ELEMENT_NOT_FOUND':
-                        # Special handling for ELEMENT_NOT_FOUND: extract exception types with counts
-                        exception_counts = {}
-                        unmatched_failures = []  # Store unmatched failures for pattern analysis
-                        
-                        for failure_entry in failures:
-                            rc_text = (failure_entry.root_cause or "").strip()
-                            matched = False
-                            
-                            # Get execution log from cache
-                            exec_log = test_data_cache.get_combined_log(failure_entry.test_name)
-                            
-                            # Combine root_cause and execution_log for searching
-                            search_text = f"{rc_text} {exec_log}"
-                            
-                            if search_text.strip():
-                                # Extract exception type (with or without colon)
-                                exception_match = re.search(r'(\w+Exception)(?::|$|\s)', search_text, re.IGNORECASE)
-                                if not exception_match:
-                                    # Try without Exception suffix (e.g., just "NullPointer")
-                                    exception_match = re.search(r'(\w+Exception)', search_text, re.IGNORECASE)
-                                
-                                if exception_match:
-                                    exception_type = exception_match.group(1)
-                                    # Normalize: remove "in X" context to group similar exceptions together
-                                    # Just use the base exception type
-                                    key = exception_type
-                                    
-                                    exception_counts[key] = exception_counts.get(key, 0) + 1
-                                    matched = True
-                            
-                            if not matched:
-                                unmatched_failures.append({
-                                    'root_cause': rc_text,
-                                    'exec_log': exec_log,
-                                    'search_text': search_text
-                                })
-                        
-                        # Analyze unmatched failures to find common patterns
-                        if unmatched_failures:
-                            # Group unmatched failures by normalized root cause patterns
-                            unmatched_patterns = {}
-                            for failure in unmatched_failures:
-                                normalized_rc = normalize_root_cause(failure['root_cause'])
-                                
-                                # Try to extract meaningful patterns from normalized root cause
-                                if normalized_rc:
-                                    # Look for common patterns
-                                    pattern = None
-                                    
-                                    # Pattern 1: Element not visible/clickable (check first as it's more specific)
-                                    if re.search(r'element.*not.*visible|element.*not.*clickable', normalized_rc, re.IGNORECASE):
-                                        pattern = "Element not visible/clickable"
-                                    # Pattern 2: Element not found
-                                    elif re.search(r'element.*not.*found|locator.*not.*found', normalized_rc, re.IGNORECASE):
-                                        pattern = "Element not found"
-                                    # Pattern 3: Timeout patterns (including waiting)
-                                    elif re.search(r'not.*loaded.*after|timeout|waiting.*for|even after waiting', normalized_rc, re.IGNORECASE):
-                                        pattern = "Element timeout"
-                                    # Pattern 4: Stale element
-                                    elif re.search(r'stale|element.*reference', normalized_rc, re.IGNORECASE):
-                                        pattern = "Stale element reference"
-                                    # Pattern 5: Page load issues
-                                    elif re.search(r'page.*not.*load|page.*load.*fail', normalized_rc, re.IGNORECASE):
-                                        pattern = "Page load failure"
-                                    # Pattern 6: Click intercepted
-                                    elif re.search(r'click.*intercept|element.*intercept', normalized_rc, re.IGNORECASE):
-                                        pattern = "Element click intercepted"
-                                    # Pattern 7: Element is null
-                                    elif re.search(r'element.*is.*null|element.*null', normalized_rc, re.IGNORECASE):
-                                        pattern = "Element is null"
-                                    # Pattern 8: Wait/Timeout related (catch-all for wait patterns)
-                                    elif re.search(r'\bwait\b|can.*t.*wait|waiting', normalized_rc, re.IGNORECASE):
-                                        pattern = "Element wait timeout"
-                                    
-                                    if pattern:
-                                        unmatched_patterns[pattern] = unmatched_patterns.get(pattern, 0) + 1
-                                    else:
-                                        # Use first 60 chars of normalized root cause as pattern, but normalize further
-                                        short_pattern = normalized_rc[:60].strip()
-                                        # Remove common variable parts
-                                        short_pattern = re.sub(r'\[PAGE_ELEMENT\]|\[DURATION\]|\[ID\]', '', short_pattern)
-                                        short_pattern = ' '.join(short_pattern.split())  # Normalize whitespace
-                                        if short_pattern and len(short_pattern) > 10:
-                                            unmatched_patterns[short_pattern] = unmatched_patterns.get(short_pattern, 0) + 1
-                                        else:
-                                            unmatched_patterns["Other"] = unmatched_patterns.get("Other", 0) + 1
-                                else:
-                                    unmatched_patterns["Other"] = unmatched_patterns.get("Other", 0) + 1
-                            
-                            # Add grouped patterns to exception_counts
-                            for pattern, pattern_count in unmatched_patterns.items():
-                                if pattern == "Other" and pattern_count > 0:
-                                    exception_counts["Others"] = exception_counts.get("Others", 0) + pattern_count
-                                elif pattern_count > 0:
-                                    exception_counts[pattern] = exception_counts.get(pattern, 0) + pattern_count
-                        
-                        if exception_counts:
-                            # Sort by count (descending), then alphabetically
-                            sorted_exceptions = sorted(exception_counts.items(), key=lambda x: (-x[1], x[0]))
-                            # Format as "ExceptionType(count)"
-                            exceptions_with_counts = [f"{exc_type}({exc_count})" for exc_type, exc_count in sorted_exceptions]
-                            exceptions_text = ", ".join(exceptions_with_counts)
-                            
-                            root_cause_note_html = f"""
-                                <div class="root-cause-note-title">Representative signals</div>
-                                <div style="color: #1f2933; font-size: 12px; line-height: 1.5;">{html_escape.escape(exceptions_text)}</div>
-                            """
-                        else:
-                            root_cause_note_html = "No exception types extracted from element locator failures."
-                    elif category == 'ASSERTION_FAILURE':
-                        # Special handling for ASSERTION_FAILURE: categorize assertion failures into specific types
-                        assertion_categories = {}
-                        for failure_entry in failures:
-                            rc_text = (failure_entry.root_cause or "").strip()
-                            
-                            # Get execution log from cache
-                            exec_log = test_data_cache.get_combined_log(failure_entry.test_name)
-                            
-                            # Combine root_cause and execution_log for searching
-                            search_text = f"{rc_text} {exec_log}"
-                            
-                            # Categorize assertion failure type
-                            category_type = None
-                            
-                            if search_text.strip():
-                                # Category 1: API Keys mismatch - Missing keys or keys don't match between expected and actual
-                                if (re.search(r"missing\s+key\s*:", search_text, re.IGNORECASE) or
-                                    re.search(r"actual\s+json\s+doesn'?t\s+contain\s+all\s+expected\s+keys", search_text, re.IGNORECASE) or
-                                    re.search(r"expected\s+(?:keys|has)\s*:.*but\s+actual\s+(?:keys|has)\s*:", search_text, re.IGNORECASE)):
-                                    category_type = "API Keys mismatch"
-                                
-                                # Category 2: Keys formatting mismatch - Class type mismatches, null values, formatting issues
-                                elif (re.search(r"classes\s+of\s+actual\s+and\s+expected\s+key", search_text, re.IGNORECASE) or
-                                      re.search(r"key\s*/\s*value\s+is\s+null", search_text, re.IGNORECASE) or
-                                      re.search(r"class\s+\w+\.\w+\$Null", search_text, re.IGNORECASE)):
-                                    category_type = "Keys formatting mismatch"
-                                
-                                # Category 3: Single text not matching - Expected vs Actual value mismatches for single fields
-                                elif re.search(r"expected\s+['\"]?[^'\"]+['\"]?\s+was\s*[:-]\s*['\"]?[^'\"]+['\"]?\s*\.?\s*but\s+actual\s+is", search_text, re.IGNORECASE):
-                                    category_type = "Single text not matching"
-                            
-                            # Fallback: use generic category if no specific pattern matched
-                            if not category_type:
-                                category_type = "Assertion failure"
-                            
-                            assertion_categories[category_type] = assertion_categories.get(category_type, 0) + 1
-                        
-                        if assertion_categories:
-                            # Sort by count (descending), then alphabetically
-                            sorted_categories = sorted(assertion_categories.items(), key=lambda x: (-x[1], x[0]))
-                            # Format as "Category(count)"
-                            categories_with_counts = [f"{category}({cat_count})" for category, cat_count in sorted_categories]
-                            categories_text = ", ".join(categories_with_counts)
-                            
-                            root_cause_note_html = f"""
-                                <div class="root-cause-note-title">Representative signals</div>
-                                <div style="color: #1f2933; font-size: 12px; line-height: 1.5;">{html_escape.escape(categories_text)}</div>
-                            """
-                        else:
-                            root_cause_note_html = "No assertion categories extracted from failures."
-                    else:
-                        # Default behavior for OTHER and other categories: extract exception types or error patterns with counts
-                        error_patterns = {}
-                        for failure_entry in failures:
-                            rc_text = (failure_entry.root_cause or "").strip()
-                            
-                            pattern_key = None
-                            if rc_text:
-                                # Extract exception type
-                                exception_match = re.search(r'(\w+Exception)(?::|$|\s)', rc_text, re.IGNORECASE)
-                                if exception_match:
-                                    exception_type = exception_match.group(1)
-                                    pattern_key = exception_type
-                                else:
-                                    # Extract error message pattern (first 40 chars)
-                                    error_msg = rc_text[:40].strip()
-                                    if error_msg:
-                                        # Normalize similar errors
-                                        normalized = normalize_root_cause(rc_text) or error_msg.lower()
-                                        pattern_key = normalized
-                            
-                            # Fallback: use generic pattern if no pattern matched
-                            if not pattern_key:
-                                pattern_key = "Unknown error"
-                            
-                            error_patterns[pattern_key] = error_patterns.get(pattern_key, 0) + 1
-                        
-                        if error_patterns:
-                            # Sort by count (descending), then alphabetically
-                            sorted_patterns = sorted(error_patterns.items(), key=lambda x: (-x[1], x[0]))
-                            # Format as "Pattern(count)"
-                            patterns_with_counts = [f"{pattern}({pattern_count})" for pattern, pattern_count in sorted_patterns]
-                            patterns_text = ", ".join(patterns_with_counts)
-                            
-                            root_cause_note_html = f"""
-                                <div class="root-cause-note-title">Representative signals</div>
-                                <div style="color: #1f2933; font-size: 12px; line-height: 1.5;">{html_escape.escape(patterns_text)}</div>
-                            """
-                        else:
-                            root_cause_note_html = "No error patterns extracted from failures."
+                # Use FailureSignalExtractor for concise signals
+                patterns_text = signal_extractor.get_signals(category, failures)
+                
+                if patterns_text:
+                    root_cause_note_html = f"""
+                        <div class="root-cause-note-title">Representative signals</div>
+                        <div style="color: #1f2933; font-size: 12px; line-height: 1.5;">{html_escape.escape(patterns_text)}</div>
+                    """
+                else:
+                    root_cause_note_html = f"No signals extracted for {category} failures."
+                
                 root_cause_note_html = f'<div class="root-cause-note">{root_cause_note_html}</div>'
                 
                 pill_html = f'<span class="root-cause-pill" style="background: {style["pill_bg"]}; color: {style["pill_color"]};">{style["tag"]}</span>'
@@ -2945,6 +3013,282 @@ class ReportGenerator:
         html += """
                 </div>
             """
+
+        # Known Failures Section
+        # Filter test results to find tests with known_failure (Jira ticket ID)
+        known_failures = []
+        if test_results:
+            for test_result in test_results:
+                if test_result.known_failure:
+                    known_failures.append(test_result)
+        
+        known_failures_count = len(known_failures)
+        known_failures_subtitle = (
+            "No tests in this run were marked as known failures."
+            if known_failures_count == 0
+            else f"{known_failures_count} test{'' if known_failures_count == 1 else 's'} marked as PASSED due to known issues. Each test has a linked Jira ticket for tracking."
+        )
+        html += f"""
+            <div class="section" id="known-failures">
+            <h2 class="section-title" style="border-color: #ff9800">🔖 Known Failures ({known_failures_count} tests)</h2>
+            <p class="root-cause-subtitle">{known_failures_subtitle}</p>
+        """
+        
+        if known_failures:
+            # Build Jira URL helper
+            jira_base_url = Config.JIRA_BASE_URL.rstrip('/')
+            
+            # Fetch execution history for known failure tests
+            from src.agent.memory import AgentMemory
+            memory = AgentMemory()
+            known_failure_test_names = [t.full_name for t in known_failures]
+            known_failure_history = memory._get_test_execution_history_from_db(
+                report_name=report_name,
+                test_names=known_failure_test_names,
+                limit_per_test=Config.FLAKY_TESTS_LAST_RUNS,
+                table_name=None  # Will be auto-detected
+            )
+            
+            html += f"""
+                    <div class="section-content known-failures">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Testcase Name</th>
+                                <th>Last {Config.FLAKY_TESTS_LAST_RUNS} Executions</th>
+                                <th>Jira Ticket</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            """
+            
+            # Sort by test name for consistency
+            sorted_known_failures = sorted(known_failures, key=lambda t: t.full_name)
+            
+            for test_result in sorted_known_failures:
+                full_name = test_result.full_name
+                full_name_cleaned = remove_duplicate_class_name(full_name)
+                
+                # Extract just class.method for display
+                class_name, method_name = extract_class_and_method(full_name_cleaned)
+                display_name = f"{class_name}.{method_name}"
+                display_name_escaped = html_escape.escape(display_name)
+                test_name_escaped = html_escape.escape(full_name_cleaned)
+                
+                # Get execution history for this test
+                execution_records = known_failure_history.get(full_name, [])
+                
+                # Build Jira URL
+                jira_ticket_id = test_result.known_failure.strip()
+                jira_url = f"{jira_base_url}/browse/{jira_ticket_id}"
+                jira_ticket_escaped = html_escape.escape(jira_ticket_id)
+                jira_url_escaped = html_escape.escape(jira_url)
+                
+                # Generate execution history dots
+                history_html = ""
+                history = []  # 0 = fail, 1 = pass, 2 = known failure (yellow)
+                execution_details = []
+                
+                # Get current test's knownFailure and current buildTag for fallback logic
+                current_known_failure = test_result.known_failure.strip() if test_result.known_failure else None
+                current_build_tag = report_name  # Current report's buildTag
+                
+                # Reverse execution records to match Flaky Tests ordering (oldest to newest)
+                # DB query returns newest first (id DESC), but we want oldest first for consistent display
+                reversed_execution_records = list(reversed(execution_records[:Config.FLAKY_TESTS_LAST_RUNS]))
+                
+                # Process execution records to build history (oldest to newest)
+                for idx, exec_record in enumerate(reversed_execution_records):
+                    exec_status = str(exec_record.get('testStatus', '')).upper().strip()
+                    exec_build_tag = exec_record.get('buildTag', '')
+                    exec_known_failure = exec_record.get('knownFailure', '') or None
+                    if exec_known_failure:
+                        exec_known_failure = str(exec_known_failure).strip()
+                        if not exec_known_failure or exec_known_failure.upper() in ['NULL', 'NONE', '']:
+                            exec_known_failure = None
+                    
+                    # If this is the current execution (same buildTag) and it doesn't have knownFailure but current test does,
+                    # use current test's knownFailure (this handles the case where knownFailure was just added today)
+                    is_current_execution = (exec_build_tag == current_build_tag)
+                    if not exec_known_failure and is_current_execution and current_known_failure:
+                        exec_known_failure = current_known_failure
+                    
+                    # Determine status: 0 = fail, 1 = pass, 2 = known failure (yellow)
+                    # Priority: 1. Check if has knownFailure (yellow), 2. Check if actually failed (red), 3. Otherwise passed (green)
+                    if exec_known_failure:
+                        # Only executions with a knownFailure (Jira ID) should be yellow
+                        history.append(2)  # Yellow - known failure
+                    elif exec_status in ['FAIL', 'FAILED', 'FAILURE', 'ERROR', 'ERRORED']:
+                        history.append(0)  # Red - actually failed
+                    else:
+                        history.append(1)  # Green - actually passed (no knownFailure)
+                    
+                    execution_details.append({
+                        'id': exec_record.get('id', ''),
+                        'buildTag': exec_record.get('buildTag', ''),
+                        'date': str(exec_record.get('executionDate', '')),
+                        'failureReason': str(exec_record.get('failureReason', '')),
+                        'testStatus': exec_status,
+                        'knownFailure': exec_known_failure
+                    })
+                
+                # Pad history to FLAKY_TESTS_LAST_RUNS if needed
+                while len(history) < Config.FLAKY_TESTS_LAST_RUNS:
+                    history.insert(0, None)  # None = padded
+                    execution_details.insert(0, {'padded': True})
+                
+                # Generate clickable dots with data attributes
+                for idx, status in enumerate(history):
+                    if status is None:
+                        # Padded entry
+                        color = "#e0e0e0"  # Gray for padded
+                        is_padded = True
+                        exec_detail = {'padded': True}
+                    elif status == 0:
+                        color = "#dc3545"  # Red - actually failed
+                        is_padded = False
+                        exec_detail = execution_details[idx] if idx < len(execution_details) else {}
+                    elif status == 2:
+                        color = "#ffc107"  # Yellow - known failure
+                        is_padded = False
+                        exec_detail = execution_details[idx] if idx < len(execution_details) else {}
+                    else:  # status == 1
+                        color = "#28a745"  # Green - actually passed
+                        is_padded = False
+                        exec_detail = execution_details[idx] if idx < len(execution_details) else {}
+                    
+                    # Prepare data attributes for JavaScript
+                    exec_id = exec_detail.get('id', '')
+                    exec_date = html_escape.escape(str(exec_detail.get('date', '')))
+                    exec_build = html_escape.escape(str(exec_detail.get('buildTag', '')))
+                    exec_url = ""
+                    if exec_build:
+                        exec_url = ReportUrlBuilder.build_dashboard_url(
+                            Config.DASHBOARD_BASE_URL,
+                            exec_build,
+                            "html/index.html",
+                            project_name_from_path,
+                            job_name_for_url
+                        )
+                        exec_url = html_escape.escape(exec_url)
+                    raw_error = str(exec_detail.get('failureReason', ''))
+                    cleaned_error_lines = [line.lstrip() for line in raw_error.split('\n')]
+                    cleaned_error = '\n'.join(cleaned_error_lines).strip()
+                    exec_error = html_escape.escape(cleaned_error)
+                    exec_status = html_escape.escape(str(exec_detail.get('testStatus', '')))
+                    exec_known_failure = exec_detail.get('knownFailure', '')
+                    
+                    # Determine history status for display
+                    if status == 0:
+                        history_status = "fail"
+                        status_text = "Failed"
+                    elif status == 2:
+                        history_status = "known_failure"
+                        status_text = "FAILED due to known issue, but marked as PASSED!"
+                    elif status == 1:
+                        history_status = "pass"
+                        status_text = "Passed"
+                    else:
+                        history_status = "padded"
+                        status_text = "N/A"
+                    
+                    test_hash = abs(hash(test_name_escaped)) % 100000
+                    dot_id = f"known_dot_{test_hash}_{idx}"
+                    
+                    cursor_style = "cursor: pointer;" if not is_padded else "cursor: default;"
+                    title_text = f"Execution {idx + 1} ({status_text})" + (f" - {exec_date}" if exec_date else "")
+                    
+                    history_html += f'''
+                        <span 
+                            class="history-dot" 
+                            id="{dot_id}"
+                            data-test-name="{test_name_escaped}"
+                            data-execution-index="{idx}"
+                            data-execution-id="{exec_id}"
+                            data-execution-date="{exec_date}"
+                            data-execution-build="{exec_build}"
+                            data-execution-url="{exec_url}"
+                            data-execution-error="{exec_error}"
+                            data-execution-status="{exec_status}"
+                            data-history-status="{history_status}"
+                            data-known-failure="{html_escape.escape(str(exec_known_failure)) if exec_known_failure else ''}"
+                            data-is-padded="{is_padded}"
+                            style="display:inline-block; width:14px; height:14px; background-color:{color}; border-radius:50%; margin-right:3px; vertical-align:middle; {cursor_style}"
+                            title="{title_text}"
+                        ></span>
+                    '''
+                
+                # Find HTML link for this test
+                html_link = None
+                if test_html_links:
+                    html_link = test_html_links.get(test_result.full_name)
+                
+                # Build test name with optional link (wrap in .test-name for same box styling as Flaky Tests)
+                full_name_escaped = html_escape.escape(full_name_cleaned)
+                test_name_inner = display_name_escaped
+                if html_link:
+                    html_link_escaped = html_escape.escape(html_link)
+                    test_name_inner = f'<a href="{html_link_escaped}" target="_blank" style="color: #3498db; text-decoration: none;">{display_name_escaped}</a>'
+                test_name_cell = f'<div class="test-name" title="{full_name_escaped}">{test_name_inner}</div>'
+                
+                # Create unique row ID for execution details
+                details_row_id = f"known_details_{test_hash}"
+                
+                html += f"""
+                            <tr>
+                                <td>
+                                    {test_name_cell}
+                                </td>
+                                <td>
+                                    <div class="history-dots-container">
+                                        {history_html}
+                                    </div>
+                                </td>
+                                <td>
+                                    <a href="{jira_url_escaped}" target="_blank" style="color: #ff9800; text-decoration: none; font-weight: 600; font-size: 13px;">
+                                        🔗 {jira_ticket_escaped}
+                                    </a>
+                                </td>
+                            </tr>
+                            <tr id="{details_row_id}" class="execution-details-row" style="display: none;">
+                                <td colspan="3" style="padding: 0;">
+                                    <div class="execution-details-content">
+                                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                            <div style="font-weight: 600; color: #495057; font-size: 12px;">
+                                                📋 Execution Details
+                                            </div>
+                                            <button onclick="closeExecutionDetails('{details_row_id}')" style="background-color: #6c757d; color: white; border: none; border-radius: 2px; padding: 3px 7px; cursor: pointer; font-size: 10px; font-weight: 600;" title="Close details">
+                                                ✕ Close
+                                            </button>
+                                        </div>
+                                        <div id="{details_row_id}_content" style="color: #6c757d; font-size: 12px; text-align: left;">
+                                            Click on a dot above to view execution details
+                                        </div>
+                                    </div>
+                                </td>
+                            </tr>
+                """
+            
+            html += """
+                        </tbody>
+                    </table>
+                </div>
+            """
+        else:
+            # Show message when no known failures found
+            html += """
+                <div class="section-content">
+                    <p style="color: #6c757d; padding: 20px; text-align: center; font-style: italic;">
+                        ✅ No known failures found in this test run.
+                        <br>
+                        <small style="color: #999;">All passing tests are genuine passes without known issues.</small>
+                    </p>
+                </div>
+            """
+        
+        html += """
+            </div>
+        """
 
         # Build the full logs URL
         # Build the full logs URL

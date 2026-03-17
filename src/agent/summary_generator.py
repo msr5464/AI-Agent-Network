@@ -7,7 +7,6 @@ import logging
 import html as html_escape
 import re
 from typing import List, Dict, Optional
-from langchain_ollama import OllamaLLM
 
 from ..parsers.models import TestSummary
 from .analyzer import FailureClassification
@@ -20,24 +19,81 @@ logger = logging.getLogger(__name__)
 
 class SummaryGenerator:
     """Generates executive summaries of test results"""
-    
-    
+
     def __init__(self):
-        """Initialize the summary generator with Ollama LLM"""
-        self.model = Config.OLLAMA_MODEL
-        self.base_url = Config.OLLAMA_BASE_URL
-        
-        logger.info(f"Initializing SummaryGenerator with model: {self.model}")
-        
+        """Initialize the summary generator with configured LLM provider (openai, ollama, or gemini)."""
+        self.llm_provider = Config.LLM_PROVIDER
+        logger.info(f"Initializing SummaryGenerator with provider: {self.llm_provider}")
+
+        if self.llm_provider == 'openai':
+            self._init_openai()
+        elif self.llm_provider == 'gemini':
+            self._init_gemini()
+        else:
+            self._init_ollama()
+
+
+    def _init_ollama(self):
+        """Initialize Ollama LLM for summary generation."""
         try:
+            from langchain_ollama import OllamaLLM
+            self.model = Config.OLLAMA_MODEL
+            self.base_url = Config.OLLAMA_BASE_URL
             self.llm = OllamaLLM(
                 model=self.model,
                 base_url=self.base_url,
-                temperature=0.5  # Slightly higher for more creative summaries
+                temperature=0.5
             )
-            logger.info("✅ Ollama LLM initialized for summary generation")
+            logger.info(f"✅ Ollama LLM initialized for summary generation: {self.model}")
+        except ImportError:
+            logger.error("langchain-ollama not installed.")
+            raise
         except Exception as e:
             logger.error(f"Failed to initialize Ollama: {e}")
+            raise
+
+    def _init_openai(self):
+        """Initialize OpenAI LLM for summary generation."""
+        try:
+            from langchain_openai import ChatOpenAI
+            api_key = Config.OPENAI_API_KEY
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY not found in environment variables")
+            self.model = Config.OPENAI_MODEL
+            self.llm = ChatOpenAI(
+                model=self.model,
+                api_key=api_key,
+                temperature=0.5
+            )
+            logger.info(f"✅ OpenAI LLM initialized for summary generation: {self.model}")
+        except ImportError:
+            logger.error("langchain-openai not installed.")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI: {e}")
+            raise
+
+    def _init_gemini(self):
+        """Initialize Google Gemini LLM for summary generation."""
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+        except ImportError:
+            logger.warning("Gemini provider selected but langchain-google-genai is not installed.")
+            raise ImportError("langchain-google-genai not installed")
+
+        try:
+            api_key = Config.GEMINI_API_KEY
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY not found in environment variables")
+            self.model = Config.GEMINI_MODEL
+            self.llm = ChatGoogleGenerativeAI(
+                model=self.model,
+                google_api_key=api_key,
+                temperature=0.5
+            )
+            logger.info(f"✅ Gemini LLM initialized for summary generation: {self.model}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini: {e}")
             raise
     
     def generate_executive_summary(
@@ -67,7 +123,7 @@ class SummaryGenerator:
         """
         logger.info("Generating executive summary...")
         
-        # Generate HTML-formatted summary with insights
+        # Execution insights (failure breakdown, flaky tests, quick wins, etc.)
         html_summary = self._generate_html_executive_summary(
             summary,
             category_counts=category_counts,
@@ -80,50 +136,73 @@ class SummaryGenerator:
         logger.info("✅ Executive summary generated")
         return html_summary
     
-    def _identify_common_root_causes(self, category_failures: Dict[str, List[FailureClassification]]) -> Dict[str, Dict]:
+    def _identify_common_failures_by_signature(self, category_failures: Dict[str, List[FailureClassification]]) -> Dict[str, Dict]:
         """
-        Identify root causes that affect multiple tests.
-        Groups failures by normalized root cause to find common issues.
+        Identify failures that share the same AI-generated failure_signature.
+        Groups failures by signature to find common issues affecting multiple tests.
+        
+        This is simpler and more accurate than normalizing root_cause text,
+        as the AI already generates concise, groupable signatures.
         
         Args:
             category_failures: Dictionary mapping category to list of FailureClassification objects
             
         Returns:
-            Dictionary mapping normalized root cause to:
+            Dictionary mapping failure_signature to:
             {
-                'root_cause': original root cause text (from first occurrence),
+                'signature': failure signature text,
                 'tests': list of test names affected,
-                'category': root cause category
+                'category': root cause category,
+                'root_causes': list of {test_name, root_cause} dicts for details
             }
         """
-        common_causes = {}
+        signature_groups = {}
+        from ..utils import normalize_failure_signature
         
         # Iterate through all failures across all categories
         for category, failures in category_failures.items():
             for failure in failures:
-                if not failure.root_cause:
-                    continue
+                # Use AI-generated signature (same field used by Representative Signals)
+                if hasattr(failure, 'failure_signature') and failure.failure_signature:
+                    original_sig = failure.failure_signature.strip()
+                else:
+                    # Fallback for legacy data without failure_signature
+                    original_sig = "Unclassified Failure"
                 
-                # Normalize the root cause to group similar issues
-                normalized_rc = normalize_root_cause(failure.root_cause)
+                # Normalize for grouping key (case insensitive, ignore trailing dots)
+                group_key = normalize_failure_signature(original_sig)
                 
-                if not normalized_rc:
-                    continue
-                
-                # Group by normalized root cause
-                if normalized_rc not in common_causes:
-                    common_causes[normalized_rc] = {
-                        'root_cause': failure.root_cause,  # Keep original for display
+                # Group by normalized signature
+                if group_key not in signature_groups:
+                    signature_groups[group_key] = {
+                        'signature': original_sig,  # Keep the first encountered original signature for display
                         'tests': [],
-                        'category': failure.root_cause_category
+                        'category': failure.root_cause_category,
+                        'root_causes': []  # Store root causes for tooltip/detail view
                     }
                 
-                # Add test name if not already present
-                if failure.test_name not in common_causes[normalized_rc]['tests']:
-                    common_causes[normalized_rc]['tests'].append(failure.test_name)
+                # Add test if not already present
+                if failure.test_name not in signature_groups[group_key]['tests']:
+                    signature_groups[group_key]['tests'].append(failure.test_name)
+                    # Store root cause for this specific test (for detail view)
+                    signature_groups[group_key]['root_causes'].append({
+                        'test_name': failure.test_name,
+                        'root_cause': failure.root_cause
+                    })
         
-        # Filter to only include root causes affecting 2+ tests
-        return {rc: data for rc, data in common_causes.items() if len(data['tests']) >= 2}
+        # Filter to only include signatures affecting 2+ tests (Quick Wins!)
+        filtered = {data['signature']: data for key, data in signature_groups.items() if len(data['tests']) >= 2}
+        
+        # Debug logging
+        logger.info(f"Quick Wins: Found {len(signature_groups)} unique normalized signatures across all failures")
+        logger.info(f"Quick Wins: After filtering (2+ tests), {len(filtered)} signatures qualify")
+        if len(signature_groups) > 0 and len(filtered) == 0:
+            logger.warning("⚠️ Quick Wins: All failures have unique signatures - no common patterns found")
+            for key, data in list(signature_groups.items())[:5]:  # Show first 5
+                logger.info(f"  - '{data['signature']}': {len(data['tests'])} test(s)")
+        
+        return filtered
+    
     
     def _generate_html_executive_summary(
         self,
@@ -374,54 +453,68 @@ class SummaryGenerator:
             
             html.append('</div>')
         
-        # 3. Quick Wins (Common Root Causes Affecting Multiple Tests)
+        # 2.5. Known Failures Summary
+        if test_results:
+            known_failures_list = [t for t in test_results if t.known_failure]
+            if known_failures_list:
+                html.append('<div style="margin-bottom: 15px;">')
+                html.append('<h3 style="color: #2c3e50; margin-bottom: 8px; font-size: 16px; border-bottom: 2px solid #ff9800; padding-bottom: 6px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif;">🔖 Known Failures</h3>')
+                
+                total_known = len(known_failures_list)
+                html.append(f'<p style="margin-bottom: 8px; color: #666; font-size: 15px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif;">{total_known} test{"" if total_known == 1 else "s"} marked as PASSED due to known issues (Jira tickets linked). <a href="#known-failures" style="color: #6366f1; text-decoration: none;">View all →</a></p>')
+                
+                # Group by Jira ticket ID
+                ticket_groups = {}
+                for test in known_failures_list:
+                    ticket_id = test.known_failure.strip()
+                    if ticket_id not in ticket_groups:
+                        ticket_groups[ticket_id] = []
+                    ticket_groups[ticket_id].append(test)
+                
+                # Show ticket breakdown (sorted by count descending)
+                sorted_tickets = sorted(ticket_groups.items(), key=lambda x: len(x[1]), reverse=True)
+                
+                for ticket_id, tests in sorted_tickets[:5]:  # Show top 5 tickets
+                    count = len(tests)
+                    jira_url = f"{Config.JIRA_BASE_URL.rstrip('/')}/browse/{ticket_id}"
+                    
+                    html.append(f'''
+                        <div style="background: #fff; padding: 10px 12px; border-radius: 6px; margin-bottom: 5px; border-left: 3px solid #ff9800; box-shadow: 0 1px 2px rgba(0,0,0,0.05); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span style="font-size: 12px; font-weight: 600; color: #111827; background: rgba(255, 152, 0, 0.08); padding: 2px 6px; border-radius: 3px; white-space: nowrap;">
+                                    {count} test{"" if count == 1 else "s"}
+                                </span>
+                                <span style="font-size: 12px; color: #374151; flex: 1;">
+                                    failed but marked as passed due to known issue <a href="{jira_url}" target="_blank" style="color: #ff9800; text-decoration: none; font-weight: 600;">{ticket_id}</a>
+                                </span>
+                            </div>
+                        </div>
+                    ''')
+                
+                html.append('</div>')
+        
+        # 3. Quick Wins (Common Failures by Signature - Fix Once, Resolve Multiple)
         if category_failures:
-            common_root_causes = self._identify_common_root_causes(category_failures)
-            if common_root_causes:
+            common_failures = self._identify_common_failures_by_signature(category_failures)
+            if common_failures:
                 html.append('<div style="margin-bottom: 15px;">')
                 html.append('<h3 style="color: #2c3e50; margin-bottom: 8px; font-size: 16px; border-bottom: 2px solid #10b981; padding-bottom: 6px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif;">⚡ Quick Wins</h3>')
                 html.append('<p style="margin-bottom: 8px; color: #666; font-size: 15px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif;">Fix once, resolve multiple test failures.</p>')
                 
-                # Sort by number of affected tests (descending)
-                sorted_common_causes = sorted(common_root_causes.items(), key=lambda x: len(x[1]['tests']), reverse=True)
+                # Calculate total failures for impact percentage
+                total_failures = sum(len(failures) for failures in category_failures.values())
                 
-                for idx, (normalized_rc, data) in enumerate(sorted_common_causes[:5]):  # Show top 5 common root causes
+                # Sort by number of affected tests (descending)
+                sorted_common_failures = sorted(common_failures.items(), key=lambda x: len(x[1]['tests']), reverse=True)
+                
+                for idx, (signature, data) in enumerate(sorted_common_failures[:5]):  # Show top 5 quick wins
                     affected_tests = data['tests']
                     num_tests = len(affected_tests)
-                    root_cause_text = data['root_cause']  # Use the first occurrence's root cause for display
+                    failure_signature = data['signature']
                     category = data['category']
                     
-                    # CRITICAL: Extract correct API from execution logs for the first test in the group
-                    # This ensures we show the correct API that actually failed, not the one from AI-generated root_cause
-                    if test_results and affected_tests:
-                        from ..utils import TestDataCache
-                        from ..reporters.report_generator import ReportGenerator
-                        test_data_cache = TestDataCache(test_results, test_html_links or {})
-                        report_gen = ReportGenerator()
-                        
-                        # Get execution log for the first test
-                        first_test_name = affected_tests[0]
-                        execution_log = test_data_cache.get_combined_log(first_test_name)
-                        
-                        if execution_log:
-                            # Extract correct API using the same logic as report generator
-                            details_info = report_gen._extract_detailed_info(root_cause_text, execution_log=execution_log, test_name=first_test_name)
-                            
-                            if details_info.get('api_info'):
-                                correct_api = details_info['api_info'][0]
-                                # Replace API name in root_cause_text if it contains an API name pattern
-                                # Pattern: "API Name: /dashboard/aml/lnrn-search" or "API Name: GetAmlSearchSuccessfulResponse"
-                                api_pattern = r'(API Name|Endpoint|api name|api url|url)[:\s]+([^\s,<>\n]+)'
-                                if re.search(api_pattern, root_cause_text, re.IGNORECASE):
-                                    # Replace the API name with the correct one
-                                    # Match the pattern and replace just the API part (group 2)
-                                    root_cause_text = re.sub(
-                                        api_pattern,
-                                        lambda m: f"{m.group(1)}: {correct_api}",
-                                        root_cause_text,
-                                        count=1,
-                                        flags=re.IGNORECASE
-                                    )
+                    # Calculate impact percentage
+                    impact_pct = (num_tests / total_failures * 100) if total_failures > 0 else 0
                     
                     # Get category style
                     category_style = category_styles.get(category, {
@@ -429,16 +522,6 @@ class SummaryGenerator:
                         'label': category.replace('_', ' ').title(),
                         'color': '#475569'
                     })
-                    
-                    # Truncate root cause text if too long (shorter for cleaner display)
-                    display_rc = root_cause_text[:150] + "..." if len(root_cause_text) > 150 else root_cause_text
-                    
-                    # Create a compact preview list of test names (first 2)
-                    test_names_preview = []
-                    for test_name in affected_tests[:2]:
-                        from ..utils import extract_class_and_method
-                        class_name, method_name = extract_class_and_method(test_name)
-                        test_names_preview.append(f"{class_name}.{method_name}")
                     
                     # Generate collapsible section ID
                     details_id = f"quick-win-{idx}"
@@ -511,33 +594,55 @@ class SummaryGenerator:
                             '''
                         test_names_html.append(test_name_html)
                     
-                    preview_text = ', '.join([html_escape.escape(name) for name in test_names_preview])
+                    # Create compact preview (first 2 tests)
+                    preview_tests = []
+                    for test_name in affected_tests[:2]:
+                        from ..utils import extract_class_and_method
+                        class_name, method_name = extract_class_and_method(test_name)
+                        preview_tests.append(f"{class_name}.{method_name}")
+                    
+                    preview_text = ', '.join([html_escape.escape(name) for name in preview_tests])
                     if num_tests > 2:
                         preview_text += f" +{num_tests - 2} more"
                     
+                    # Determine impact level for visual styling
+                    if impact_pct >= 20:
+                        impact_label = "High Impact"
+                        impact_color = "#dc2626"
+                    elif impact_pct >= 10:
+                        impact_label = "Medium Impact"
+                        impact_color = "#f59e0b"
+                    else:
+                        impact_label = "Low Impact"
+                        impact_color = "#6b7280"
+                    
                     html.append(f'''
-                        <div style="background: #fff; padding: 8px 12px; border-radius: 6px; margin-bottom: 4px; border-left: 3px solid {category_style['color']}; box-shadow: 0 1px 2px rgba(0,0,0,0.05); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+                        <div style="background: #fff; padding: 10px 12px; border-radius: 6px; margin-bottom: 6px; border-left: 3px solid {category_style['color']}; box-shadow: 0 1px 2px rgba(0,0,0,0.05); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
                             <div style="display: flex; align-items: flex-start; gap: 8px;">
                                 <div style="flex: 1; min-width: 0;">
-                                    <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 3px; flex-wrap: wrap;">
-                                        <span style="font-size: 13px; font-weight: 600; color: #111827; background: rgba(16, 185, 129, 0.1); padding: 2px 6px; border-radius: 3px; white-space: nowrap;">
-                                            {num_tests} test{"" if num_tests == 1 else "s"}
+                                    <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px; flex-wrap: wrap;">
+                                        <span style="font-size: 14px;">{category_style['icon']}</span>
+                                        <span style="font-size: 14px; font-weight: 600; color: #111827; line-height: 1.4; flex: 1; min-width: 0;">
+                                            {html_escape.escape(failure_signature)}
                                         </span>
-                                        <span style="font-size: 13px; font-weight: 600; color: #374151; line-height: 1.4; flex: 1; min-width: 0;">
-                                            {html_escape.escape(display_rc)}
+                                        <span style="font-size: 13px; font-weight: 600; color: #111827; background: rgba(16, 185, 129, 0.1); padding: 2px 8px; border-radius: 3px; white-space: nowrap;">
+                                            {num_tests} test{"s" if num_tests != 1 else ""}
                                         </span>
                                     </div>
-                                    <div style="font-size: 11px; color: #9ca3af; margin-top: 1px; margin-bottom: 0; line-height: 1.2;">
+                                    <div style="font-size: 12px; color: #6b7280; margin-bottom: 4px; line-height: 1.3;">
+                                        Fix this {category_style['label'].lower()} to resolve {num_tests} test failure{"s" if num_tests != 1 else ""} • <span style="color: {impact_color}; font-weight: 500;">{impact_label}</span> ({impact_pct:.1f}% of all failures)
+                                    </div>
+                                    <div style="font-size: 11px; color: #9ca3af; margin-top: 2px; margin-bottom: 0; line-height: 1.2;">
                                         {preview_text}
                                     </div>
-                                    <details id="{details_id}" style="margin: 0; padding: 0;">
+                                    <details id="{details_id}" style="margin: 0; padding: 0; margin-top: 4px;">
                                         <summary style="font-size: 11px; color: #6366f1; cursor: pointer; user-select: none; list-style: none; display: inline-flex; align-items: center; gap: 3px; text-decoration: underline; text-decoration-color: rgba(99, 102, 241, 0.4); margin: 0; padding: 0; line-height: 1;" onmouseover="this.style.textDecorationColor='rgba(99, 102, 241, 0.7)'" onmouseout="this.style.textDecorationColor='rgba(99, 102, 241, 0.4)'">
-                                            <span style="line-height: 1;">Show all tests</span>
+                                            <span style="line-height: 1;">Show all {num_tests} test{"s" if num_tests != 1 else ""}</span>
                                             <svg id="{details_id}-icon" xmlns="http://www.w3.org/2000/svg" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="transition: transform 0.2s; display: inline-block; vertical-align: middle; line-height: 1;">
                                                 <polyline points="6 9 12 15 18 9"></polyline>
                                             </svg>
                                         </summary>
-                                        <div style="margin-top: 3px; padding-top: 3px; border-top: 1px solid #e5e7eb; max-height: 200px; overflow-y: auto;">
+                                        <div style="margin-top: 4px; padding-top: 4px; border-top: 1px solid #e5e7eb; max-height: 200px; overflow-y: auto;">
                                             {''.join(test_names_html)}
                                         </div>
                                     </details>
@@ -566,5 +671,6 @@ class SummaryGenerator:
                     ''')
                 
                 html.append('</div>')
+        
         
         return ''.join(html)

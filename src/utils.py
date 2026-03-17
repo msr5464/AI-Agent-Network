@@ -81,6 +81,54 @@ class TestNameNormalizer:
         return None
 
 
+class FailureClassificationUtils:
+    """
+    Utilities for handling FailureClassification objects.
+    """
+
+    @staticmethod
+    def deduplicate(classifications: list) -> list:
+        """
+        Deduplicate failure classifications by test name.
+        Uses a "highest confidence wins" strategy:
+        HIGH > MEDIUM > LOW > UNKNOWN
+
+        Args:
+            classifications: List of FailureClassification objects
+
+        Returns:
+            Deduplicated list of FailureClassification objects
+        """
+        if not classifications:
+            return []
+
+        seen_tests = {}
+        deduplicated = []
+
+        confidence_order = {'HIGH': 3, 'MEDIUM': 2, 'LOW': 1, 'UNKNOWN': 0}
+
+        for classification in classifications:
+            # Normalize test name for consistent matching
+            test_name = classification.test_name
+            test_name_normalized = TestNameNormalizer.normalize(test_name)
+
+            if test_name_normalized not in seen_tests:
+                seen_tests[test_name_normalized] = classification
+                deduplicated.append(classification)
+            else:
+                existing = seen_tests[test_name_normalized]
+                existing_conf = confidence_order.get(existing.confidence, 0)
+                new_conf = confidence_order.get(classification.confidence, 0)
+
+                if new_conf > existing_conf:
+                    # Replace with higher confidence one
+                    index = deduplicated.index(existing)
+                    deduplicated[index] = classification
+                    seen_tests[test_name_normalized] = classification
+
+        return deduplicated
+
+
 class ReportUrlBuilder:
     """
     Centralized utility for building report URLs.
@@ -131,6 +179,8 @@ class ReportUrlBuilder:
     def extract_project_job_from_path(report_dir: str) -> Tuple[Optional[str], Optional[str]]:
         """
         Extract project name and job name from directory structure.
+        Expected structure: .../ProjectName/JobName/ReportName (e.g. .../RegressionResults/ProdSanity/ProdSanity-All-Tests-541).
+        Uses string parsing for UNC/network paths so project/job are found even when resolve() fails (e.g. share not accessible).
         
         Args:
             report_dir: Path to report directory
@@ -138,23 +188,37 @@ class ReportUrlBuilder:
         Returns:
             Tuple of (project_name, job_name) or (None, None) if extraction fails
         """
+        def _parse_from_components(normalized: str) -> Tuple[Optional[str], Optional[str]]:
+            # Parse without resolve(): split path and take last 3 parts as report_name, job_name, project_name
+            parts = [p for p in normalized.replace('\\', '/').split('/') if p]
+            if len(parts) >= 3:
+                report_name_part = parts[-1]
+                job_name = parts[-2]
+                project_name = parts[-3]
+                # Skip if any looks like a host (e.g. IP)
+                if project_name and job_name and not project_name.replace('.', '').isdigit():
+                    return project_name, job_name
+            return None, None
+
         try:
             normalized_dir = ReportUrlBuilder.normalize_path(report_dir)
             report_path_obj = Path(normalized_dir).resolve()
-            
-            # Try to extract from path first
+
             # Expected structure: .../ProjectName/JobName/ReportName
             job_name = report_path_obj.parent.name
             project_name = report_path_obj.parent.parent.name
-            
-            # Validate extracted names (ensure they are not empty or root)
-            if not job_name or not project_name or job_name == report_path_obj.anchor:
-                return None, None
-            
+
+            # Validate (ensure not empty and job is not the path anchor, e.g. UNC share)
+            if not job_name or not project_name:
+                return _parse_from_components(normalized_dir)
+            if job_name == report_path_obj.anchor or (report_path_obj.anchor and job_name in report_path_obj.anchor):
+                return _parse_from_components(normalized_dir)
+
             return project_name, job_name
-            
+
         except Exception:
-            return None, None
+            # resolve() often fails for UNC paths when share is not accessible; parse from string
+            return _parse_from_components(ReportUrlBuilder.normalize_path(report_dir))
             
     @staticmethod
     def build_dashboard_url(base_url: str, report_name: str, html_path: str = "html/index.html", 
@@ -182,14 +246,23 @@ class ReportUrlBuilder:
             return html_path
         
         # Special case: ProdSanity reports don't have job name in the path
+        # Always use report-name-derived project name (not directory-derived) since
+        # CI directory structure is .../RegressionResults/ProdSanity/... but dashboard
+        # URL must be /Results/ProdSanity/...
         if report_name.startswith('ProdSanity-'):
-            return f"{base_url}/Results/{project_name}/{report_name}/{html_path}"
+            prod_project = ReportUrlBuilder.extract_project_name(report_name)
+            return f"{base_url}/Results/{prod_project}/{report_name}/{html_path}"
         
+        # Use provided job_name or default to configured value (falls back to Access-Jobs)
+        if not job_name:
+            try:
+                from src.settings import Config
+                job_name = Config.DASHBOARD_JOB_NAME
+            except Exception:
+                job_name = "Access-Jobs"
+            
         # Standard pattern: /Results/{project_name}/{job_name}/{report_name}/html/...
-        # If job_name is missing, omit that segment.
-        if job_name:
-            return f"{base_url}/Results/{project_name}/{job_name}/{report_name}/{html_path}"
-        return f"{base_url}/Results/{project_name}/{report_name}/{html_path}"
+        return f"{base_url}/Results/{project_name}/{job_name}/{report_name}/{html_path}"
 
 
 def remove_duplicate_class_name(class_name: str) -> str:
@@ -250,6 +323,7 @@ def normalize_root_cause(root_cause: str) -> str:
     normalized = re.sub(r'https?://[^\s\)]+', '[URL]', normalized)
     
     # Remove dates in various formats (e.g., "24 Dec 2025", "2025-12-24", "12/24/2025", "Dec 24, 2025")
+    # Remove times (e.g., "22:45:43", "10:30 AM", "14:30:00")
     normalized = re.sub(r'\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}\b', '[DATE]', normalized, flags=re.IGNORECASE)
     normalized = re.sub(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b', '[DATE]', normalized, flags=re.IGNORECASE)
     normalized = re.sub(r'\b\d{4}-\d{2}-\d{2}\b', '[DATE]', normalized)
@@ -261,23 +335,6 @@ def normalize_root_cause(root_cause: str) -> str:
     
     # Remove timestamps (e.g., "40.431 seconds", "40 seconds", "2025-12-01 22:45:43")
     normalized = re.sub(r'\b\d+\.?\d*\s*(seconds?|minutes?|hours?|ms|milliseconds?)\b', '[DURATION]', normalized, flags=re.IGNORECASE)
-    
-    # Remove testcase names/class names (common patterns like "TestClassName.methodName", "ClassName.testMethod")
-    # But preserve page names (classes ending with "Page")
-    # Match patterns like "TestAutoFreezeAdvanceAccounts4.verifyAdminCanSee..." but NOT page classes
-    normalized = re.sub(r'\b(?!.*page)[a-z][a-z0-9_]*[a-z0-9]*\.[a-z][a-z0-9_]*\b', '[TESTCASE]', normalized, flags=re.IGNORECASE)
-    
-    # Match page element patterns like "TransactionsPage:No Result Found Message" or "CardCreationPage:search card holder name text box"
-    # IMPORTANT: Preserve the page name (e.g., "TransactionsPage", "NewTransferAmountInputPage", "CardPage")
-    # Only normalize the element description part after the colon
-    # Pattern: "PageName:element description" -> "PageName:[ELEMENT]"
-    
-    # Handle patterns with quotes: Element 'TransactionsPage:No Result Found Message' is NOT visible
-    normalized = re.sub(r'([a-z][a-z0-9_]*page[a-z0-9_]*):([^\']+)\'', r'\1:[ELEMENT]\'', normalized, flags=re.IGNORECASE)
-    # Handle patterns already inside quotes: 'TransactionsPage:No Result Found Message'
-    normalized = re.sub(r'\'([a-z][a-z0-9_]*page[a-z0-9_]*):([^\']+)\'', r'\'\1:[ELEMENT]\'', normalized, flags=re.IGNORECASE)
-    # Handle patterns without quotes: TransactionsPage:No Result Found Message
-    normalized = re.sub(r'\b([a-z][a-z0-9_]*page[a-z0-9_]*):([^\s\']+)', r'\1:[ELEMENT]', normalized, flags=re.IGNORECASE)
     
     # CRITICAL: Normalize missing keys patterns FIRST to group all key mismatch failures together
     # This ensures all "missing keys" failures group together regardless of API name differences
@@ -388,6 +445,28 @@ def extract_api_endpoint(root_cause: str) -> Optional[str]:
             return api
     
     return None
+
+
+def normalize_failure_signature(signature: str) -> str:
+    """
+    Normalize failure signature for grouping.
+    - Lowercase
+    - Remove trailing punctuation
+    - Collapse whitespace
+    
+    Args:
+        signature: Raw failure signature string
+    
+    Returns:
+        Normalized signature string suitable for grouping keys
+    """
+    if not signature:
+        return ""
+    # Normalize:
+    # 1. Lowercase for case-insensitivity
+    # 2. Strip standard whitespace and trailing punctuation
+    # 3. Collapse multiple whitespace into single space
+    return " ".join(signature.strip().rstrip(".,;:!?").lower().split())
 
 
 class TestDataCache:

@@ -61,12 +61,42 @@ def main():
     parser.add_argument("--input-dir", help="Path to input directory containing test reports")
     parser.add_argument("--output-dir", help="Path to output directory for generated reports")
     parser.add_argument("--table-name", help="Explicit database table name to query (overrides auto-detection)")
+    parser.add_argument("--environment", help="Environment label to display/use (e.g., qa-1, qa-2, production)")
+    parser.add_argument("--skip-report", action="store_true", help="Skip HTML/report generation (useful for auto-fix only runs)")
+    parser.add_argument("--skip-autofix", action="store_true", help="Skip auto-fix flow (report-only runs)")
+    parser.add_argument("--autofix-tests", help="Comma-separated list of test names to auto-fix (e.g., 'TestClass.testMethod1,TestClass.testMethod2')")
+    parser.add_argument("--autofix-tests-file", help="Path to file containing test names (one per line) to auto-fix")
     args = parser.parse_args()
     
     logger.info("🚀 Starting QA AI Agent...")
+    if args.skip_report:
+        logger.info("Report generation will be skipped (skip-report flag).")
+    if args.skip_autofix:
+        logger.info("Auto-fix flow will be skipped (skip-autofix flag).")
     
+    def _guess_environment(report_path: str) -> str:
+        name = Path(report_path).name.lower() if report_path else ""
+        if Config.AUTO_FIX_ENV_OVERRIDE:
+            return Config.AUTO_FIX_ENV_OVERRIDE
+        for token, env in [
+            ("prod", "production"),
+            ("production", "production"),
+            ("qa-2", "qa-2"),
+            ("qa2", "qa-2"),
+            ("qa-1", "qa-1"),
+            ("qa1", "qa-1"),
+            ("staging", "staging"),
+        ]:
+            if token in name:
+                return env
+        return ""
+
     # Determine report directory to process
     report_dir = args.input_dir
+    if report_dir and not Path(report_dir).exists():
+        candidate = Path(Config.INPUT_DIR) / report_dir
+        if candidate.exists():
+            report_dir = str(candidate)
     
     # Determine output directory for reports
     output_dir = args.output_dir if args.output_dir else Config.OUTPUT_DIR
@@ -105,6 +135,9 @@ def main():
         
         logger.info(f"📊 Found {len(db_results)} test results in database")
         
+    except ValueError as e:
+        logger.error(f"❌ {e}")
+        return
     except Exception as e:
         logger.error(f"Failed to query database: {e}")
         logger.error("Please check your database configuration in config/.env")
@@ -228,6 +261,20 @@ def main():
     # 5. Extract API endpoints map BEFORE generating summary (same method as tables)
     logger.info("🔍 Extracting API endpoints map...")
     report_gen = ReportGenerator()
+    # Parse group/branch from overview (used for header and for aligning auto-fix branch if available)
+    automation_group = automation_branch = automation_env = None
+    try:
+        automation_group, automation_branch, automation_env = report_gen._parse_automation_group_and_branch(report_dir)
+    except Exception:
+        automation_group = automation_branch = automation_env = None
+    if automation_env is None:
+        automation_env = ""
+    environment_label = (
+        (args.environment or "").strip().lower()
+        or automation_env
+        or _guess_environment(report_dir)
+        or "qa-1"
+    )
     # Create cache for consistent data access
     from src.utils import TestDataCache
     test_data_cache = TestDataCache(data['test_results'], data.get('html_links', {}))
@@ -236,18 +283,13 @@ def main():
     
     # 5.5. Calculate category breakdown for Executive Summary (same logic as report generator)
     from src.reporters.category_rules import CategoryRuleEngine
+    from src.utils import FailureClassificationUtils
     rule_engine = CategoryRuleEngine()
     category_counts = {}
     category_failures = {}
     
-    # Deduplicate classifications first (same as report generator)
-    seen_tests = {}
-    deduplicated_classifications = []
-    for classification in classifications:
-        test_name_normalized = classification.test_name.strip()
-        if test_name_normalized not in seen_tests:
-            seen_tests[test_name_normalized] = classification
-            deduplicated_classifications.append(classification)
+    # Deduplicate classifications using centralized utility (highest confidence wins)
+    deduplicated_classifications = FailureClassificationUtils.deduplicate(classifications)
     
     for failure in deduplicated_classifications:
         category = rule_engine.classify(failure, test_data_cache)
@@ -259,40 +301,164 @@ def main():
     
     logger.info(f"📊 Category breakdown: {category_counts}")
     
-    # 6. Generate Summary
-    logger.info("📝 Generating Executive Summary...")
-    generator = SummaryGenerator()
-    ai_summary = generator.generate_executive_summary(
-        summary=summary,
-        classifications=deduplicated_classifications,
-        report_name=report_name,
-        category_counts=category_counts,
-        category_failures=category_failures,
-        recurring_failures=recurring,
-        test_html_links=data.get('html_links', {}),
-        test_results=data.get('test_results')
-    )
+    if args.skip_report:
+        logger.info("📝 Skipping summary and HTML report generation (skip-report flag).")
+        ai_summary = ""
+    else:
+        # 6. Generate Summary
+        logger.info("📝 Generating Executive Summary...")
+        generator = SummaryGenerator()
+        ai_summary = generator.generate_executive_summary(
+            summary=summary,
+            classifications=deduplicated_classifications,
+            report_name=report_name,
+            category_counts=category_counts,
+            category_failures=category_failures,
+            recurring_failures=recurring,
+            test_html_links=data.get('html_links', {}),
+            test_results=data.get('test_results')
+        )
 
-    # 7. Generate HTML Report
-    logger.info("🎨 Generating HTML Report...")
-    html_content, _ = report_gen.generate_html_report(
-        summary=summary,
-        classifications=classifications,
-        report_name=report_name,
-        ai_summary=ai_summary,
-        recurring_failures=recurring,
-        trend=trends['trend'],
-        report_dir=report_dir,
-        test_results=data['test_results'],
-        test_html_links=data.get('html_links', {})
-    )
-    
-    # Save HTML report with dynamic name based on report_name
-    # Sanitize report_name for filename (remove invalid characters)
-    safe_report_name = "".join(c for c in report_name if c.isalnum() or c in ('-', '_', ' ')).strip().replace(' ', '-')
-    html_report_path = Path(output_dir) / f"AI-Generated-Report_{safe_report_name}.html"
-    saved_path = report_gen.save_report(html_content, str(html_report_path))
-    logger.info(f"📄 HTML report saved to: {saved_path}")
+        # 7. Generate HTML Report
+        logger.info("🎨 Generating HTML Report...")
+        html_content, _ = report_gen.generate_html_report(
+            summary=summary,
+            classifications=deduplicated_classifications,
+            report_name=report_name,
+            ai_summary=ai_summary,
+            recurring_failures=recurring,
+            trend=trends['trend'],
+            report_dir=report_dir,
+            test_results=data['test_results'],
+            test_html_links=data.get('html_links', {}),
+            environment=environment_label,
+            output_dir=output_dir,
+        )
+        
+        # Save HTML report with dynamic name based on report_name
+        # Sanitize report_name for filename (remove invalid characters)
+        safe_report_name = "".join(c for c in report_name if c.isalnum() or c in ('-', '_', ' ')).strip().replace(' ', '-')
+        html_report_path = Path(output_dir) / f"AI-Generated-Report_{safe_report_name}.html"
+        saved_path = report_gen.save_report(html_content, str(html_report_path))
+        logger.info(f"📄 HTML report saved to: {saved_path}")
+        
+        # Generate auto-fix tests file (contains all auto-fixable test names)
+        autofix_tests_file = report_gen.save_autofix_tests_file(
+            classifications=classifications,
+            output_dir=output_dir,
+            report_name=report_name
+        )
+        if autofix_tests_file:
+            logger.info(f"📋 Auto-fix tests file: {autofix_tests_file}")
+            logger.info(f"   This file will be auto-detected when running auto-fix (no need to specify manually)")
+
+    # 8. Optional Auto-Fix Flow (experimental)
+    if Config.AUTO_FIX_ENABLED and not args.skip_autofix:
+        autofix_results = []
+        try:
+            from src.auto_fix import AutoFixManager
+
+            # Filter classifications to auto-fixable ones (Automation Issues only for now)
+            def _to_autofixable(items):
+                allowed = []
+                for item in items:
+                    if item.classification == "AUTOMATION_ISSUE" and item.confidence in ["HIGH", "MEDIUM"]:
+                        allowed.append(item)
+                return allowed
+            
+            auto_classifications = _to_autofixable(classifications)
+            
+            # Auto-detect autofix tests file if not explicitly provided
+            autofix_tests_file = args.autofix_tests_file
+            if not autofix_tests_file and not args.autofix_tests:
+                # Try to find auto-generated file in output directory
+                report_name_for_file = Path(report_dir).name if report_dir else None
+                if report_name_for_file:
+                    safe_report_name = "".join(c for c in report_name_for_file if c.isalnum() or c in ('-', '_', ' ')).strip().replace(' ', '-')
+                    auto_generated_file = Path(output_dir) / f"autofix_tests_{safe_report_name}.txt"
+                    if auto_generated_file.exists():
+                        autofix_tests_file = str(auto_generated_file)
+                        logger.info(f"📋 Auto-detected autofix tests file: {autofix_tests_file}")
+            
+            # Apply test selection filter if provided
+            if args.autofix_tests or autofix_tests_file:
+                selected_tests = set()
+                
+                # Read from comma-separated string
+                if args.autofix_tests:
+                    selected_tests.update([t.strip() for t in args.autofix_tests.split(',') if t.strip()])
+                
+                # Read from file
+                if autofix_tests_file:
+                    try:
+                        with open(autofix_tests_file, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                test_name = line.strip()
+                                if test_name and not test_name.startswith('#'):
+                                    selected_tests.add(test_name)
+                        logger.info(f"📋 Loaded {len(selected_tests)} test names from file: {autofix_tests_file}")
+                    except Exception as e:
+                        logger.error(f"Failed to read test file {autofix_tests_file}: {e}")
+                
+                if selected_tests:
+                    # Normalize test names for matching (handle various formats)
+                    def normalize_test_name(name):
+                        # Remove package prefix if present, keep class.method
+                        parts = name.split('.')
+                        if len(parts) >= 2:
+                            return '.'.join(parts[-2:])  # ClassName.methodName
+                        return name
+                    
+                    normalized_selected = {normalize_test_name(t) for t in selected_tests}
+                    
+                    # Filter classifications to only selected tests
+                    filtered = []
+                    for item in auto_classifications:
+                        normalized_item = normalize_test_name(item.test_name)
+                        # Match by full name or class.method
+                        if (item.test_name in selected_tests or 
+                            normalized_item in normalized_selected or
+                            any(item.test_name.endswith(t) for t in selected_tests if '.' in t)):
+                            filtered.append(item)
+                    
+                    logger.info(f"🔧 Test selection: {len(filtered)} tests selected from {len(auto_classifications)} auto-fixable tests")
+                    auto_classifications = filtered
+            
+            if not auto_classifications:
+                logger.info("🔧 Auto-fix enabled but no auto-fixable classifications found (need AUTOMATION_ISSUE with MEDIUM/HIGH confidence)")
+            elif not Config.GITHUB_TOKEN or not Config.GITHUB_REPO_AUTOMATION:
+                logger.error("🔧 Auto-fix enabled but GitHub configuration is missing (GITHUB_TOKEN or GITHUB_REPO_AUTOMATION)")
+            else:
+                logger.info(f"🔧 Auto-fix: attempting up to {Config.AUTO_FIX_MAX_FIXES_PER_RUN} fixes (dry_run={Config.AUTO_FIX_DRY_RUN})")
+                # Create session file path for tracking passed tests
+                report_name = Path(report_dir).name if report_dir else "unknown"
+                session_file = Path(output_dir) / f".autofix_session_{report_name}.json"
+                
+                manager = AutoFixManager(
+                    github_token=Config.GITHUB_TOKEN,
+                    github_org=Config.GITHUB_ORG,
+                    github_repo_automation=Config.GITHUB_REPO_AUTOMATION,
+                    github_default_branch=automation_branch or Config.GITHUB_DEFAULT_BRANCH,
+                    github_pr_reviewers=Config.GITHUB_PR_REVIEWERS,
+                    llm_provider=Config.LLM_PROVIDER,
+                    openai_api_key=Config.OPENAI_API_KEY,
+                    openai_model=Config.OPENAI_MODEL,
+                    ollama_model=Config.OLLAMA_MODEL,
+                    ollama_base_url=Config.OLLAMA_BASE_URL,
+                    gemini_api_key=Config.GEMINI_API_KEY,
+                    gemini_model=Config.GEMINI_MODEL,
+                    max_fixes_per_run=Config.AUTO_FIX_MAX_FIXES_PER_RUN,
+                    dry_run=Config.AUTO_FIX_DRY_RUN,
+                    run_tests_locally=True,
+                    target_environment=environment_label,
+                    session_file=str(session_file)  # Pass session file for tracking
+                )
+                autofix_results = manager.process_classifications(auto_classifications)
+                logger.info(f"🔧 Auto-fix completed: {len([r for r in autofix_results if r.success])} succeeded, {len([r for r in autofix_results if r.skipped])} skipped, {len([r for r in autofix_results if not r.success and not r.skipped])} failed")
+        except Exception as e:
+            logger.error(f"Auto-fix flow failed: {e}")
+    elif args.skip_autofix:
+        logger.info("🔧 Auto-fix skipped (skip-autofix flag).")
 
 
 

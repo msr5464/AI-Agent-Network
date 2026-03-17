@@ -21,6 +21,9 @@ try:
 except ImportError:
     pymysql = None
 
+# MySQL error: table doesn't exist
+MYSQL_ER_NO_SUCH_TABLE = 1146
+
 logger = logging.getLogger(__name__)
 
 
@@ -94,6 +97,10 @@ class AgentMemory:
             if 'id' in available_columns:
                 select_columns.append('id')
             
+            # Add knownFailure if available
+            if 'knownFailure' in available_columns:
+                select_columns.append('knownFailure')
+            
             if not select_columns or 'testcaseName' not in available_columns:
                 raise ValueError(f"Required columns (testcaseName) not found in table {table_name}")
             
@@ -108,12 +115,31 @@ class AgentMemory:
             
             logger.info(f"Querying test results for buildTag: {build_tag} from table: {table_name}")
             cursor.execute(query, (build_tag,))
-            results = cursor.fetchall()
-            
+            raw_results = cursor.fetchall()
+            # One row per (testcaseName, buildTag): table can have duplicates per test due to multiple testrailCaseIds
+            seen_testcase = set()
+            results = []
+            for row in raw_results:
+                key = (row.get('testcaseName') or '').strip()
+                if key in seen_testcase:
+                    continue
+                seen_testcase.add(key)
+                results.append(row)
+            if len(raw_results) != len(results):
+                logger.debug(f"Deduplicated build results: {len(raw_results)} rows -> {len(results)} unique tests")
             logger.info(f"Found {len(results)} test results for buildTag: {build_tag}")
             return results
             
         except Error as e:
+            errno = getattr(e, 'args', [None])[0] if getattr(e, 'args', None) else None
+            if errno == MYSQL_ER_NO_SUCH_TABLE:
+                msg = (
+                    f"Table '{table_name}' does not exist in the database. "
+                    "Ensure test results have been uploaded to the results table first (e.g. from your test run/CI), "
+                    "or verify --table-name and DB_NAME in config/.env."
+                )
+                logger.error(msg)
+                raise ValueError(msg) from e
             logger.error(f"Error querying database for buildTag {build_tag}: {e}")
             raise
         finally:
@@ -208,6 +234,10 @@ class AgentMemory:
             if not error_col:
                 logger.warning(f"No error message column found in table {table_name}. Available columns: {available_columns}")
             
+            # Add knownFailure column if available
+            if 'knownFailure' in available_columns:
+                select_columns.append('knownFailure')
+            
             # Try to find date column - prioritize createdAt (actual column name)
             date_col = None
             date_columns = ['createdAt', 'created_at', 'executionDate', 'timestamp', 'date', 'execution_date', 'runDate', 'executedAt']
@@ -290,42 +320,82 @@ class AgentMemory:
                 logger.warning("No valid test names to query after extraction")
                 return {}
             
-            # Build parameterized IN clause query
-            # Use placeholders for safe parameterized queries
-            placeholders = ','.join(['%s'] * len(query_names_list))
-            
             # Single batch query to fetch all results
             # Note: We fetch more than limit_per_test initially, then limit per test in Python
             # This is more efficient than N separate queries
-            batch_query = f"""
-                SELECT {select_clause}
-                FROM {table_name}
-                WHERE testcaseName IN ({placeholders})
-                ORDER BY {order_by}
-            """
             
+            # CHUNKING LOGIC: Split query_names_list into chunks of 200 to avoid huge queries
+            CHUNK_SIZE = 200
+            chunks = [query_names_list[i:i + CHUNK_SIZE] for i in range(0, len(query_names_list), CHUNK_SIZE)]
+            all_results = []
+            
+            # Calculate date threshold to prevent fetching ancient data
+            # Use 90 days instead of 14 because CI runs may be infrequent;
+            # we need enough executions per test to cross the min_occurrences threshold
+            # (e.g., FLAKY_TESTS_MIN_FAILURES=5). The actual per-test cap is
+            # handled by limit_per_test in Python code below.
+            date_threshold = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d %H:%M:%S')
+            date_filter = f"AND {date_col} >= %s" if date_col else ""
+            
+            import time
+            for chunk_idx, name_chunk in enumerate(chunks):
+                placeholders = ','.join(['%s'] * len(name_chunk))
+                batch_query = f"""
+                    SELECT {select_clause}
+                    FROM {table_name}
+                    WHERE testcaseName IN ({placeholders})
+                    {date_filter}
+                    ORDER BY {order_by}
+                """
+                
+                try:
+                    start_time = time.time()
+                    logger.info(f"⏳ Executing batch query chunk {chunk_idx+1}/{len(chunks)} for {len(name_chunk)} tests (last 90 days)...")
+                    
+                    params = tuple(name_chunk)
+                    if date_col:
+                        params = params + (date_threshold,)
+                    
+                    cursor.execute(batch_query, params)
+                    chunk_results = cursor.fetchall()
+                    
+                    query_duration = time.time() - start_time
+                    logger.info(f"✅ Chunk {chunk_idx+1} completed in {query_duration:.2f}s. Found {len(chunk_results)} rows.")
+                    
+                    # If no exact matches for this chunk, try optimized case-insensitive search
+                    if not chunk_results:
+                        logger.info(f"⚠️ No exact matches for chunk {chunk_idx+1}. Attempting optimized case-insensitive search...")
+                        lower_names = [n.lower() for n in name_chunk]
+                        start_time_ci = time.time()
+                        
+                        params_ci = tuple(lower_names)
+                        if date_col:
+                            params_ci = params_ci + (date_threshold,)
+                            
+                        cursor.execute(batch_query, params_ci)
+                        chunk_results = cursor.fetchall()
+                        ci_duration = time.time() - start_time_ci
+                        logger.info(f"✅ Case-insensitive search for chunk {chunk_idx+1} completed in {ci_duration:.2f}s. Found {len(chunk_results)} rows.")
+                    
+                    all_results.extend(chunk_results)
+                    
+                except Error as e:
+                    logger.error(f"Error executing batch query chunk {chunk_idx+1}: {e}")
+                    # If this chunk fails, we continue with others or let it fallback to individual queries later if no results
+                    continue
+            
+            if not all_results:
+                logger.warning(f"No results found across all {len(chunks)} chunks.")
+            else:
+                logger.info(f"Total results across all chunks: {len(all_results)} rows")
+
             try:
-                # Execute batch query
-                cursor.execute(batch_query, tuple(query_names_list))
-                all_results = cursor.fetchall()
-                
-                logger.info(f"Batch query returned {len(all_results)} total rows for {len(query_names_list)} unique test names")
-                
-                # If no exact matches, try case-insensitive batch query
-                if not all_results:
-                    batch_query_ci = f"""
-                        SELECT {select_clause}
-                        FROM {table_name}
-                        WHERE LOWER(testcaseName) IN ({','.join(['LOWER(%s)'] * len(query_names_list))})
-                        ORDER BY {order_by}
-                    """
-                    cursor.execute(batch_query_ci, tuple(query_names_list))
-                    all_results = cursor.fetchall()
-                    logger.info(f"Case-insensitive batch query returned {len(all_results)} total rows")
-                
                 # Group results by testcaseName and limit per test
                 results_by_test = {}
                 for row in all_results:
+                    if not isinstance(row, dict):
+                        logger.warning("Skipping malformed execution row (not a dict)")
+                        continue
                     db_test_name = row.get('testcaseName')
                     if not db_test_name:
                         continue
@@ -361,58 +431,78 @@ class AgentMemory:
                     else:
                         logger.debug(f"No match found for DB test name: '{db_test_name}' (query names: {list(query_names_map.keys())[:5]})")
                 
-                # Process results: limit per test and build execution records
+                # Process results: one row per (test, buildTag) then limit per test
                 import re
                 for test_name, rows in results_by_test.items():
+                    # Table can have multiple rows per (testcaseName, buildTag) due to testrailCaseIds; keep one per build
+                    seen_build = set()
+                    unique_rows = []
+                    for row in rows:
+                        bt = row.get('buildTag')
+                        if bt in seen_build:
+                            continue
+                        seen_build.add(bt)
+                        unique_rows.append(row)
                     # Limit to last N executions per test (already ordered by id DESC or date DESC)
-                    limited_rows = rows[:limit_per_test]
+                    limited_rows = unique_rows[:limit_per_test]
                     
                     test_history[test_name] = []
                     
                     for row in limited_rows:
-                        execution_record = {
-                            'buildTag': row.get('buildTag')
-                        }
-                        
-                        # Add testStatus if available
-                        if status_col:
-                            exec_status = row.get(status_col)
-                            if exec_status is not None:
-                                execution_record['testStatus'] = exec_status
-                        
-                        # Add failureReason if available (filter redundant lines)
-                        if error_col:
-                            exec_error = row.get(error_col)
-                            if exec_error is not None:
-                                if isinstance(exec_error, str):
-                                    # Split by newlines and filter out redundant lines
-                                    lines = exec_error.split('\n')
-                                    filtered_lines = []
-                                    for line in lines:
-                                        # Remove "Results Url:" lines
-                                        if re.match(r'^\s*Results\s*Url\s*:', line, re.IGNORECASE):
-                                            continue
-                                        # Remove "Testcase Name:" lines
-                                        if re.match(r'^\s*Testcase\s*Name\s*:', line, re.IGNORECASE):
-                                            continue
-                                        filtered_lines.append(line)
-                                    exec_error = '\n'.join(filtered_lines).strip()
-                                execution_record['failureReason'] = exec_error
-                        
-                        # Add date if available
-                        if date_col:
-                            exec_date = row.get('executionDate')
-                            if not exec_date:
-                                exec_date = row.get(date_col)
-                            if exec_date:
-                                execution_record['date'] = exec_date
-                                execution_record['executionDate'] = exec_date
-                        
-                        # Add id if available
-                        if has_id_column and 'id' in row:
-                            execution_record['id'] = row.get('id')
-                        
-                        test_history[test_name].append(execution_record)
+                        if not isinstance(row, dict):
+                            logger.warning("Skipping malformed execution row (not a dict)")
+                            continue
+                        try:
+                            execution_record = {
+                                'buildTag': row.get('buildTag')
+                            }
+                            
+                            # Add testStatus if available
+                            if status_col:
+                                exec_status = row.get(status_col)
+                                if exec_status is not None:
+                                    execution_record['testStatus'] = exec_status
+                            
+                            # Add failureReason if available (filter redundant lines)
+                            if error_col:
+                                exec_error = row.get(error_col)
+                                if exec_error is not None:
+                                    if isinstance(exec_error, str):
+                                        # Split by newlines and filter out redundant lines
+                                        lines = exec_error.split('\n')
+                                        filtered_lines = []
+                                        for line in lines:
+                                            # Remove "Results Url:" lines
+                                            if re.match(r'^\s*Results\s*Url\s*:', line, re.IGNORECASE):
+                                                continue
+                                            # Remove "Testcase Name:" lines
+                                            if re.match(r'^\s*Testcase\s*Name\s*:', line, re.IGNORECASE):
+                                                continue
+                                            filtered_lines.append(line)
+                                        exec_error = '\n'.join(filtered_lines).strip()
+                                    execution_record['failureReason'] = exec_error
+                            
+                            # Add date if available
+                            if date_col:
+                                exec_date = row.get('executionDate')
+                                if not exec_date:
+                                    exec_date = row.get(date_col)
+                                if exec_date:
+                                    execution_record['date'] = exec_date
+                                    execution_record['executionDate'] = exec_date
+                            
+                            # Add id if available
+                            if has_id_column and 'id' in row:
+                                execution_record['id'] = row.get('id')
+                            
+                            # Add knownFailure if available (for Known Failures section history dots)
+                            if 'knownFailure' in row:
+                                execution_record['knownFailure'] = row.get('knownFailure')
+                            
+                            test_history[test_name].append(execution_record)
+                        except Exception as e:
+                            logger.warning("Skipping malformed execution record: %s", e, exc_info=False)
+                            continue
                     
                     logger.debug(f"Retrieved {len(test_history[test_name])} executions for {test_name}")
                 
@@ -425,10 +515,13 @@ class AgentMemory:
                     logger.debug(f"No results found for {len(tests_without_results)} test(s)")
                 
             except Error as e:
-                logger.error(f"Error executing batch query: {e}")
-                # Fallback to individual queries if batch query fails
-                logger.warning("Falling back to individual queries")
-                import re
+                logger.error(f"Error processing batch results: {e}")
+                # Fallback to individual queries ONLY if there are few tests
+                if len(test_names) > 20:
+                    logger.warning(f"Too many tests ({len(test_names)}) to fallback to individual queries. Skipping history for some.")
+                    return test_history
+                
+                logger.warning("Falling back to individual queries for few tests")
                 for test_name in test_names:
                     query_name = extract_class_method(test_name)
                     try:
@@ -439,34 +532,53 @@ class AgentMemory:
                             ORDER BY {order_by}
                             LIMIT %s
                         """
-                        cursor.execute(query, (query_name, limit_per_test))
-                        results = cursor.fetchall()
-                        
+                        cursor.execute(query, (query_name, max(limit_per_test * 15, 100)))
+                        raw_results = cursor.fetchall()
+                        # One row per buildTag (table can have multiple rows per test per build)
+                        seen_build = set()
+                        results = []
+                        for row in raw_results:
+                            if not isinstance(row, dict):
+                                continue
+                            bt = row.get('buildTag')
+                            if bt in seen_build:
+                                continue
+                            seen_build.add(bt)
+                            results.append(row)
+                        results = results[:limit_per_test]
                         if results:
                             test_history[test_name] = []
                             for row in results:
-                                execution_record = {'buildTag': row.get('buildTag')}
-                                if status_col:
-                                    exec_status = row.get(status_col)
-                                    if exec_status is not None:
-                                        execution_record['testStatus'] = exec_status
-                                if error_col:
-                                    exec_error = row.get(error_col)
-                                    if exec_error and isinstance(exec_error, str):
-                                        lines = exec_error.split('\n')
-                                        filtered_lines = [l for l in lines 
-                                                         if not re.match(r'^\s*Results\s*Url\s*:', l, re.IGNORECASE)
-                                                         and not re.match(r'^\s*Testcase\s*Name\s*:', l, re.IGNORECASE)]
-                                        exec_error = '\n'.join(filtered_lines).strip()
-                                        execution_record['failureReason'] = exec_error
-                                if date_col:
-                                    exec_date = row.get('executionDate') or row.get(date_col)
-                                    if exec_date:
-                                        execution_record['date'] = exec_date
-                                        execution_record['executionDate'] = exec_date
-                                if has_id_column and 'id' in row:
-                                    execution_record['id'] = row.get('id')
-                                test_history[test_name].append(execution_record)
+                                if not isinstance(row, dict):
+                                    continue
+                                try:
+                                    execution_record = {'buildTag': row.get('buildTag')}
+                                    if status_col:
+                                        exec_status = row.get(status_col)
+                                        if exec_status is not None:
+                                            execution_record['testStatus'] = exec_status
+                                    if error_col:
+                                        exec_error = row.get(error_col)
+                                        if exec_error and isinstance(exec_error, str):
+                                            lines = exec_error.split('\n')
+                                            filtered_lines = [l for l in lines 
+                                                             if not re.match(r'^\s*Results\s*Url\s*:', l, re.IGNORECASE)
+                                                             and not re.match(r'^\s*Testcase\s*Name\s*:', l, re.IGNORECASE)]
+                                            exec_error = '\n'.join(filtered_lines).strip()
+                                            execution_record['failureReason'] = exec_error
+                                    if date_col:
+                                        exec_date = row.get('executionDate') or row.get(date_col)
+                                        if exec_date:
+                                            execution_record['date'] = exec_date
+                                            execution_record['executionDate'] = exec_date
+                                    if has_id_column and 'id' in row:
+                                        execution_record['id'] = row.get('id')
+                                    if 'knownFailure' in row:
+                                        execution_record['knownFailure'] = row.get('knownFailure')
+                                    test_history[test_name].append(execution_record)
+                                except Exception as e:
+                                    logger.warning("Skipping malformed execution record (fallback): %s", e, exc_info=False)
+                                    continue
                     except Error as e2:
                         logger.warning(f"Error querying test {test_name}: {e2}")
                         continue
@@ -568,21 +680,28 @@ class AgentMemory:
         all_dates = set()
         for test_executions in test_history.values():
             for exec_record in test_executions:
-                exec_date = exec_record.get('date') or exec_record.get('executionDate')
-                if exec_date:
-                    # Handle datetime objects
-                    if hasattr(exec_date, 'date'):
-                        all_dates.add(exec_date.date())
-                    elif isinstance(exec_date, str):
-                        # Try to parse string date
-                        try:
-                            from datetime import datetime
-                            parsed_date = datetime.strptime(exec_date.split()[0], '%Y-%m-%d').date()
-                            all_dates.add(parsed_date)
-                        except:
-                            pass
-                    else:
-                        all_dates.add(exec_date)
+                if not isinstance(exec_record, dict):
+                    logger.warning("Skipping malformed exec_record when collecting dates (not a dict)")
+                    continue
+                try:
+                    exec_date = exec_record.get('date') or exec_record.get('executionDate')
+                    if exec_date:
+                        # Handle datetime objects
+                        if hasattr(exec_date, 'date'):
+                            all_dates.add(exec_date.date())
+                        elif isinstance(exec_date, str):
+                            # Try to parse string date
+                            try:
+                                from datetime import datetime
+                                parsed_date = datetime.strptime(exec_date.split()[0], '%Y-%m-%d').date()
+                                all_dates.add(parsed_date)
+                            except (ValueError, IndexError, TypeError):
+                                pass
+                        else:
+                            all_dates.add(exec_date)
+                except Exception as e:
+                    logger.warning("Skipping malformed exec_record when collecting dates: %s", e, exc_info=False)
+                    continue
         
         sorted_dates = sorted(all_dates, reverse=True)[:days] if all_dates else []  # Last N days
         logger.info(f"Found {len(sorted_dates)} unique dates from execution records")
@@ -597,12 +716,16 @@ class AgentMemory:
             if executions:
                 failure_count = 0
                 for e in executions:
-                    exec_status = e.get('testStatus')
-                    if exec_status:
-                        status = str(exec_status).upper().strip()
-                        if status in ['FAIL', 'FAILED', 'ERROR', 'FAILURE']:
-                            failure_count += 1
-                    # If no status, assume pass (don't count as failure)
+                    if not isinstance(e, dict):
+                        continue
+                    try:
+                        exec_status = e.get('testStatus')
+                        if exec_status:
+                            status = str(exec_status).upper().strip()
+                            if status in ['FAIL', 'FAILED', 'ERROR', 'FAILURE']:
+                                failure_count += 1
+                    except Exception:
+                        pass
             else:
                 failure_count = 0
             
@@ -617,225 +740,243 @@ class AgentMemory:
                 
                 # Extract details from failed executions
                 for exec_record in executions:
-                    # Check if this is a failure using testStatus
-                    exec_status = exec_record.get('testStatus')
-                    is_failure = False
-                    if exec_status:
-                        is_failure = str(exec_status).upper() in ['FAIL', 'FAILED', 'ERROR', 'FAILURE']
-                    elif exec_record.get('failureReason'):
-                        # If no status but has error message, it's a failure
-                        is_failure = True
-                    
-                    if is_failure:
-                        exec_date = exec_record.get('date') or exec_record.get('executionDate')
-                        if exec_date:
-                            if hasattr(exec_date, 'date'):
-                                date_str = str(exec_date.date())
-                            else:
-                                date_str = str(exec_date).split()[0] if ' ' in str(exec_date) else str(exec_date)
-                            failure_details[test_name]['dates'].append(date_str)
+                    if not isinstance(exec_record, dict):
+                        continue
+                    try:
+                        # Check if this is a failure using testStatus
+                        exec_status = exec_record.get('testStatus')
+                        is_failure = False
+                        if exec_status:
+                            is_failure = str(exec_status).upper() in ['FAIL', 'FAILED', 'ERROR', 'FAILURE']
+                        elif exec_record.get('failureReason'):
+                            # If no status but has error message, it's a failure
+                            is_failure = True
                         
-                        error_msg = exec_record.get('failureReason') or ''
-                        failure_details[test_name]['root_causes'].append(error_msg)
-                        
-                        # Try to classify based on error message
-                        classification = self._classify_from_error_message(error_msg)
-                        failure_details[test_name]['classifications'].append(classification)
+                        if is_failure:
+                            exec_date = exec_record.get('date') or exec_record.get('executionDate')
+                            if exec_date:
+                                if hasattr(exec_date, 'date'):
+                                    date_str = str(exec_date.date())
+                                else:
+                                    date_str = str(exec_date).split()[0] if ' ' in str(exec_date) else str(exec_date)
+                                failure_details[test_name]['dates'].append(date_str)
+                            
+                            error_msg = exec_record.get('failureReason') or ''
+                            failure_details[test_name]['root_causes'].append(error_msg)
+                            
+                            # Try to classify based on error message
+                            classification = self._classify_from_error_message(error_msg)
+                            failure_details[test_name]['classifications'].append(classification)
+                    except Exception as e:
+                        logger.warning("Skipping malformed exec_record in failure_details for %s: %s", test_name, e, exc_info=False)
+                        continue
         
         # Build history vector for each test (1=Pass, 0=Fail) using last N executions (newest first from DB)
         recurring = []
         for test_name, count in failure_counts.items():
-            details = failure_details[test_name]
-            
-            # Always use execution order (not date buckets) to build history
-            executions = details['executions'][:Config.FLAKY_TESTS_LAST_RUNS]  # newest first
-            
-            # Build history from executions (oldest -> newest for display)
-            history = []
-            for idx, exec_record in enumerate(reversed(executions)):  # oldest first
-                exec_status = exec_record.get('testStatus')
-                is_failure = False
+            try:
+                details = failure_details[test_name]
                 
-                if exec_status:
-                    status = str(exec_status).upper().strip()
-                    if status in ['FAIL', 'FAILED', 'ERROR', 'FAILURE']:
-                        is_failure = True
-                        logger.debug(f"Execution {idx+1} for {test_name}: testStatus='{exec_status}' -> FAILED")
-                    elif status in ['PASS', 'PASSED', 'SUCCESS', 'OK']:
+                # Always use execution order (not date buckets) to build history
+                executions = details['executions'][:Config.FLAKY_TESTS_LAST_RUNS]  # newest first
+                
+                # Build history from executions (oldest -> newest for display)
+                history = []
+                for idx, exec_record in enumerate(reversed(executions)):  # oldest first
+                    if not isinstance(exec_record, dict):
+                        logger.warning("Skipping malformed exec_record when building history for %s; treating as pass", test_name)
+                        history.append(1)
+                        continue
+                    try:
+                        exec_status = exec_record.get('testStatus')
                         is_failure = False
-                        logger.debug(f"Execution {idx+1} for {test_name}: testStatus='{exec_status}' -> PASSED")
+                        
+                        if exec_status:
+                            status = str(exec_status).upper().strip()
+                            if status in ['FAIL', 'FAILED', 'ERROR', 'FAILURE']:
+                                is_failure = True
+                                logger.debug(f"Execution {idx+1} for {test_name}: testStatus='{exec_status}' -> FAILED")
+                            elif status in ['PASS', 'PASSED', 'SUCCESS', 'OK']:
+                                is_failure = False
+                                logger.debug(f"Execution {idx+1} for {test_name}: testStatus='{exec_status}' -> PASSED")
+                            else:
+                                logger.warning(f"Unknown testStatus '{exec_status}' for {test_name} execution {idx+1}; treating as pass")
+                                is_failure = False
+                        else:
+                            # No status available; assume pass
+                            logger.warning(f"No testStatus found for {test_name} execution {idx+1}; treating as pass")
+                            is_failure = False
+                        
+                        history.append(0 if is_failure else 1)
+                    except Exception as e:
+                        logger.warning("Skipping malformed exec_record when building history for %s: %s; treating as pass", test_name, e, exc_info=False)
+                        history.append(1)
+                
+                logger.info(f"Generated history for {test_name}: {history} (from {len(executions)} executions)")
+                
+                # Ensure history has exactly 10 items (pad or truncate if needed)
+                if len(history) > 10:
+                    # Truncate to last 10 items (newest)
+                    history = history[-10:]
+                    logger.warning(f"History for {test_name} had {len(history)} items, truncated to 10")
+                elif len(history) < 10:
+                    # Pad with passes at the beginning (older runs) to always show 10 dots
+                    padding_needed = 10 - len(history)
+                    while len(history) < 10:
+                        history.insert(0, 1)  # Insert passes at the beginning (older runs)
+                    logger.debug(f"History for {test_name} had {len(history) - padding_needed} items, padded {padding_needed} items to 10")
+                
+                # Ensure history is not empty - if still empty, create a default history
+                if not history:
+                    logger.warning(f"No history generated for {test_name}, creating default history")
+                    # Create history based on failure count (10 days)
+                    # If it failed multiple times, show mostly failures
+                    if count >= 7:
+                        history = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # All failures
+                    elif count >= 5:
+                        history = [0, 0, 0, 0, 0, 1, 0, 1, 0, 1]  # Mostly failures
+                    elif count >= 3:
+                        history = [0, 0, 1, 0, 1, 0, 1, 0, 1, 0]  # Intermittent failures
                     else:
-                        logger.warning(f"Unknown testStatus '{exec_status}' for {test_name} execution {idx+1}; treating as pass")
-                        is_failure = False
-                else:
-                    # No status available; assume pass
-                    logger.warning(f"No testStatus found for {test_name} execution {idx+1}; treating as pass")
-                    is_failure = False
+                        history = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0]  # Mostly passes
                 
-                history.append(0 if is_failure else 1)
-            
-            logger.info(f"Generated history for {test_name}: {history} (from {len(executions)} executions)")
-            
-            # Ensure history has exactly 10 items (pad or truncate if needed)
-            if len(history) > 10:
-                # Truncate to last 10 items (newest)
-                history = history[-10:]
-                logger.warning(f"History for {test_name} had {len(history)} items, truncated to 10")
-            elif len(history) < 10:
-                # Pad with passes at the beginning (older runs) to always show 10 dots
-                padding_needed = 10 - len(history)
-                while len(history) < 10:
-                    history.insert(0, 1)  # Insert passes at the beginning (older runs)
-                logger.debug(f"History for {test_name} had {len(history) - padding_needed} items, padded {padding_needed} items to 10")
-            
-            # Ensure history is not empty - if still empty, create a default history
-            if not history:
-                logger.warning(f"No history generated for {test_name}, creating default history")
-                # Create history based on failure count (10 days)
-                # If it failed multiple times, show mostly failures
-                if count >= 7:
-                    history = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # All failures
-                elif count >= 5:
-                    history = [0, 0, 0, 0, 0, 1, 0, 1, 0, 1]  # Mostly failures
-                elif count >= 3:
-                    history = [0, 0, 1, 0, 1, 0, 1, 0, 1, 0]  # Intermittent failures
+                # Recalculate occurrences from history vector to ensure consistency
+                # Count failures (0 = fail, 1 = pass) in the last 10 executions
+                # This ensures occurrences matches what's actually displayed in the UI
+                failures_in_history = sum(1 for status in history if status == 0)
+                # Update count to match the actual failures shown in history
+                if failures_in_history != count:
+                    logger.debug(f"Recalculating occurrences for {test_name}: was {count}, now {failures_in_history} (from history vector)")
+                    count = failures_in_history
+                
+                # Log history generation for first few tests
+                if len(recurring) < 3:
+                    logger.info(f"History for {test_name}: {history} (length: {len(history)}, failures: {failures_in_history})")
+                
+                # Recalculate occurrences from history vector to ensure consistency
+                # Count failures (0 = fail, 1 = pass) in the last 10 executions
+                # This ensures occurrences matches what's actually displayed in the UI
+                failures_in_history = sum(1 for status in history if status == 0)
+                # Update count to match the actual failures shown in history
+                if failures_in_history != count:
+                    logger.debug(f"Recalculating occurrences for {test_name}: was {count}, now {failures_in_history} (from history vector)")
+                    count = failures_in_history
+                
+                # Determine if it's consistently the same type
+                classifications = details['classifications']
+                if classifications:
+                    most_common = max(set(classifications), key=classifications.count)
+                    consistency = classifications.count(most_common) / len(classifications)
                 else:
-                    history = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0]  # Mostly passes
-            
-            # Recalculate occurrences from history vector to ensure consistency
-            # Count failures (0 = fail, 1 = pass) in the last 10 executions
-            # This ensures occurrences matches what's actually displayed in the UI
-            failures_in_history = sum(1 for status in history if status == 0)
-            # Update count to match the actual failures shown in history
-            if failures_in_history != count:
-                logger.debug(f"Recalculating occurrences for {test_name}: was {count}, now {failures_in_history} (from history vector)")
-                count = failures_in_history
-            
-            # Log history generation for first few tests
-            if len(recurring) < 3:
-                logger.info(f"History for {test_name}: {history} (length: {len(history)}, failures: {failures_in_history})")
-            
-            # Recalculate occurrences from history vector to ensure consistency
-            # Count failures (0 = fail, 1 = pass) in the last 10 executions
-            # This ensures occurrences matches what's actually displayed in the UI
-            failures_in_history = sum(1 for status in history if status == 0)
-            # Update count to match the actual failures shown in history
-            if failures_in_history != count:
-                logger.debug(f"Recalculating occurrences for {test_name}: was {count}, now {failures_in_history} (from history vector)")
-                count = failures_in_history
-            
-            # Determine if it's consistently the same type
-            classifications = details['classifications']
-            if classifications:
-                most_common = max(set(classifications), key=classifications.count)
-                consistency = classifications.count(most_common) / len(classifications)
-            else:
-                most_common = 'UNKNOWN'
-                consistency = 0.0
-            
-            # Determine if it's flaky
-            has_passes = 1 in history
-            has_failures = 0 in history
-            is_intermittent = has_passes and has_failures
-            is_inconsistent = consistency < 0.8
-            
-            # Analyze root causes - normalize to handle dynamic values like URLs, IDs
-            root_causes = details['root_causes']
-            normalized_root_causes = [normalize_root_cause(rc) for rc in root_causes if rc]
-            unique_root_causes = len(set(normalized_root_causes))
-            same_reason = unique_root_causes == 1
-            different_reasons = unique_root_causes > 1
-            
-            # Categorize failure pattern
-            failure_pattern = self._categorize_failure_pattern(
-                is_intermittent=is_intermittent,
-                same_reason=same_reason,
-                different_reasons=different_reasons
-            )
-            
-            # Prepare execution details for UI expansion
-            # CRITICAL: Use the CORRECTED history vector (after all corrections have been applied)
-            # Executions are ordered by id DESC (newest first), but history is oldest to newest
-            # We need to align them: history[0] corresponds to oldest execution, history[9] to newest
-            execution_details = []
-            executions_list = details.get('executions', [])
-            
-            # Reverse executions to match history order (oldest to newest)
-            reversed_executions = list(reversed(executions_list[:10])) if executions_list else []
-            
-            # Calculate padding offset: if history was padded, the first N items are padded passes
-            # We need to find where actual execution data starts in the history vector
-            actual_execution_count = len(reversed_executions)
-            history_length = len(history)
-            padding_count = max(0, history_length - actual_execution_count)
-            
-            # Create execution details aligned with CORRECTED history vector
-            # CRITICAL: The history vector is the source of truth - it's built from testStatus column
-            # and may have been corrected for current failures. Use hist_status (from history vector)
-            # to determine pass/fail, NOT the original testStatus from database.
-            # NOTE: If history was padded, history[0] through history[padding_count-1] are padded,
-            # and actual execution data starts at history[padding_count]
-            for idx, hist_status in enumerate(history):
-                exec_detail = {
-                    'index': idx,
-                    'status': 'pass' if hist_status == 1 else 'fail',  # Use corrected history status
+                    most_common = 'UNKNOWN'
+                    consistency = 0.0
+                
+                # Determine if it's flaky
+                has_passes = 1 in history
+                has_failures = 0 in history
+                is_intermittent = has_passes and has_failures
+                is_inconsistent = consistency < 0.8
+                
+                # Analyze root causes - normalize to handle dynamic values like URLs, IDs
+                root_causes = details['root_causes']
+                normalized_root_causes = [normalize_root_cause(rc) for rc in root_causes if rc]
+                unique_root_causes = len(set(normalized_root_causes))
+                same_reason = unique_root_causes == 1
+                different_reasons = unique_root_causes > 1
+                
+                # Categorize failure pattern
+                failure_pattern = self._categorize_failure_pattern(
+                    is_intermittent=is_intermittent,
+                    same_reason=same_reason,
+                    different_reasons=different_reasons
+                )
+                
+                # Prepare execution details for UI expansion
+                # CRITICAL: Use the CORRECTED history vector (after all corrections have been applied)
+                # Executions are ordered by id DESC (newest first), but history is oldest to newest
+                # We need to align them: history[0] corresponds to oldest execution, history[9] to newest
+                execution_details = []
+                executions_list = details.get('executions', [])
+                
+                # Reverse executions to match history order (oldest to newest)
+                reversed_executions = list(reversed(executions_list[:10])) if executions_list else []
+                
+                # Calculate padding offset: if history was padded, the first N items are padded passes
+                # We need to find where actual execution data starts in the history vector
+                actual_execution_count = len(reversed_executions)
+                history_length = len(history)
+                padding_count = max(0, history_length - actual_execution_count)
+                
+                # Create execution details aligned with CORRECTED history vector
+                # CRITICAL: The history vector is the source of truth - it's built from testStatus column
+                # and may have been corrected for current failures. Use hist_status (from history vector)
+                # to determine pass/fail, NOT the original testStatus from database.
+                # NOTE: If history was padded, history[0] through history[padding_count-1] are padded,
+                # and actual execution data starts at history[padding_count]
+                for idx, hist_status in enumerate(history):
+                    exec_detail = {
+                        'index': idx,
+                        'status': 'pass' if hist_status == 1 else 'fail',  # Use corrected history status
                         'history_index': idx
-                }
+                    }
+                    
+                    # Check if this is a padded entry (before actual execution data starts)
+                    if idx < padding_count:
+                        # This is a padded entry (older run, assumed pass)
+                        exec_detail['padded'] = True
+                        exec_detail['testStatus'] = 'PASSED'
+                    elif idx - padding_count < len(reversed_executions):
+                        # This corresponds to actual execution data
+                        exec_record = reversed_executions[idx - padding_count]
+                        
+                        # Get original testStatus from database for reference
+                        original_testStatus = exec_record.get('testStatus', '') if isinstance(exec_record, dict) else ''
+                        
+                        # CRITICAL: Use hist_status (from corrected history vector) as the source of truth
+                        # The history vector was built from testStatus, but may have been corrected
+                        # Store both: original from DB and the corrected status from history vector
+                        corrected_testStatus = 'PASSED' if hist_status == 1 else 'FAILED'
+                        
+                        # CRITICAL: If this is the last execution (newest) and test is in current failures,
+                        # ensure error message is preserved even if database doesn't have it
+                        error_msg = exec_record.get('failureReason', '') if isinstance(exec_record, dict) else ''
+                        if idx == len(history) - 1 and test_name in current_failures and hist_status == 0:
+                            # This is the newest execution and it's marked as failed in corrected history
+                            # If no error message, add a placeholder
+                            if not error_msg or not str(error_msg).strip():
+                                error_msg = 'Test failed in current build'
+                        
+                        exec_detail.update({
+                            'id': exec_record.get('id') if isinstance(exec_record, dict) else None,
+                            'buildTag': exec_record.get('buildTag', '') if isinstance(exec_record, dict) else '',
+                            'date': str(exec_record.get('date') or exec_record.get('executionDate', '')) if isinstance(exec_record, dict) else '',
+                            'failureReason': error_msg,
+                            'testStatus': corrected_testStatus  # Use corrected status from history vector, not original from DB
+                        })
+                    else:
+                        # No execution data (padded entry)
+                        exec_detail['padded'] = True
+                    
+                    execution_details.append(exec_detail)
                 
-                # Check if this is a padded entry (before actual execution data starts)
-                if idx < padding_count:
-                    # This is a padded entry (older run, assumed pass)
-                    exec_detail['padded'] = True
-                    exec_detail['testStatus'] = 'PASSED'
-                elif idx - padding_count < len(reversed_executions):
-                    # This corresponds to actual execution data
-                    exec_record = reversed_executions[idx - padding_count]
-                    
-                    # Get original testStatus from database for reference
-                    original_testStatus = exec_record.get('testStatus', '')
-                    
-                    # CRITICAL: Use hist_status (from corrected history vector) as the source of truth
-                    # The history vector was built from testStatus, but may have been corrected
-                    # Store both: original from DB and the corrected status from history vector
-                    corrected_testStatus = 'PASSED' if hist_status == 1 else 'FAILED'
-                    
-                    # CRITICAL: If this is the last execution (newest) and test is in current failures,
-                    # ensure error message is preserved even if database doesn't have it
-                    error_msg = exec_record.get('failureReason', '')
-                    if idx == len(history) - 1 and test_name in current_failures and hist_status == 0:
-                        # This is the newest execution and it's marked as failed in corrected history
-                        # If no error message, add a placeholder
-                        if not error_msg or not str(error_msg).strip():
-                            error_msg = 'Test failed in current build'
-                    
-                    exec_detail.update({
-                        'id': exec_record.get('id'),
-                        'buildTag': exec_record.get('buildTag'),
-                        'date': str(exec_record.get('date') or exec_record.get('executionDate', '')),
-                        'failureReason': error_msg,
-                        'testStatus': corrected_testStatus  # Use corrected status from history vector, not original from DB
-                    })
-                else:
-                    # No execution data (padded entry)
-                    exec_detail['padded'] = True
-                
-                execution_details.append(exec_detail)
-            
-            recurring.append({
-                'test_name': test_name,
-                'occurrences': count,  # This is now recalculated from history vector to match what's displayed
-                'dates': details['dates'],
-                'most_common_classification': most_common,
-                'consistency': consistency,
-                'is_flaky': is_intermittent or is_inconsistent,
-                'in_current_run': test_name in current_failures,
-                'history': history,  # Always exactly 10 items
-                'execution_details': execution_details,  # Details for each execution, aligned with history
-                'failure_pattern': failure_pattern,
-                'same_reason': same_reason,
-                'different_reasons': different_reasons,
-                'unique_root_causes': unique_root_causes
-            })
+                recurring.append({
+                    'test_name': test_name,
+                    'occurrences': count,  # This is now recalculated from history vector to match what's displayed
+                    'dates': details['dates'],
+                    'most_common_classification': most_common,
+                    'consistency': consistency,
+                    'is_flaky': is_intermittent or is_inconsistent,
+                    'in_current_run': test_name in current_failures,
+                    'history': history,  # Always exactly 10 items
+                    'execution_details': execution_details,  # Details for each execution, aligned with history
+                    'failure_pattern': failure_pattern,
+                    'same_reason': same_reason,
+                    'different_reasons': different_reasons,
+                    'unique_root_causes': unique_root_causes
+                })
+            except Exception as e:
+                logger.warning("Skipping test %s due to malformed execution data: %s", test_name, e, exc_info=False)
+                continue
         
         # Filter to only show tests that meet the criteria:
         # occurrences >= Y failures in last X runs
@@ -994,11 +1135,11 @@ class AgentMemory:
             for build in builds[:20]:  # Limit to last 20 builds
                 build_tag = build['buildTag']
                 
-                # Count total tests and passed tests for this build
+                # Count distinct tests (one row per test per build; table may have duplicates per test due to testrailCaseIds)
                 count_query = f"""
                     SELECT 
-                        COUNT(*) as total,
-                        SUM(CASE WHEN {status_col} IN ('PASS', 'PASSED', 'SUCCESS', 'OK') THEN 1 ELSE 0 END) as passed
+                        COUNT(DISTINCT testcaseName) as total,
+                        COUNT(DISTINCT CASE WHEN {status_col} IN ('PASS', 'PASSED', 'SUCCESS', 'OK') THEN testcaseName END) as passed
                     FROM {table_name}
                     WHERE buildTag = %s
                 """

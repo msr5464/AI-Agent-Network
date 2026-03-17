@@ -38,8 +38,8 @@ if (-not (Test-Path $venvPython)) {
 }
 
 Write-Host "Using Python: $venvPython" -ForegroundColor Cyan
-Write-Host "Running src/main.py $Arguments" -ForegroundColor Cyan
+Write-Host "Running src/main.py $Arguments --skip-autofix" -ForegroundColor Cyan
 
-& $venvPython "src/main.py" $Arguments
+& $venvPython "src/main.py" $Arguments --skip-autofix
 exit $LASTEXITCODE
 
