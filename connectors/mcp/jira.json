@@ -1,0 +1,13 @@
+{
+  "name": "jira",
+  "status": "active",
+  "type": "url",
+  "url": "https://mcp.atlassian.com/mcp",
+  "auth": {
+    "type": "bearer",
+    "env_var": "JIRA_API_TOKEN"
+  },
+  "used_by": ["qa-agent"],
+  "description": "Atlassian Jira MCP — used by qa-agent to look up known failure tickets and link failures to Jira issues",
+  "docs": "https://developer.atlassian.com/cloud/jira/platform/mcp/"
+}

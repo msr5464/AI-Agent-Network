@@ -1,297 +1,199 @@
-# Auto-Fix Guide: Running Self-Healing Locator Fixes
+# Auto-Fix Guide: Self-Healing Locator Fixes
 
-This guide explains how to run the auto-fix system to automatically fix test failures with `ELEMENT_NOT_FOUND` or `TIMEOUT` issues using browser-based locator discovery.
+The QA pipeline uses two independent agents to analyse and fix test failures:
+
+1. **`qa-auto-analyse`** — Analyses test reports, classifies failures, writes an HTML report, and queues fixable automation issues.
+2. **`qa-auto-fix`** — Picks up queued issues, fixes broken locators via Claude, runs each test to verify, and creates a GitHub PR.
+
+---
 
 ## Prerequisites
 
-### Automatic Installation (Recommended)
-
-The scripts will automatically install all dependencies when you run auto-fix. No manual installation needed!
-
-**macOS/Linux:**
-```bash
-./scripts/trigger_auto_fix.sh --input-dir Regression-Frs-Tests-249
-# Dependencies (Selenium & ChromeDriver) will be installed automatically if missing
-```
-
-**Windows:**
-```powershell
-.\scripts\trigger_auto_fix.ps1 -InputDir Regression-Frs-Tests-249
-# Dependencies (Selenium & ChromeDriver) will be installed automatically if missing
-```
-
-### Manual Installation (Optional)
-
-If you prefer to install dependencies manually:
-
-**macOS/Linux:**
-```bash
-./scripts/install_browser_deps.sh
-```
-
-**Windows:**
-```powershell
-.\scripts\install_browser_deps.ps1
-```
-
-**What gets installed:**
-- Selenium Python package (via pip)
-- ChromeDriver (via package manager or manual download)
-- Chrome browser detection (will warn if not found)
-
-### Configure Environment Variables
-
-Ensure your `config/.env` file has the following variables set:
+### 1. Install dependencies
 
 ```bash
-# Enable auto-fix
-AUTO_FIX_ENABLED=true
+# macOS / Linux
+./scripts/setup.sh
 
-# Set to false to actually create PRs (true = dry run, no PRs created)
-AUTO_FIX_DRY_RUN=false
+# Windows
+.\scripts\setup.ps1
+```
 
-# Maximum number of fixes per run
-AUTO_FIX_MAX_FIXES_PER_RUN=5
+### 2. Configure environment variables
 
-# GitHub configuration (required for PR creation)
+Copy the template and fill in your values:
+
+```bash
+cp config/.env.example config/.env
+```
+
+Required variables for the autofix flow:
+
+```bash
+# GitHub — needed for PR creation
 GITHUB_TOKEN=your_github_token_here
 GITHUB_ORG=your_org_name
 GITHUB_REPO_AUTOMATION=your_automation_repo_name
 GITHUB_DEFAULT_BRANCH=main
+GITHUB_PR_REVIEWERS=reviewer1,reviewer2
 
-# LLM configuration
-OPENAI_API_KEY=your_openai_key_here
-LLM_PROVIDER=openai
-OPENAI_MODEL=gpt-4o-mini
+# Parent directory for the automation repo (not the repo itself).
+# Must be OUTSIDE of QA-AI-Agent. If the repo is not already present,
+# qa-auto-fix will clone it automatically using GITHUB_TOKEN + GITHUB_ORG + GITHUB_REPO_AUTOMATION.
+# e.g. to place the repo at /home/runner/work/automation-repo:
+#   WORKSPACE_DIR=/home/runner/work
+#   GITHUB_REPO_AUTOMATION=automation-repo
+WORKSPACE_DIR=/home/runner/work
 
-# Optional: Override environment detection
-AUTO_FIX_ENV_OVERRIDE=qa-1  # Optional: force specific environment
+# Claude CLI (autofix uses claude directly)
+CLAUDE_CLI_PATH=claude
+AUTOFIX_MODEL=claude-opus-4-6
+
+# Test runner (override default if your framework needs extra flags)
+# Placeholders: {class}, {class_simple}, {method}
+TEST_RUNNER_CMD=./gradlew test --tests {class_simple}.{method}
+
+# Slack notifications (optional)
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_NOTIFY_CHANNEL=#qa-reports
+SLACK_ALERT_CHANNEL=#qa-critical
 ```
 
-## Running Auto-Fix
+---
 
-### Method 1: Using the Trigger Script (Recommended)
+## Running the Pipeline
 
-**macOS/Linux:**
+### Step 1 — Analyse (produces the handoff)
+
 ```bash
-# Run auto-fix on a specific report (dependencies auto-installed)
-./scripts/trigger_auto_fix.sh --input-dir Regression-Frs-Tests-249 --output-dir reports
+# macOS / Linux
+./scripts/run-analyse.sh                          # scout mode: auto-selects build
+./scripts/run-analyse.sh ProdSanity-All-Tests-541  # direct mode: specific build tag
 
-# With custom table name
-./scripts/trigger_auto_fix.sh --input-dir Regression-Frs-Tests-249 --table-name results_frs
-
-# With environment override
-AUTO_FIX_ENV_OVERRIDE=qa-1 ./scripts/trigger_auto_fix.sh --input-dir Regression-Frs-Tests-249
+# Windows
+.\scripts\run-analyse.ps1
+.\scripts\run-analyse.ps1 -BuildTag ProdSanity-All-Tests-541
 ```
 
-**Windows:**
-```powershell
-# Run auto-fix on a specific report (dependencies auto-installed)
-.\scripts\trigger_auto_fix.ps1 -InputDir Regression-Frs-Tests-249 -OutputDir reports
+This writes:
+- An HTML report to `OUTPUT_DIR`
+- A handoff file to `agents/qa-auto-fix/queue/<build_tag>.json` (only when verdict=APPROVED and eligible failures exist)
 
-# With custom table name
-.\scripts\trigger_auto_fix.ps1 -InputDir Regression-Frs-Tests-249 -TableName results_frs
-```
+### Step 2 — Fix (picks up the handoff and raises a PR)
 
-### Method 2: Direct Python Command
-
-**macOS/Linux:**
 ```bash
-source venv/bin/activate
+# macOS / Linux
+./scripts/run-autofix.sh                           # queue mode: picks oldest handoff
+./scripts/run-autofix.sh ProdSanity-All-Tests-541  # direct: specific build tag
+./scripts/run-autofix.sh /path/to/handoff.json     # direct: pass handoff file path
 
-# Enable auto-fix and run
-export AUTO_FIX_ENABLED=true
-export AUTO_FIX_DRY_RUN=false
-
-python3 src/main.py \
-  --input-dir Regression-Frs-Tests-249 \
-  --output-dir reports \
-  --table-name results_frs \
-  --skip-report
+# Windows
+.\scripts\run-autofix.ps1
+.\scripts\run-autofix.ps1 -BuildTag ProdSanity-All-Tests-541
+.\scripts\run-autofix.ps1 -HandoffFile C:\path\to\handoff.json
 ```
 
-**Windows:**
-```powershell
-venv\Scripts\Activate.ps1
+### Dry run (no PR created)
 
-$env:AUTO_FIX_ENABLED = "true"
-$env:AUTO_FIX_DRY_RUN = "false"
-
-python src/main.py --input-dir Regression-Frs-Tests-249 --output-dir reports --table-name results_frs --skip-report
-```
-
-### Method 3: Dry Run (Test Without Creating PRs)
-
-**macOS/Linux:**
 ```bash
-# Set dry run mode
-export AUTO_FIX_DRY_RUN=true
-export AUTO_FIX_ENABLED=true
-
-./scripts/trigger_auto_fix.sh --input-dir Regression-Frs-Tests-249
+AUTO_PUSH=false ./scripts/run-autofix.sh
 ```
 
-**Windows:**
-```powershell
-$env:AUTO_FIX_DRY_RUN = "true"
-$env:AUTO_FIX_ENABLED = "true"
-
-.\scripts\trigger_auto_fix.ps1 -InputDir Regression-Frs-Tests-249
-```
+---
 
 ## How It Works
 
-### Step-by-Step Process
+### What gets queued for autofix
 
-1. **Report Analysis**
-   - The system reads the test report (from `--input-dir`)
-   - Identifies failures classified as `AUTOMATION_ISSUE` with `HIGH` or `MEDIUM` confidence
-   - Filters for `ELEMENT_NOT_FOUND` or `TIMEOUT` root cause categories
+Only failures matching **all three** of these criteria are included in the handoff:
 
-2. **Browser Inspection** (for ELEMENT_NOT_FOUND/TIMEOUT only)
-   - Extracts page URL from execution logs
-   - Extracts element name from root cause (e.g., "Block Reason PopUp Header")
-   - Opens headless Chrome browser
-   - Navigates to the page
-   - Discovers elements matching the element name using multiple strategies:
-     - Text matching (exact and partial)
-     - ID, name, class attributes
-     - Data attributes (`data-cy`, `data-testid`)
-     - ARIA labels
-   - Generates candidate locators with confidence scores
+| Criterion | Value |
+|-----------|-------|
+| Classification | `AUTOMATION_ISSUE` |
+| Confidence | `HIGH` |
+| Root cause category | `ELEMENT_NOT_FOUND` |
 
-3. **Fix Generation**
-   - LLM receives:
-     - Original failing test code
-     - Stack traces and file snippets
-     - Page object code
-     - **Discovered locators from browser**
-   - LLM generates fix:
-     - Updates test code if needed
-     - Updates page object with new locator
-     - Creates `additional_changes` for page object updates
+Product bugs, timeouts, and low/medium confidence issues are reported but not queued.
 
-4. **Verification**
-   - Runs the test locally to verify the fix
-   - If it passes, proceeds to PR creation
-   - If it fails, retries with additional context (up to 2 attempts)
+### Fix process (qa-auto-fix)
 
-5. **PR Creation** (if not dry run)
-   - Creates a new branch: `auto-fix/testMethodName`
-   - Commits the changes
-   - Pushes to GitHub
-   - Creates a Pull Request with reviewers
+1. **Read handoff** — loads the queue file with full failure context (error type, stack trace, execution log, class/method names)
+2. **Extract base class** — finds the relevant page object files in `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION`
+3. **Generate fix** — calls Claude with: failing test code, stack trace, execution log, and `CONVENTIONS.md` (wrapper methods, `@FindBy` style, naming conventions)
+4. **Apply and verify** — applies the fix and runs the test locally; rolls back on failure
+5. **Retry** — if any test still fails, re-runs the fix step (up to `MAX_FIX_ATTEMPTS`) with the failed test output injected into the prompt
+6. **Ship** — commits all passing fixes, creates a branch, pushes, and opens a GitHub PR
 
-## What Gets Fixed
+### Audit trail
 
-The auto-fix system will automatically:
+Every session writes to `agents/qa-auto-fix/audit/$SESSION_ID/`:
 
-✅ **Update Page Object Locators**
-   - When an element is not found, discovers new locators from the browser
-   - Updates `@FindBy` annotations in page object files
-   - Example: Changes `@FindBy(css = "old-selector")` to `@FindBy(css = "[data-cy='new-selector']")`
+| File | Content |
+|------|---------|
+| `00-session-init.md` | Session metadata, env snapshot |
+| `01-fix.json` + `.md` | Per-test fix results, diffs, test output |
+| `.fix-passed` | Gate: `true` / `false` / `skipped` |
+| `02-ship.json` + `.md` | PR URL, Slack status |
 
-✅ **Fix Test Code**
-   - Updates test methods to use correct element references
-   - Fixes timing issues
-   - Adjusts wait conditions
-
-✅ **Update Related Files**
-   - Can update helper classes if needed
-   - Can update configuration if environment-specific
-
-## Example Output
-
-When running auto-fix, you'll see logs like:
-
+View audit trail:
+```bash
+make audit AGENT=qa-auto-fix
+make audit AGENT=qa-auto-fix SESSION=20260329-143022-fix-ProdSanity-All-Tests-541
 ```
-🔧 Auto-fix: attempting up to 5 fixes (dry_run=false)
-Processing auto-fix for: TestDashMobileDevices.testReasonPopUpOnBlockingDevice
-🏃 Running test locally to capture fresh logs: Automation.Access.Frs.web.customer.TestDashMobileDevices.testReasonPopUpOnBlockingDevice
-🔍 Discovering locators for element 'Block Reason PopUp Header' on page: https://qa-1-dash.your-app.example.com/people/...
-Discovered 3 locator candidates from browser
-Found 1 page object files for locators: ['src/main/java/Automation/Access/dash/web/DashPeopleDetailsPage.java']
-Generating fix for: TestDashMobileDevices.testReasonPopUpOnBlockingDevice
-✅ Verification passed for Automation.Access.Frs.web.customer.TestDashMobileDevices.testReasonPopUpOnBlockingDevice
-Created branch: auto-fix/testReasonPopUpOnBlockingDevice
-Created PR: https://github.com/your-org/your-repo/pull/123
-🔧 Auto-fix completed: 1 succeeded, 0 skipped, 0 failed
+
+---
+
+## Queue Management
+
+Handoff files live in `agents/qa-auto-fix/queue/`.
+
+```bash
+# View pending queue
+ls agents/qa-auto-fix/queue/
+
+# View processed items
+ls agents/qa-auto-fix/queue/processed/
 ```
+
+After `qa-auto-fix` completes, the handoff file is automatically moved to `queue/processed/`.
+
+To override the queue path (e.g., if agents run on different machines):
+```bash
+AUTOFIX_QUEUE_DIR=/shared/mount/qa-fix-queue make run AGENT=qa-auto-fix
+```
+
+---
 
 ## Troubleshooting
 
-### Issue: "selenium not installed"
-**Solution:** 
-- Run `./scripts/install_browser_deps.sh` (macOS/Linux) or `.\scripts\install_browser_deps.ps1` (Windows)
-- Or manually: `pip install selenium>=4.15.0`
+### "Queue is empty — nothing to fix"
 
-### Issue: "ChromeDriver not found"
-**Solution:** 
-- Run `./scripts/install_browser_deps.sh` (macOS/Linux) or `.\scripts\install_browser_deps.ps1` (Windows)
-- The script will automatically install ChromeDriver
-- Or install manually:
-  - macOS: `brew install chromedriver`
-  - Linux: `sudo apt-get install chromium-chromedriver`
-  - Windows: `choco install chromedriver`
+Run `qa-auto-analyse` first to populate the queue, or check that the build had eligible failures (AUTOMATION_ISSUE + HIGH + ELEMENT_NOT_FOUND).
 
-### Issue: "No page URL found in execution logs"
-**Solution:** Ensure the test execution logs contain "Page URL:- https://..." format. This is automatically logged by the test framework.
+### "No handoff file for BUILD_TAG"
 
-### Issue: "Failed to initialize browser inspector"
-**Solution:** 
-- Check ChromeDriver installation: `chromedriver --version`
-- Ensure Chrome browser is installed
-- Try running with visible browser (modify `browser_inspector.py` to set `headless=False` for debugging)
+The handoff is only written when `qa-auto-analyse` finishes with verdict=APPROVED and finds eligible failures. Check the analyse audit:
+```bash
+make audit AGENT=qa-auto-analyse SESSION=<session-id>
+```
 
-### Issue: "No auto-fixable classifications found"
-**Solution:** 
-- Ensure failures are classified as `AUTOMATION_ISSUE` (not `PRODUCT_BUG`)
-- Check confidence level is `HIGH` or `MEDIUM`
-- Verify root cause category is `ELEMENT_NOT_FOUND` or `TIMEOUT`
+### "Fix gate: false" after max attempts
 
-### Issue: "GitHub configuration is missing"
-**Solution:** Set `GITHUB_TOKEN`, `GITHUB_ORG`, and `GITHUB_REPO_AUTOMATION` in `config/.env`
+Some locator fixes may require manual review. The agent creates a PR with all fixes that _did_ pass and sends a Slack alert to `SLACK_ALERT_CHANNEL` listing the failed ones.
+
+### "GitHub configuration is missing"
+
+Ensure `GITHUB_TOKEN`, `GITHUB_ORG`, and `GITHUB_REPO_AUTOMATION` are set in `config/.env`.
+
+### "claude: command not found"
+
+Set `CLAUDE_CLI_PATH` in `config/.env` to the full path of the Claude CLI binary.
+
+---
 
 ## Best Practices
 
-1. **Start with Dry Run**: Always test with `AUTO_FIX_DRY_RUN=true` first to see what would be fixed
-2. **Limit Fixes**: Use `AUTO_FIX_MAX_FIXES_PER_RUN=1` initially to test one fix at a time
-3. **Review PRs**: Always review the generated PRs before merging
-4. **Monitor Logs**: Check the logs to see which locators were discovered and why
-5. **Verify Locators**: The discovered locators are suggestions - verify they're correct before merging
-
-## Advanced Configuration
-
-### Custom Browser Options
-
-Edit `src/auto_fix/browser_inspector.py` to customize:
-- Headless mode: `headless=True/False`
-- Timeout: `timeout=10` (seconds)
-- Browser window size
-- Additional Chrome options
-
-### Filtering Which Tests to Fix
-
-The system automatically filters:
-- Only `AUTOMATION_ISSUE` classifications
-- Only `HIGH` or `MEDIUM` confidence
-- Only `ELEMENT_NOT_FOUND` or `TIMEOUT` categories
-
-To change this, modify `src/main.py` in the `_to_autofixable` function.
-
-## Troubleshooting
-
-### "Table 'thanos.results_&lt;name&gt;' doesn't exist"
-
-If the agent fails with a message that the results table doesn't exist (e.g. `Table 'thanos.results_frs' doesn't exist`):
-
-1. **Upload test results first.** The table is created and populated by your test run (e.g. the step that uploads results to the database). Run that step for the same build (e.g. `Regression-Frs-Tests-266`) before running the QA-AI-Agent.
-2. **Check DB and table name.** Verify `DB_NAME` and `DB_HOST` in `config/.env`. If you pass `--table-name results_frs`, ensure that table exists in that database (same name your upload job uses).
-3. **Table naming.** Tables are usually `results_<project>` in lowercase (e.g. `results_frs` for FRS). The agent will now show a clear error instead of a full traceback when the table is missing.
-
-## Support
-
-For issues or questions:
-1. Check the logs in `logs/qa_ai_agent.log`
-2. Review the generated PR to see what changes were made
-3. Check browser inspector logs for locator discovery details
+1. **Review PRs before merging** — Claude-generated fixes are good but always worth a quick code review.
+2. **Start with dry-run** — use `AUTO_PUSH=false` to see what would be fixed without creating a PR.
+3. **Limit fixes per run** — set `AUTO_FIX_MAX_FIXES_PER_RUN=1` initially to test one fix at a time.
+4. **Keep `CONVENTIONS.md` up to date** — the fix quality directly depends on this file teaching Claude your wrapper methods and locator patterns.

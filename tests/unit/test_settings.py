@@ -60,7 +60,7 @@ class TestConfigDefaults:
         assert Cfg.DB_PORT == 3306
         assert Cfg.DB_USER == 'root'
         assert Cfg.DB_PASSWORD == ''
-        assert Cfg.DB_NAME == 'thanos'
+        assert Cfg.DB_NAME == 'qa_results'
 
     def test_llm_defaults(self):
         """Default LLM provider should be ollama with llama3.2:3b."""

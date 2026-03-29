@@ -1,0 +1,13 @@
+{
+  "name": "slack",
+  "status": "active",
+  "type": "url",
+  "url": "https://mcp.slack.com/mcp",
+  "auth": {
+    "type": "bearer",
+    "env_var": "SLACK_BOT_TOKEN"
+  },
+  "used_by": ["qa-agent"],
+  "description": "Slack MCP — used by qa-agent to send report notifications and escalation alerts",
+  "docs": "https://api.slack.com/mcp"
+}

@@ -1,277 +1,120 @@
-# Auto-Fix Test Selection and Session Tracking
+# Auto-Fix: Test Selection and Handoff
 
-This guide explains how to select specific test cases for auto-fix and how the system tracks tests that pass locally.
+This document explains how `qa-auto-analyse` selects which failures to queue for `qa-auto-fix`, and how the handoff file works.
 
-## Test Case Selection
+---
 
-You can now select specific test cases to auto-fix instead of processing all auto-fixable failures.
+## Selection Criteria
 
-### Method 1: Comma-Separated List
+`qa-auto-analyse` automatically filters failures using three hard criteria. A test is queued for autofix only when **all three** are true:
 
-**macOS/Linux:**
-```bash
-./scripts/trigger_auto_fix.sh \
-  --input-dir Regression-Frs-Tests-249 \
-  --autofix-tests "TestDashMobileDevices.testReasonPopUpOnBlockingDevice,TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername"
-```
+| Criterion | Required value | Where set |
+|-----------|---------------|-----------|
+| Classification | `AUTOMATION_ISSUE` | Claude's classification in step 03 |
+| Confidence | `HIGH` | Claude's confidence score in step 03 |
+| Root cause category | `ELEMENT_NOT_FOUND` | Rule engine + Claude in step 03 |
 
-**Windows:**
-```powershell
-.\scripts\trigger_auto_fix.ps1 `
-  -InputDir Regression-Frs-Tests-249 `
-  -AutofixTests "TestDashMobileDevices.testReasonPopUpOnBlockingDevice,TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername"
-```
+Tests that are `PRODUCT_BUG`, `UNKNOWN`, `MEDIUM`/`LOW` confidence, `TIMEOUT`, or `ASSERTION_FAILURE` are reported in the HTML report but are **not** queued.
 
-### Method 2: Auto-Generated File (Automatic - Recommended)
+This is intentional: the autofix agent only has a good chance of success on locator issues where we are highly confident the automation code is wrong, not the product.
 
-When you generate a report, it automatically creates a file with all auto-fixable test names:
+---
 
-```
-reports/autofix_tests_Regression-Frs-Tests-249.txt
-```
+## What a Queued Test Looks Like
 
-This file contains all test names that are:
-- Classified as `AUTOMATION_ISSUE` (not `PRODUCT_BUG`)
-- Have `HIGH` or `MEDIUM` confidence
-
-**The auto-fix script automatically detects and uses this file!** No need to specify it manually.
-
-**macOS/Linux:**
-```bash
-# Step 1: Generate the report (this creates the autofix tests file)
-./scripts/generate_report.sh --input-dir Regression-Frs-Tests-249
-
-# Step 2: Run auto-fix (automatically uses the generated file)
-./scripts/trigger_auto_fix.sh --input-dir Regression-Frs-Tests-249
-# ✅ No need to specify --autofix-tests-file - it's auto-detected!
-```
-
-**Windows:**
-```powershell
-# Step 1: Generate the report (this creates the autofix tests file)
-.\scripts\generate_report.ps1 -InputDir Regression-Frs-Tests-249
-
-# Step 2: Run auto-fix (automatically uses the generated file)
-.\scripts\trigger_auto_fix.ps1 -InputDir Regression-Frs-Tests-249
-# ✅ No need to specify -AutofixTestsFile - it's auto-detected!
-```
-
-**Note:** You can still manually specify a different file if needed:
-```bash
-./scripts/trigger_auto_fix.sh \
-  --input-dir Regression-Frs-Tests-249 \
-  --autofix-tests-file custom_tests.txt  # Override auto-detection
-```
-
-### Method 3: From Custom File
-
-You can also create your own file `tests_to_fix.txt`:
-```
-TestDashMobileDevices.testReasonPopUpOnBlockingDevice
-TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername
-TestPushNotificationFlows.testAccountBlockingAfterConsecutiveLoginRequestDenials
-```
-
-**macOS/Linux:**
-```bash
-./scripts/trigger_auto_fix.sh \
-  --input-dir Regression-Frs-Tests-249 \
-  --autofix-tests-file tests_to_fix.txt
-```
-
-**Windows:**
-```powershell
-.\scripts\trigger_auto_fix.ps1 `
-  -InputDir Regression-Frs-Tests-249 `
-  -AutofixTestsFile tests_to_fix.txt
-```
-
-### Test Name Formats
-
-The system supports multiple test name formats:
-- Full qualified name: `Automation.Access.Frs.web.customer.TestDashMobileDevices.testReasonPopUpOnBlockingDevice`
-- Class.method: `TestDashMobileDevices.testReasonPopUpOnBlockingDevice`
-- Method only: `testReasonPopUpOnBlockingDevice` (matches any test with this method name)
-
-The system will match tests flexibly, so you can use any format that uniquely identifies the test.
-
-## Session Tracking (Passed Tests)
-
-The system automatically tracks tests that **pass locally** during auto-fix and skips them in subsequent runs for the same report.
-
-### How It Works
-
-1. **First Run**: When you run auto-fix, the system:
-   - Runs each test locally to capture fresh logs
-   - If a test **passes locally**, it's marked as "passed" and skipped from fix generation
-   - The passed test is saved to a session file: `.autofix_session_{report_name}.json`
-
-2. **Subsequent Runs**: When you run auto-fix again on the same report:
-   - The system loads the session file
-   - Tests that passed in previous runs are automatically skipped
-   - Only tests that failed locally are processed
-
-### Session File Location
-
-Session files are stored in the output directory:
-```
-reports/.autofix_session_Regression-Frs-Tests-249.json
-```
-
-### Session File Format
+Each queued test in the handoff file (`agents/qa-auto-fix/queue/<build_tag>.json`) contains:
 
 ```json
 {
-  "passed_tests": [
-    "TestDashMobileDevices.testReasonPopUpOnBlockingDevice",
-    "TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername"
-  ],
-  "last_updated": "2026-01-25T20:30:00.123456"
+  "test_name": "Automation.Access.login.web.customer.TestLoginFlows.testLogin",
+  "classification": "AUTOMATION_ISSUE",
+  "confidence": "HIGH",
+  "root_cause_category": "ELEMENT_NOT_FOUND",
+  "root_cause": "NoSuchElementException on #submit-btn",
+  "failure_signature": "NoSuchElementException: #submit-btn",
+  "recommended_action": "Update locator",
+  "error_type": "NoSuchElementException",
+  "error_message": "Unable to locate element: {\"method\":\"css selector\",\"selector\":\"#submit-btn\"}",
+  "stack_trace": "...",
+  "execution_log": "...",
+  "class_name": "Automation.Access.login.web.customer.TestLoginFlows",
+  "method_name": "testLogin"
 }
 ```
 
-### Clearing Session Data
+The fix agent uses `error_message`, `stack_trace`, `execution_log`, `class_name`, and `method_name` to locate the right file and generate the fix.
 
-To reset the session and process all tests again:
+---
 
-**macOS/Linux:**
+## When Is the Handoff Written?
+
+`05_ship.py` (the final step of `qa-auto-analyse`) writes the handoff **only when**:
+1. The review verdict is `APPROVED` (not `NEEDS-HUMAN`)
+2. At least one failure passes all three selection criteria
+
+If the build had only product bugs, or all automation issues were LOW/MEDIUM confidence, no handoff file is written. The HTML report is still generated and sent to Slack.
+
+---
+
+## Adjusting Selection Criteria
+
+The filter is applied in `agents/qa-auto-analyse/actions/05_ship.py`:
+
+```python
+eligible = [
+    c for c in classifications
+    if c.get("classification") == "AUTOMATION_ISSUE"
+    and c.get("confidence") == "HIGH"
+    and c.get("root_cause_category") == "ELEMENT_NOT_FOUND"
+]
+```
+
+To include `TIMEOUT` issues, add it to the category filter. To include `MEDIUM` confidence, adjust the confidence check. Changes here affect what goes into the handoff — the fix agent processes whatever it receives.
+
+---
+
+## Manually Creating or Editing a Handoff
+
+If you want to run `qa-auto-fix` on a specific set of tests, you can create a handoff file manually:
+
 ```bash
-rm reports/.autofix_session_Regression-Frs-Tests-249.json
+cat > agents/qa-auto-fix/queue/MyBuild-541.json << 'EOF'
+{
+  "build_tag": "MyBuild-541",
+  "created_at": "2026-03-29T10:00:00Z",
+  "source_session": "manual",
+  "source_audit_dir": "",
+  "automation_issues": [
+    {
+      "test_name": "Automation.Foo.TestBar.testSomething",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "ELEMENT_NOT_FOUND",
+      "root_cause": "NoSuchElementException on .my-button",
+      "error_type": "NoSuchElementException",
+      "error_message": "Unable to locate element: .my-button",
+      "stack_trace": "",
+      "execution_log": "",
+      "class_name": "Automation.Foo.TestBar",
+      "method_name": "testSomething"
+    }
+  ]
+}
+EOF
 ```
 
-**Windows:**
-```powershell
-Remove-Item reports\.autofix_session_Regression-Frs-Tests-249.json
-```
-
-## Auto-Generated Tests File
-
-When you generate a report, a file is automatically created containing all auto-fixable test names:
-
-**File Location:**
-```
-reports/autofix_tests_{report_name}.txt
-```
-
-**File Format:**
-```
-# Auto-fixable test names (AUTOMATION_ISSUE with HIGH/MEDIUM confidence)
-# Generated from report: Regression-Frs-Tests-249
-# Total tests: 4
-# Use with: --autofix-tests-file <this-file>
-#
-TestDashMobileDevices.testReasonPopUpOnBlockingDevice
-TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername
-TestPushNotificationFlows.testAccountBlockingAfterConsecutiveLoginRequestDenials
-TestPasswordChangeFlows.testResetPasswordGoThroughCaptcha
-```
-
-**Benefits:**
-- ✅ No manual file creation needed
-- ✅ Always up-to-date with current failures
-- ✅ Only includes auto-fixable tests (excludes product bugs)
-- ✅ Ready to use immediately after report generation
-
-## Example Workflow
-
-### Scenario: Fix specific tests (override auto-detection)
-
-If you want to fix only specific tests instead of all auto-fixable ones:
-
-1. **Generate report:**
+Then run:
 ```bash
-./scripts/generate_report.sh --input-dir Regression-Frs-Tests-249
+./scripts/run-autofix.sh agents/qa-auto-fix/queue/MyBuild-541.json
 ```
 
-2. **Run auto-fix with specific tests (overrides auto-detection):**
-```bash
-# Option A: Comma-separated list
-./scripts/trigger_auto_fix.sh \
-  --input-dir Regression-Frs-Tests-249 \
-  --autofix-tests "TestDashMobileDevices.testReasonPopUpOnBlockingDevice,TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername"
+---
 
-# Option B: Custom file
-./scripts/trigger_auto_fix.sh \
-  --input-dir Regression-Frs-Tests-249 \
-  --autofix-tests-file my_custom_tests.txt
-```
+## Queue State
 
-### Scenario: Fix all auto-fixable tests (Simplest)
+| Location | Meaning |
+|----------|---------|
+| `agents/qa-auto-fix/queue/*.json` | Pending — not yet processed |
+| `agents/qa-auto-fix/queue/processed/*.json` | Done — moved after successful run |
 
-1. **Generate report (creates autofix tests file automatically):**
-```bash
-./scripts/generate_report.sh --input-dir Regression-Frs-Tests-249
-```
-
-2. **Run auto-fix (automatically uses the generated file):**
-```bash
-./scripts/trigger_auto_fix.sh --input-dir Regression-Frs-Tests-249
-# ✅ Automatically uses reports/autofix_tests_Regression-Frs-Tests-249.txt
-```
-
-### Scenario: Fix specific tests and track progress
-
-1. **First run - select specific tests:**
-```bash
-./scripts/trigger_auto_fix.sh \
-  --input-dir Regression-Frs-Tests-249 \
-  --autofix-tests "TestDashMobileDevices.testReasonPopUpOnBlockingDevice,TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername"
-```
-
-Output:
-```
-🔧 Auto-fix: attempting up to 5 fixes
-📋 Loaded 0 passed tests from session (will be skipped)
-Found 2 auto-fixable failures
-🏃 Running test locally: TestDashMobileDevices.testReasonPopUpOnBlockingDevice
-✅ Test passed locally! Skipping fix generation
-🏃 Running test locally: TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername
-Test failed locally as expected. Capturing logs.
-...
-🔧 Auto-fix completed: 1 succeeded, 1 skipped, 0 failed
-```
-
-2. **Second run - same tests (one already passed):**
-```bash
-./scripts/trigger_auto_fix.sh \
-  --input-dir Regression-Frs-Tests-249 \
-  --autofix-tests "TestDashMobileDevices.testReasonPopUpOnBlockingDevice,TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername"
-```
-
-Output:
-```
-🔧 Auto-fix: attempting up to 5 fixes
-📋 Loaded 1 passed tests from session (will be skipped)
-⏭️  Skipping 1 tests that passed locally in previous runs
-Found 1 auto-fixable failures (1 filtered out)
-🏃 Running test locally: TestLoginFlows.testLoginWith3IncorrectPasswordAttemptsWithDifferentUsername
-...
-```
-
-### Scenario: Process all tests, track passed ones
-
-1. **First run - all auto-fixable tests:**
-```bash
-./scripts/trigger_auto_fix.sh --input-dir Regression-Frs-Tests-249
-```
-
-2. **Second run - only failed tests are processed:**
-```bash
-./scripts/trigger_auto_fix.sh --input-dir Regression-Frs-Tests-249
-# Tests that passed in first run are automatically skipped
-```
-
-## Benefits
-
-✅ **Selective Fixing**: Fix only the tests you want, not all failures
-✅ **Progress Tracking**: Don't waste time re-processing tests that already pass
-✅ **Incremental Work**: Run auto-fix multiple times, only new failures are processed
-✅ **Session Persistence**: Session data persists across runs for the same report
-
-## Notes
-
-- Session files are **per report** - each report has its own session file
-- Tests are tracked by their full test name (as classified)
-- If you delete the session file, all tests will be processed again
-- Tests that pass locally are skipped even if they were in the original failure list
-- Session tracking works with both selected tests and all auto-fixable tests
+A handoff file stays in `queue/processed/` even if the fixes failed — check the audit trail for results.

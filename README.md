@@ -1,293 +1,327 @@
 <div>
-  <img src="https://raw.githubusercontent.com/msr5464/Basic-Automation-Framework/refs/heads/master/Logo-full.png" title="Powered by Thanos and created by Mukesh Rajput" height="50">
+  <img src="https://raw.githubusercontent.com/msr5464/Basic-Automation-Framework/refs/heads/master/Logo-full.png" height="50">
 
   # QA AI Agent
-
-  **🤖 Automated Test Report Analyzer | Database-First Intelligence | Two-Level Failure Classification | Flaky Test Detection | Screenshots & Known Issues**
 
   [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 </div>
 
----
-
-## 📋 Table of Contents
-- [Overview](#-overview)
-- [Sample Report](#-sample-report)
-- [Features](#-features)
-- [Quick Start](#-quick-start)
-- [Architecture & Components](#-architecture--components)
-- [Project Structure](#-project-structure)
-- [Troubleshooting](#-troubleshooting)
-- [Creator](#-creator)
+Two AI agents that close the loop on test failures — from analysis to a merged PR — with no manual steps required.
 
 ---
 
-## 🎯 Overview
-**QA AI Agent** is an intelligent, automated analysis system that transforms raw test execution data into actionable insights. Unlike traditional report generators, it uses a **database-first approach** combined with **HTML log parsing** to provide a complete picture of test health.
+## How It Works
 
-It leverages **Generative AI (OpenAI, Ollama, or Google Gemini)** to classify failures with human-like understanding, distinguishing between genuine product bugs and automation issues.
+```
+Test build finishes
+       │
+       ▼
+┌─────────────────────────────────────────────────────┐
+│  Agent 1: qa-auto-analyse                           │
+│                                                     │
+│  01 Scout  → pick unanalyzed build tag from DB      │
+│  02 Collect→ DB query + HTML log parse              │
+│  03 Classify → Claude batch-classifies failures     │
+│  04 Review → adversarial review + verdict gate      │
+│  05 Ship   → HTML report + Slack + handoff JSON     │
+└──────────────────────────┬──────────────────────────┘
+                           │  queue/<build_tag>.json
+                           │  (AUTOMATION_ISSUE HIGH ELEMENT_NOT_FOUND only)
+                           ▼
+┌─────────────────────────────────────────────────────┐
+│  Agent 2: qa-auto-fix   (runs independently)        │
+│                                                     │
+│  01 Fix  → Claude generates locator fix per test    │
+│            → applies fix, runs test, rolls back     │
+│              on failure, retries up to N times      │
+│  02 Ship → push branch → GitHub PR → Slack          │
+└─────────────────────────────────────────────────────┘
+```
 
-### What It Does
-- **🤖 Intelligent Classification**: Automatically analyzes failure logs to determine if a failure is a `🐛 Product Bug` or `🔧 Automation Issue`.
-- **📊 Historical Trending**: Tracks test stability over time using a MySQL database to identify flaky tests and recurring patterns.
-- **📝 Root Cause Analysis**: Extracts precise root causes (e.g., "API 500 Error", "Element Not Found", "Assertion Mismatch") from verbose logs, plus a **Likely location** (file:line) for faster triage.
-- **🧠 Context-Aware Recommendations**: Provides specific, actionable steps to resolve failures based on the error context.
-- **📸 Failure Screenshots**: Embeds failure screenshots from test runs in the report (thumbnails with click-to-zoom) when available in the report directory.
-- **🔖 Known Issues**: Highlights tests marked as known failures in the database (with execution history and optional Jira links) in a dedicated section.
-- **📈 Interactive Reporting**: Generates a modern, single-file HTML report with executive summaries, trend charts, and detailed drill-downs.
-
----
-
-## 📸 Sample Report
+**Agent 1** classifies every failure as `PRODUCT_BUG` or `AUTOMATION_ISSUE`, writes an HTML report, and queues only the fixable ones.
 
 ![Sample Report](sample_report.png)
 
+**Agent 2** picks up the queue, fixes broken locators using Claude, verifies each fix by running the test locally, and opens a GitHub PR. If only some tests are fixed, it still ships a PR for what passed and alerts on what didn't.
+
+**Example Slack messages from Agent 2:**
+
+All tests fixed → posted to `#qa-reports`
+```
+✅ QA Auto-Fix — ProdSanity-All-Tests-541
+8/8 tests fixed
+
+✅ Fixed (8):
+  • TestLogin.testLoginWithValidCredentials — updated locator [data-cy='submit-btn']
+  • TestDashboard.testDashboardLoadsCorrectly — updated locator #dashboard-header
+  • TestProfile.testEditProfileSaves — @FindBy css updated to [data-testid='save-btn']
+  • ... and 5 more
+  PR: https://github.com/org/automation-repo/pull/214
+
+Audit: 20260329-143022-fix-ProdSanity-All-Tests-541
+```
+
+Partial fix → posted to `#qa-critical`
+```
+🟡 QA Auto-Fix — ProdSanity-All-Tests-541
+5/8 tests fixed — 3 need manual attention
+
+✅ Fixed (5):
+  • TestLogin.testLoginWithValidCredentials — updated locator [data-cy='submit-btn']
+  • TestDashboard.testDashboardLoadsCorrectly — updated locator #dashboard-header
+  • ... and 3 more
+  PR: https://github.com/org/automation-repo/pull/214
+
+❌ Could not fix (3) — manual review required:
+  • TestCheckout.testCheckoutFlow — fix applied but test still failing
+  • TestPayment.testPaymentWithCard — unfixable: multiple candidate locators, ambiguous
+  • TestLogout.testSessionExpiry — test file not found in workspace
+
+Audit: 20260329-143022-fix-ProdSanity-All-Tests-541
+```
+
+No tests fixed → posted to `#qa-critical`
+```
+❌ QA Auto-Fix — ProdSanity-All-Tests-541
+0/8 tests could be fixed — all need manual attention
+
+❌ Could not fix (8) — manual review required:
+  • TestLogin.testLoginWithValidCredentials — fix applied but test still failing
+  • TestDashboard.testDashboardLoadsCorrectly — unfixable: dynamic element, no stable locator
+  • ... and 6 more
+
+Audit: 20260329-143022-fix-ProdSanity-All-Tests-541
+```
+
 ---
 
-## ✨ Features
+## Quick Start
 
-### Core Capabilities
-- **📊 Database-First Data Retrieval**
-  - Queries MySQL database for reliable historical test results.
-  - Merges database records with detailed execution logs parsed from HTML artifacts.
-  
-- **🤖 Two-Level AI Classification System**
-  - **Level 1 (High-Level)**: Classifies as `Product Bug` vs. `Automation Issue`.
-  - **Level 2 (Root Cause)**: Categorizes into `ELEMENT_NOT_FOUND`, `TIMEOUT`, `ASSERTION_FAILURE`, `ENVIRONMENT_ISSUE`, or `OTHER`.
-  - powered by **GPT-4** (OpenAI), **Gemini** (Google), or **Llama 3** (Ollama, Local/Private).
-
-- **📉 Smart Flaky Test Detection**
-  - Identifies tests that flip-flop between Pass/Fail.
-  - Configurable thresholds (e.g., "Failed 4 times in the last 10 runs").
-  - Visualizes execution history with colored status dots.
-
-### Report Features
-- **Executive Summary**: High-level health metrics and AI-generated insights.
-- **Failures by Category**: Grouped failures for efficient triage (e.g., see all "Timeouts" together).
-- **Screenshots**: Failure screenshots from the test run are shown in test details (thumbnail; click to view full size). When the report is opened from disk, images load from the local testdata path.
-- **Likely location**: For each failure, the report shows a **Likely location** (e.g. `LoginPage.java:115`) derived from stack traces so you can jump straight to the code.
-- **Known Failures**: A dedicated section lists tests marked as known failures in the database, with last 10 execution history dots and optional Jira links for tracking.
-- **Interactive UI**: Search, sort, expand details, copy-to-clipboard, and screenshot zoom.
-
-*Auto-fix (self-healing locator fixes) is planned as a future enhancement and is not yet fully supported.*
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-- **Python 3.9+** (3.11+ recommended)
-- **MySQL Database** (for storage of test results)
-- **LLM Provider**:
-  - **Ollama** (Local, Private, Free) - *Recommended*
-  - **OpenAI API Key** (Cloud, Powerful)
-  - **Google Gemini API Key** (Cloud; set `LLM_PROVIDER=gemini` and `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey))
-
-### Installation
+### 1. Install
 
 ```bash
-# Clone the repository
 git clone <repository-url>
 cd QA-AI-Agent
 
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
+./scripts/setup.sh          # macOS / Linux
+.\scripts\setup.ps1         # Windows
 ```
+
+### 2. Configure
+
+```bash
+cp config/.env.example config/.env
+```
+
+Minimum required settings in `config/.env`:
+
+```bash
+# Database (stores test results and history)
+DB_HOST=localhost
+DB_USER=root
+DB_PASSWORD=your_password
+DB_NAME=qa_results
+
+# Claude CLI
+CLAUDE_CLI_PATH=claude          # or full path if not on $PATH
+
+# Report output
+INPUT_DIR=testdata              # where HTML test reports live
+OUTPUT_DIR=reports              # where to write generated HTML reports
+```
+
+### 3. Run Agent 1 — Analyse
+
+```bash
+# macOS / Linux
+./scripts/run-analyse.sh                              # auto-selects most recent unanalyzed build
+./scripts/run-analyse.sh ProdSanity-All-Tests-541     # specific build tag
+STOP_AFTER=classify ./scripts/run-analyse.sh          # stop early for inspection
+
+# Windows
+.\scripts\run-analyse.ps1 -BuildTag ProdSanity-All-Tests-541
+```
+
+Outputs:
+- HTML report → `OUTPUT_DIR/`
+- Handoff file → `agents/qa-auto-fix/queue/<build_tag>.json` (if fixable issues found)
+- Slack notification → `SLACK_NOTIFY_CHANNEL` or `SLACK_ALERT_CHANNEL`
+
+### 4. Run Agent 2 — Auto-fix
+
+```bash
+# macOS / Linux
+./scripts/run-autofix.sh                              # process oldest item in queue
+./scripts/run-autofix.sh ProdSanity-All-Tests-541     # specific build tag
+./scripts/run-autofix.sh /path/to/handoff.json        # pass handoff file directly
+AUTO_PUSH=false ./scripts/run-autofix.sh              # dry-run: fix + test locally, no PR
+
+# Windows
+.\scripts\run-autofix.ps1 -BuildTag ProdSanity-All-Tests-541
+.\scripts\run-autofix.ps1 -HandoffFile C:\path\to\handoff.json
+```
+
+Outputs:
+- GitHub PR with all passing fixes (even if some tests couldn't be fixed)
+- Slack notification with per-test breakdown (see examples above)
+
+---
+
+## Configuration Reference
+
+### Database & Claude
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DB_HOST` | `localhost` | MySQL host |
+| `DB_PORT` | `3306` | MySQL port |
+| `DB_USER` | `root` | MySQL user |
+| `DB_PASSWORD` | | MySQL password |
+| `DB_NAME` | `qa_results` | MySQL database name |
+| `CLAUDE_CLI_PATH` | `claude` | Path to Claude CLI binary |
+| `CLASSIFIER_MODEL` | `claude-opus-4-6` | Model for failure classification |
+| `REVIEWER_MODEL` | `claude-sonnet-4-6` | Model for adversarial review |
+| `AUTOFIX_MODEL` | `claude-opus-4-6` | Model for fix generation |
+
+### Agent 1 — qa-auto-analyse
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `BUILD_TAG` | | Skip scout and analyse this build directly |
+| `STOP_AFTER` | | Stop after: `scout` `collect` `classify` `review` |
+| `SCOUT_LOOKBACK_DAYS` | `7` | How far back scout looks for unanalyzed builds |
+| `MAX_REVIEW_ROUNDS` | `2` | Max classifier ↔ reviewer debate rounds |
+| `INPUT_DIR` | `testdata` | Directory containing test report HTML |
+| `OUTPUT_DIR` | `reports` | Directory for generated HTML reports |
+| `AUTOFIX_QUEUE_DIR` | `agents/qa-auto-fix/queue` | Where to write handoff files |
+
+### Agent 2 — qa-auto-fix
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WORKSPACE_DIR` | parent of QA-AI-Agent | Parent directory for the automation repo. If the repo is absent, it is cloned automatically. |
+| `GITHUB_REPO_AUTOMATION` | | Automation repo directory name under `WORKSPACE_DIR` |
+| `GITHUB_TOKEN` | | GitHub token — used for clone + PR creation |
+| `GITHUB_ORG` | | GitHub organisation owning the automation repo |
+| `GITHUB_DEFAULT_BRANCH` | `main` | Base branch for PRs |
+| `GITHUB_PR_REVIEWERS` | | Comma-separated list of PR reviewers |
+| `AUTOFIX_BRANCH_PREFIX` | `chore/qa-autofix` | Branch name prefix (full: `<prefix>/<build-tag>`) |
+| `AUTO_PUSH` | `true` | Set `false` for dry-run (fix and test locally, skip PR) |
+| `MAX_FIX_ATTEMPTS` | `2` | Retry cycles if tests still fail after fix |
+| `AUTO_FIX_MAX_FIXES_PER_RUN` | `5` | Max tests to fix per session |
+| `TEST_RUNNER_CMD` | auto-detect | Override test runner. Placeholders: `{class}` `{class_simple}` `{method}` |
+| `REPO_CONTEXT_FILE` | `CONVENTIONS.md` | Path to conventions file Claude reads before generating fixes |
+
+---
+
+## Slack Notifications
+
+Both agents post to Slack using the **Slack Bot API** (`chat.postMessage`).
+
+### Setup
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → From scratch
+2. **OAuth & Permissions** → Bot Token Scopes → add `chat:write`
+3. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-...`)
+4. In each target channel, run `/invite @your-bot-name`
 
 ### Configuration
-1. **Create environment file**:
-   ```bash
-   cp config/.env.example config/.env
-   ```
 
-2. **Edit `config/.env`**:
-   - Set `LLM_PROVIDER=ollama` (default), `openai`, or `gemini`.
-   - For **OpenAI**: set `OPENAI_API_KEY` and optionally `OPENAI_MODEL`.
-   - For **Gemini**: set `GEMINI_API_KEY` (get one at [Google AI Studio](https://aistudio.google.com/apikey)) and optionally `GEMINI_MODEL` (default: `gemini-1.5-flash`).
-   - Configure `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`.
-   - Set `INPUT_DIR` (where your raw reports live) and `OUTPUT_DIR`.
-
-### Run the Application
-
-**macOS / Linux:**
 ```bash
-./scripts/run.sh --input-dir testdata/Regression-Suite --output-dir reports
+SLACK_BOT_TOKEN=xoxb-your-token-here
+SLACK_NOTIFY_CHANNEL=#qa-reports      # normal results (reports, successful fixes)
+SLACK_ALERT_CHANNEL=#qa-critical      # failures and escalations needing human action
 ```
 
-**Windows (PowerShell):**
-```powershell
-.\scripts\run.ps1 --input-dir testdata/Regression-Suite --output-dir reports
-```
+If `SLACK_ALERT_CHANNEL` is not set, all messages go to `SLACK_NOTIFY_CHANNEL`.
+If `SLACK_BOT_TOKEN` is not set, Slack is silently skipped.
 
-> **Note**: If no arguments are passed, it defaults to the paths in your `.env` file.
+### What gets posted
+
+| Event | Channel | Message includes |
+|-------|---------|-----------------|
+| Analysis complete, verdict APPROVED | `NOTIFY` | Report summary, pass/fail counts, handoff queued count |
+| Analysis complete, verdict NEEDS-HUMAN | `ALERT` | Reason for escalation, audit trail link |
+| All tests fixed | `NOTIFY` | List of fixed tests, PR link |
+| Some tests fixed, some failed | `ALERT` | Fixed list + PR link, failed list with reasons |
+| No tests could be fixed | `ALERT` | Failed list with reasons per test, audit trail link |
 
 ---
 
-## 🏗 Architecture & Components
-
-The agent is designed with modularity in mind, separating data parsing, intelligence, and reporting.
-
-### 🔄 Workflow (high level)
-1. **Ingest** → 2. **Query DB** → 3. **Parse HTML** → 4. **Merge** → 5. **AI + Rules** → 6. **Summary** → 7. **Generate Report**
-
-### 📊 Data Flow Diagram (how the report is created, step by step)
-
-Each step shows **inputs** → **component** → **outputs**. Follow the flow top to bottom to see how data moves until the final HTML report is produced.
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  INPUTS                                                                     │
-│  • Report Directory (path to test run: HTML, logs, Screenshots/)            │
-│  • report_name / build_tag (from directory name, e.g. Regression-Frs-266)    │
-│  • --table-name (optional; else derived from report_name)                    │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 1 — Load data from database                                            │
-│  Component: AgentMemory  (reads from MySQL)                                  │
-│  • get_test_results_by_buildtag(...)  → db_results                          │
-│  • detect_recurring_failures(...)      → recurring (flaky tests)             │
-│  • get_trend_analysis(...)             → trends (pass rate, etc.)             │
-│  Outputs: db_results, recurring, trends                                       │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 2 — Parse HTML from report directory                                   │
-│  Component: HTML Parsers / DataBuilder helpers                               │
-│  • get_execution_logs_from_html(report_dir)  → execution_logs, html_links   │
-│  • get_test_durations_from_html(report_dir)  → durations                      │
-│  Outputs: execution_logs, durations, html_links                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 3 — Merge DB + HTML into full test data                                │
-│  Component: DataBuilder (get_full_report_data_from_db)                       │
-│  Inputs: report_dir, db_results, execution_logs, durations, html_links      │
-│  Outputs: data = { summary, test_results }                                    │
-│           (each TestResult: status, execution_log, knownFailure from DB…)   │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 4 — Classify failures with AI                                           │
-│  Component: TestAnalyzer (LLM: OpenAI / Ollama / Gemini)                     │
-│  Inputs: failures = test_results where status = FAIL/ERROR                   │
-│  Outputs: classifications (Product Bug vs Automation, root cause,            │
-│           recommended_action, root_cause_category)                            │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 5 — Refine categories with rules                                       │
-│  Component: CategoryRuleEngine                                               │
-│  Inputs: classifications, test_data_cache (execution logs)                   │
-│  Outputs: category_counts, category_failures (ELEMENT_NOT_FOUND, TIMEOUT,   │
-│           ASSERTION_FAILURE, ENVIRONMENT_ISSUE, OTP→product, etc.)           │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 6 — Generate executive summary text                                    │
-│  Component: SummaryGenerator (LLM)                                           │
-│  Inputs: summary, classifications, category_*, recurring, test_html_links,  │
-│          test_results                                                         │
-│  Outputs: ai_summary (narrative for the report)                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 7 — Build and save HTML report                                          │
-│  Component: ReportGenerator                                                   │
-│  Inputs: summary, classifications, ai_summary, recurring, trends,            │
-│          report_dir (screenshots + likely location from logs),               │
-│          test_results, test_html_links, environment, output_dir               │
-│  • Resolves screenshot paths under report_dir (e.g. …/Screenshots/*.png)     │
-│  • Extracts "Likely location" (file:line) from stack traces                   │
-│  • Renders: categories, known failures, flaky table, trend, summary, links  │
-│  Outputs: HTML file (e.g. AI-Generated-Report_Regression-Frs-266.html)        │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-                              ┌─────────────────────┐
-                              │   HTML Report       │
-                              │   (single file)     │
-                              └─────────────────────┘
-```
-
----
-
-## 📁 Project Structure
+## Project Structure
 
 ```
 QA-AI-Agent/
-├── config/               # Configuration (.env.example, prompts.yaml)
-├── docs/                 # Guides (report usage; auto-fix docs for future enhancement)
-├── scripts/              # Run scripts
-│   ├── run.sh, run.ps1           # Report generation (recommended)
-│   ├── trigger_auto_fix.*        # Planned: auto-fix flow (coming soon)
-│   └── windows/setup.ps1         # Windows venv setup
-├── src/
-│   ├── agent/            # AI and analysis
-│   │   ├── analyzer.py           # LLM classification (Product Bug vs Automation)
-│   │   ├── memory.py             # DB access (results, history, flaky, trends)
-│   │   └── summary_generator.py  # Executive summary (LLM)
-│   ├── auto_fix/         # Planned: self-healing locator fixes (enhancement, coming later)
-│   ├── parsers/          # HTML & data
-│   │   ├── data_builder.py       # Merge DB + HTML into TestResults
-│   │   ├── html_parser.py        # Parse suite index and test result HTML
-│   │   └── models.py            # TestResult, TestSummary
-│   ├── reporters/       # Report generation
-│   │   ├── report_generator.py   # HTML report (screenshots, likely location, known failures)
-│   │   ├── category_rules.py     # Refine root-cause categories (OTP, timeout, etc.)
-│   │   ├── html_styles.py        # Report CSS
-│   │   └── html_scripts.py      # Report JS
-│   ├── database.py      # MySQL connection & table name resolution
-│   ├── main.py          # Entry point (orchestrator)
-│   ├── settings.py      # Config loader
-│   └── utils.py         # Helpers (TestDataCache, ReportUrlBuilder, etc.)
-├── testdata/            # Sample / input report directories
-├── reports/              # Generated HTML reports (output)
-├── tests/                # Unit tests (e.g. unit/test_memory.py, test_html_parser.py)
-├── requirements.txt
-└── README.md
+├── agents/
+│   ├── qa-auto-analyse/       # Agent 1 — analyse, classify, report
+│   │   ├── run.sh             # Orchestrator (steps 01–05)
+│   │   ├── CLAUDE.md          # Full agent spec (read by Claude CLI)
+│   │   ├── feedback/          # skip-buildtags.json
+│   │   └── actions/
+│   │       ├── 01_scout.py    # Pick unanalyzed build tag from DB
+│   │       ├── 02_collect.py  # DB query + HTML parse + flaky detection
+│   │       ├── 03_classify.py # Batch classify failures via Claude
+│   │       ├── 04_review.py   # Adversarial review + .verdict gate
+│   │       └── 05_ship.py     # HTML report + handoff JSON + Slack
+│   └── qa-auto-fix/           # Agent 2 — fix locators, raise PR
+│       ├── run.sh             # Orchestrator (queue / direct / file-path mode)
+│       ├── CLAUDE.md          # Full agent spec (read by Claude CLI)
+│       ├── queue/             # Pending handoffs from qa-auto-analyse
+│       ├── feedback/          # known-issues.json (patterns to skip)
+│       └── actions/
+│           ├── 01_fix.py      # Fix locators → run tests → commit
+│           └── 02_ship.py     # Push branch → PR → Slack
+├── config/
+│   ├── .env.example           # All env vars documented with defaults
+│   └── prompts.yaml           # Prompt templates
+├── docs/
+│   ├── AUTO_FIX_GUIDE.md      # Full autofix setup and walkthrough
+│   └── AUTO_FIX_TEST_SELECTION.md  # How tests are selected and filtered
+├── scripts/
+│   ├── run-analyse.sh / .ps1  # Entry point for Agent 1
+│   ├── run-autofix.sh / .ps1  # Entry point for Agent 2
+│   └── setup.sh / .ps1        # Install dependencies
+├── src/                       # Shared Python library
+│   ├── agent/                 # DB-backed memory, LLM analyzer, summary generator
+│   ├── parsers/               # HTML parser, data builder, models
+│   ├── reporters/             # HTML report generator, category rules
+│   ├── database.py
+│   ├── settings.py
+│   └── utils.py
+├── tests/                     # Unit tests
+└── requirements.txt
 ```
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
-### Common Issues
+**"Queue is empty — nothing to fix"**
+Run Agent 1 first. The queue is only populated when Agent 1 finds `AUTOMATION_ISSUE + HIGH confidence + ELEMENT_NOT_FOUND` failures and the review verdict is `APPROVED`.
 
-**Q: No test results found in database?**
-A: Ensure your test runner inserts results into MySQL *before* running this agent. The agent queries by `buildTag` (directory name).
+**"No test results found in database"**
+Your test runner must insert results into MySQL before running Agent 1. The agent queries by `buildTag` (the directory name of the test report).
 
-**Q: AI analysis is failing or slow?**
-A: If using **Ollama**, ensure the model is pulled (`ollama pull llama3.2`). If using **OpenAI**, check your API key quota. If using **Gemini**, set `GEMINI_API_KEY` in `config/.env` (create one at [Google AI Studio](https://aistudio.google.com/apikey)).
+**"claude: command not found"**
+Set `CLAUDE_CLI_PATH` in `config/.env` to the full path of the Claude CLI binary.
 
-**Q: "Table not found" error?**
-A: The agent attempts to derive the table name from the report name. You can override this with `--table-name`.
+**"GitHub configuration is missing"**
+Set `GITHUB_TOKEN`, `GITHUB_ORG`, and `GITHUB_REPO_AUTOMATION` in `config/.env`.
+
+**PR not created after fix**
+Check `agents/qa-auto-fix/audit/<session>/02-ship.md` for the exact reason. Common causes: push failed, no successful fixes, `AUTO_PUSH=false`.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE)
 
 ---
 
-## 📝 License
-This project is open source. See [LICENSE](LICENSE) file for details.
+## Creator
 
----
+**Mukesh Rajput** · [LinkedIn](https://www.linkedin.com/in/mukesh-rajput/)
 
-## 👤 Creator
-**Mukesh Rajput**
-
-For any further help or queries, contact [@mukesh.rajput](https://www.linkedin.com/in/mukesh-rajput/)
-
----
-<div align="center">
-  <strong>Made with ❤️ for Engineering Team!</strong>
-</div>
+<div align="center"><strong>Made with ❤️ for the Engineering Team</strong></div>

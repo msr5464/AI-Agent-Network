@@ -31,7 +31,7 @@ class Config:
     DB_PORT = int(os.getenv('DB_PORT', '3306'))
     DB_USER = os.getenv('DB_USER', 'root')
     DB_PASSWORD = os.getenv('DB_PASSWORD', '')
-    DB_NAME = os.getenv('DB_NAME', 'thanos')
+    DB_NAME = os.getenv('DB_NAME', 'qa_results')
     
     # LLM Configuration
     LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama').lower()
