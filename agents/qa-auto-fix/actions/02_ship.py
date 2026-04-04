@@ -10,6 +10,7 @@ No AI calls. No code changes.
 import os, sys, json, subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Tuple
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -58,7 +59,7 @@ def read_gate() -> str:
     return gate_path.read_text().strip() if gate_path.exists() else "skipped"
 
 
-def get_workspace() -> Path | None:
+def get_workspace() -> Optional[Path]:
     workspace = Path(WORKSPACE_DIR)
     if GITHUB_REPO_AUTOMATION:
         repo_path = workspace / GITHUB_REPO_AUTOMATION
@@ -95,7 +96,7 @@ def send_slack(channel: str, text: str) -> bool:
         return False
 
 
-def push_and_create_pr(fix_data: dict, failed_fixes: list) -> str | None:
+def push_and_create_pr(fix_data: dict, failed_fixes: list) -> Optional[str]:
     pr_branch = fix_data.get("pr_branch")
     if not pr_branch:
         log("No PR branch from fix step — skipping PR creation")
@@ -210,7 +211,7 @@ def _failed_pr_line(f: dict) -> str:
 
 
 def _build_slack_message(build_tag: str, fixes: list, failed_fixes: list,
-                          pr_url: str | None, fix_gate: str, fix_attempt: int) -> tuple[str, str]:
+                          pr_url: Optional[str], fix_gate: str, fix_attempt: int) -> Tuple[str, str]:
     """
     Build a rich Slack message. Returns (channel, text).
     Uses SLACK_ALERT_CHANNEL if any failures, SLACK_NOTIFY_CHANNEL otherwise.

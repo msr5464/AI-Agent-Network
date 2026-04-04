@@ -11,6 +11,7 @@
 
 AGENT     ?= qa-auto-analyse
 BUILD_TAG ?=
+FEATURE   ?=
 SESSION   ?=
 AGENTS_DIR = agents
 
@@ -19,7 +20,7 @@ AGENTS_DIR = agents
 run:
 	@if [ -z "$(AGENT)" ]; then echo "Usage: make run AGENT=qa-auto-analyse  OR  make run AGENT=qa-auto-fix"; exit 1; fi
 	@if [ ! -f "$(AGENTS_DIR)/$(AGENT)/run.sh" ]; then echo "Agent not found: $(AGENTS_DIR)/$(AGENT)/run.sh"; exit 1; fi
-	@BUILD_TAG="$(BUILD_TAG)" bash "$(AGENTS_DIR)/$(AGENT)/run.sh" "$(BUILD_TAG)"
+	@BUILD_TAG="$(BUILD_TAG)" FEATURE="$(FEATURE)" bash "$(AGENTS_DIR)/$(AGENT)/run.sh" "$(BUILD_TAG)"
 
 # ── Audit ──────────────────────────────────────────────────────────────────────
 .PHONY: audit
@@ -108,6 +109,10 @@ help:
 	@echo "  make audit AGENT=qa-auto-analyse SESSION=...       View specific session"
 	@echo "  make feedback AGENT=qa-auto-analyse                Show feedback files"
 	@echo "  make clear-feedback AGENT=qa-auto-analyse          Clear skip-buildtags.json"
+	@echo ""
+	@echo "  make run AGENT=qa-auto-create FEATURE=payments     Create from queue/payments.txt"
+	@echo "  AUTO_PUSH=false make run AGENT=qa-auto-create      Dry-run (generates + tests, no PR)"
+	@echo "  make audit AGENT=qa-auto-create                    List recent sessions"
 	@echo ""
 	@echo "  make setup                                         Install deps"
 	@echo "  make test                                          Run unit tests"
