@@ -29,7 +29,7 @@ AGENT_DIR    = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents
 REPO_ROOT    = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
 
 WORKSPACE_DIR    = Path(os.environ.get("WORKSPACE_DIR", REPO_ROOT.parent))
-THANOS_PW_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Thanos-pw")
+AUTOMATION_FRAMEWORK_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
 
 CLAUDE_CLI   = os.environ.get("CLAUDE_CLI_PATH", "claude")
 MODEL        = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
@@ -97,7 +97,7 @@ def run_maven_test(test_class: str, test_method: str) -> tuple:
             cmd,
             capture_output=True, text=True,
             timeout=300,
-            cwd=str(THANOS_PW_DIR)
+            cwd=str(AUTOMATION_FRAMEWORK_DIR)
         )
         output = result.stdout + "\n" + result.stderr
         passed = result.returncode == 0
@@ -115,7 +115,7 @@ def read_generated_files(files_written: list) -> dict:
     """Read the content of all generated Java files."""
     contents = {}
     for rel_path in files_written:
-        full = THANOS_PW_DIR / rel_path
+        full = AUTOMATION_FRAMEWORK_DIR / rel_path
         if full.exists():
             try:
                 contents[rel_path] = full.read_text()
@@ -130,10 +130,10 @@ def apply_fix(files_map: dict) -> list:
     for rel_path, content in files_map.items():
         if not content or not content.strip():
             continue
-        full = THANOS_PW_DIR / rel_path
+        full = AUTOMATION_FRAMEWORK_DIR / rel_path
         # Safety: only write inside Thanos-pw
         try:
-            full.resolve().relative_to(THANOS_PW_DIR.resolve())
+            full.resolve().relative_to(AUTOMATION_FRAMEWORK_DIR.resolve())
         except ValueError:
             log(f"  BLOCKED: {rel_path} escapes repo root")
             continue
@@ -203,7 +203,7 @@ def try_fix_infra_db() -> bool:
         log("DB auto-repair: could not connect to local MySQL as root (no password)")
         return False
 
-    sys_props = THANOS_PW_DIR / "parameters" / "system.properties"
+    sys_props = AUTOMATION_FRAMEWORK_DIR / "parameters" / "system.properties"
     if not sys_props.exists():
         sys_props.parent.mkdir(parents=True, exist_ok=True)
         sys_props.write_text("")
@@ -306,10 +306,10 @@ def main() -> None:
         _write_result({"skipped": True, "reason": "no test class"}, [], FIX_ATTEMPT)
         return
 
-    if not THANOS_PW_DIR.exists():
-        log(f"ERROR: Thanos-pw directory not found: {THANOS_PW_DIR}")
+    if not AUTOMATION_FRAMEWORK_DIR.exists():
+        log(f"ERROR: Automation framework repo not found: {AUTOMATION_FRAMEWORK_DIR}")
         _write_gate("skipped")
-        _write_result({"skipped": True, "reason": f"Thanos-pw not found at {THANOS_PW_DIR}"}, [], FIX_ATTEMPT)
+        _write_result({"skipped": True, "reason": f"Automation framework repo not found at {AUTOMATION_FRAMEWORK_DIR}"}, [], FIX_ATTEMPT)
         return
 
     log(f"Attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS}: Running {test_class}#{test_method}")
@@ -374,7 +374,7 @@ def main() -> None:
 
     if failure_class == "INFRA_BUILD":
         log(f"ERROR: Maven project not found — check WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
-        log(f"Expected pom.xml at: {THANOS_PW_DIR}")
+        log(f"Expected pom.xml at: {AUTOMATION_FRAMEWORK_DIR}")
         _write_gate("skipped")
         _write_result({
             "attempt": FIX_ATTEMPT,
@@ -382,7 +382,7 @@ def main() -> None:
             "test_method": test_method,
             "passed": False,
             "skipped": True,
-            "reason": f"Maven project not found at {THANOS_PW_DIR} — ensure WORKSPACE_DIR and GITHUB_REPO_AUTOMATION point to a valid Maven project",
+            "reason": f"Maven project not found at {AUTOMATION_FRAMEWORK_DIR} — ensure WORKSPACE_DIR and GITHUB_REPO_AUTOMATION point to a valid Maven project",
             "test_output": test_output,
             "fixes_applied": [],
         }, files_written, FIX_ATTEMPT)
@@ -406,7 +406,11 @@ def main() -> None:
     # CODE_ERROR — call Claude for a fix
     log("Test FAILED — calling Claude for fix...")
     generated_files = read_generated_files(files_written)
-    claude_md = (AGENT_DIR / "CLAUDE.md").read_text() if (AGENT_DIR / "CLAUDE.md").exists() else ""
+    # Read Jarvis/CLAUDE.md — single source of truth for framework conventions.
+    fw_claude_md_path = AUTOMATION_FRAMEWORK_DIR / "CLAUDE.md"
+    claude_md = fw_claude_md_path.read_text() if fw_claude_md_path.exists() else ""
+    if not claude_md:
+        log("WARNING: Jarvis/CLAUDE.md not found — check WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
 
     files_context = "\n".join(
         f"\n--- {path} ---\n{content}\n" for path, content in generated_files.items()
@@ -423,7 +427,7 @@ Previous fix did not resolve the test. Previous failure:
 Try a DIFFERENT approach — do NOT repeat what was tried before.
 """
 
-    prompt = f"""You are a Java test automation debugging agent for the Thanos-pw framework.
+    prompt = f"""You are a Java test automation debugging agent for the Jarvis framework.
 
 <framework_conventions>
 {claude_md}
@@ -449,7 +453,7 @@ Common failure causes:
 - Method not found — check the framework API (use BasePage/Element/WaitHelper wrappers)
 - Compilation error — fix the Java syntax
 - User not allocated — check allocateUser() call matches feature enum
-- Auth not set — ensure loginAndSetAuth() or doLogin() is called before API calls
+- Auth not set — ensure setAuthToken(token) is called on the helper, or doLogin() for web tests
 
 Return ONLY a JSON object:
 {{

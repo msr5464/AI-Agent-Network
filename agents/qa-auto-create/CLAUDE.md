@@ -5,7 +5,7 @@ Read this file first. Every time. Before doing anything else.
 ## What This Agent Does
 
 Takes plain English test steps from a `.txt` file in the queue, generates complete
-framework-compliant Java test code for the Thanos-pw automation repository, validates
+framework-compliant Java test code for the Jarvis automation repository, validates
 generated web flows with a headless Playwright script, runs the generated test via Maven,
 fixes any failures iteratively, and raises a GitHub PR.
 
@@ -126,10 +126,10 @@ Web Steps:
 |----------|---------|---------|
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary | `claude` |
 | `AUTOCREATE_MODEL` | Claude model for all AI steps | `claude-opus-4-6` |
-| `WORKSPACE_DIR` | Parent directory containing Thanos-pw | required |
+| `WORKSPACE_DIR` | Parent directory containing Jarvis | required |
 | `GITHUB_TOKEN` | GitHub auth token for PR creation | required |
 | `GITHUB_ORG` | GitHub org/user owning the repo | required |
-| `GITHUB_REPO_AUTOMATION` | Name of the Thanos-pw repo dir | `Thanos-pw` |
+| `GITHUB_REPO_AUTOMATION` | Name of the Jarvis repo dir | `Jarvis` |
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs | `main` |
 | `GITHUB_PR_REVIEWERS` | Comma-separated reviewer handles | optional |
 | `AUTOCREATE_BRANCH_PREFIX` | Branch name prefix | `feat/qa-autocreate` |
@@ -148,6 +148,10 @@ Web Steps:
 ## How to Run
 
 ```bash
+# First-time setup: copy the example env file and fill in your values
+cp agents/qa-auto-create/.env.example agents/qa-auto-create/.env
+# Edit .env: set WORKSPACE_DIR, GITHUB_TOKEN, GITHUB_ORG at minimum
+
 # Direct mode — process a specific feature input file
 make run AGENT=qa-auto-create FEATURE=payments
 
@@ -164,17 +168,20 @@ make audit AGENT=qa-auto-create SESSION=20260330-143022-create-payments
 
 ---
 
-## Thanos-pw Framework Conventions
+## Jarvis Framework Conventions
 
-**The following rules are MANDATORY for all generated Java code. Claude must follow these
-exactly — any deviation will cause test compilation or runtime failures.**
+> **All framework conventions are defined in `Jarvis/CLAUDE.md`** (the single source of truth).
+> The agent scripts read that file directly and inject it into every Claude prompt.
+> Do NOT duplicate framework rules here — update `Jarvis/CLAUDE.md` instead.
+
+The section below covers **agent-specific generation rules** that are not in `Jarvis/CLAUDE.md`.
 
 ### Package Structure (new module)
 ```
 src/main/java/automation/modules/{feature}/
   {Feature}Data.java
   {Feature}Builder.java
-  {Feature}Helper.java          extends AuthHelper
+  {Feature}Helper.java          extends ApiHelper
   api/{Feature}Api.java         enum implements ApiDetails
   web/{Page}Page.java           extends BasePage
 
@@ -183,231 +190,9 @@ src/test/java/automation/{feature}/
   {Feature}WebTest.java         extends TestBase
 ```
 
-### Data POJO
-```java
-@Data @NoArgsConstructor @AllArgsConstructor
-@JsonInclude(JsonInclude.Include.NON_NULL)
-public class PaymentData {
-    @JsonProperty("recipient_id") private String recipientId;
-    @JsonProperty("amount")       private String amount;
-    @JsonProperty("currency")     private String currency;
-    // response-only (set by server, not sent in request body):
-    @JsonProperty("id")           private String id;
-    @JsonProperty("status")       private String status;
-}
-```
-- All field names map JSON `snake_case` → Java `camelCase` via `@JsonProperty`
-- `@JsonInclude(NON_NULL)` omits null fields from request bodies
-- Response-only fields (id, status, createdAt) must still be on the POJO but not set in Builder
-
-### Builder
-```java
-public class PaymentBuilder {
-    private String recipientId;
-    private String amount;
-    private String currency = "SGD";   // default value
-
-    public PaymentBuilder withRecipientId(String id)  { this.recipientId = id; return this; }
-    public PaymentBuilder withAmount(String amount)    { this.amount = amount;  return this; }
-    public PaymentBuilder withCurrency(String cur)     { this.currency = cur;   return this; }
-
-    public PaymentBuilder withDefaults() {
-        if (recipientId == null) recipientId = DataGenerator.randomUUID();
-        if (amount == null)      amount = "100";
-        return this;
-    }
-
-    public PaymentData build() {
-        withDefaults();
-        PaymentData p = new PaymentData();
-        p.setRecipientId(recipientId);
-        p.setAmount(amount);
-        p.setCurrency(currency);
-        return p;
-    }
-}
-```
-
-### API Enum
-```java
-public enum PaymentApi implements ApiDetails {
-    CreatePayment(Method.POST,   "/v1/payments",       201),
-    GetPayment(   Method.GET,    "/v1/payments/{id}",  200),
-    ListPayments( Method.GET,    "/v1/payments",       200),
-    DeletePayment(Method.DELETE, "/v1/payments/{id}",  200);
-
-    private final Method method;
-    private final String endpoint;
-    private final int expectedStatus;
-
-    PaymentApi(Method method, String endpoint, int expectedStatus) {
-        this.method = method; this.endpoint = endpoint; this.expectedStatus = expectedStatus;
-    }
-
-    @Override public Method getMethod()       { return method; }
-    @Override public String getEndpoint()     { return endpoint; }
-    @Override public int getExpectedStatus()  { return expectedStatus; }
-
-    public ApiDetails withPath(String param, String value) {
-        String resolved = this.endpoint.replace("{" + param + "}", value);
-        final Method m = this.method; final int s = this.expectedStatus;
-        return new ApiDetails() {
-            @Override public Method getMethod()      { return m; }
-            @Override public String getEndpoint()    { return resolved; }
-            @Override public int getExpectedStatus() { return s; }
-        };
-    }
-}
-```
-
-### Helper
-```java
-public class PaymentHelper extends AuthHelper {
-    public PaymentHelper(Config config) { super(config); }
-
-    // API workflows
-    public PaymentData createPayment(PaymentData payment) {
-        PaymentData created = executeAndVerify(PaymentApi.CreatePayment, payment, payment);
-        AssertHelper.assertNotNull(config, created.getId(), "Payment ID generated");
-        return created;
-    }
-    public PaymentData getPayment(String paymentId) {
-        return execute(PaymentApi.GetPayment.withPath("id", paymentId), null, PaymentData.class);
-    }
-
-    // Web workflows (only if orchestrating 2+ page objects)
-    public PaymentFormPage createPaymentViaUI(DashboardPage dashboard, PaymentData payment) {
-        PaymentListPage list = dashboard.navigateToPayments();
-        PaymentFormPage form = list.clickNewPayment();
-        form.createPayment(payment);
-        return form;
-    }
-}
-```
-
-### Page Object
-```java
-public class PaymentListPage extends BasePage {
-    private final Locator newPaymentButton;
-    private final Locator paymentList;
-
-    public PaymentListPage(Config config) {
-        super(config);
-        newPaymentButton = page.locator("[data-cy='new-payment-btn']");
-        paymentList      = page.locator("[data-cy='payment-list']");
-        waitUntilLoaded();   // ONLY in constructor
-    }
-
-    @Override protected void waitUntilLoaded() {
-        WaitHelper.waitForElementToBeVisible(config, paymentList, "Payment list");
-    }
-
-    public PaymentFormPage clickNewPayment() {
-        click(newPaymentButton, "New Payment button");
-        return new PaymentFormPage(config);   // always return next page
-    }
-
-    public boolean isPaymentVisible(String reference) {
-        Locator row = page.locator("[data-cy='payment-row']:has-text('" + reference + "')");
-        return isElementDisplayed(row);
-    }
-}
-```
-
-### API Test Class
-```java
-package automation.payments;
-
-import org.testng.annotations.Test;
-import automation.core.*;
-import automation.core.Enums.*;
-import automation.modules.payments.*;
-import automation.modules.payments.api.PaymentApi;
-
-public class PaymentApiTest extends TestBase {
-
-    @Test(description = "Create a payment and verify it is returned by GET",
-          dataProvider = "getConfig", groups = {GROUP_REGRESSION, GROUP_API})
-    @TestVariables(automatedBy = QA.Mukesh, country = Country.SG)
-    public void createAndVerifyPayment(Config config) {
-        User user = allocateUser(config, UserType.Admin, Feature.CARD, Country.SG);
-
-        PaymentHelper payments = new PaymentHelper(config);
-        payments.loginAndSetAuth(user);
-
-        config.logStep("Create a payment of 100 SGD and verify the ID is returned");
-        PaymentData payment = new PaymentBuilder().withAmount("100").withCurrency("SGD").build();
-        PaymentData created = payments.createPayment(payment);
-
-        config.logStep("Fetch the payment by ID and verify status is PENDING");
-        PaymentData fetched = payments.getPayment(created.getId());
-        AssertHelper.assertEquals(config, fetched.getStatus(), "PENDING", "Payment status is PENDING");
-    }
-}
-```
-
-### Web Test Class
-```java
-package automation.payments;
-
-import org.testng.annotations.Test;
-import automation.core.*;
-import automation.core.Enums.*;
-import automation.modules.payments.*;
-import automation.modules.payments.web.*;
-import automation.modules.access.web.DashboardPage;
-
-public class PaymentWebTest extends TestBase {
-
-    @Test(description = "Create a payment via UI and verify success message",
-          dataProvider = "getConfig", groups = {GROUP_REGRESSION, GROUP_WEB})
-    @TestVariables(testrailData = "1:C0001:WEB", automatedBy = QA.Mukesh, country = Country.SG)
-    public void createPaymentViaUI(Config config) {
-        User user = allocateUser(config, UserType.Admin, Feature.CARD, Country.SG);
-
-        PaymentData payment = new PaymentBuilder().withAmount("100").withCurrency("SGD").build();
-
-        PaymentHelper payments = new PaymentHelper(config);
-        DashboardPage dashboard = payments.doLogin(user);
-
-        config.logStep("Navigate to Payments, click New Payment, fill form and submit");
-        PaymentFormPage form = payments.createPaymentViaUI(dashboard, payment);
-
-        config.logStep("Verify success message is displayed");
-        AssertHelper.assertTrue(config, form.isSuccessMessageVisible(), "Success message should appear");
-    }
-}
-```
-
----
-
-## Critical Rules (enforced during code review)
-
-**DO:**
-- Extend `TestBase` in all test classes
-- Use `@TestVariables` on every `@Test` method
-- Use `dataProvider = "getConfig"` or `"getTwoConfigs"`
-- Allocate users via `allocateUser(config, UserType, Feature, Country)` — never hardcode
-- Use `[data-cy='...']` as primary locator strategy
-- Use `BasePage` methods in page objects (`click`, `fillText`, `getText`)
-- Use `AssertHelper` for all assertions
-- Call `waitUntilLoaded()` in page constructors only
-- Use `WaitHelper` everywhere else — never `Thread.sleep()`
-- Return the next page object from every navigation method
-- Use `config.logStep()` in test classes, `config.logComment()` in helpers/pages
-- Use `@JsonInclude(NON_NULL)` and `@JsonProperty` on all Data POJOs
-
-**DON'T:**
-- Hardcode credentials — use `allocateUser()`
-- Call Playwright locator methods directly — use `BasePage`/`Element` wrappers
-- Use `Assert.*` — use `AssertHelper.*`
-- Use `Thread.sleep()` — use `WaitHelper`
-- Use XPath unless nothing else works
-- Use CSS class names like `.v-btn` or hash classes as locators
-- Instantiate page objects in test classes — use Helper methods
-- Use `Log.step()` inside helpers or page objects
-- Share users between test methods
-- Hardcode URLs — put them in properties files
+All patterns (Data POJO, Builder, API Enum, Helper, Page Object, Test classes, DO/DON'T rules)
+are defined in `Jarvis/CLAUDE.md` and injected into every Claude prompt at runtime.
+Refer to [Jarvis/CLAUDE.md](../../../Jarvis/CLAUDE.md) for the authoritative reference.
 
 ---
 

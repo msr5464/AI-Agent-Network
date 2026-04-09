@@ -28,7 +28,7 @@ AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
 
 WORKSPACE_DIR    = Path(os.environ.get("WORKSPACE_DIR", REPO_ROOT.parent))
-THANOS_PW_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Thanos-pw")
+AUTOMATION_FRAMEWORK_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
 
 CLAUDE_CLI = os.environ.get("CLAUDE_CLI_PATH", "claude")
 MODEL      = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
@@ -75,19 +75,20 @@ def extract_json(text: str):
 
 
 def read_reference_files() -> dict:
-    """Read reference implementation files from Thanos-pw to show Claude the patterns."""
+    """Read reference implementation files from Jarvis to show Claude the patterns."""
     ref_paths = [
-        "src/main/java/automation/modules/cards/CardData.java",
-        "src/main/java/automation/modules/cards/CardBuilder.java",
-        "src/main/java/automation/modules/cards/CardHelper.java",
-        "src/main/java/automation/modules/cards/api/CardApi.java",
-        "src/main/java/automation/modules/access/AuthHelper.java",
-        "src/test/java/automation/cards/CardApiTest.java",
-        "src/test/java/automation/cards/CardWebTest.java",
+        "src/main/java/automation/modules/github/GitHubData.java",
+        "src/main/java/automation/modules/github/GitHubBuilder.java",
+        "src/main/java/automation/modules/github/GitHubHelper.java",
+        "src/main/java/automation/modules/github/api/GitHubApi.java",
+        "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
+        "src/main/java/automation/core/api/ApiHelper.java",
+        "src/test/java/automation/github/GitHubApiTest.java",
+        "src/test/java/automation/saucedemo/SauceDemoWebTest.java",
     ]
     refs = {}
     for rel in ref_paths:
-        full = THANOS_PW_DIR / rel
+        full = AUTOMATION_FRAMEWORK_DIR / rel
         if full.exists():
             try:
                 refs[rel] = full.read_text()
@@ -98,13 +99,13 @@ def read_reference_files() -> dict:
 
 def read_existing_file(rel_path: str) -> str:
     """Read an existing file from Thanos-pw if it exists (for append mode)."""
-    full = THANOS_PW_DIR / rel_path
+    full = AUTOMATION_FRAMEWORK_DIR / rel_path
     return full.read_text() if full.exists() else ""
 
 
 def write_file(rel_path: str, content: str) -> None:
     """Write a file into Thanos-pw, creating parent directories as needed."""
-    full = THANOS_PW_DIR / rel_path
+    full = AUTOMATION_FRAMEWORK_DIR / rel_path
     full.parent.mkdir(parents=True, exist_ok=True)
     full.write_text(content)
     log(f"  Wrote: {rel_path}")
@@ -115,7 +116,11 @@ def write_file(rel_path: str, content: str) -> None:
 def main() -> None:
     plan = json.loads((AUDIT_DIR / "01-parse.json").read_text())
     web_data = json.loads((AUDIT_DIR / "02-validate-web.json").read_text())
-    claude_md = (AGENT_DIR / "CLAUDE.md").read_text() if (AGENT_DIR / "CLAUDE.md").exists() else ""
+    # Read Jarvis/CLAUDE.md — single source of truth for framework conventions.
+    fw_claude_md_path = AUTOMATION_FRAMEWORK_DIR / "CLAUDE.md"
+    claude_md = fw_claude_md_path.read_text() if fw_claude_md_path.exists() else ""
+    if not claude_md:
+        log("WARNING: Jarvis/CLAUDE.md not found — check WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
 
     feature        = plan["feature_name"]
     feature_class  = plan["feature_class"]
@@ -190,7 +195,7 @@ def main() -> None:
     # Determine which files to generate
     files_to_generate = _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, feature)
 
-    prompt = f"""You are a Java test automation code generator for the Thanos-pw framework.
+    prompt = f"""You are a Java test automation code generator for the Jarvis framework.
 
 <framework_conventions>
 {claude_md}
@@ -219,7 +224,9 @@ Rules (MANDATORY — violations will cause compilation failures):
 3. Builder: fluent with*() methods returning `this`. withDefaults() sets null fields.
    build() calls withDefaults() then constructs the POJO.
 4. API enum: implements ApiDetails. Include withPath(String param, String value) method.
-5. Helper: extends AuthHelper. API methods call execute()/executeAndVerify()/executeRaw().
+5. Helper: extends ApiHelper (import automation.core.api.ApiHelper). Pass customBaseUrl to super(config, BASE_URL).
+   API methods call execute()/executeAndVerify()/executeRaw().
+   For token auth: call setAuthToken(token) on the helper after construction.
    Web methods only if they orchestrate 2+ page objects.
 6. Page objects: extend BasePage. Define all locators in constructor using page.locator().
    Call waitUntilLoaded() LAST in constructor. waitUntilLoaded() uses WaitHelper.
@@ -262,9 +269,9 @@ Return ONLY a JSON object, no prose:
             log(f"  Skipping empty: {rel_path}")
             continue
         # Safety check — only write into Thanos-pw
-        full_path = THANOS_PW_DIR / rel_path
+        full_path = AUTOMATION_FRAMEWORK_DIR / rel_path
         try:
-            full_path.resolve().relative_to(THANOS_PW_DIR.resolve())
+            full_path.resolve().relative_to(AUTOMATION_FRAMEWORK_DIR.resolve())
         except ValueError:
             log(f"  BLOCKED: path escapes Thanos-pw root: {rel_path}")
             continue
@@ -279,7 +286,7 @@ Return ONLY a JSON object, no prose:
         "test_type": test_type,
         "existing_module": existing,
         "files_written": written,
-        "thanos_pw_dir": str(THANOS_PW_DIR),
+        "automation_framework_dir": str(AUTOMATION_FRAMEWORK_DIR),
         "test_class": _infer_test_class(written, test_type),
         "test_method": _infer_test_method(plan, test_type),
     }
@@ -319,7 +326,7 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
             for page_def in plan.get("web_pages", []):
                 class_name = page_def["class_name"]
                 page_path = f"src/main/java/automation/modules/{feature_lower}/web/{class_name}.java"
-                if not (THANOS_PW_DIR / page_path).exists():
+                if not (AUTOMATION_FRAMEWORK_DIR / page_path).exists():
                     files.append(page_path)
 
     # Test classes — always new files (even for existing modules)

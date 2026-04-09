@@ -25,7 +25,7 @@ REPO_ROOT  = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[
 INPUT_FILE = Path(os.environ["INPUT_FILE"])
 
 WORKSPACE_DIR    = Path(os.environ.get("WORKSPACE_DIR", REPO_ROOT.parent))
-THANOS_PW_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Thanos-pw")
+AUTOMATION_FRAMEWORK_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
 
 CLAUDE_CLI = os.environ.get("CLAUDE_CLI_PATH", "claude")
 MODEL      = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
@@ -72,18 +72,18 @@ def extract_json(text: str):
 
 def module_exists(feature_name: str) -> bool:
     """Check if the feature module already exists in Thanos-pw."""
-    module_dir = THANOS_PW_DIR / "src/main/java/automation/modules" / feature_name.lower()
+    module_dir = AUTOMATION_FRAMEWORK_DIR / "src/main/java/automation/modules" / feature_name.lower()
     return module_dir.exists()
 
 
 def read_existing_module_files(feature_name: str) -> dict:
     """Read existing module files to give Claude context when appending."""
-    module_dir = THANOS_PW_DIR / "src/main/java/automation/modules" / feature_name.lower()
+    module_dir = AUTOMATION_FRAMEWORK_DIR / "src/main/java/automation/modules" / feature_name.lower()
     if not module_dir.exists():
         return {}
     files = {}
     for f in module_dir.rglob("*.java"):
-        rel = f.relative_to(THANOS_PW_DIR)
+        rel = f.relative_to(AUTOMATION_FRAMEWORK_DIR)
         try:
             files[str(rel)] = f.read_text()[:3000]  # truncate large files
         except Exception:
@@ -97,14 +97,15 @@ def main() -> None:
     log(f"Reading input: {INPUT_FILE}")
     raw_text = INPUT_FILE.read_text()
 
-    # Load agent CLAUDE.md — for parsing we only need the package structure and naming
-    # conventions, not the full Java code examples (those are only needed in 03_generate.py).
-    # Trim at the first Java code block to keep the prompt compact.
-    claude_md_path = AGENT_DIR / "CLAUDE.md"
-    claude_md_full = claude_md_path.read_text() if claude_md_path.exists() else ""
-    # Keep everything up to (but not including) the first ```java block
-    java_block_pos = claude_md_full.find("```java")
-    claude_md = claude_md_full[:java_block_pos].strip() if java_block_pos > 0 else claude_md_full
+    # Load Jarvis CLAUDE.md (the single source of truth for framework conventions).
+    # For parsing we only need structure/naming rules, not full Java examples, so
+    # trim at the first ```java block to keep the prompt compact.
+    fw_claude_md_path = AUTOMATION_FRAMEWORK_DIR / "CLAUDE.md"
+    fw_claude_md_full = fw_claude_md_path.read_text() if fw_claude_md_path.exists() else ""
+    if not fw_claude_md_full:
+        log("WARNING: Jarvis/CLAUDE.md not found — check WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
+    java_block_pos = fw_claude_md_full.find("```java")
+    claude_md = fw_claude_md_full[:java_block_pos].strip() if java_block_pos > 0 else fw_claude_md_full
 
     # Extract feature name hint from first line to check module existence early
     feature_hint = ""
@@ -126,7 +127,7 @@ def main() -> None:
             existing_context += f"\n--- {path} ---\n{content}\n"
         existing_context += "</existing_module_files>"
 
-    prompt = f"""You are a QA automation planning agent for the Thanos-pw Java framework.
+    prompt = f"""You are a QA automation planning agent for the Jarvis Java framework.
 
 <framework_conventions>
 {claude_md}
@@ -171,7 +172,7 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
       "description": "Create a payment and verify it is returned by GET",
       "steps": [
         "allocate Admin user",
-        "loginAndSetAuth",
+        "setAuthToken",
         "build PaymentData with amount 100 and currency SGD",
         "call createPayment and assertNotNull id",
         "call getPayment by id and assertEquals status PENDING"

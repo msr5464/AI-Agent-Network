@@ -30,11 +30,11 @@ AGENT_DIR  = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1
 REPO_ROOT  = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
 
 WORKSPACE_DIR          = Path(os.environ.get("WORKSPACE_DIR", str(REPO_ROOT.parent)))
-THANOS_PW_DIR          = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Thanos-pw")
+AUTOMATION_FRAMEWORK_DIR          = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
 
 AUTO_PUSH              = os.environ.get("AUTO_PUSH", "true").lower() == "true"
 GITHUB_ORG             = os.environ.get("GITHUB_ORG", "")
-GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "Thanos-pw")
+GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
 GITHUB_DEFAULT_BRANCH  = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
 GITHUB_PR_REVIEWERS    = [r.strip() for r in os.environ.get("GITHUB_PR_REVIEWERS", "").split(",") if r.strip()]
 BRANCH_PREFIX          = os.environ.get("AUTOCREATE_BRANCH_PREFIX", "feat/qa-autocreate")
@@ -107,8 +107,8 @@ def create_branch_and_commit(gen_data: dict, fix_data: dict) -> tuple:
         log("No files to commit")
         return None, None
 
-    if not THANOS_PW_DIR.exists():
-        log(f"ERROR: Thanos-pw not found: {THANOS_PW_DIR}")
+    if not AUTOMATION_FRAMEWORK_DIR.exists():
+        log(f"ERROR: Automation framework repo not found: {AUTOMATION_FRAMEWORK_DIR}")
         return None, None
 
     # Build branch name
@@ -119,29 +119,29 @@ def create_branch_and_commit(gen_data: dict, fix_data: dict) -> tuple:
     log(f"Creating branch: {branch_name}")
 
     # Ensure we're on the default branch first
-    rc, _, err = git(["checkout", GITHUB_DEFAULT_BRANCH], THANOS_PW_DIR)
+    rc, _, err = git(["checkout", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
         log(f"WARNING: Could not checkout {GITHUB_DEFAULT_BRANCH}: {err}")
 
-    rc, _, err = git(["pull", "origin", GITHUB_DEFAULT_BRANCH], THANOS_PW_DIR)
+    rc, _, err = git(["pull", "origin", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
         log(f"WARNING: Pull failed: {err}")
 
-    rc, _, err = git(["checkout", "-b", branch_name], THANOS_PW_DIR)
+    rc, _, err = git(["checkout", "-b", branch_name], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
         log(f"ERROR: Could not create branch: {err}")
         return None, None
 
     # Stage only the generated files
     for rel_path in files_written:
-        full_path = THANOS_PW_DIR / rel_path
+        full_path = AUTOMATION_FRAMEWORK_DIR / rel_path
         if full_path.exists():
-            rc, _, err = git(["add", rel_path], THANOS_PW_DIR)
+            rc, _, err = git(["add", rel_path], AUTOMATION_FRAMEWORK_DIR)
             if rc != 0:
                 log(f"WARNING: Could not stage {rel_path}: {err}")
 
     # Check if there's anything staged
-    rc, status_out, _ = git(["diff", "--cached", "--name-only"], THANOS_PW_DIR)
+    rc, status_out, _ = git(["diff", "--cached", "--name-only"], AUTOMATION_FRAMEWORK_DIR)
     if not status_out.strip():
         log("Nothing to commit — files unchanged")
         return branch_name, None
@@ -163,12 +163,12 @@ def create_branch_and_commit(gen_data: dict, fix_data: dict) -> tuple:
         f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
     )
 
-    rc, _, err = git(["commit", "-m", commit_msg], THANOS_PW_DIR)
+    rc, _, err = git(["commit", "-m", commit_msg], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
         log(f"ERROR: Commit failed: {err}")
         return branch_name, None
 
-    rc, sha, _ = git(["rev-parse", "--short", "HEAD"], THANOS_PW_DIR)
+    rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
     log(f"Committed: {sha}")
     return branch_name, sha
 
@@ -186,7 +186,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
     full_repo = f"{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}"
     log(f"Pushing {branch_name} to {full_repo}...")
 
-    rc, _, err = git(["push", "-u", "origin", branch_name], THANOS_PW_DIR)
+    rc, _, err = git(["push", "-u", "origin", branch_name], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
         log(f"Push failed: {err}")
         return None
@@ -258,7 +258,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
         pr_cmd += ["--reviewer", reviewer]
 
     log("Creating PR...")
-    result = subprocess.run(pr_cmd, cwd=str(THANOS_PW_DIR), capture_output=True, text=True, timeout=60)
+    result = subprocess.run(pr_cmd, cwd=str(AUTOMATION_FRAMEWORK_DIR), capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
         log(f"PR creation failed: {result.stderr[:500]}")
         return None
