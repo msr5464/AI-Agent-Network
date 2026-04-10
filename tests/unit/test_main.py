@@ -1,20 +1,15 @@
 """
-Unit tests for src/main.py - entry point and orchestration helpers.
-Tests the _guess_environment() helper, argparse setup, prompt configuration,
-and that the main entry point is invokable.
+Unit tests for main orchestration helpers (environment detection, argparse, prompts config).
+Does not test src/main.py (deleted) — tests standalone helper logic only.
 """
 
-import subprocess
 import sys
 from pathlib import Path
-from unittest import mock
 
 import pytest
 import yaml
 
-# Add repo root to path so src.* imports work
 _repo_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_repo_root))
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +96,7 @@ class TestArgparse:
         """The main() function should support all documented CLI flags."""
         import argparse
         # Replicate the argparse setup from main.py
-        parser = argparse.ArgumentParser(description="QA AI Agent")
+        parser = argparse.ArgumentParser(description="QA Agent Network")
         parser.add_argument("--input-dir")
         parser.add_argument("--output-dir")
         parser.add_argument("--table-name")
@@ -203,48 +198,3 @@ class TestPromptsYaml:
         assert 'JSON' in prompt or 'json' in prompt.lower()
 
 
-class TestEntryPoint:
-    """Test that the main entry point (src/main.py) is correctly exposed and CLI works."""
-
-    def test_main_module_has_main_callable(self):
-        """src.main should expose a callable main() as the entry point."""
-        import src.main as main_module
-        assert hasattr(main_module, 'main')
-        assert callable(main_module.main)
-
-    def test_config_loaded_at_bootstrap(self):
-        """Importing src.main loads Config first; key config attributes are available."""
-        import src.main as main_module  # noqa: F401
-        from src.settings import Config
-        # Bootstrap doc: Config is imported in main before other app code; verify it is usable
-        assert hasattr(Config, 'INPUT_DIR')
-        assert hasattr(Config, 'OUTPUT_DIR')
-        assert hasattr(Config, 'LOG_FORMAT')
-        assert hasattr(Config, 'LOG_FILE_NAME')
-        assert isinstance(Config.INPUT_DIR, str) and len(Config.INPUT_DIR) > 0
-        assert isinstance(Config.OUTPUT_DIR, str) and len(Config.OUTPUT_DIR) > 0
-
-    def test_main_module_cli_help_exits_successfully(self):
-        """Running python -m src.main --help should exit with code 0 and show CLI options."""
-        result = subprocess.run(
-            [sys.executable, '-m', 'src.main', '--help'],
-            cwd=str(_repo_root),
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0
-        out = result.stdout + result.stderr
-        assert '--input-dir' in out or 'input-dir' in out
-        assert '--output-dir' in out or 'output-dir' in out
-
-    def test_run_scripts_exist_and_invoke_main(self):
-        """Documented run scripts (run.sh, run.ps1) should exist and reference the main entry point."""
-        scripts_dir = _repo_root / 'scripts'
-        run_sh = scripts_dir / 'run.sh'
-        run_ps1 = scripts_dir / 'run.ps1'
-        assert run_sh.exists(), "scripts/run.sh should exist (see docs/ENTRY_POINTS_AND_CONFIG.md)"
-        assert run_ps1.exists(), "scripts/run.ps1 should exist (see docs/ENTRY_POINTS_AND_CONFIG.md)"
-        run_sh_text = run_sh.read_text(encoding='utf-8')
-        run_ps1_text = run_ps1.read_text(encoding='utf-8')
-        assert 'main.py' in run_sh_text or 'src.main' in run_sh_text, "run.sh should invoke src main"
-        assert 'main.py' in run_ps1_text or 'src.main' in run_ps1_text, "run.ps1 should invoke src main"

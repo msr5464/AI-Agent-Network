@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-_repo_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_repo_root))
+_agent_dir = Path(__file__).resolve().parent.parent.parent / 'agents' / 'test-triaging-agent'
+sys.path.insert(0, str(_agent_dir))
 
-from src.parsers.models import (
+from lib.parsers.models import (
     TestResult as ResultModel,
     TestStatus as StatusEnum,
     TestSummary as SummaryModel,

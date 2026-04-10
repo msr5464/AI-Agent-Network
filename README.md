@@ -1,13 +1,13 @@
 <div>
   <img src="https://raw.githubusercontent.com/msr5464/Basic-Automation-Framework/refs/heads/master/Logo-full.png" height="50">
 
-  # QA AI Agent
+  # QA Agent Network
 
   [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 </div>
 
-Two AI agents that close the loop on test failures — from analysis to a merged PR — with no manual steps required.
+*An AI-driven multi-agent system for end-to-end QA automation*
 
 ---
 
@@ -18,7 +18,7 @@ Test build finishes
        │
        ▼
 ┌─────────────────────────────────────────────────────┐
-│  Agent 1: qa-auto-analyse                           │
+│  Agent 1: test-triaging-agent                           │
 │                                                     │
 │  01 Scout  → pick unanalyzed build tag from DB      │
 │  02 Collect→ DB query + HTML log parse              │
@@ -30,7 +30,7 @@ Test build finishes
                            │  (AUTOMATION_ISSUE HIGH ELEMENT_NOT_FOUND only)
                            ▼
 ┌─────────────────────────────────────────────────────┐
-│  Agent 2: qa-auto-fix   (runs independently)        │
+│  Agent 2: test-healing-agent   (runs independently)        │
 │                                                     │
 │  01 Fix  → Claude generates locator fix per test    │
 │            → applies fix, runs test, rolls back     │
@@ -102,7 +102,7 @@ Audit: 20260329-143022-fix-ProdSanity-All-Tests-541
 
 ```bash
 git clone <repository-url>
-cd QA-AI-Agent
+cd QA-Agent-Network
 
 ./scripts/setup.sh          # macOS / Linux
 .\scripts\setup.ps1         # Windows
@@ -145,7 +145,7 @@ STOP_AFTER=classify ./scripts/run-analyse.sh          # stop early for inspectio
 
 Outputs:
 - HTML report → `OUTPUT_DIR/`
-- Handoff file → `agents/qa-auto-fix/queue/<build_tag>.json` (if fixable issues found)
+- Handoff file → `agents/test-healing-agent/queue/<build_tag>.json` (if fixable issues found)
 - Slack notification → `SLACK_NOTIFY_CHANNEL` or `SLACK_ALERT_CHANNEL`
 
 ### 4. Run Agent 2 — Auto-fix
@@ -184,7 +184,7 @@ Outputs:
 | `REVIEWER_MODEL` | `claude-sonnet-4-6` | Model for adversarial review |
 | `AUTOFIX_MODEL` | `claude-opus-4-6` | Model for fix generation |
 
-### Agent 1 — qa-auto-analyse
+### Agent 1 — test-triaging-agent
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -194,13 +194,13 @@ Outputs:
 | `MAX_REVIEW_ROUNDS` | `2` | Max classifier ↔ reviewer debate rounds |
 | `INPUT_DIR` | `testdata` | Directory containing test report HTML |
 | `OUTPUT_DIR` | `reports` | Directory for generated HTML reports |
-| `AUTOFIX_QUEUE_DIR` | `agents/qa-auto-fix/queue` | Where to write handoff files |
+| `AUTOFIX_QUEUE_DIR` | `agents/test-healing-agent/queue` | Where to write handoff files |
 
-### Agent 2 — qa-auto-fix
+### Agent 2 — test-healing-agent
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `WORKSPACE_DIR` | parent of QA-AI-Agent | Parent directory for the automation repo. If the repo is absent, it is cloned automatically. |
+| `WORKSPACE_DIR` | parent of QA-Agent-Network | Parent directory for the automation repo. If the repo is absent, it is cloned automatically. |
 | `GITHUB_REPO_AUTOMATION` | | Automation repo directory name under `WORKSPACE_DIR` |
 | `GITHUB_TOKEN` | | GitHub token — used for clone + PR creation |
 | `GITHUB_ORG` | | GitHub organisation owning the automation repo |
@@ -252,9 +252,9 @@ If `SLACK_BOT_TOKEN` is not set, Slack is silently skipped.
 ## Project Structure
 
 ```
-QA-AI-Agent/
+QA-Agent-Network/
 ├── agents/
-│   ├── qa-auto-analyse/       # Agent 1 — analyse, classify, report
+│   ├── test-triaging-agent/       # Agent 1 — analyse, classify, report
 │   │   ├── run.sh             # Orchestrator (steps 01–05)
 │   │   ├── CLAUDE.md          # Full agent spec (read by Claude CLI)
 │   │   ├── feedback/          # skip-buildtags.json
@@ -264,10 +264,10 @@ QA-AI-Agent/
 │   │       ├── 03_classify.py # Batch classify failures via Claude
 │   │       ├── 04_review.py   # Adversarial review + .verdict gate
 │   │       └── 05_ship.py     # HTML report + handoff JSON + Slack
-│   └── qa-auto-fix/           # Agent 2 — fix locators, raise PR
+│   └── test-healing-agent/           # Agent 2 — fix locators, raise PR
 │       ├── run.sh             # Orchestrator (queue / direct / file-path mode)
 │       ├── CLAUDE.md          # Full agent spec (read by Claude CLI)
-│       ├── queue/             # Pending handoffs from qa-auto-analyse
+│       ├── queue/             # Pending handoffs from test-triaging-agent
 │       ├── feedback/          # known-issues.json (patterns to skip)
 │       └── actions/
 │           ├── 01_fix.py      # Fix locators → run tests → commit
@@ -310,7 +310,7 @@ Set `CLAUDE_CLI_PATH` in `config/.env` to the full path of the Claude CLI binary
 Set `GITHUB_TOKEN`, `GITHUB_ORG`, and `GITHUB_REPO_AUTOMATION` in `config/.env`.
 
 **PR not created after fix**
-Check `agents/qa-auto-fix/audit/<session>/02-ship.md` for the exact reason. Common causes: push failed, no successful fixes, `AUTO_PUSH=false`.
+Check `agents/test-healing-agent/audit/<session>/02-ship.md` for the exact reason. Common causes: push failed, no successful fixes, `AUTO_PUSH=false`.
 
 ---
 

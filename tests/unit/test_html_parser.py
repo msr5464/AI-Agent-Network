@@ -10,10 +10,11 @@ from pathlib import Path
 import pytest
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_repo_root))
+_agent_dir = _repo_root / 'agents' / 'test-triaging-agent'
+sys.path.insert(0, str(_agent_dir))
 
-from src.parsers.html_parser import HTMLReportParser
-from src.parsers.models import TestStatus
+from lib.parsers.html_parser import HTMLReportParser
+from lib.parsers.models import TestStatus
 
 
 # Minimal overview.html fragment (ReportNG-style)
@@ -145,7 +146,7 @@ class TestHTMLReportParserSummary:
     """get_summary_stats."""
 
     def test_get_summary_stats(self):
-        from src.parsers.models import TestResult as TR, TestSummary as TS
+        from lib.parsers.models import TestResult as TR, TestSummary as TS
 
         parser = HTMLReportParser()
         results = [

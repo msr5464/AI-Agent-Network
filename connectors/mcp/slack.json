@@ -7,7 +7,6 @@
     "type": "bearer",
     "env_var": "SLACK_BOT_TOKEN"
   },
-  "used_by": ["qa-agent"],
-  "description": "Slack MCP — used by qa-agent to send report notifications and escalation alerts",
-  "docs": "https://api.slack.com/mcp"
+  "used_by": ["test-triaging-agent", "test-healing-agent", "test-authoring-agent"],
+  "docs": "https://api.slack.com/docs/mcp"
 }

@@ -2,7 +2,7 @@
 set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # scripts/run-autofix.sh
-# Run the qa-auto-fix agent.
+# Run the test-healing-agent agent.
 #
 # Usage:
 #   ./scripts/run-autofix.sh                                     # queue mode: picks oldest
@@ -34,4 +34,4 @@ else
   unset HANDOFF_FILE 2>/dev/null || true
 fi
 
-make run AGENT=qa-auto-fix BUILD_TAG="${BUILD_TAG:-}"
+make run AGENT=test-healing-agent BUILD_TAG="${BUILD_TAG:-}"

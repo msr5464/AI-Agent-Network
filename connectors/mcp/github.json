@@ -1,0 +1,12 @@
+{
+  "name": "github",
+  "status": "active",
+  "type": "url",
+  "url": "https://api.githubcopilot.com/mcp/",
+  "auth": {
+    "type": "bearer",
+    "env_var": "GITHUB_TOKEN"
+  },
+  "used_by": ["test-healing-agent", "test-authoring-agent"],
+  "docs": "https://docs.github.com/en/copilot/using-github-copilot/using-claude-as-your-copilot-in-github"
+}

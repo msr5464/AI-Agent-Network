@@ -1,16 +1,21 @@
 """
-Unit tests for ReportGenerator (src/reporters/report_generator.py).
-Tests HTML report generation, save_report, save_autofix_tests_file, and recurring failures section.
+Unit tests for ReportGenerator (agents/test-triaging-agent/lib/reporters/report_generator.py).
+Tests HTML report generation and recurring failures section.
 """
 
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from src.agent.analyzer import FailureClassification
-from src.parsers.models import TestSummary, TestResult, TestStatus
-from src.reporters.report_generator import ReportGenerator
+# Point at the agent's lib/ directory
+_agent_dir = Path(__file__).resolve().parent.parent.parent / 'agents' / 'test-triaging-agent'
+sys.path.insert(0, str(_agent_dir))
+
+from lib.agent.analyzer import FailureClassification
+from lib.parsers.models import TestSummary, TestResult, TestStatus
+from lib.reporters.report_generator import ReportGenerator
 
 
 def _minimal_summary():
@@ -57,39 +62,6 @@ class TestReportGeneratorSaveReport:
             assert Path(out).read_text(encoding="utf-8") == html
 
 
-class TestReportGeneratorSaveAutofixTestsFile:
-    """Test ReportGenerator.save_autofix_tests_file."""
-
-    def test_save_autofix_tests_file_creates_file_when_auto_fixable(self):
-        gen = ReportGenerator()
-        classifications = [
-            _minimal_classification("ClassA.testOne", automation=True),
-            _minimal_classification("ClassB.testTwo", automation=True),
-        ]
-        with tempfile.TemporaryDirectory() as tmp:
-            path = gen.save_autofix_tests_file(classifications, tmp, "MyReport-123")
-            assert path is not None
-            content = Path(path).read_text(encoding="utf-8")
-            assert "ClassA.testOne" in content
-            assert "ClassB.testTwo" in content
-            assert "Auto-fixable" in content or "autofix" in content.lower()
-
-    def test_save_autofix_tests_file_returns_none_when_no_auto_fixable(self):
-        gen = ReportGenerator()
-        classifications = [
-            _minimal_classification("ClassA.testOne", automation=False),
-        ]
-        with tempfile.TemporaryDirectory() as tmp:
-            path = gen.save_autofix_tests_file(classifications, tmp, "MyReport-123")
-            assert path is None
-
-    def test_save_autofix_tests_file_returns_none_when_empty(self):
-        gen = ReportGenerator()
-        with tempfile.TemporaryDirectory() as tmp:
-            path = gen.save_autofix_tests_file([], tmp, "MyReport-123")
-            assert path is None
-
-
 class TestReportGeneratorGenerateHtmlReport:
     """Test ReportGenerator.generate_html_report return type and flaky section."""
 
@@ -113,7 +85,6 @@ class TestReportGeneratorGenerateHtmlReport:
     def test_generate_html_report_includes_flaky_section_with_recurring_failures(self):
         gen = ReportGenerator()
         summary = _minimal_summary()
-        # Minimal recurring failure structure (as produced by AgentMemory.detect_recurring_failures)
         recurring_failures = [
             {
                 "test_name": "MySuite.MyTest",

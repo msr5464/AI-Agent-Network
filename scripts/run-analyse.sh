@@ -2,7 +2,7 @@
 set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # scripts/run-analyse.sh
-# Run the qa-auto-analyse agent.
+# Run the test-triaging-agent agent.
 #
 # Usage:
 #   ./scripts/run-analyse.sh [BUILD_TAG] [INPUT_DIR] [OUTPUT_DIR]
@@ -26,4 +26,4 @@ export BUILD_TAG
 [[ -n "$INPUT_DIR" ]]  && export INPUT_DIR
 [[ -n "$OUTPUT_DIR" ]] && export OUTPUT_DIR
 
-make run AGENT=qa-auto-analyse BUILD_TAG="$BUILD_TAG"
+make run AGENT=test-triaging-agent BUILD_TAG="$BUILD_TAG"
