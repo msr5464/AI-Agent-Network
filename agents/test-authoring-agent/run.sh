@@ -29,6 +29,33 @@ export FEATURE AGENT_DIR REPO_ROOT
 # ── Session helpers (log, run_step, fmt_duration, elapsed_since) ──────────────
 source "$REPO_ROOT/shared/session.sh"
 
+# ── Testing-mode cache helpers ────────────────────────────────────────────────
+# When TESTING_MODE=true, step-01 and step-02 outputs are cached under
+# agents/test-authoring-agent/cache/<feature>/ so they are reused on every
+# subsequent run of the same input file — saving ~3 minutes per iteration.
+# Clear the cache manually to force a fresh run:
+#   rm -rf agents/test-authoring-agent/cache/<feature>/
+TESTING_MODE="${TESTING_MODE:-false}"
+CACHE_DIR="$AGENT_DIR/cache/$FEATURE"
+
+# _cache_hit <filename>  → returns 0 if cache exists and TESTING_MODE=true
+_cache_hit() {
+  [[ "$TESTING_MODE" == "true" ]] && [[ -f "$CACHE_DIR/$1" ]]
+}
+# _cache_restore <filename>  → copies file from cache into current AUDIT_DIR
+_cache_restore() {
+  cp "$CACHE_DIR/$1" "$AUDIT_DIR/$1"
+  log "TESTING_MODE: restored $1 from cache ($CACHE_DIR)"
+}
+# _cache_save <filename>  → copies file from current AUDIT_DIR into cache
+_cache_save() {
+  if [[ "$TESTING_MODE" == "true" ]] && [[ -f "$AUDIT_DIR/$1" ]]; then
+    mkdir -p "$CACHE_DIR"
+    cp "$AUDIT_DIR/$1" "$CACHE_DIR/$1"
+    log "TESTING_MODE: cached $1 → $CACHE_DIR"
+  fi
+}
+
 # ── Locate input file ─────────────────────────────────────────────────────────
 QUEUE_DIR="$AGENT_DIR/queue"
 PROCESSED_DIR="$QUEUE_DIR/processed"
@@ -57,8 +84,11 @@ fi
 export INPUT_FILE FEATURE
 
 # ── Session init ───────────────────────────────────────────────────────────────
-SESSION_ID="$(date +%Y%m%d-%H%M%S)-create-${FEATURE}"
-AUDIT_DIR="$AGENT_DIR/audit/$SESSION_ID"
+# Honor a pre-set SESSION_ID / AUDIT_DIR (used by qa_agents_server so the wrapper
+# knows where the agent will write audit files before it starts). When invoked
+# via the CLI / Makefile neither is set, so we fall back to the historical default.
+SESSION_ID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)-create-${FEATURE}}"
+AUDIT_DIR="${AUDIT_DIR:-$AGENT_DIR/audit/$SESSION_ID}"
 mkdir -p "$AUDIT_DIR"
 export SESSION_ID AUDIT_DIR
 
@@ -89,8 +119,48 @@ EOF
 declare -a STEP_NAMES=()
 declare -a STEP_DURATIONS=()
 
+# ── Prerequisite — sync GITHUB_DEFAULT_BRANCH before any step runs ───────────────
+WORKSPACE_DIR="${WORKSPACE_DIR:-}"
+GITHUB_REPO_AUTOMATION="${GITHUB_REPO_AUTOMATION:-Jarvis}"
+GITHUB_DEFAULT_BRANCH="${GITHUB_DEFAULT_BRANCH:-main}"
+AUTOMATION_FRAMEWORK_DIR="${WORKSPACE_DIR}/${GITHUB_REPO_AUTOMATION}"
+
+if [[ -z "$WORKSPACE_DIR" ]]; then
+  log "ERROR: WORKSPACE_DIR is not set — cannot sync automation repo"
+  exit 1
+fi
+if [[ ! -d "$AUTOMATION_FRAMEWORK_DIR/.git" ]]; then
+  log "ERROR: Automation repo not found at $AUTOMATION_FRAMEWORK_DIR"
+  exit 1
+fi
+
+log "Prerequisite: syncing $AUTOMATION_FRAMEWORK_DIR to origin/$GITHUB_DEFAULT_BRANCH ..."
+if ! git -C "$AUTOMATION_FRAMEWORK_DIR" checkout -f "$GITHUB_DEFAULT_BRANCH" 2>&1; then
+  log "Prerequisite: checkout failed — fetching from origin and retrying ..."
+  git -C "$AUTOMATION_FRAMEWORK_DIR" fetch origin
+  if ! git -C "$AUTOMATION_FRAMEWORK_DIR" checkout -f "$GITHUB_DEFAULT_BRANCH" 2>&1; then
+    log "ERROR: Could not checkout $GITHUB_DEFAULT_BRANCH in $AUTOMATION_FRAMEWORK_DIR — aborting"
+    exit 1
+  fi
+fi
+if ! git -C "$AUTOMATION_FRAMEWORK_DIR" pull origin "$GITHUB_DEFAULT_BRANCH" 2>&1; then
+  log "ERROR: git pull origin/$GITHUB_DEFAULT_BRANCH failed — aborting to avoid stale base"
+  exit 1
+fi
+log "Prerequisite: $GITHUB_DEFAULT_BRANCH is up to date"
+
 # ── Step 01 — Parse ────────────────────────────────────────────────────────────
-run_step "[01/05] Parse" "python3 '$AGENT_DIR/actions/01_parse.py'"
+if _cache_hit "01-parse.json"; then
+  _cache_restore "01-parse.json"
+  [[ -f "$CACHE_DIR/01-parse.md" ]] && cp "$CACHE_DIR/01-parse.md" "$AUDIT_DIR/01-parse.md"
+  log "✓ [01/05] Parse — skipped (TESTING_MODE cache hit)"
+  STEP_NAMES+=("[01/05] Parse")
+  STEP_DURATIONS+=(0)
+else
+  run_step "[01/05] Parse" "python3 '$AGENT_DIR/actions/01_parse.py'"
+  _cache_save "01-parse.json"
+  _cache_save "01-parse.md"
+fi
 
 # ── Step 02 — Validate Web (skip for API-only) ────────────────────────────────
 TEST_TYPE=$(python3 -c "
@@ -101,7 +171,27 @@ print(d.get('test_type', 'api'))
 ")
 
 if [[ "$TEST_TYPE" == "web" || "$TEST_TYPE" == "both" ]]; then
-  run_step "[02/05] Validate Web" "python3 '$AGENT_DIR/actions/02_validate_web.py'"
+  if _cache_hit "02-validate-web.json"; then
+    _cache_restore "02-validate-web.json"
+    [[ -f "$CACHE_DIR/02-validate-web.md" ]] && cp "$CACHE_DIR/02-validate-web.md" "$AUDIT_DIR/02-validate-web.md"
+    log "✓ [02/05] Validate Web — skipped (TESTING_MODE cache hit)"
+    STEP_NAMES+=("[02/05] Validate Web")
+    STEP_DURATIONS+=(0)
+  else
+    run_step "[02/05] Validate Web" "python3 '$AGENT_DIR/actions/02_validate_web.py'"
+    # Only cache if Claude actually returned data (selectors or step results present)
+    if python3 -c "
+import json, os, sys
+from pathlib import Path
+d = json.loads(Path(os.environ['AUDIT_DIR']).joinpath('02-validate-web.json').read_text())
+sys.exit(0 if (d.get('selectors') or d.get('steps_passed') or d.get('steps_failed')) else 1)
+" 2>/dev/null; then
+      _cache_save "02-validate-web.json"
+      _cache_save "02-validate-web.md"
+    else
+      log "TESTING_MODE: step-02 result is empty — not caching (will re-run next time)"
+    fi
+  fi
 else
   log "[02/05] Validate Web — skipped (test_type=$TEST_TYPE)"
   python3 -c "

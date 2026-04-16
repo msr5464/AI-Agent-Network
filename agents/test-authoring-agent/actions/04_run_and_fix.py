@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +37,7 @@ AUTOMATION_FRAMEWORK_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMA
 MODEL        = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
 ENVIRONMENT  = os.environ.get("AUTOCREATE_ENVIRONMENT", "staging")
 COUNTRY      = os.environ.get("AUTOCREATE_COUNTRY", "SG")
+HEADLESS     = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
 FIX_ATTEMPT  = int(os.environ.get("FIX_ATTEMPT", "1"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
 
@@ -69,38 +71,60 @@ def extract_json(text: str):
 
 
 def run_maven_test(test_class: str, test_method: str) -> tuple:
-    """Run a single test via mvn. Returns (passed: bool, output: str)."""
-    if test_method:
-        test_arg = f"{test_class}#{test_method}"
-    else:
-        test_arg = test_class
+    """Run mvn test with real-time line-by-line streaming. Returns (passed, output)."""
+    test_arg = f"{test_class}#{test_method}" if test_method else test_class
 
     cmd = [
         "mvn", "test",
         f"-Dtest={test_arg}",
         f"-Denvironment={ENVIRONMENT}",
         f"-Dcountry={COUNTRY}",
-        "-Dheadless=true",
+        f"-Dheadless={'true' if HEADLESS else 'false'}",
         "--no-transfer-progress",
     ]
     log(f"Running: {' '.join(cmd)}")
+
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True, text=True,
-            timeout=300,
-            cwd=str(AUTOMATION_FRAMEWORK_DIR)
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,   # merge stderr into the same stream
+            text=True,
+            cwd=str(AUTOMATION_FRAMEWORK_DIR),
         )
-        output = result.stdout + "\n" + result.stderr
-        passed = result.returncode == 0
-        log(f"Test exit code: {result.returncode} ({'PASS' if passed else 'FAIL'})")
-        return passed, output[-4000:]
-    except subprocess.TimeoutExpired:
-        log("ERROR: mvn test timed out (300s)")
-        return False, "ERROR: Maven test timed out after 300 seconds."
     except FileNotFoundError:
         log("ERROR: mvn not found in PATH")
         return False, "ERROR: mvn command not found. Is Maven installed and in PATH?"
+
+    all_lines: list = []
+    timed_out = False
+
+    def _stream() -> None:
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            all_lines.append(line)
+            if line.strip():            # skip blank separator lines
+                log(f"  {line}")
+
+    reader = threading.Thread(target=_stream, daemon=True)
+    reader.start()
+
+    try:
+        proc.wait(timeout=300)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+
+    reader.join(timeout=5)
+
+    if timed_out:
+        log("ERROR: mvn test timed out (300s)")
+        return False, "\n".join(all_lines) + "\nERROR: Maven test timed out after 300 seconds."
+
+    passed = proc.returncode == 0
+    log(f"Test exit code: {proc.returncode} ({'PASS' if passed else 'FAIL'})")
+    # Return the full captured output (last 6000 chars keeps tail for Claude context)
+    return passed, "\n".join(all_lines)[-6000:]
 
 
 def read_generated_files(files_written: list) -> dict:
@@ -116,9 +140,11 @@ def read_generated_files(files_written: list) -> dict:
     return contents
 
 
-def apply_fix(files_map: dict) -> list:
-    """Write Claude's fixed file contents back to Thanos-pw. Returns list of patched files."""
+def apply_fix(files_map: dict) -> tuple:
+    """Write Claude's fixed file contents back to Thanos-pw.
+    Returns (patched_paths: list, patched_contents: dict)."""
     patched = []
+    patched_contents: dict = {}
     for rel_path, content in files_map.items():
         if not content or not content.strip():
             continue
@@ -132,8 +158,48 @@ def apply_fix(files_map: dict) -> list:
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content)
         patched.append(rel_path)
+        patched_contents[rel_path] = content
         log(f"  Fixed: {rel_path}")
-    return patched
+    return patched, patched_contents
+
+
+def _log_failure_summary(output: str) -> None:
+    """Extract and log the most actionable failure lines from Maven/TestNG output."""
+    summary = []
+    capture_call_log = False
+    for line in output.splitlines():
+        s = line.strip()
+        # TestNG failure header: [ERROR]   ClassName.method:N » ErrorType
+        if s.startswith("[ERROR]") and ("»" in s or ("Failures" in s and s != "[ERROR] Failures:")):
+            summary.append(s)
+        # Timeout exceeded line
+        elif "exceeded" in s and ("Timeout" in s or "timeout" in s):
+            summary.append(s)
+        # "waiting for locator(...)" — what the test got stuck on
+        elif "waiting for locator" in s:
+            summary.append(f"  stuck waiting for: {s.split('waiting for locator')[-1].strip()}")
+            capture_call_log = False
+        # Assertion mismatch
+        elif ("Expected" in s and ("but got" in s or "was" in s)) or "AssertionError" in s:
+            summary.append(s)
+        # Java compile errors
+        elif "cannot find symbol" in s or ("error:" in s and ".java" in s):
+            summary.append(s)
+        # Maven timeout (from our subprocess)
+        elif "Maven test timed out" in s:
+            summary.append(s)
+
+    if summary:
+        log("Failure summary:")
+        for ln in summary[:10]:
+            log(f"  {ln}")
+    else:
+        # Fallback: show last few [ERROR] lines
+        error_lines = [l.strip() for l in output.splitlines() if "[ERROR]" in l][-5:]
+        if error_lines:
+            log("Last errors:")
+            for ln in error_lines:
+                log(f"  {ln}")
 
 
 # ── Infrastructure helpers ────────────────────────────────────────────────────
@@ -307,6 +373,9 @@ def main() -> None:
     log(f"Attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS}: Running {test_class}#{test_method}")
     passed, test_output = run_maven_test(test_class, test_method)
 
+    if not passed:
+        _log_failure_summary(test_output)
+
     if passed:
         log("Test PASSED")
         _write_gate("true")
@@ -447,6 +516,9 @@ Common failure causes:
 - User not allocated — check allocateUser() call matches feature enum
 - Auth not set — ensure setAuthToken(token) is called on the helper, or doLogin() for web tests
 
+CRITICAL: Preserve ALL existing JavaDoc comments, inline comments, and annotations exactly as written.
+Only change the minimum code required to fix the failure. Do NOT remove, shorten, or reword any comments.
+
 Return ONLY a JSON object:
 {{
   "src/test/java/automation/{plan_data.get('feature_name', 'feature')}/{{}}.java": "...fixed content...",
@@ -460,14 +532,14 @@ Include the COMPLETE file content (not just the changed lines). Output ONLY vali
     fix_map = extract_json(fix_response)
 
     fixes_applied = []
+    fix_contents: dict = {}
     if fix_map:
-        fixes_applied = apply_fix(fix_map)
+        fixes_applied, fix_contents = apply_fix(fix_map)
         log(f"Applied fixes to {len(fixes_applied)} file(s)")
     else:
         log("WARNING: Claude did not return a valid fix map")
 
-    _write_gate("false")  # Signal to run.sh to retry (if attempts remain)
-    _write_result({
+    result_data = {
         "attempt": FIX_ATTEMPT,
         "test_class": test_class,
         "test_method": test_method,
@@ -475,7 +547,16 @@ Include the COMPLETE file content (not just the changed lines). Output ONLY vali
         "test_output": test_output,
         "fixes_applied": fixes_applied,
         "fix_response_length": len(fix_response),
-    }, files_written, FIX_ATTEMPT)
+    }
+
+    _write_gate("false")  # Signal to run.sh to retry (if attempts remain)
+    _write_result(result_data, files_written, FIX_ATTEMPT)
+
+    # Per-attempt audit file — includes fix file contents for per-step git commits in ship step
+    attempt_data = {**result_data, "fix_file_contents": fix_contents}
+    (AUDIT_DIR / f"04-run-and-fix-attempt-{FIX_ATTEMPT}.json").write_text(
+        json.dumps(attempt_data, indent=2)
+    )
 
 
 def _write_gate(value: str) -> None:
