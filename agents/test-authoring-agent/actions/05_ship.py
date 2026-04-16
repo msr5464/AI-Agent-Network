@@ -79,80 +79,115 @@ def read_gate() -> str:
     return gate.read_text().strip() if gate.exists() else "skipped"
 
 
-def create_branch_and_commit(gen_data: dict, fix_data: dict) -> tuple:
-    """
-    Creates a branch, stages only the generated files, commits, and returns
-    (branch_name, commit_sha). Returns (None, None) on failure.
-    """
-    files_written = gen_data.get("files_written", [])
-    if not files_written:
-        log("No files to commit")
-        return None, None
+def _stage_and_commit(contents: dict, message: str) -> bool:
+    """Write contents to disk, stage them, and commit. Returns True if a commit was made."""
+    for rel_path, content in contents.items():
+        full = AUTOMATION_FRAMEWORK_DIR / rel_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content)
+    for rel_path in contents:
+        git(["add", rel_path], AUTOMATION_FRAMEWORK_DIR)
+    rc, staged, _ = git(["diff", "--cached", "--name-only"], AUTOMATION_FRAMEWORK_DIR)
+    if not staged.strip():
+        return False
+    rc, _, err = git(["commit", "-m", message], AUTOMATION_FRAMEWORK_DIR)
+    if rc != 0:
+        log(f"ERROR: Commit failed: {err}")
+        return False
+    return True
 
+
+def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
+    """
+    Creates a PR branch with one commit per pipeline step:
+      • Commit 1 — step-03: the AI-generated code as initially produced
+      • Commit N — step-04 attempt N: each Claude fix attempt as its own commit
+
+    This makes it easy to spot which step has quality issues by inspecting
+    individual commits in the PR.  Returns (branch_name, tip_sha) or (None, None).
+    """
     if not AUTOMATION_FRAMEWORK_DIR.exists():
         log(f"ERROR: Automation framework repo not found: {AUTOMATION_FRAMEWORK_DIR}")
         return None, None
 
-    # Build branch name
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    branch_name = f"{BRANCH_PREFIX}/{FEATURE}-{timestamp}"
-    feature_class = gen_data.get("feature_class", FEATURE.capitalize())
+    # Step-03 file contents (saved by 03_generate.py in files_content)
+    step3_contents: dict = gen_data.get("files_content", {})
+    if not step3_contents:
+        # Fallback for older runs that don't have files_content
+        step3_contents = {
+            p: (AUTOMATION_FRAMEWORK_DIR / p).read_text()
+            for p in gen_data.get("files_written", [])
+            if (AUTOMATION_FRAMEWORK_DIR / p).exists()
+        }
 
+    attempts_with_fixes = [a for a in fix_attempts_data if a.get("fix_file_contents")]
+
+    if not step3_contents and not attempts_with_fixes:
+        log("No files to commit")
+        return None, None
+
+    # ── Reset to GITHUB_DEFAULT_BRANCH (or stay on current HEAD if blank) ────────
+    timestamp     = datetime.now().strftime("%Y%m%d%H%M%S")
+    branch_name   = f"{BRANCH_PREFIX}/{FEATURE}-{timestamp}"
+    feature_class = gen_data.get("feature_class", FEATURE.capitalize())
     log(f"Creating branch: {branch_name}")
 
-    # Ensure we're on the default branch first
-    rc, _, err = git(["checkout", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
-    if rc != 0:
-        log(f"WARNING: Could not checkout {GITHUB_DEFAULT_BRANCH}: {err}")
-
-    rc, _, err = git(["pull", "origin", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
-    if rc != 0:
-        log(f"WARNING: Pull failed: {err}")
+    if GITHUB_DEFAULT_BRANCH:
+        rc, _, err = git(["checkout", "-f", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
+        if rc != 0:
+            log(f"WARNING: checkout -f failed ({err.strip()!r}), trying fetch + retry")
+            git(["fetch", "origin"], AUTOMATION_FRAMEWORK_DIR)
+            rc, _, err = git(["checkout", "-f", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
+            if rc != 0:
+                log(f"ERROR: Could not checkout {GITHUB_DEFAULT_BRANCH}: {err}")
+                return None, None
+        rc, _, err = git(["pull", "origin", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
+        if rc != 0:
+            log(f"ERROR: Pull from origin/{GITHUB_DEFAULT_BRANCH} failed — aborting to avoid stale branch: {err}")
+            return None, None
+    else:
+        log("GITHUB_DEFAULT_BRANCH not set — branching from current HEAD")
 
     rc, _, err = git(["checkout", "-b", branch_name], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
         log(f"ERROR: Could not create branch: {err}")
         return None, None
 
-    # Stage only the generated files
-    for rel_path in files_written:
-        full_path = AUTOMATION_FRAMEWORK_DIR / rel_path
-        if full_path.exists():
-            rc, _, err = git(["add", rel_path], AUTOMATION_FRAMEWORK_DIR)
-            if rc != 0:
-                log(f"WARNING: Could not stage {rel_path}: {err}")
-
-    # Check if there's anything staged
-    rc, status_out, _ = git(["diff", "--cached", "--name-only"], AUTOMATION_FRAMEWORK_DIR)
-    if not status_out.strip():
-        log("Nothing to commit — files unchanged")
-        return branch_name, None
-
-    # Commit
+    # ── Commit 1: step-03 generated files ────────────────────────────────────────
     fix_gate    = read_gate()
-    test_passed = fix_data.get("passed", False)
-    if test_passed:
-        test_status = "tests pass"
-    elif fix_gate == "skipped":
-        test_status = "tests not run"
-    else:
-        test_status = "tests need review"
-    commit_msg = (
-        f"feat(automation): add {feature_class} test automation — {test_status}\n\n"
-        f"Generated by test-authoring-agent agent\n"
-        f"Session: {SESSION_ID}\n"
-        f"Files: {len(files_written)}\n\n"
-        f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
-    )
+    test_passed = (fix_attempts_data[-1].get("passed", False)
+                   if fix_attempts_data else False)
+    test_status = ("tests pass" if test_passed
+                   else "tests not run" if fix_gate == "skipped"
+                   else "tests need review")
 
-    rc, _, err = git(["commit", "-m", commit_msg], AUTOMATION_FRAMEWORK_DIR)
-    if rc != 0:
-        log(f"ERROR: Commit failed: {err}")
-        return branch_name, None
+    if step3_contents:
+        msg = (
+            f"feat(automation): [step-03] generate {feature_class} — {test_status}\n\n"
+            f"AI-generated test code — review before merge\n"
+            f"Session: {SESSION_ID}  Files: {len(step3_contents)}\n\n"
+            f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+        )
+        if _stage_and_commit(step3_contents, msg):
+            rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
+            log(f"Committed step-03 ({len(step3_contents)} file(s)): {sha.strip()}")
 
-    rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
-    log(f"Committed: {sha}")
-    return branch_name, sha
+    # ── Commits 2+: one per fix attempt ──────────────────────────────────────────
+    for attempt_data in attempts_with_fixes:
+        n            = attempt_data.get("attempt", "?")
+        fix_contents = attempt_data.get("fix_file_contents", {})
+        msg = (
+            f"fix(automation): [step-04 attempt-{n}] fix {feature_class} failures\n\n"
+            f"Claude-generated fix — patched: {list(fix_contents.keys())}\n"
+            f"Session: {SESSION_ID}\n\n"
+            f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+        )
+        if _stage_and_commit(fix_contents, msg):
+            rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
+            log(f"Committed step-04 attempt-{n} ({len(fix_contents)} file(s)): {sha.strip()}")
+
+    rc, final_sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
+    return branch_name, final_sha.strip()
 
 
 def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Optional[str]:
@@ -174,6 +209,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
         return None
 
     files_written = gen_data.get("files_written", [])
+    files_fixed   = [f for f in fix_data.get("fixes_applied", []) if not f.startswith("auto:")]
     feature_class = gen_data.get("feature_class", FEATURE.capitalize())
     test_type     = gen_data.get("test_type", "api")
     test_passed   = fix_data.get("passed", False)
@@ -185,8 +221,15 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
     else:
         pr_title = f"feat(automation): add {feature_class} test automation [needs review]"
 
-    # Files section
-    files_section = "\n".join(f"- `{f}`" for f in files_written) or "_(none)_"
+    # Files section — show generated + fixed separately so reviewers can tell what changed
+    all_committed = list(dict.fromkeys(files_written + files_fixed))
+    if all_committed:
+        gen_lines   = [f"- `{f}`" for f in files_written] or ["_(none)_"]
+        fix_lines   = [f"- `{f}` _(auto-fixed)_" for f in files_fixed if f not in files_written]
+        files_lines = gen_lines + fix_lines
+        files_section = "\n".join(files_lines)
+    else:
+        files_section = "_(none)_"
 
     # Test result section
     if test_passed:
@@ -297,9 +340,23 @@ def main() -> None:
     pr_url      = None
     slack_sent  = False
 
-    files_written = gen_data.get("files_written", [])
-    if files_written:
-        branch_name, commit_sha = create_branch_and_commit(gen_data, fix_data)
+    # Load per-attempt audit files for per-step commits in create_branch_and_commit
+    fix_attempts_data = []
+    i = 1
+    while True:
+        attempt_path = AUDIT_DIR / f"04-run-and-fix-attempt-{i}.json"
+        if not attempt_path.exists():
+            break
+        fix_attempts_data.append(json.loads(attempt_path.read_text()))
+        i += 1
+    if fix_attempts_data:
+        log(f"Loaded {len(fix_attempts_data)} fix-attempt file(s) for per-step commits")
+
+    files_generated = gen_data.get("files_written", [])
+    files_fixed     = [f for f in fix_data.get("fixes_applied", []) if not f.startswith("auto:")]
+    files_written   = list(dict.fromkeys(files_generated + files_fixed))  # for result JSON
+    if files_generated or files_fixed:
+        branch_name, commit_sha = create_branch_and_commit(gen_data, fix_attempts_data)
 
         if branch_name and commit_sha:
             pr_url = push_and_create_pr(branch_name, gen_data, fix_data)

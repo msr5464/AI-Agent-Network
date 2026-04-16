@@ -51,7 +51,8 @@ if [ ! -f "requirements.txt" ]; then
     echo -e "${RED}Error: requirements.txt not found!${NC}"
     exit 1
 fi
-pip install -r requirements.txt
+# Use `python3 -m pip` for portability — on macOS/Homebrew, `pip` may not be on PATH.
+python3 -m pip install -r requirements.txt
 
 # 4. Initialize config
 ENV_PATH="config/.env"

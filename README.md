@@ -295,6 +295,42 @@ QA-Agent-Network/
 
 ---
 
+## HTTP Server (for UI integration)
+
+In addition to the Makefile / shell entry points, the repo ships a thin HTTP + SSE server that wraps `test-authoring-agent/run.sh`. It is used by the AI-Test-Studio "QA Agents" tab to trigger runs and stream live progress; CLI users do not need it.
+
+```bash
+bash scripts/run-server.sh
+# Listens on http://0.0.0.0:8765 by default
+```
+
+Key endpoints (all scoped to `test-authoring-agent` for v1):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET`  | `/health` | Service health + active run id |
+| `GET`  | `/agents/test-authoring-agent/queue` | List feature files in `queue/` |
+| `POST` | `/agents/test-authoring-agent/queue` | Create/update a feature file |
+| `POST` | `/agents/test-authoring-agent/run` | Trigger a run — returns `session_id` |
+| `GET`  | `/agents/test-authoring-agent/run/active` | Active run (for UI re-attach) |
+| `GET`  | `/agents/test-authoring-agent/run/<id>/stream?offset=N` | SSE: live + replay |
+| `POST` | `/agents/test-authoring-agent/run/<id>/cancel` | SIGTERM the run |
+| `GET`  | `/agents/test-authoring-agent/sessions` | Audit history |
+| `GET`  | `/agents/test-authoring-agent/sessions/<id>` | Full session detail |
+
+The server reuses the agent's existing `run.sh` — it does not reimplement any pipeline logic. CLI-triggered runs and UI-triggered runs write to the same `agents/test-authoring-agent/audit/` folder, so the history endpoint surfaces both.
+
+Environment overrides:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `QA_AGENT_SERVER_HOST` | `0.0.0.0` | Bind host |
+| `QA_AGENT_SERVER_PORT` | `8765` | Bind port |
+| `AI_TEST_STUDIO_URL` | `http://localhost:5001` | CORS allowlist (the proxying frontend) |
+| `QA_AGENT_RUN_TIMEOUT_SECONDS` | `1800` | SIGKILL after this many seconds |
+
+---
+
 ## Troubleshooting
 
 **"Queue is empty — nothing to fix"**

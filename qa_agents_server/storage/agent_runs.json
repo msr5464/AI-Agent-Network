@@ -1,0 +1,110 @@
+[
+  {
+    "session_id": "20260413-192828-create-demo",
+    "agent": "test-authoring-agent",
+    "feature": "demo",
+    "auto_push": false,
+    "audit_dir": "/Users/mukesh/msr5464/AI-Test-Studio/QA-Agent-Network/agents/test-authoring-agent/audit/20260413-192828-create-demo",
+    "started_at": 1776088708.2324748,
+    "ended_at": 1776088767.765641,
+    "status": "completed",
+    "exit_code": 0,
+    "pid": 11987
+  },
+  {
+    "session_id": "20260413-194904-create-demo",
+    "agent": "test-authoring-agent",
+    "feature": "demo",
+    "auto_push": false,
+    "audit_dir": "/Users/mukesh/msr5464/AI-Test-Studio/QA-Agent-Network/agents/test-authoring-agent/audit/20260413-194904-create-demo",
+    "started_at": 1776089944.6392431,
+    "ended_at": 1776089967.044565,
+    "status": "failed",
+    "exit_code": 1,
+    "pid": 12774
+  },
+  {
+    "session_id": "20260413-225018-create-demo",
+    "agent": "test-authoring-agent",
+    "feature": "demo",
+    "auto_push": true,
+    "audit_dir": "/Users/mukesh/msr5464/AI-Test-Studio/QA-Agent-Network/agents/test-authoring-agent/audit/20260413-225018-create-demo",
+    "started_at": 1776100818.43084,
+    "ended_at": 1776100840.2731671,
+    "status": "failed",
+    "exit_code": 1,
+    "pid": 13719
+  },
+  {
+    "session_id": "20260413-225955-create-demo",
+    "agent": "test-authoring-agent",
+    "feature": "demo",
+    "auto_push": true,
+    "audit_dir": "/Users/mukesh/msr5464/AI-Test-Studio/QA-Agent-Network/agents/test-authoring-agent/audit/20260413-225955-create-demo",
+    "started_at": 1776101395.5558982,
+    "ended_at": 1776101419.902573,
+    "status": "failed",
+    "exit_code": 1,
+    "pid": 15582
+  },
+  {
+    "session_id": "20260413-230233-create-demo",
+    "agent": "test-authoring-agent",
+    "feature": "demo",
+    "auto_push": false,
+    "audit_dir": "/Users/mukesh/msr5464/AI-Test-Studio/QA-Agent-Network/agents/test-authoring-agent/audit/20260413-230233-create-demo",
+    "started_at": 1776101553.102946,
+    "ended_at": 1776101574.76477,
+    "status": "failed",
+    "exit_code": 1,
+    "pid": 15790
+  },
+  {
+    "session_id": "20260413-230416-create-demo",
+    "agent": "test-authoring-agent",
+    "feature": "demo",
+    "auto_push": true,
+    "audit_dir": "/Users/mukesh/msr5464/AI-Test-Studio/QA-Agent-Network/agents/test-authoring-agent/audit/20260413-230416-create-demo",
+    "started_at": 1776101656.744027,
+    "ended_at": 1776101677.0476851,
+    "status": "failed",
+    "exit_code": 1,
+    "pid": 16048
+  },
+  {
+    "session_id": "20260413-230518-create-demo",
+    "agent": "test-authoring-agent",
+    "feature": "demo",
+    "auto_push": true,
+    "audit_dir": "/Users/mukesh/msr5464/AI-Test-Studio/QA-Agent-Network/agents/test-authoring-agent/audit/20260413-230518-create-demo",
+    "started_at": 1776101718.842054,
+    "ended_at": 1776101867.304683,
+    "status": "completed",
+    "exit_code": 0,
+    "pid": 16322
+  },
+  {
+    "session_id": "20260413-231235-create-github_user",
+    "agent": "test-authoring-agent",
+    "feature": "github_user",
+    "auto_push": true,
+    "audit_dir": "/Users/mukesh/msr5464/AI-Test-Studio/QA-Agent-Network/agents/test-authoring-agent/audit/20260413-231235-create-github_user",
+    "started_at": 1776102155.232051,
+    "ended_at": 1776102295.523419,
+    "status": "failed",
+    "exit_code": 0,
+    "pid": 16843
+  },
+  {
+    "session_id": "20260414-153919-create-github_user",
+    "agent": "test-authoring-agent",
+    "feature": "github_user",
+    "auto_push": false,
+    "audit_dir": "/Users/mukesh/msr5464/AI-Test-Studio/QA-Agent-Network/agents/test-authoring-agent/audit/20260414-153919-create-github_user",
+    "started_at": 1776161359.9955578,
+    "ended_at": 1776162727.325409,
+    "status": "failed",
+    "exit_code": 0,
+    "pid": 5827
+  }
+]

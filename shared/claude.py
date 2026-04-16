@@ -35,6 +35,7 @@ def call_claude(
     on_output=None,
     system_prompt_file=None,
     log_dir=None,
+    allowed_tools: list = None,
 ) -> str:
     """Call `claude -p <prompt> --model <model>` as a subprocess.
 
@@ -45,11 +46,15 @@ def call_claude(
       on_output(label, line)  — called for each streamed output line
       system_prompt_file      — path passed as --system-prompt-file to claude CLI
       log_dir                 — directory to write a timestamped claude-*.log file
+      allowed_tools           — list of tool names/patterns passed as --allowedTools
+                                (e.g. ["mcp__playwright__*"] to enable browser control)
     """
     claude_cli = os.environ.get("CLAUDE_CLI_PATH", "claude")
     cmd = [claude_cli, "-p", prompt, "--model", model]
     if system_prompt_file:
         cmd.extend(["--system-prompt-file", str(system_prompt_file)])
+    if allowed_tools:
+        cmd.extend(["--allowedTools", ",".join(allowed_tools)])
 
     # Resolve log path if requested
     log_path = None
