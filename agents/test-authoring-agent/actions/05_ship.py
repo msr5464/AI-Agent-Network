@@ -163,7 +163,7 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
 
     if step3_contents:
         msg = (
-            f"feat(automation): [step-03] generate {feature_class} — {test_status}\n\n"
+            f"[Authoring Agent]: First draft for {FEATURE}\n\n"
             f"AI-generated test code — review before merge\n"
             f"Session: {SESSION_ID}  Files: {len(step3_contents)}\n\n"
             f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -177,7 +177,7 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
         n            = attempt_data.get("attempt", "?")
         fix_contents = attempt_data.get("fix_file_contents", {})
         msg = (
-            f"fix(automation): [step-04 attempt-{n}] fix {feature_class} failures\n\n"
+            f"[Authoring Agent]: Fix attempt-{n} for {FEATURE}\n\n"
             f"Claude-generated fix — patched: {list(fix_contents.keys())}\n"
             f"Session: {SESSION_ID}\n\n"
             f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -217,9 +217,9 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
 
     # PR title
     if test_passed:
-        pr_title = f"feat(automation): add {feature_class} test automation"
+        pr_title = f"Authoring Agent: {feature_class} automation for {FEATURE} [done]"
     else:
-        pr_title = f"feat(automation): add {feature_class} test automation [needs review]"
+        pr_title = f"Authoring Agent: {feature_class} automation for {FEATURE} [needs review]"
 
     # Files section — show generated + fixed separately so reviewers can tell what changed
     all_committed = list(dict.fromkeys(files_written + files_fixed))

@@ -7,5 +7,5 @@ Password: automationPassword
 
 Steps:
 1. Navigate to github and do login
-2. Then navigate to this repo: automationdemo/QA-Dashboard
-3. Validate that screenshot related to "FCT Test Coverage Data for all the Projects:" is present in the ReadMe file and its properly visible
+2. Then using left sidebar, find and click to this repo: automationdemo/QA-Dashboard, this should open reseptive Repo page
+3. Validate that screenshot related to "Test Coverage Data for all the Projects:" is present in the ReadMe file and its properly visible

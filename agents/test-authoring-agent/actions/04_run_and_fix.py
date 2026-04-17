@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
 Step 04 — Run and Fix
-Runs the generated test via mvn test, captures output, and if the test fails
-calls Claude with the error context to generate a fix.
+Two-phase design driven by FIX_ATTEMPT (set by run.sh):
 
-run.sh re-invokes this script on each retry (FIX_ATTEMPT env var increments).
-On retry, the previous test failure output is injected into the Claude prompt.
+  FIX_ATTEMPT=0  (initial run)
+    Runs the generated test as-is. No Claude call. Writes gate=true/false.
+    If the test passes, the fix loop in run.sh is skipped entirely.
+
+  FIX_ATTEMPT>=1  (fix attempt N)
+    Loads the previous failure output, calls Claude for a fix, applies it,
+    THEN runs the test. Each fix attempt is an atomic (fix + verify) unit.
+    run.sh counts only these attempts against MAX_FIX_ATTEMPTS.
 
 Reads:  $AUDIT_DIR/03-generate.json
-        $AUDIT_DIR/04-run-and-fix.json  (on retries — previous attempt context)
+        $AUDIT_DIR/04-run-and-fix.json  (previous attempt's test output)
 Writes: $AUDIT_DIR/04-run-and-fix.json
         $AUDIT_DIR/04-run-and-fix.md
+        $AUDIT_DIR/04-run-and-fix-attempt-{N}.json  (fix attempts only, for per-step commits)
         $AUDIT_DIR/.fix-passed          gate: true / false / skipped
 """
 
@@ -347,17 +353,6 @@ def main() -> None:
     test_method   = gen_data.get("test_method", "")
     plan_data     = json.loads((AUDIT_DIR / "01-parse.json").read_text())
 
-    # Load previous attempt context if retrying
-    prev_output = ""
-    prev_fix_path = AUDIT_DIR / "04-run-and-fix.json"
-    if FIX_ATTEMPT > 1 and prev_fix_path.exists():
-        try:
-            prev = json.loads(prev_fix_path.read_text())
-            prev_output = prev.get("test_output", "")[-3000:]
-            log(f"Retry attempt {FIX_ATTEMPT} — loaded previous failure output")
-        except Exception:
-            pass
-
     if not test_class:
         log("No test class found in generate output — skipping test run")
         _write_gate("skipped")
@@ -370,33 +365,45 @@ def main() -> None:
         _write_result({"skipped": True, "reason": f"Automation framework repo not found at {AUTOMATION_FRAMEWORK_DIR}"}, [], FIX_ATTEMPT)
         return
 
-    log(f"Attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS}: Running {test_class}#{test_method}")
-    passed, test_output = run_maven_test(test_class, test_method)
-
-    if not passed:
-        _log_failure_summary(test_output)
-
-    if passed:
-        log("Test PASSED")
-        _write_gate("true")
+    # ── FIX_ATTEMPT == 0 — initial run, no fix ────────────────────────────────
+    if FIX_ATTEMPT == 0:
+        log(f"Initial test run: {test_class}#{test_method}")
+        passed, test_output = run_maven_test(test_class, test_method)
+        if not passed:
+            _log_failure_summary(test_output)
+            log("Initial test FAILED — fix attempt 1 will apply a Claude fix and re-run")
+        else:
+            log("Initial test PASSED")
+        _write_gate("true" if passed else "false")
         _write_result({
-            "attempt": FIX_ATTEMPT,
+            "attempt": 0,
             "test_class": test_class,
             "test_method": test_method,
-            "passed": True,
+            "passed": passed,
             "test_output": test_output,
             "fixes_applied": [],
-        }, files_written, FIX_ATTEMPT)
+        }, files_written, 0)
         return
 
-    # Classify the failure before spending Claude API quota on code fixes
-    failure_class = classify_failure(test_output)
+    # ── FIX_ATTEMPT >= 1 — classify previous failure → fix → run ─────────────
+    # Load the failure output written by the previous attempt
+    prev_output = ""
+    prev_fix_path = AUDIT_DIR / "04-run-and-fix.json"
+    if prev_fix_path.exists():
+        try:
+            prev = json.loads(prev_fix_path.read_text())
+            prev_output = prev.get("test_output", "")[-3000:]
+            log(f"Fix attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS} — loaded previous failure ({len(prev_output)} chars)")
+        except Exception:
+            pass
+
+    failure_class = classify_failure(prev_output)
     log(f"Failure classified as: {failure_class}")
 
     if failure_class == "INFRA_DB":
         log("Detected DB infrastructure error — attempting auto-repair")
         if try_fix_infra_db():
-            log("DB auto-configured — retrying test once")
+            log("DB auto-configured — running test")
             passed, test_output = run_maven_test(test_class, test_method)
             if passed:
                 log("Test PASSED after DB auto-repair")
@@ -416,7 +423,7 @@ def main() -> None:
     if failure_class == "INFRA_USER":
         log("Detected user pool error — attempting demo user auto-insert")
         if try_fix_infra_user(plan_data):
-            log("Demo user inserted/reset — retrying test once")
+            log("Demo user inserted/reset — running test")
             passed, test_output = run_maven_test(test_class, test_method)
             if passed:
                 log("Test PASSED after user auto-repair")
@@ -444,7 +451,7 @@ def main() -> None:
             "passed": False,
             "skipped": True,
             "reason": f"Maven project not found at {AUTOMATION_FRAMEWORK_DIR} — ensure WORKSPACE_DIR and GITHUB_REPO_AUTOMATION point to a valid Maven project",
-            "test_output": test_output,
+            "test_output": prev_output,
             "fixes_applied": [],
         }, files_written, FIX_ATTEMPT)
         return
@@ -459,13 +466,13 @@ def main() -> None:
             "passed": False,
             "skipped": True,
             "reason": f"Infrastructure error: {failure_class} — manual setup required",
-            "test_output": test_output,
+            "test_output": prev_output,
             "fixes_applied": [],
         }, files_written, FIX_ATTEMPT)
         return
 
-    # CODE_ERROR — call Claude for a fix
-    log("Test FAILED — calling Claude for fix...")
+    # CODE_ERROR — call Claude for a fix, apply it, then run the test
+    log(f"Fix attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS}: calling Claude for a fix...")
     generated_files = read_generated_files(files_written)
     # Read Jarvis/CLAUDE.md — single source of truth for framework conventions.
     fw_claude_md_path = AUTOMATION_FRAMEWORK_DIR / "CLAUDE.md"
@@ -478,9 +485,9 @@ def main() -> None:
     )
 
     retry_section = ""
-    if prev_output:
+    if FIX_ATTEMPT > 1:
         retry_section = f"""
-## ⚠️ RETRY — Attempt {FIX_ATTEMPT}
+## ⚠️ RETRY — Fix attempt {FIX_ATTEMPT}
 Previous fix did not resolve the test. Previous failure:
 ```
 {prev_output}
@@ -500,7 +507,7 @@ Try a DIFFERENT approach — do NOT repeat what was tried before.
 
 <test_failure>
 ```
-{test_output}
+{prev_output}
 ```
 </test_failure>
 {retry_section}
@@ -535,21 +542,32 @@ Include the COMPLETE file content (not just the changed lines). Output ONLY vali
     fix_contents: dict = {}
     if fix_map:
         fixes_applied, fix_contents = apply_fix(fix_map)
-        log(f"Applied fixes to {len(fixes_applied)} file(s)")
+        log(f"Applied fixes to {len(fixes_applied)} file(s) — running test")
     else:
-        log("WARNING: Claude did not return a valid fix map")
+        log("WARNING: Claude did not return a valid fix map — running test without fix")
+
+    # Run the test with the fix applied
+    passed, test_output = run_maven_test(test_class, test_method)
+    if not passed:
+        _log_failure_summary(test_output)
+
+    if passed:
+        log(f"Test PASSED after fix attempt {FIX_ATTEMPT}")
+        _write_gate("true")
+    else:
+        log(f"Test still FAILED after fix attempt {FIX_ATTEMPT}")
+        _write_gate("false")
 
     result_data = {
         "attempt": FIX_ATTEMPT,
         "test_class": test_class,
         "test_method": test_method,
-        "passed": False,
+        "passed": passed,
         "test_output": test_output,
         "fixes_applied": fixes_applied,
         "fix_response_length": len(fix_response),
     }
 
-    _write_gate("false")  # Signal to run.sh to retry (if attempts remain)
     _write_result(result_data, files_written, FIX_ATTEMPT)
 
     # Per-attempt audit file — includes fix file contents for per-step git commits in ship step

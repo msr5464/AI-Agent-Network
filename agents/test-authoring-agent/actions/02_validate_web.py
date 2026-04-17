@@ -213,7 +213,18 @@ EXECUTION RULES — follow exactly:
    d) [aria-label='...']
    e) role-based  (e.g. role=button[name='Sign in'])
    f) text-based  (e.g. text='Sign in')
-   Emit SELECTOR_FOUND for whichever strategy succeeds.
+
+   UNIQUENESS CHECK — mandatory before emitting SELECTOR_FOUND:
+   While the browser is still open on that page, immediately after finding a
+   candidate selector, use the browser tools to count how many elements it matches:
+   • count == 1 → emit SELECTOR_FOUND and proceed.
+   • count > 1  → selector is NOT unique. Do NOT emit it. Narrow it by:
+       - Adding a parent scope:        form >> [name='commit']
+       - Combining attributes:         button[type='submit'][name='commit']
+       - Using a more specific attribute from the DOM snapshot
+     Repeat the count check with the narrowed selector until count == 1,
+     then emit SELECTOR_FOUND.
+   Never emit a selector that matches more than one element.
 
 3. RETRIES — if an element is not immediately found or visible:
    Wait 1 second and retry up to 3 times before declaring failure.

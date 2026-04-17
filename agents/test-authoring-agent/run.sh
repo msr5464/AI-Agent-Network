@@ -209,26 +209,34 @@ run_step "[03/05] Generate" "python3 '$AGENT_DIR/actions/03_generate.py'"
 
 # ── Step 04 — Run and Fix (with retry loop) ───────────────────────────────────
 MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-3}"
-FIX_ATTEMPT=1
 
-while true; do
-  run_step "[04/05] Run+Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
-    "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
+# Initial test run — not counted as a fix attempt
+run_step "[04/05] Run (initial)" \
+  "FIX_ATTEMPT=0 python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
 
-  FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
+FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
 
-  if [[ "$FIX_RESULT" == "true" || "$FIX_RESULT" == "skipped" ]]; then
-    break
-  fi
+if [[ "$FIX_RESULT" != "true" && "$FIX_RESULT" != "skipped" ]]; then
+  FIX_ATTEMPT=1
+  while true; do
+    run_step "[04/05] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
+      "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
 
-  if [[ "$FIX_ATTEMPT" -ge "$MAX_FIX_ATTEMPTS" ]]; then
-    log "Tests still failing after $FIX_ATTEMPT attempt(s) — proceeding to ship"
-    break
-  fi
+    FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
 
-  log "Tests failed — retrying fix (attempt $((FIX_ATTEMPT + 1)))"
-  FIX_ATTEMPT=$((FIX_ATTEMPT + 1))
-done
+    if [[ "$FIX_RESULT" == "true" || "$FIX_RESULT" == "skipped" ]]; then
+      break
+    fi
+
+    if [[ "$FIX_ATTEMPT" -ge "$MAX_FIX_ATTEMPTS" ]]; then
+      log "Tests still failing after $FIX_ATTEMPT fix attempt(s) — proceeding to ship"
+      break
+    fi
+
+    log "Tests failed — retrying (fix attempt $((FIX_ATTEMPT + 1)))"
+    FIX_ATTEMPT=$((FIX_ATTEMPT + 1))
+  done
+fi
 
 # ── Step 05 — Ship ────────────────────────────────────────────────────────────
 run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'"

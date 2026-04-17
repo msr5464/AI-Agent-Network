@@ -45,3 +45,4 @@ node_modules/
 agents/test-authoring-agent/audit
 agents/test-authoring-agent/cache
 .playwright-mcp/
+.mcp.json
