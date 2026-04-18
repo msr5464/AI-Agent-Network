@@ -14,6 +14,7 @@ Writes: $AUDIT_DIR/02-validate-web.json   (selector map + step results)
 
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -127,27 +128,31 @@ def main() -> None:
         _write_empty(reason=f"invalid web_base_url: '{base_url}' — must start with http:// or https://")
         return
 
-    # Credential check — fail fast if login steps require credentials not provided
+    # Credential check — warn if login steps detected but no structured credentials found.
+    # Credentials may be inline in the step text (e.g. "login using username: foo, password: bar")
+    # so Claude can still use them; only hard-fail if truly absent everywhere.
     demo_creds = plan.get("demo_credentials", {})
     login_keywords = ("login", "log in", "sign in", "signin", "authenticate")
     steps_need_login = any(
         any(kw in step.lower() for kw in login_keywords)
         for step in web_steps
     )
+    _input_file = plan.get("_input_file") or os.environ.get("INPUT_FILE", "")
+    raw_text = Path(_input_file).read_text() if _input_file and Path(_input_file).exists() else ""
+    creds_inline = bool(
+        re.search(r'username[:\s]+\S', raw_text, re.IGNORECASE) and
+        re.search(r'password[:\s]+\S', raw_text, re.IGNORECASE)
+    )
     if steps_need_login and not (demo_creds.get("username") and demo_creds.get("password")):
-        log("ERROR: Login step detected but no credentials found in input file.")
-        log("Add the following to your queue input file:")
-        log("  Username: your_username")
-        log("  Password: your_password")
-        log("Example:")
-        log("  Feature: github")
-        log("  Type: web")
-        log("  Username: octocat")
-        log("  Password: mypassword")
-        log("  Steps:")
-        log("    1. Login and navigate to dashboard")
-        _write_empty(reason="login step detected but no credentials in input file — add Username/Password fields")
-        sys.exit(1)
+        if creds_inline:
+            log("WARNING: Credentials found inline in steps — Claude will use them directly.")
+        else:
+            log("ERROR: Login step detected but no credentials found in input file.")
+            log("Add credentials as top-level fields or inline in the step:")
+            log("  Username: your_username")
+            log("  Password: your_password")
+            _write_empty(reason="login step detected but no credentials in input file — add Username/Password fields")
+            sys.exit(1)
 
     creds_section = ""
     if demo_creds:

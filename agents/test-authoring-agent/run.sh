@@ -7,9 +7,9 @@ set -euo pipefail
 # framework-compliant Java tests in Thanos-pw, validates, and raises a PR.
 #
 # Usage (via Makefile):
-#   make run AGENT=test-authoring-agent FEATURE=payments   # direct mode
+#   make run AGENT=test-authoring-agent MODULE=payments    # direct mode
 #   make run AGENT=test-authoring-agent                    # queue mode: picks oldest .txt
-#   AUTO_PUSH=false make run AGENT=test-authoring-agent FEATURE=payments  # dry-run
+#   AUTO_PUSH=false make run AGENT=test-authoring-agent MODULE=payments   # dry-run
 #
 # Retry loop: if mvn test fails after generation, re-runs 04_run_and_fix.py
 # up to MAX_FIX_ATTEMPTS (default: 3).
@@ -19,24 +19,24 @@ AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$AGENT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-FEATURE="${1:-${FEATURE:-}}"
+MODULE="${1:-${MODULE:-}}"
 
 # Load .env files (root → agent override)
 source "$REPO_ROOT/shared/load_env.sh"
 
-export FEATURE AGENT_DIR REPO_ROOT
+export MODULE AGENT_DIR REPO_ROOT
 
 # ── Session helpers (log, run_step, fmt_duration, elapsed_since) ──────────────
 source "$REPO_ROOT/shared/session.sh"
 
 # ── Testing-mode cache helpers ────────────────────────────────────────────────
 # When TESTING_MODE=true, step-01 and step-02 outputs are cached under
-# agents/test-authoring-agent/cache/<feature>/ so they are reused on every
+# agents/test-authoring-agent/cache/<module>/ so they are reused on every
 # subsequent run of the same input file — saving ~3 minutes per iteration.
 # Clear the cache manually to force a fresh run:
-#   rm -rf agents/test-authoring-agent/cache/<feature>/
+#   rm -rf agents/test-authoring-agent/cache/<module>/
 TESTING_MODE="${TESTING_MODE:-false}"
-CACHE_DIR="$AGENT_DIR/cache/$FEATURE"
+CACHE_DIR="$AGENT_DIR/cache/$MODULE"
 
 # _cache_hit <filename>  → returns 0 if cache exists and TESTING_MODE=true
 _cache_hit() {
@@ -61,11 +61,11 @@ QUEUE_DIR="$AGENT_DIR/queue"
 PROCESSED_DIR="$QUEUE_DIR/processed"
 mkdir -p "$PROCESSED_DIR"
 
-if [[ -n "$FEATURE" ]]; then
-  INPUT_FILE="$QUEUE_DIR/${FEATURE}.txt"
+if [[ -n "$MODULE" ]]; then
+  INPUT_FILE="$QUEUE_DIR/${MODULE}.txt"
   if [[ ! -f "$INPUT_FILE" ]]; then
     log "ERROR: Input file not found: $INPUT_FILE"
-    log "Create agents/test-authoring-agent/queue/${FEATURE}.txt first."
+    log "Create agents/test-authoring-agent/queue/${MODULE}.txt first."
     exit 1
   fi
   MODE="direct"
@@ -77,17 +77,17 @@ else
     log "Add a .txt file to agents/test-authoring-agent/queue/ first."
     exit 0
   fi
-  FEATURE=$(basename "$INPUT_FILE" .txt)
+  MODULE=$(basename "$INPUT_FILE" .txt)
   MODE="queue"
 fi
 
-export INPUT_FILE FEATURE
+export INPUT_FILE MODULE
 
 # ── Session init ───────────────────────────────────────────────────────────────
 # Honor a pre-set SESSION_ID / AUDIT_DIR (used by qa_agents_server so the wrapper
 # knows where the agent will write audit files before it starts). When invoked
 # via the CLI / Makefile neither is set, so we fall back to the historical default.
-SESSION_ID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)-create-${FEATURE}}"
+SESSION_ID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)-create-${MODULE}}"
 AUDIT_DIR="${AUDIT_DIR:-$AGENT_DIR/audit/$SESSION_ID}"
 mkdir -p "$AUDIT_DIR"
 export SESSION_ID AUDIT_DIR
@@ -95,7 +95,7 @@ export SESSION_ID AUDIT_DIR
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log "test-authoring-agent | mode=$MODE"
-log "feature=$FEATURE"
+log "module=$MODULE"
 log "input=$INPUT_FILE"
 log "session=$SESSION_ID"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -107,7 +107,7 @@ cat > "$AUDIT_DIR/00-session-init.md" << EOF
 
 Mode: $MODE
 Session ID: $SESSION_ID
-Feature: $FEATURE
+Module: $MODULE
 Input File: $INPUT_FILE
 Started: $(date +%Y-%m-%dT%H:%M:%S)
 

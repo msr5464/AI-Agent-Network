@@ -49,7 +49,7 @@ SLACK_NOTIFY_CHANNEL = os.environ.get("SLACK_NOTIFY_CHANNEL", "")
 SLACK_ALERT_CHANNEL  = os.environ.get("SLACK_ALERT_CHANNEL", "")
 
 SESSION_ID = os.environ.get("SESSION_ID", AUDIT_DIR.name)
-FEATURE    = os.environ.get("FEATURE", "unknown")
+MODULE     = os.environ.get("MODULE", "unknown")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -128,8 +128,8 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
 
     # ── Reset to GITHUB_DEFAULT_BRANCH (or stay on current HEAD if blank) ────────
     timestamp     = datetime.now().strftime("%Y%m%d%H%M%S")
-    branch_name   = f"{BRANCH_PREFIX}/{FEATURE}-{timestamp}"
-    feature_class = gen_data.get("feature_class", FEATURE.capitalize())
+    branch_name   = f"{BRANCH_PREFIX}/{MODULE}-{timestamp}"
+    feature_class = gen_data.get("feature_class", MODULE.capitalize())
     log(f"Creating branch: {branch_name}")
 
     if GITHUB_DEFAULT_BRANCH:
@@ -163,7 +163,7 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
 
     if step3_contents:
         msg = (
-            f"[Authoring Agent]: First draft for {FEATURE}\n\n"
+            f"[Authoring Agent]: First draft for {MODULE}\n\n"
             f"AI-generated test code — review before merge\n"
             f"Session: {SESSION_ID}  Files: {len(step3_contents)}\n\n"
             f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -177,7 +177,7 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
         n            = attempt_data.get("attempt", "?")
         fix_contents = attempt_data.get("fix_file_contents", {})
         msg = (
-            f"[Authoring Agent]: Fix attempt-{n} for {FEATURE}\n\n"
+            f"[Authoring Agent]: Fix attempt-{n} for {MODULE}\n\n"
             f"Claude-generated fix — patched: {list(fix_contents.keys())}\n"
             f"Session: {SESSION_ID}\n\n"
             f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
@@ -210,16 +210,16 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
 
     files_written = gen_data.get("files_written", [])
     files_fixed   = [f for f in fix_data.get("fixes_applied", []) if not f.startswith("auto:")]
-    feature_class = gen_data.get("feature_class", FEATURE.capitalize())
+    feature_class = gen_data.get("feature_class", MODULE.capitalize())
     test_type     = gen_data.get("test_type", "api")
     test_passed   = fix_data.get("passed", False)
     fix_attempts  = fix_data.get("attempt", 1)
 
     # PR title
     if test_passed:
-        pr_title = f"Authoring Agent: {feature_class} automation for {FEATURE} [done]"
+        pr_title = f"Authoring Agent: {feature_class} automation for {MODULE} [done]"
     else:
-        pr_title = f"Authoring Agent: {feature_class} automation for {FEATURE} [needs review]"
+        pr_title = f"Authoring Agent: {feature_class} automation for {MODULE} [needs review]"
 
     # Files section — show generated + fixed separately so reviewers can tell what changed
     all_committed = list(dict.fromkeys(files_written + files_fixed))
@@ -247,7 +247,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
 ### Summary
 | | Value |
 |---|---|
-| Feature | {feature_class} |
+| Module | {feature_class} |
 | Test type | {test_type} |
 | Files generated | {len(files_written)} |
 | Fix attempts | {fix_attempts} |
@@ -263,7 +263,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
 
 ### How to review
 1. Verify locators match the actual DOM (check `[data-cy='...']` attributes)
-2. Confirm `allocateUser()` uses the correct `Feature` enum value for this module
+2. Confirm `allocateUser()` uses the correct `Module` enum value for this module
 3. Ensure the API endpoint paths match the actual backend routes
 4. Run locally: `mvn test -Dtest={gen_data.get('test_class', '')}#{gen_data.get('test_method', '')} -Denvironment=staging`
 
@@ -290,7 +290,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
 
 def build_slack_message(gen_data: dict, fix_data: dict, pr_url: Optional[str], fix_gate: str) -> tuple:
     """Returns (channel, text)."""
-    feature_class = gen_data.get("feature_class", FEATURE.capitalize())
+    feature_class = gen_data.get("feature_class", MODULE.capitalize())
     files_count   = len(gen_data.get("files_written", []))
     test_passed   = fix_data.get("passed", False)
 
@@ -328,7 +328,7 @@ def main() -> None:
     fix_data = load_json("04-run-and-fix.json", required=False)
     fix_gate = read_gate()
 
-    feature_class = gen_data.get("feature_class", FEATURE.capitalize())
+    feature_class = gen_data.get("feature_class", MODULE.capitalize())
     test_passed   = fix_data.get("passed", False)
 
     log(f"Feature:   {feature_class}")
@@ -382,7 +382,7 @@ def main() -> None:
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     result = {
         "timestamp":        ts,
-        "feature":          FEATURE,
+        "module":           MODULE,
         "feature_class":    feature_class,
         "fix_gate":         fix_gate,
         "test_passed":      test_passed,

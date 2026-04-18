@@ -66,7 +66,7 @@ class Event:
 @dataclass
 class RunState:
     session_id: str
-    feature: str
+    module: str
     auto_push: bool
     audit_dir: Path
     started_at: float
@@ -85,7 +85,7 @@ class RunState:
         return {
             "session_id": self.session_id,
             "agent": AGENT,
-            "feature": self.feature,
+            "module": self.module,
             "auto_push": self.auto_push,
             "audit_dir": str(self.audit_dir),
             "started_at": self.started_at,
@@ -144,17 +144,17 @@ def get_run(session_id: str) -> Optional[RunState]:
     return _runs.get(session_id)
 
 
-def start_run(feature: str, auto_push: bool) -> RunState:
-    """Spawn run.sh for the given feature. Raises RunnerError on validation."""
+def start_run(module: str, auto_push: bool) -> RunState:
+    """Spawn run.sh for the given module. Raises RunnerError on validation."""
     global _active_session_id
 
-    if not feature:
-        raise RunnerError("feature is required")
+    if not module:
+        raise RunnerError("module is required")
 
-    # Feature file must exist in the queue (writable via /queue endpoint).
-    if feature_exists(feature) is None:
+    # Module file must exist in the queue (writable via /queue endpoint).
+    if feature_exists(module) is None:
         raise RunnerError(
-            f"feature file not found: {feature}.txt — create it first via "
+            f"module file not found: {module}.txt — create it first via "
             f"POST /agents/{AGENT}/queue",
             status=404,
         )
@@ -173,12 +173,12 @@ def start_run(feature: str, auto_push: bool) -> RunState:
                     status=409,
                 )
 
-        session_id = _make_session_id(feature)
+        session_id = _make_session_id(module)
         audit_dir = AUTHORING_AUDIT_DIR / session_id
         audit_dir.mkdir(parents=True, exist_ok=True)
 
         env = os.environ.copy()
-        env["FEATURE"] = feature
+        env["MODULE"] = module
         env["AUTO_PUSH"] = "true" if auto_push else "false"
         env["SESSION_ID"] = session_id
         env["AUDIT_DIR"] = str(audit_dir)
@@ -199,7 +199,7 @@ def start_run(feature: str, auto_push: bool) -> RunState:
 
         run = RunState(
             session_id=session_id,
-            feature=feature,
+            module=module,
             auto_push=auto_push,
             audit_dir=audit_dir,
             started_at=time.time(),
@@ -212,7 +212,7 @@ def start_run(feature: str, auto_push: bool) -> RunState:
     # Emit initial status event
     _append_event(run, "status", {
         "session_id": session_id,
-        "feature": feature,
+        "module": module,
         "auto_push": auto_push,
         "status": "running",
         "started_at": run.started_at,
@@ -305,9 +305,9 @@ def subscribe_stream(session_id: str, offset: int) -> Generator[Event, None, Non
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
-def _make_session_id(feature: str) -> str:
+def _make_session_id(module: str) -> str:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe = re.sub(r"[^A-Za-z0-9_-]", "-", feature)
+    safe = re.sub(r"[^A-Za-z0-9_-]", "-", module)
     return f"{ts}-create-{safe}"
 
 

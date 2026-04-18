@@ -101,7 +101,7 @@ def main() -> None:
     # Extract feature name hint from first line to check module existence early
     feature_hint = ""
     for line in raw_text.splitlines():
-        if line.lower().startswith("feature:"):
+        if line.lower().startswith("module:"):
             feature_hint = line.split(":", 1)[1].strip().lower()
             break
     if not feature_hint:
@@ -243,6 +243,7 @@ Rules:
     # Claude may not always put them in demo_credentials, so do it in Python as a fallback.
     if not plan.get("demo_credentials"):
         creds = {}
+        # Pass 1: top-level key: value lines
         for line in raw_text.splitlines():
             lower = line.lower().strip()
             if lower.startswith("demo username:") or lower.startswith("username:"):
@@ -251,6 +252,14 @@ Rules:
                 creds["password"] = line.split(":", 1)[1].strip()
             elif lower.startswith("demo otp:") or lower.startswith("otp:"):
                 creds["otp"] = line.split(":", 1)[1].strip()
+        # Pass 2: inline patterns within step text, e.g. "login using username: foo, password: bar"
+        if not (creds.get("username") and creds.get("password")):
+            u_match = re.search(r'username[:\s]+([^\s,]+)', raw_text, re.IGNORECASE)
+            p_match = re.search(r'password[:\s]+([^\s,]+)', raw_text, re.IGNORECASE)
+            if u_match and not creds.get("username"):
+                creds["username"] = u_match.group(1).strip()
+            if p_match and not creds.get("password"):
+                creds["password"] = p_match.group(1).strip()
         if creds.get("username") and creds.get("password"):
             plan["demo_credentials"] = creds
             log(f"Extracted demo credentials for: {creds['username']}")

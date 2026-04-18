@@ -11,7 +11,7 @@
 
 AGENT     ?= test-triaging-agent
 BUILD_TAG ?=
-FEATURE   ?=
+MODULE    ?=
 SESSION   ?=
 AGENTS_DIR = agents
 
@@ -20,7 +20,7 @@ AGENTS_DIR = agents
 run:
 	@if [ -z "$(AGENT)" ]; then echo "Usage: make run AGENT=test-triaging-agent  OR  make run AGENT=test-healing-agent"; exit 1; fi
 	@if [ ! -f "$(AGENTS_DIR)/$(AGENT)/run.sh" ]; then echo "Agent not found: $(AGENTS_DIR)/$(AGENT)/run.sh"; exit 1; fi
-	@BUILD_TAG="$(BUILD_TAG)" FEATURE="$(FEATURE)" bash "$(AGENTS_DIR)/$(AGENT)/run.sh" "$(BUILD_TAG)"
+	@BUILD_TAG="$(BUILD_TAG)" MODULE="$(MODULE)" bash "$(AGENTS_DIR)/$(AGENT)/run.sh" "$(BUILD_TAG)"
 
 # ── Audit ──────────────────────────────────────────────────────────────────────
 .PHONY: audit
@@ -121,7 +121,7 @@ help:
 	@echo "  make feedback AGENT=test-triaging-agent                Show feedback files"
 	@echo "  make clear-feedback AGENT=test-triaging-agent          Clear skip-buildtags.json"
 	@echo ""
-	@echo "  make run AGENT=test-authoring-agent FEATURE=payments     Create from queue/payments.txt"
+	@echo "  make run AGENT=test-authoring-agent MODULE=payments       Create from queue/payments.txt"
 	@echo "  AUTO_PUSH=false make run AGENT=test-authoring-agent      Dry-run (generates + tests, no PR)"
 	@echo "  make audit AGENT=test-authoring-agent                    List recent sessions"
 	@echo ""

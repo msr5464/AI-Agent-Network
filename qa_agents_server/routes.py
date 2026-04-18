@@ -22,7 +22,7 @@ qa_bp = Blueprint("qa_agents", __name__)
 _BASE = f"/agents/{AGENT}"
 
 
-# ── Feature file CRUD ─────────────────────────────────────────────────────────
+# ── Module file CRUD ──────────────────────────────────────────────────────────
 @qa_bp.route(f"{_BASE}/queue", methods=["GET"])
 def queue_list():
     return jsonify({"items": feature_files.list_features()})
@@ -52,15 +52,15 @@ def queue_read(name: str):
 @qa_bp.route(f"{_BASE}/run", methods=["POST"])
 def run_start():
     body = request.get_json(silent=True) or {}
-    feature = body.get("feature")
+    module = body.get("module")
     auto_push = bool(body.get("auto_push", False))
     try:
-        run = runner.start_run(feature=feature, auto_push=auto_push)
+        run = runner.start_run(module=module, auto_push=auto_push)
     except runner.RunnerError as e:
         return jsonify({"error": str(e)}), e.status
     return jsonify({
         "session_id": run.session_id,
-        "feature": run.feature,
+        "module": run.module,
         "auto_push": run.auto_push,
         "status": run.status,
         "started_at": run.started_at,
@@ -78,7 +78,7 @@ def run_active():
     return jsonify({
         "active": True,
         "session_id": run.session_id,
-        "feature": run.feature,
+        "module": run.module,
         "auto_push": run.auto_push,
         "status": run.status,
         "started_at": run.started_at,

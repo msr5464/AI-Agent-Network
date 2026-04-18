@@ -9,7 +9,7 @@ framework-compliant Java test code for the Jarvis automation repository, validat
 generated web flows with a headless Playwright script, runs the generated test via Maven,
 fixes any failures iteratively, and raises a GitHub PR.
 
-Runs independently. One session = one feature input file = one PR (or Slack alert if tests fail).
+Runs independently. One session = one module input file = one PR (or Slack alert if tests fail).
 
 ---
 
@@ -42,7 +42,7 @@ run.sh (orchestrator)
 ## Data Flow
 
 ```
-queue/<feature>.txt  (plain English test steps)
+queue/<module>.txt  (plain English test steps)
     ↓
 01-parse.json            (structured generation plan: classes, fields, methods)
     ↓
@@ -56,18 +56,18 @@ queue/<feature>.txt  (plain English test steps)
 05-ship.json             (PR URL, Slack status)
 .verdict                 (APPROVED / NEEDS-REVIEW)
     ↓
-queue/processed/<feature>.txt  (moved after completion)
+queue/processed/<module>.txt  (moved after completion)
 ```
 
 ---
 
 ## Input File Format
 
-Plain text file at `queue/<feature>.txt`. Claude in step 01 is flexible about exact format.
+Plain text file at `queue/<module>.txt`. Claude in step 01 is flexible about exact format.
 The minimum required information:
 
 ```
-Feature: payments
+Module: payments
 Type: both          # api | web | both
 URL: https://app.staging.example.com
 API URL: https://api.staging.example.com
@@ -141,7 +141,7 @@ Web Steps:
 | `SLACK_BOT_TOKEN` | Slack bot token | optional |
 | `SLACK_NOTIFY_CHANNEL` | Slack channel for success notifications | optional |
 | `SLACK_ALERT_CHANNEL` | Slack channel for failure alerts | optional |
-| `SESSION_ID`, `AUDIT_DIR`, `INPUT_FILE`, `FEATURE` | Set by run.sh — do not set manually | — |
+| `SESSION_ID`, `AUDIT_DIR`, `INPUT_FILE`, `MODULE` | Set by run.sh — do not set manually | — |
 
 ---
 
@@ -152,14 +152,14 @@ Web Steps:
 cp agents/test-authoring-agent/.env.example agents/test-authoring-agent/.env
 # Edit .env: set WORKSPACE_DIR, GITHUB_TOKEN, GITHUB_ORG at minimum
 
-# Direct mode — process a specific feature input file
-make run AGENT=test-authoring-agent FEATURE=payments
+# Direct mode — process a specific module input file
+make run AGENT=test-authoring-agent MODULE=payments
 
 # Queue mode — picks the oldest .txt in the queue
 make run AGENT=test-authoring-agent
 
 # Dry-run — generates, tests, but no PR pushed
-AUTO_PUSH=false make run AGENT=test-authoring-agent FEATURE=payments
+AUTO_PUSH=false make run AGENT=test-authoring-agent MODULE=payments
 
 # View audit trail
 make audit AGENT=test-authoring-agent
