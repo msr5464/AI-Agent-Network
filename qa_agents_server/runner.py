@@ -101,12 +101,54 @@ _runs: Dict[str, RunState] = {}
 _active_session_id: Optional[str] = None
 _registry_lock = threading.Lock()
 
+# ── Pending queue ─────────────────────────────────────────────────────────────
+# Each entry: {"module": str, "auto_push": bool}
+_pending_queue: List[Dict] = []
+_queue_lock = threading.Lock()
+
 
 # ── Errors ────────────────────────────────────────────────────────────────────
 class RunnerError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
+
+
+class _QueuedNotification(Exception):
+    """Raised (not an error) to signal that a run was enqueued, not started."""
+    def __init__(self, position: int, session_id: str):
+        self.position = position
+        self.session_id = session_id
+
+
+def _start_next_from_queue() -> None:
+    """Pick the first pending item and start it. Runs in the reap thread."""
+    with _queue_lock:
+        if not _pending_queue:
+            return
+        next_item = _pending_queue.pop(0)
+    try:
+        start_run(next_item["module"], next_item["auto_push"],
+                  session_id=next_item.get("session_id"))
+    except Exception as e:
+        print(f"[runner] failed to start queued run for {next_item['module']!r}: {e}")
+
+
+def get_queue() -> List[Dict]:
+    """Return a snapshot of pending queue items."""
+    with _queue_lock:
+        return [{"module": item["module"], "auto_push": item["auto_push"],
+                 "session_id": item.get("session_id"), "position": i + 1}
+                for i, item in enumerate(_pending_queue)]
+
+
+def remove_from_queue(index: int) -> bool:
+    """Remove item at 0-based index. Returns True if removed."""
+    with _queue_lock:
+        if 0 <= index < len(_pending_queue):
+            _pending_queue.pop(index)
+            return True
+        return False
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -144,7 +186,7 @@ def get_run(session_id: str) -> Optional[RunState]:
     return _runs.get(session_id)
 
 
-def start_run(module: str, auto_push: bool) -> RunState:
+def start_run(module: str, auto_push: bool, session_id: Optional[str] = None) -> RunState:
     """Spawn run.sh for the given module. Raises RunnerError on validation."""
     global _active_session_id
 
@@ -168,12 +210,14 @@ def start_run(module: str, auto_push: bool) -> RunState:
         if _active_session_id is not None:
             active = _runs.get(_active_session_id)
             if active and active.status == "running":
-                raise RunnerError(
-                    f"another run is already in progress: {_active_session_id}",
-                    status=409,
-                )
+                # Queue instead of rejecting — generate session_id now so it's stable
+                with _queue_lock:
+                    queued_session_id = _make_session_id(module)
+                    _pending_queue.append({"module": module, "auto_push": auto_push, "session_id": queued_session_id})
+                    position = len(_pending_queue)
+                raise _QueuedNotification(position, queued_session_id)
 
-        session_id = _make_session_id(module)
+        session_id = session_id or _make_session_id(module)
         audit_dir = AUTHORING_AUDIT_DIR / session_id
         audit_dir.mkdir(parents=True, exist_ok=True)
 
@@ -321,14 +365,17 @@ def _append_event(run: RunState, kind: str, data: dict) -> Event:
 
 
 def _stdout_reader(run: RunState) -> None:
-    """Read the subprocess's stdout line-by-line into the ring buffer."""
+    """Read the subprocess's stdout line-by-line into the ring buffer and persist to disk."""
     proc = run.proc
     if proc is None or proc.stdout is None:
         return
+    log_path = run.audit_dir / "stdout.log"
     try:
-        for raw in proc.stdout:
-            line = raw.rstrip("\n")
-            _append_event(run, "stdout", {"line": line})
+        with open(log_path, "w", buffering=1) as log_fh:
+            for raw in proc.stdout:
+                line = raw.rstrip("\n")
+                _append_event(run, "stdout", {"line": line})
+                log_fh.write(line + "\n")
     except Exception as e:
         _append_event(run, "error", {"source": "stdout_reader", "message": str(e)})
 
@@ -410,6 +457,11 @@ def _wait_and_reap(run: RunState) -> None:
     # Derive final status
     if run.status == "cancelled":
         final_status = "cancelled"
+        # Persist cancellation so audit_reader survives server restarts
+        try:
+            (run.audit_dir / ".cancelled").write_text("true\n")
+        except OSError:
+            pass
     elif exit_code == 0:
         # Check .verdict if present to distinguish APPROVED vs NEEDS-REVIEW
         verdict_path = run.audit_dir / ".verdict"
@@ -457,3 +509,6 @@ def _wait_and_reap(run: RunState) -> None:
     with _registry_lock:
         if _active_session_id == run.session_id:
             _active_session_id = None
+
+    # Kick off the next queued run, if any
+    _start_next_from_queue()

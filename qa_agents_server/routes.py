@@ -56,15 +56,36 @@ def run_start():
     auto_push = bool(body.get("auto_push", False))
     try:
         run = runner.start_run(module=module, auto_push=auto_push)
+    except runner._QueuedNotification as q:
+        return jsonify({
+            "queued": True,
+            "position": q.position,
+            "module": module,
+            "session_id": q.session_id,
+        }), 202
     except runner.RunnerError as e:
         return jsonify({"error": str(e)}), e.status
     return jsonify({
+        "queued": False,
         "session_id": run.session_id,
         "module": run.module,
         "auto_push": run.auto_push,
         "status": run.status,
         "started_at": run.started_at,
     }), 201
+
+
+@qa_bp.route(f"{_BASE}/run/queue", methods=["GET"])
+def pending_queue_list():
+    return jsonify({"queue": runner.get_queue()})
+
+
+@qa_bp.route(f"{_BASE}/run/queue/<int:index>", methods=["DELETE"])
+def pending_queue_remove(index: int):
+    removed = runner.remove_from_queue(index)
+    if not removed:
+        return jsonify({"error": "index out of range"}), 404
+    return jsonify({"removed": True, "queue": runner.get_queue()})
 
 
 @qa_bp.route(f"{_BASE}/run/active", methods=["GET"])

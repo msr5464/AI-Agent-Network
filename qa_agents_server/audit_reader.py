@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -58,7 +59,7 @@ def _parse_session_id(session_id: str) -> Dict[str, Optional[str]]:
     """Split a session_id like '20260410-142203-create-payments' into parts."""
     m = _SESSION_RE.match(session_id)
     if not m:
-        return {"timestamp": None, "feature": None}
+        return {"timestamp": None, "module": None}
     ts_raw, _, feature = m.groups()
     # ts_raw format: YYYYMMDD-HHMMSS
     try:
@@ -68,19 +69,38 @@ def _parse_session_id(session_id: str) -> Dict[str, Optional[str]]:
         )
     except IndexError:
         iso = None
-    return {"timestamp": iso, "feature": feature}
+    return {"timestamp": iso, "module": feature}
+
+
+def _step_has_error(data: Optional[Dict]) -> bool:
+    """Return True if a step JSON signals a hard failure."""
+    if not isinstance(data, dict):
+        return False
+    return "error" in data or data.get("status") == "failed"
 
 
 def _derive_status(session_dir: Path, ship_data: Optional[Dict]) -> str:
-    """Compute a UI status: running / completed / failed / unknown."""
+    """Compute a UI status: running / completed / failed / cancelled / unknown."""
     if ship_data is not None:
         verdict = ship_data.get("verdict")
         if verdict == "APPROVED":
             return "completed"
         if verdict == "NEEDS-REVIEW":
             return "failed"
-    # 05-ship.json missing. Did any step land? If step 1 hasn't appeared,
-    # the session likely never got past init.
+
+    # Explicit cancellation marker written by runner._wait_and_reap
+    if (session_dir / ".cancelled").exists():
+        return "cancelled"
+
+    # No ship.json — check if any step JSON carries an error flag.
+    for _, fname, _ in STEPS:
+        data = _safe_load_json(session_dir / fname)
+        if data is not None and _step_has_error(data):
+            return "failed"
+
+    # Session init file exists → run started, just hasn't finished step 1 yet
+    if (session_dir / "00-session-init.md").exists():
+        return "running"
     parse_json = session_dir / "01-parse.json"
     if not parse_json.exists():
         return "unknown"
@@ -103,7 +123,7 @@ def list_sessions(limit: int = 50, offset: int = 0) -> List[Dict]:
         status = _derive_status(entry, ship)
         sessions.append({
             "session_id": entry.name,
-            "feature": (ship or {}).get("feature") or parsed["feature"],
+            "module": (ship or {}).get("feature") or parsed["module"],
             "feature_class": (ship or {}).get("feature_class"),
             "started_at": parsed["timestamp"],
             "status": status,
@@ -137,7 +157,7 @@ def get_session(session_id: str) -> Optional[Dict]:
 
     return {
         "session_id": session_id,
-        "feature": (ship or {}).get("feature") or parsed["feature"],
+        "module": (ship or {}).get("feature") or parsed["module"],
         "started_at": parsed["timestamp"],
         "status": _derive_status(session_dir, ship),
         "verdict": verdict,
@@ -176,26 +196,37 @@ def replay_events(session_id: str) -> Optional[List[Dict]]:
     parsed = _parse_session_id(session_id)
     emit("status", {
         "session_id": session_id,
-        "feature": parsed["feature"],
+        "module": parsed["module"],
         "status": "running",
         "started_at": parsed["timestamp"],
     })
 
-    # Each step's presence becomes a 'step' event with status=done
+    # Replay persisted stdout lines (written by runner._stdout_reader)
+    stdout_log = session_dir / "stdout.log"
+    if stdout_log.exists():
+        try:
+            for line in stdout_log.read_text(errors="replace").splitlines():
+                emit("stdout", {"line": line})
+        except OSError:
+            pass
+
+    # Each step's presence becomes a 'step' event — status reflects error if present
     for key, fname, display in STEPS:
         data = _safe_load_json(session_dir / fname)
         if data is None:
             continue
+        step_status = "failed" if _step_has_error(data) else "done"
         emit("step", {
             "key": key,
             "display": display,
-            "status": "done",
+            "status": step_status,
             "summary": _summarise_step(key, data),
         })
 
     # Terminal event from ship + verdict
     ship = _safe_load_json(session_dir / "05-ship.json")
     verdict = (_read_text(session_dir / ".verdict") or "").strip() or None
+    duration_s = _compute_duration_s(session_id, ship)
     if ship is not None:
         emit("done", {
             "status": _derive_status(session_dir, ship),
@@ -203,6 +234,7 @@ def replay_events(session_id: str) -> Optional[List[Dict]]:
             "pr_url": ship.get("pr_url"),
             "test_passed": ship.get("test_passed"),
             "files_count": ship.get("files_count"),
+            "duration_s": duration_s,
         })
     else:
         emit("done", {
@@ -211,9 +243,31 @@ def replay_events(session_id: str) -> Optional[List[Dict]]:
             "pr_url": None,
             "test_passed": None,
             "files_count": None,
+            "duration_s": duration_s,
         })
 
     return events
+
+
+def _compute_duration_s(session_id: str, ship_data: Optional[Dict]) -> Optional[float]:
+    """Return wall-clock duration in seconds from session start to ship timestamp."""
+    if not ship_data:
+        return None
+    end_ts = ship_data.get("timestamp")
+    if not end_ts:
+        return None
+    m = re.match(r'^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})', session_id)
+    if not m:
+        return None
+    try:
+        yr, mo, dy, hh, mm, ss = (int(x) for x in m.groups())
+        naive_local = datetime(yr, mo, dy, hh, mm, ss)
+        start_utc = naive_local.astimezone(timezone.utc)
+        end_utc = datetime.fromisoformat(end_ts.replace("Z", "+00:00"))
+        secs = (end_utc - start_utc).total_seconds()
+        return secs if secs >= 0 else None
+    except Exception:
+        return None
 
 
 def _summarise_step(key: str, data: Dict) -> Dict:
@@ -223,7 +277,7 @@ def _summarise_step(key: str, data: Dict) -> Dict:
     if key == "parse":
         return {
             "test_type": data.get("test_type"),
-            "feature": data.get("feature"),
+            "module": data.get("feature"),
             "existing_module": data.get("existing_module"),
         }
     if key == "validate_web":
