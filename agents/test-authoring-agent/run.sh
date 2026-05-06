@@ -130,8 +130,14 @@ if [[ -z "$WORKSPACE_DIR" ]]; then
   exit 1
 fi
 if [[ ! -d "$AUTOMATION_FRAMEWORK_DIR/.git" ]]; then
-  log "ERROR: Automation repo not found at $AUTOMATION_FRAMEWORK_DIR"
-  exit 1
+  log "Automation repo not found at $AUTOMATION_FRAMEWORK_DIR — cloning from GitHub ..."
+  mkdir -p "$WORKSPACE_DIR"
+  CLONE_URL="https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/${GITHUB_REPO_AUTOMATION}.git"
+  if ! git clone "$CLONE_URL" "$AUTOMATION_FRAMEWORK_DIR"; then
+    log "ERROR: Failed to clone $GITHUB_ORG/$GITHUB_REPO_AUTOMATION into $AUTOMATION_FRAMEWORK_DIR"
+    exit 1
+  fi
+  log "Cloned $GITHUB_ORG/$GITHUB_REPO_AUTOMATION successfully"
 fi
 
 log "Prerequisite: syncing $AUTOMATION_FRAMEWORK_DIR to origin/$GITHUB_DEFAULT_BRANCH ..."

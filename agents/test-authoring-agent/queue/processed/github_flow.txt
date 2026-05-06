@@ -1,8 +1,0 @@
-Module: github
-Type: web
-
-Steps:
-1. Navigate to github website 
-2. Perform login using Username: automationdemo@yopmail.com, Password: automationPassword
-3. Then using left sidebar, find and click to this repo: automationdemo/QA-Dashboard, this should open the respective Repo page
-4. Validate that the image related to "Test Coverage Data for all the Projects:" is present in the ReadMe file and is properly visible
