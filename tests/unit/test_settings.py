@@ -1,5 +1,5 @@
 """
-Unit tests for src/settings.py - Config class.
+Unit tests for agents/test-triaging-agent/lib/settings.py - Config class.
 Tests environment variable loading, defaults, type conversions, and helper methods.
 """
 
@@ -10,9 +10,9 @@ from unittest import mock
 
 import pytest
 
-# Add repo root to path so src.* imports work
-_repo_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_repo_root))
+# Point at the agent's lib/ directory so `lib.settings` resolves
+_agent_dir = Path(__file__).resolve().parent.parent.parent / 'agents' / 'test-triaging-agent'
+sys.path.insert(0, str(_agent_dir))
 
 
 class TestConfigDefaults:
@@ -27,8 +27,6 @@ class TestConfigDefaults:
         'INPUT_DIR', 'OUTPUT_DIR', 'REPORT_FORMAT_VERSION',
         'DASHBOARD_BASE_URL', 'JIRA_BASE_URL',
         'FLAKY_TESTS_LAST_RUNS', 'FLAKY_TESTS_MIN_FAILURES',
-        'AUTO_FIX_ENABLED', 'AUTO_FIX_DRY_RUN', 'AUTO_FIX_MAX_FIXES_PER_RUN',
-        'AUTO_FIX_ENV_OVERRIDE',
         'GITHUB_TOKEN', 'GITHUB_ORG', 'GITHUB_REPO_AUTOMATION',
         'GITHUB_DEFAULT_BRANCH', 'GITHUB_PR_REVIEWERS',
     ]
@@ -48,9 +46,9 @@ class TestConfigDefaults:
              mock.patch('dotenv.load_dotenv', return_value=None):
             # Remove cached module so it reloads with the patched env
             for mod_name in list(sys.modules):
-                if mod_name.startswith('src.settings'):
+                if mod_name.startswith('lib.settings'):
                     del sys.modules[mod_name]
-            from src.settings import Config as FreshConfig
+            from lib.settings import Config as FreshConfig
             return FreshConfig
 
     def test_database_defaults(self):
@@ -60,7 +58,7 @@ class TestConfigDefaults:
         assert Cfg.DB_PORT == 3306
         assert Cfg.DB_USER == 'root'
         assert Cfg.DB_PASSWORD == ''
-        assert Cfg.DB_NAME == 'thanos'
+        assert Cfg.DB_NAME == 'qa_results'
 
     def test_llm_defaults(self):
         """Default LLM provider should be ollama with llama3.2:3b."""
@@ -84,13 +82,6 @@ class TestConfigDefaults:
         Cfg = self._load_config_with_env()
         assert Cfg.FLAKY_TESTS_LAST_RUNS == 10
         assert Cfg.FLAKY_TESTS_MIN_FAILURES == 5
-
-    def test_autofix_defaults_disabled(self):
-        """Auto-fix should be disabled by default."""
-        Cfg = self._load_config_with_env()
-        assert Cfg.AUTO_FIX_ENABLED is False
-        assert Cfg.AUTO_FIX_DRY_RUN is False
-        assert Cfg.AUTO_FIX_MAX_FIXES_PER_RUN == 5
 
     def test_github_defaults_empty(self):
         """GitHub config should default to empty when not configured."""
@@ -121,8 +112,6 @@ class TestConfigEnvOverrides:
             'INPUT_DIR', 'OUTPUT_DIR', 'REPORT_FORMAT_VERSION',
             'DASHBOARD_BASE_URL', 'JIRA_BASE_URL',
             'FLAKY_TESTS_LAST_RUNS', 'FLAKY_TESTS_MIN_FAILURES',
-            'AUTO_FIX_ENABLED', 'AUTO_FIX_DRY_RUN', 'AUTO_FIX_MAX_FIXES_PER_RUN',
-            'AUTO_FIX_ENV_OVERRIDE',
             'GITHUB_TOKEN', 'GITHUB_ORG', 'GITHUB_REPO_AUTOMATION',
             'GITHUB_DEFAULT_BRANCH', 'GITHUB_PR_REVIEWERS',
         ]
@@ -131,9 +120,9 @@ class TestConfigEnvOverrides:
 
         with mock.patch.dict(os.environ, clean_env, clear=True):
             for mod_name in list(sys.modules):
-                if mod_name.startswith('src.settings'):
+                if mod_name.startswith('lib.settings'):
                     del sys.modules[mod_name]
-            from src.settings import Config as FreshConfig
+            from lib.settings import Config as FreshConfig
             return FreshConfig
 
     def test_db_host_override(self):
@@ -161,16 +150,6 @@ class TestConfigEnvOverrides:
         assert Cfg.GEMINI_API_KEY == 'test-gemini-key'
         assert Cfg.GEMINI_MODEL == 'gemini-1.5-pro'
 
-    def test_auto_fix_enabled_true(self):
-        """AUTO_FIX_ENABLED='true' should resolve to boolean True."""
-        Cfg = self._load_config_with_env({'AUTO_FIX_ENABLED': 'true'})
-        assert Cfg.AUTO_FIX_ENABLED is True
-
-    def test_auto_fix_enabled_false_for_random_string(self):
-        """AUTO_FIX_ENABLED with a non-'true' value should be False."""
-        Cfg = self._load_config_with_env({'AUTO_FIX_ENABLED': 'yes'})
-        assert Cfg.AUTO_FIX_ENABLED is False
-
     def test_flaky_tests_int_conversion(self):
         """FLAKY_TESTS_LAST_RUNS should be converted to int."""
         Cfg = self._load_config_with_env({'FLAKY_TESTS_LAST_RUNS': '20'})
@@ -186,18 +165,13 @@ class TestConfigEnvOverrides:
         Cfg = self._load_config_with_env({'GITHUB_PR_REVIEWERS': ''})
         assert Cfg.GITHUB_PR_REVIEWERS == []
 
-    def test_auto_fix_env_override_stripped(self):
-        """AUTO_FIX_ENV_OVERRIDE should be stripped of whitespace."""
-        Cfg = self._load_config_with_env({'AUTO_FIX_ENV_OVERRIDE': '  qa-2  '})
-        assert Cfg.AUTO_FIX_ENV_OVERRIDE == 'qa-2'
-
 
 class TestConfigGetDbConfig:
     """Test the get_db_config() classmethod."""
 
     def test_get_db_config_returns_dict(self):
         """get_db_config() should return a dict with the expected keys."""
-        from src.settings import Config
+        from lib.settings import Config
         db_config = Config.get_db_config()
         assert isinstance(db_config, dict)
         assert 'host' in db_config
@@ -208,7 +182,7 @@ class TestConfigGetDbConfig:
 
     def test_get_db_config_values_match_class(self):
         """get_db_config() values should match Config class attributes."""
-        from src.settings import Config
+        from lib.settings import Config
         db_config = Config.get_db_config()
         assert db_config['host'] == Config.DB_HOST
         assert db_config['port'] == Config.DB_PORT
@@ -218,13 +192,13 @@ class TestConfigGetDbConfig:
 
     def test_get_db_config_port_is_int(self):
         """Port in the db config dict should be an integer."""
-        from src.settings import Config
+        from lib.settings import Config
         db_config = Config.get_db_config()
         assert isinstance(db_config['port'], int)
 
 
 class TestEnvFileLoadOrder:
-    """Test that the .env file load order is correct (config/.env > config/.env.example > root .env)."""
+    """Test that the .env file load order is correct."""
 
     def test_config_env_path_exists(self):
         """config/.env or config/.env.example should exist for the project to function."""
@@ -232,10 +206,3 @@ class TestEnvFileLoadOrder:
         has_env = (config_dir / '.env').exists()
         has_example = (config_dir / '.env.example').exists()
         assert has_env or has_example, "Neither config/.env nor config/.env.example found"
-
-    def test_config_dir_relative_to_settings_module(self):
-        """The config directory should be at project_root/config/ relative to settings.py."""
-        from src import settings
-        settings_path = Path(settings.__file__).resolve()
-        expected_config_dir = settings_path.parent.parent / 'config'
-        assert expected_config_dir.is_dir(), f"Expected config dir at {expected_config_dir}"

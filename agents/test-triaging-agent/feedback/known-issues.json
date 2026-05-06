@@ -1,0 +1,7 @@
+[
+  {
+    "pattern": "OTP|testOtp|testOneTimePassword",
+    "reason": "OTP failures are product defects, not locator issues — auto-fix cannot resolve them",
+    "added": "2026-03-28"
+  }
+]

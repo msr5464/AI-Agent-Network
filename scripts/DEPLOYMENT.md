@@ -1,6 +1,6 @@
-# QA AI Agent – Deployment Guide
+# QA Agent Network – Deployment Guide
 
-This document summarizes the recommended steps for standing up the QA AI Agent on Windows workstations and wiring it into a Jenkins CI job.
+This document summarizes the recommended steps for standing up the QA Agent Network on Windows workstations and wiring it into a Jenkins CI job.
 
 ---
 
@@ -15,7 +15,7 @@ This document summarizes the recommended steps for standing up the QA AI Agent o
 2. **Clone the repo**
    ```powershell
    git clone <repo-url>
-   cd QA-AI-Agent
+   cd QA-Agent-Network
    ```
 
 3. **Bootstrap dependencies**
@@ -41,7 +41,7 @@ This document summarizes the recommended steps for standing up the QA AI Agent o
      ```
      Action: Start a program
      Program/script: powershell
-     Arguments: -ExecutionPolicy Bypass -File C:\path\to\QA-AI-Agent\scripts\run.ps1 --input-dir testdata\Regression-Growth-Tests-442 --output-dir reports
+     Arguments: -ExecutionPolicy Bypass -File C:\path\to\QA-Agent-Network\scripts\run.ps1 --input-dir testdata\Regression-Growth-Tests-442 --output-dir reports
      ```
    - Redirect logs or archive report artifacts as needed.
 
@@ -52,22 +52,22 @@ This document summarizes the recommended steps for standing up the QA AI Agent o
 1. **Prepare the Jenkins node**
    - Install Python 3.9+, Git, and (optionally) Ollama on the node.
    - Ensure the node has network access to your MySQL database and report storage.
-   - Place `QA-AI-Agent` in a stable location (e.g., `C:\jenkins\tools\QA-AI-Agent`) or allow the pipeline to clone it each run.
+   - Place `QA-Agent-Network` in a stable location (e.g., `C:\jenkins\tools\QA-Agent-Network`) or allow the pipeline to clone it each run.
    - Create `config\.env` with the same secrets used locally (store it as a Jenkins secret file if necessary).
 
 2. **Pipeline stage (example)**
    Append this stage after your existing automation run:
 
    ```groovy
-   stage('QA AI Agent Analysis') {
+   stage('QA Agent Network Analysis') {
        steps {
            script {
-               def qaAgentHome = "C:\\jenkins\\tools\\QA-AI-Agent"
+               def qaAgentHome = "C:\\jenkins\\tools\\QA-Agent-Network"
                def reportDir = "testdata\\${env.JOB_NAME}-${env.BUILD_NUMBER}"
 
                bat """
                    if not exist "${qaAgentHome}" (
-                       git clone https://github.com/your-org/QA-AI-Agent "${qaAgentHome}"
+                       git clone https://github.com/your-org/QA-Agent-Network "${qaAgentHome}"
                    )
                """
 
@@ -92,7 +92,7 @@ This document summarizes the recommended steps for standing up the QA AI Agent o
 
 5. **Monitoring**
    - Archive the generated HTML or publish it via Jenkins “HTML Publisher” to make it easy to view.
-   - Pipe script logs to `QA-AI-Agent\agent.log` for traceability.
+   - Pipe script logs to `QA-Agent-Network\agent.log` for traceability.
 
 ---
 

@@ -1,0 +1,25 @@
+{
+  "_comment": "Central per-repo metadata. Used by test-healing-agent and test-authoring-agent.",
+  "_usage": "shared/repo_config.py load_repo_config(repo_name) — falls back to GITHUB_REPO_AUTOMATION env var",
+  "Jarvis": {
+    "language": "java",
+    "framework": "TestNG + Selenium",
+    "default_branch": "main",
+    "test_runner": {
+      "cmd": ["mvn", "test", "-Dtest={class}#{method}"],
+      "test_dirs": ["src/test/java"],
+      "compile_cmd": ["mvn", "compile", "-q"]
+    },
+    "conventions_file": "CLAUDE.md",
+    "pr_checklist": [
+      "Locator uses id/name/data-cy — not positional XPath or generated class names",
+      "Uses framework wrappers (Element.click, WaitHelper.*) — no raw Selenium",
+      "No Thread.sleep — uses WaitHelper instead",
+      "AssertHelper used for all assertions — no raw TestNG Assert",
+      "Page object constructor follows mandatory pattern (super → PageFactory → waitForLoaderDisappeared → waitForPageLoad)",
+      "Navigation methods return the next page object",
+      "logStep in test classes only, logComment in page objects/helpers",
+      "No commented-out code or System.out.println"
+    ]
+  }
+}

@@ -1,17 +1,20 @@
 #!/bin/bash
-# High-performance setup script for macOS/Linux
+# Setup script for macOS/Linux
 
 set -euo pipefail
 
-# Colors for output
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 function write_step() {
     echo -e "${CYAN}==> $1${NC}"
 }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 # 1. Verify Python
 write_step "Verifying Python 3"
@@ -20,26 +23,38 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# 2. Create Virtual Environment
-if [ ! -d "venv" ]; then
-    write_step "Creating virtual environment at venv"
-    python3 -m venv venv
+# 2. Verify / install Claude CLI
+write_step "Checking Claude CLI"
+CLAUDE_CLI="${CLAUDE_CLI_PATH:-claude}"
+if command -v "$CLAUDE_CLI" &> /dev/null; then
+    echo "  Claude CLI found: $(command -v "$CLAUDE_CLI")"
 else
-    write_step "Virtual environment already exists (skipping creation)"
+    echo -e "  ${YELLOW}Claude CLI not found — attempting install via npm...${NC}"
+    if command -v npm &> /dev/null; then
+        npm install -g @anthropic-ai/claude-code
+        if command -v claude &> /dev/null; then
+            echo "  Claude CLI installed: $(command -v claude)"
+        else
+            echo -e "  ${RED}Install appeared to succeed but 'claude' not on PATH.${NC}"
+            echo -e "  ${YELLOW}Restart your terminal or set CLAUDE_CLI_PATH in config/.env.${NC}"
+        fi
+    else
+        echo -e "  ${RED}npm not found — cannot auto-install Claude CLI.${NC}"
+        echo -e "  ${YELLOW}Install Node.js from https://nodejs.org then re-run this script,${NC}"
+        echo -e "  ${YELLOW}or install manually: npm install -g @anthropic-ai/claude-code${NC}"
+    fi
 fi
 
-# 3. Upgrade Pip and Install Dependencies
-write_step "Upgrading pip and installing dependencies"
-source venv/bin/activate
-pip install --upgrade pip
-if [ -f "requirements.txt" ]; then
-    pip install -r requirements.txt
-else
+# 3. Install dependencies
+write_step "Installing Python dependencies"
+if [ ! -f "requirements.txt" ]; then
     echo -e "${RED}Error: requirements.txt not found!${NC}"
     exit 1
 fi
+# Use `python3 -m pip` for portability — on macOS/Homebrew, `pip` may not be on PATH.
+python3 -m pip install -r requirements.txt
 
-# 4. Initialize Config
+# 4. Initialize config
 ENV_PATH="config/.env"
 EXAMPLE_PATH="config/.env.example"
 
@@ -53,5 +68,6 @@ else
 fi
 
 write_step "Setup complete. Next steps:"
-echo -e "  1. ${YELLOW}Update config/.env${NC} with your database and AI provider details."
-echo -e "  2. Run the agent via: ${YELLOW}./scripts/run.sh${NC}"
+echo -e "  1. ${YELLOW}Edit config/.env${NC} — fill in DB credentials, Claude CLI path, GitHub token, Slack token."
+echo -e "  2. Analyse a build:  ${YELLOW}./scripts/run-analyse.sh${NC}"
+echo -e "  3. Fix & raise PR:   ${YELLOW}./scripts/run-autofix.sh${NC}"

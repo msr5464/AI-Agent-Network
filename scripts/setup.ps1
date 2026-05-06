@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
     [string]$PythonExe = "python",
-    [string]$VenvPath = "venv",
     [string]$Requirements = "requirements.txt"
 )
 
@@ -31,27 +30,35 @@ if (-not $pythonCmd) {
     throw "Python was not found on the PATH. Install Python 3.9+ and try again."
 }
 
-if (-not (Test-Path $VenvPath)) {
-    Write-Step "Creating virtual environment at $VenvPath"
-    Invoke-OrFail { & $PythonExe -m venv $VenvPath } "Failed to create virtual environment"
-} else {
-    Write-Step "Virtual environment already exists at $VenvPath (skipping creation)"
-}
-
-$venvPython = Join-Path $VenvPath "Scripts\python.exe"
-if (-not (Test-Path $venvPython)) {
-    throw "Unable to locate $venvPython. Ensure the virtual environment was created successfully."
-}
-
-Write-Step "Upgrading pip"
-Invoke-OrFail { & $venvPython -m pip install --upgrade pip } "Failed to upgrade pip"
-
 if (-not (Test-Path $Requirements)) {
     throw "Requirements file '$Requirements' not found."
 }
 
+Write-Step "Checking Claude CLI"
+$claudeCli = if ($env:CLAUDE_CLI_PATH) { $env:CLAUDE_CLI_PATH } else { "claude" }
+$claudeFound = Get-Command $claudeCli -ErrorAction SilentlyContinue
+if ($claudeFound) {
+    Write-Host "  Claude CLI found: $($claudeFound.Source)" -ForegroundColor Green
+} else {
+    Write-Host "  Claude CLI not found — attempting install via npm..." -ForegroundColor Yellow
+    $npmFound = Get-Command npm -ErrorAction SilentlyContinue
+    if ($npmFound) {
+        npm install -g @anthropic-ai/claude-code
+        $claudeAfter = Get-Command claude -ErrorAction SilentlyContinue
+        if ($claudeAfter) {
+            Write-Host "  Claude CLI installed: $($claudeAfter.Source)" -ForegroundColor Green
+        } else {
+            Write-Warning "  Install appeared to succeed but 'claude' not on PATH. Restart your terminal or set CLAUDE_CLI_PATH in config\.env."
+        }
+    } else {
+        Write-Warning "  npm not found — cannot auto-install Claude CLI."
+        Write-Host "  Install Node.js from https://nodejs.org then re-run this script," -ForegroundColor Yellow
+        Write-Host "  or install manually: npm install -g @anthropic-ai/claude-code" -ForegroundColor Yellow
+    }
+}
+
 Write-Step "Installing project dependencies"
-Invoke-OrFail { & $venvPython -m pip install -r $Requirements } "Failed to install dependencies"
+Invoke-OrFail { & $PythonExe -m pip install -r $Requirements } "Failed to install dependencies"
 
 $envPath = Join-Path "config" ".env"
 $envExamplePath = Join-Path "config" ".env.example"
@@ -65,7 +72,6 @@ if (-not (Test-Path $envPath) -and (Test-Path $envExamplePath)) {
 }
 
 Write-Step "Setup complete. Next steps:"
-Write-Host "  1. Update config\.env with your database and AI provider details." -ForegroundColor Yellow
-Write-Host "  2. Place/verify your report folders under testdata/ (or adjust INPUT_DIR)." -ForegroundColor Yellow
-Write-Host "  3. Run the agent via: powershell -ExecutionPolicy Bypass -File .\scripts\run.ps1 --input-dir testdata/Regression-Growth-Tests-442 --output-dir reports" -ForegroundColor Yellow
-
+Write-Host "  1. Edit config\.env — fill in DB credentials, Claude CLI path, GitHub token, Slack token." -ForegroundColor Yellow
+Write-Host "  2. Analyse a build:  .\scripts\run-analyse.ps1" -ForegroundColor Yellow
+Write-Host "  3. Fix and raise PR: .\scripts\run-autofix.ps1" -ForegroundColor Yellow

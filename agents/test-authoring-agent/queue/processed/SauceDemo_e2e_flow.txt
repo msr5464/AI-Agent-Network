@@ -1,0 +1,22 @@
+Feature: SauceDemo
+Type: web
+
+Steps:
+Feature: SauceDemo
+Type: web
+
+Credentials:
+Username: standard_user
+Password: secret_sauce
+
+Steps:
+1. Navigate to SauceDemo and log in
+2. In the Product List page, read and store the name of first item shown in the list of products
+3. Then sort all products with "Price (low to high)" using the filter icon
+4. Thereafter, validate that "Sauce Labs Onesie" is appearing as the first product in the product page and not the earlier item
+5. Now, add "Sauce Labs Fleece Jacket" item to the cart
+6. Validate after adding the item, button changed from "Add to cart" to "Remove"
+7. Then click on cart icon and perform Checkout
+8. Fill random details in the "Checkout: Your Information" form and continue
+9. Validate that all the information showing up in "Checkout: Overview" page matches the details that were being shown in the Product listing page
+10. Click on Finish and validate that order is placed with the message "Thank you for your order!"

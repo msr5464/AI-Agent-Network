@@ -8,17 +8,17 @@ from pathlib import Path
 
 import pytest
 
-_repo_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_repo_root))
+_agent_dir = Path(__file__).resolve().parent.parent.parent / 'agents' / 'test-triaging-agent'
+sys.path.insert(0, str(_agent_dir))
 
-from src.parsers.data_builder import (
+from lib.parsers.data_builder import (
     db_row_to_test_result,
     get_full_report_data_from_db,
     get_execution_logs_from_html,
     get_test_durations_from_html,
     find_latest_report,
 )
-from src.parsers.models import TestStatus
+from lib.parsers.models import TestStatus
 
 # Minimal HTML for HTML extraction tests (report_dir/html/overview + results file)
 _MINIMAL_OVERVIEW = """<!DOCTYPE html>

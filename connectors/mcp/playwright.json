@@ -1,0 +1,12 @@
+{
+  "name": "playwright",
+  "status": "active",
+  "type": "stdio",
+  "command": "npx",
+  "args": ["@playwright/mcp"],
+  "headless_flag": "--no-headless",
+  "headless_env_var": "PLAYWRIGHT_HEADLESS",
+  "used_by": ["test-authoring-agent"],
+  "docs": "https://github.com/microsoft/playwright-mcp",
+  "notes": "Headless mode is toggled dynamically by shared/mcp_config.py based on PLAYWRIGHT_HEADLESS env var"
+}
