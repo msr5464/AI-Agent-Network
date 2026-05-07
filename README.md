@@ -23,6 +23,18 @@
 
 ---
 
+## Documentation
+
+| Doc | Purpose |
+|-----|---------|
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, agent responsibilities, data flow, audit structure |
+| [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | Local dev setup, running agents, TESTING_MODE, debugging tips |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common errors and how to fix them, per agent |
+| [SERVER_API.md](docs/SERVER_API.md) | REST + SSE endpoint reference for `qa_agents_server` |
+| [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Windows workstation + Jenkins CI integration |
+
+---
+
 ## How It Works
 
 Three independent agents, each owning a distinct slice of the QA lifecycle:
@@ -69,8 +81,6 @@ CI test build finishes
 **Agent 1** takes plain English test steps and generates complete, framework-compliant Java test code, verifies it headlessly, runs it with Maven, fixes failures iteratively, and raises a GitHub PR.
 
 **Agent 2** classifies every CI failure as `PRODUCT_BUG` or `AUTOMATION_ISSUE`, writes an HTML report, and queues only the fixable locator failures for Agent 3.
-
-![Sample Report](sample_report.png)
 
 **Agent 3** picks up the queue, fixes broken locators using Claude, verifies each fix by running the test with Maven, and opens a GitHub PR. If only some tests are fixed, it still ships a PR for what passed and alerts on what didn't.
 
@@ -169,6 +179,8 @@ Outputs:
 - GitHub PR on the Jarvis repo (`feat/qa-autocreate/<module>-<timestamp>`)
 - Slack notification to `SLACK_NOTIFY_CHANNEL`
 
+![Agent 1 run](docs/authoring-run.png)
+
 ---
 
 ### Agent 2 — Test Triaging
@@ -189,6 +201,8 @@ Outputs:
 - HTML report → `OUTPUT_DIR/`
 - Handoff file → `agents/test-healing-agent/queue/<build_tag>.json` (if fixable issues found)
 - Slack notification → `SLACK_NOTIFY_CHANNEL` or `SLACK_ALERT_CHANNEL`
+
+![Agent 2 triage report](docs/sample_report.png)
 
 ---
 
@@ -211,6 +225,8 @@ AUTO_PUSH=false ./scripts/run-autofix.sh              # dry-run: fix + test loca
 Outputs:
 - GitHub PR with all passing fixes on the Jarvis repo (`chore/qa-autofix/<build-tag>`)
 - Slack notification with per-test breakdown
+
+![Agent 3 run](docs/healing-run.png)
 
 ---
 
