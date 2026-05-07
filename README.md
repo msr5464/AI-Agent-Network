@@ -7,6 +7,8 @@
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 </div>
 
+**🌐 [msr5464.github.io/ai-agent-network](https://msr5464.github.io/ai-agent-network.html)**
+
 *An AI-driven multi-agent system for end-to-end QA automation — authoring tests, triaging failures, and self-healing broken locators.*
 
 ---
