@@ -21,6 +21,15 @@ cd "$REPO_ROOT"
 
 MODULE="${1:-${MODULE:-}}"
 
+# START_FROM_STEP > 1 resumes an EXISTING session (identified by SESSION_ID)
+# from a specific step instead of starting a fresh 01→05 run — see the
+# "Resume mode" block below for what that requires.
+START_FROM_STEP="${START_FROM_STEP:-1}"
+if ! [[ "$START_FROM_STEP" =~ ^[1-5]$ ]]; then
+  echo "ERROR: START_FROM_STEP must be an integer 1-5, got: $START_FROM_STEP" >&2
+  exit 1
+fi
+
 # Load .env files (root → agent override)
 source "$REPO_ROOT/shared/load_env.sh"
 
@@ -61,7 +70,69 @@ QUEUE_DIR="$AGENT_DIR/queue"
 PROCESSED_DIR="$QUEUE_DIR/processed"
 mkdir -p "$PROCESSED_DIR"
 
-if [[ -n "$MODULE" ]]; then
+if [[ "$START_FROM_STEP" -gt 1 ]]; then
+  # ── Resume mode — continue an existing session from a specific step ────────
+  # SESSION_ID must name a session that already has valid output for every
+  # step before START_FROM_STEP (checked below). The queue .txt file this
+  # session originally parsed may already have been moved to processed/ —
+  # that's fine, step 01's output is already on disk and won't be re-read.
+  if [[ -z "${SESSION_ID:-}" ]]; then
+    log "ERROR: START_FROM_STEP=$START_FROM_STEP requires SESSION_ID to name the session being resumed"
+    exit 1
+  fi
+  AUDIT_DIR="${AUDIT_DIR:-$AGENT_DIR/audit/$SESSION_ID}"
+  if [[ ! -d "$AUDIT_DIR" ]]; then
+    log "ERROR: cannot resume — no existing session at $AUDIT_DIR"
+    exit 1
+  fi
+
+  if [[ -z "$MODULE" ]]; then
+    MODULE=$(grep -m1 '^Module: ' "$AUDIT_DIR/00-session-init.md" 2>/dev/null | sed 's/^Module: //')
+    if [[ -z "$MODULE" ]]; then
+      log "ERROR: could not recover MODULE from $AUDIT_DIR/00-session-init.md — pass MODULE explicitly"
+      exit 1
+    fi
+  fi
+
+  # The step immediately before START_FROM_STEP must have produced valid
+  # output, or there is nothing to resume from. (Plain case/if, not an
+  # associative array — macOS ships bash 3.2 as /bin/bash, which predates
+  # `declare -A`; the rest of this script only ever uses `declare -a`.)
+  case "$START_FROM_STEP" in
+    2) _prereqs="01-parse.json" ;;
+    3) _prereqs="01-parse.json 02-validate-web.json" ;;
+    4) _prereqs="01-parse.json 03-generate.json" ;;
+    5) _prereqs="03-generate.json 04-run-and-fix.json" ;;
+    *) _prereqs="" ;;
+  esac
+  for _f in $_prereqs; do
+    if [[ ! -f "$AUDIT_DIR/$_f" ]]; then
+      log "ERROR: cannot resume from step $START_FROM_STEP — missing $AUDIT_DIR/$_f"
+      log "  (that step never completed in this session; resume from an earlier step instead)"
+      exit 1
+    fi
+  done
+
+  # Best-effort — only used for the final "mark processed" step below; the
+  # session resumes fine even if this file can't be found in either place.
+  INPUT_FILE="$QUEUE_DIR/${MODULE}.txt"
+  [[ -f "$INPUT_FILE" ]] || INPUT_FILE="$PROCESSED_DIR/${MODULE}.txt"
+
+  MODE="resume"
+
+  # Clear stale output for START_FROM_STEP and every step after it, so this
+  # rerun's fresh files never mix with a previous (failed) attempt's — 05_ship.py
+  # in particular reads every 04-run-and-fix-attempt-*.json file present, and a
+  # leftover one from a prior attempt would get treated as real, current data.
+  log "Resuming session $SESSION_ID from step $START_FROM_STEP — clearing stale output for steps $START_FROM_STEP-05"
+  for _n in 02 03 04 05; do
+    if (( 10#$_n >= START_FROM_STEP )); then
+      rm -f "$AUDIT_DIR"/"${_n}"-*
+    fi
+  done
+  rm -f "$AUDIT_DIR/.fix-passed" "$AUDIT_DIR/.verdict" "$AUDIT_DIR/.cancelled"
+
+elif [[ -n "$MODULE" ]]; then
   INPUT_FILE="$QUEUE_DIR/${MODULE}.txt"
   if [[ ! -f "$INPUT_FILE" ]]; then
     log "ERROR: Input file not found: $INPUT_FILE"
@@ -85,8 +156,9 @@ export INPUT_FILE MODULE
 
 # ── Session init ───────────────────────────────────────────────────────────────
 # Honor a pre-set SESSION_ID / AUDIT_DIR (used by qa_agents_server so the wrapper
-# knows where the agent will write audit files before it starts). When invoked
-# via the CLI / Makefile neither is set, so we fall back to the historical default.
+# knows where the agent will write audit files before it starts, and by resume
+# mode above to continue an existing session). Falls back to a fresh one only
+# for a brand-new CLI / Makefile invocation.
 SESSION_ID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)-create-${MODULE}}"
 AUDIT_DIR="${AUDIT_DIR:-$AGENT_DIR/audit/$SESSION_ID}"
 mkdir -p "$AUDIT_DIR"
@@ -98,11 +170,20 @@ log "test-authoring-agent | mode=$MODE"
 log "module=$MODULE"
 log "input=$INPUT_FILE"
 log "session=$SESSION_ID"
+[[ "$MODE" == "resume" ]] && log "resuming from step $START_FROM_STEP"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# Write session init markdown
-cat > "$AUDIT_DIR/00-session-init.md" << EOF
+# Write session init markdown — resuming preserves the ORIGINAL session's
+# record instead of overwriting it; append a short resume marker instead.
+if [[ "$MODE" == "resume" ]]; then
+  cat >> "$AUDIT_DIR/00-session-init.md" << EOF
+
+## Resumed
+Started from step $START_FROM_STEP at $(date +%Y-%m-%dT%H:%M:%S)
+EOF
+else
+  cat > "$AUDIT_DIR/00-session-init.md" << EOF
 # Session Init
 
 Mode: $MODE
@@ -115,6 +196,7 @@ Started: $(date +%Y-%m-%dT%H:%M:%S)
 $(env | grep -E '^(GITHUB_|SLACK_|MAX_|AUTO_|AUTOCREATE_|CLAUDE_|WORKSPACE_|NODE_|PLAYWRIGHT_)' \
   | sed 's/=.*/=<set>/' | sort)
 EOF
+fi
 
 declare -a STEP_NAMES=()
 declare -a STEP_DURATIONS=()
@@ -156,7 +238,11 @@ fi
 log "Prerequisite: $GITHUB_DEFAULT_BRANCH is up to date"
 
 # ── Step 01 — Parse ────────────────────────────────────────────────────────────
-if _cache_hit "01-parse.json"; then
+if [[ "$START_FROM_STEP" -gt 1 ]]; then
+  log "✓ [01/05] Parse — reused from resumed session"
+  STEP_NAMES+=("[01/05] Parse")
+  STEP_DURATIONS+=(0)
+elif _cache_hit "01-parse.json"; then
   _cache_restore "01-parse.json"
   [[ -f "$CACHE_DIR/01-parse.md" ]] && cp "$CACHE_DIR/01-parse.md" "$AUDIT_DIR/01-parse.md"
   log "✓ [01/05] Parse — skipped (TESTING_MODE cache hit)"
@@ -176,7 +262,11 @@ d = json.loads(Path(os.environ['AUDIT_DIR']).joinpath('01-parse.json').read_text
 print(d.get('test_type', 'api'))
 ")
 
-if [[ "$TEST_TYPE" == "web" || "$TEST_TYPE" == "both" ]]; then
+if [[ "$START_FROM_STEP" -gt 2 ]]; then
+  log "✓ [02/05] Validate Web — reused from resumed session"
+  STEP_NAMES+=("[02/05] Validate Web")
+  STEP_DURATIONS+=(0)
+elif [[ "$TEST_TYPE" == "web" || "$TEST_TYPE" == "both" ]]; then
   if _cache_hit "02-validate-web.json"; then
     _cache_restore "02-validate-web.json"
     [[ -f "$CACHE_DIR/02-validate-web.md" ]] && cp "$CACHE_DIR/02-validate-web.md" "$AUDIT_DIR/02-validate-web.md"
@@ -211,45 +301,66 @@ Path(os.environ['AUDIT_DIR']).joinpath('02-validate-web.json').write_text(
 fi
 
 # ── Step 03 — Generate ────────────────────────────────────────────────────────
-run_step "[03/05] Generate" "python3 '$AGENT_DIR/actions/03_generate.py'"
+if [[ "$START_FROM_STEP" -gt 3 ]]; then
+  log "✓ [03/05] Generate — reused from resumed session"
+  STEP_NAMES+=("[03/05] Generate")
+  STEP_DURATIONS+=(0)
+else
+  run_step "[03/05] Generate" "python3 '$AGENT_DIR/actions/03_generate.py'"
+fi
 
 # ── Step 04 — Run and Fix (with retry loop) ───────────────────────────────────
 MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-3}"
 
-# Initial test run — not counted as a fix attempt
-run_step "[04/05] Run (initial)" \
-  "FIX_ATTEMPT=0 python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
+if [[ "$START_FROM_STEP" -gt 4 ]]; then
+  log "✓ [04/05] Run & Fix — reused from resumed session"
+  STEP_NAMES+=("[04/05] Run & Fix")
+  STEP_DURATIONS+=(0)
+else
+  # Initial test run — not counted as a fix attempt
+  run_step "[04/05] Run (initial)" \
+    "FIX_ATTEMPT=0 python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
 
-FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
+  FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
 
-if [[ "$FIX_RESULT" != "true" && "$FIX_RESULT" != "skipped" ]]; then
-  FIX_ATTEMPT=1
-  while true; do
-    run_step "[04/05] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
-      "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
+  if [[ "$FIX_RESULT" != "true" && "$FIX_RESULT" != "skipped" && "$FIX_RESULT" != "stuck" ]]; then
+    FIX_ATTEMPT=1
+    while true; do
+      run_step "[04/05] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
+        "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
 
-    FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
+      FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
 
-    if [[ "$FIX_RESULT" == "true" || "$FIX_RESULT" == "skipped" ]]; then
-      break
-    fi
+      # "stuck" (not just "skipped") also stops the loop early — 04_run_and_fix.py
+      # sets it when a fix attempt had no effect on the failure's exact location,
+      # meaning further attempts are unlikely to converge either.
+      if [[ "$FIX_RESULT" == "true" || "$FIX_RESULT" == "skipped" || "$FIX_RESULT" == "stuck" ]]; then
+        break
+      fi
 
-    if [[ "$FIX_ATTEMPT" -ge "$MAX_FIX_ATTEMPTS" ]]; then
-      log "Tests still failing after $FIX_ATTEMPT fix attempt(s) — proceeding to ship"
-      break
-    fi
+      if [[ "$FIX_ATTEMPT" -ge "$MAX_FIX_ATTEMPTS" ]]; then
+        log "Tests still failing after $FIX_ATTEMPT fix attempt(s) — proceeding to ship"
+        break
+      fi
 
-    log "Tests failed — retrying (fix attempt $((FIX_ATTEMPT + 1)))"
-    FIX_ATTEMPT=$((FIX_ATTEMPT + 1))
-  done
+      log "Tests failed — retrying (fix attempt $((FIX_ATTEMPT + 1)))"
+      FIX_ATTEMPT=$((FIX_ATTEMPT + 1))
+    done
+  fi
 fi
 
 # ── Step 05 — Ship ────────────────────────────────────────────────────────────
 run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'"
 
 # ── Mark input as processed ───────────────────────────────────────────────────
-mv "$INPUT_FILE" "$PROCESSED_DIR/$(basename "$INPUT_FILE")"
-log "Moved to processed: $PROCESSED_DIR/$(basename "$INPUT_FILE")"
+# Guarded (not unconditional) because a resumed run's input file may already
+# have been moved to processed/ by the original run that this one continues.
+if [[ -f "$INPUT_FILE" && "$(dirname "$INPUT_FILE")" != "$PROCESSED_DIR" ]]; then
+  mv "$INPUT_FILE" "$PROCESSED_DIR/$(basename "$INPUT_FILE")"
+  log "Moved to processed: $PROCESSED_DIR/$(basename "$INPUT_FILE")"
+else
+  log "Input file already processed or not found — nothing to move"
+fi
 
 # ── Final summary ─────────────────────────────────────────────────────────────
 TOTAL_ELAPSED=$(elapsed_since $SESSION_START)

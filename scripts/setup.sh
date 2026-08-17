@@ -45,13 +45,23 @@ else
     fi
 fi
 
-# 3. Install dependencies
+# 3. Create virtualenv if needed, then install dependencies
+write_step "Setting up virtual environment"
+if [ ! -d ".venv" ]; then
+    python3 -m venv .venv
+    echo "  Created .venv"
+else
+    echo "  .venv already exists (skipping creation)"
+fi
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
 write_step "Installing Python dependencies"
 if [ ! -f "requirements.txt" ]; then
     echo -e "${RED}Error: requirements.txt not found!${NC}"
     exit 1
 fi
-# Use `python3 -m pip` for portability — on macOS/Homebrew, `pip` may not be on PATH.
+python3 -m pip install --upgrade pip -q
 python3 -m pip install -r requirements.txt
 
 # 4. Initialize config
@@ -68,6 +78,7 @@ else
 fi
 
 write_step "Setup complete. Next steps:"
-echo -e "  1. ${YELLOW}Edit config/.env${NC} — fill in DB credentials, Claude CLI path, GitHub token, Slack token."
-echo -e "  2. Analyse a build:  ${YELLOW}./scripts/run-analyse.sh${NC}"
-echo -e "  3. Fix & raise PR:   ${YELLOW}./scripts/run-autofix.sh${NC}"
+echo -e "  1. ${YELLOW}source .venv/bin/activate${NC}  — activate the virtual environment in your shell."
+echo -e "  2. ${YELLOW}Edit config/.env${NC} — fill in DB credentials, Claude CLI path, GitHub token, Slack token."
+echo -e "  3. Analyse a build:  ${YELLOW}./scripts/run-analyse.sh${NC}"
+echo -e "  4. Fix & raise PR:   ${YELLOW}./scripts/run-autofix.sh${NC}"

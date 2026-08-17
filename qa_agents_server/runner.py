@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Deque, Dict, Generator, List, Optional
 
 from qa_agents_server import storage
-from qa_agents_server.audit_reader import STEPS
+from qa_agents_server.audit_reader import STEPS, get_session as _get_session
 from qa_agents_server.feature_files import feature_exists
 from qa_agents_server.paths import (
     AUTHORING_AUDIT_DIR,
@@ -46,7 +46,13 @@ AGENT = "test-authoring-agent"
 MAX_BUFFERED_EVENTS = 10_000
 AUDIT_POLL_INTERVAL = 0.5  # seconds
 CANCEL_GRACE_SECONDS = 5
-DEFAULT_RUN_TIMEOUT = int(os.getenv("QA_AGENT_RUN_TIMEOUT_SECONDS", "1800"))  # 30m
+# Whole-pipeline (run.sh, all 5 steps) kill timeout — not just one step's budget.
+# Worst case with current per-step defaults: step02 alone can now take up to
+# VALIDATE_WEB_TIMEOUT_S x (1+VALIDATE_WEB_RETRY_ATTEMPTS) = 1800x2 = 3600s;
+# step04's fix loop can take MAX_FIX_ATTEMPTS x ~600s = ~1800s; steps 01/03/05
+# add roughly another 1500s combined — so a 1800s default was already shorter
+# than step02 alone could legitimately take even before its retry loop existed.
+DEFAULT_RUN_TIMEOUT = int(os.getenv("QA_AGENT_RUN_TIMEOUT_SECONDS", "7200"))  # 2h
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 
 
@@ -79,6 +85,7 @@ class RunState:
     step_progress: Dict[str, str] = field(default_factory=dict)  # key -> 'running'|'done'
     proc: Optional[subprocess.Popen] = None
     cond: threading.Condition = field(default_factory=threading.Condition)
+    start_from_step: int = 1  # >1 means this run resumed an existing session
 
     def snapshot(self) -> Dict:
         """Persistable snapshot (no Popen, no threading primitives)."""
@@ -93,6 +100,7 @@ class RunState:
             "status": self.status,
             "exit_code": self.exit_code,
             "pid": self.pid,
+            "start_from_step": self.start_from_step,
         }
 
 
@@ -129,7 +137,8 @@ def _start_next_from_queue() -> None:
         next_item = _pending_queue.pop(0)
     try:
         start_run(next_item["module"], next_item["auto_push"],
-                  session_id=next_item.get("session_id"))
+                  session_id=next_item.get("session_id"),
+                  start_from_step=next_item.get("start_from_step", 1))
     except Exception as e:
         print(f"[runner] failed to start queued run for {next_item['module']!r}: {e}")
 
@@ -138,7 +147,9 @@ def get_queue() -> List[Dict]:
     """Return a snapshot of pending queue items."""
     with _queue_lock:
         return [{"module": item["module"], "auto_push": item["auto_push"],
-                 "session_id": item.get("session_id"), "position": i + 1}
+                 "session_id": item.get("session_id"),
+                 "start_from_step": item.get("start_from_step", 1),
+                 "position": i + 1}
                 for i, item in enumerate(_pending_queue)]
 
 
@@ -186,20 +197,43 @@ def get_run(session_id: str) -> Optional[RunState]:
     return _runs.get(session_id)
 
 
-def start_run(module: str, auto_push: bool, session_id: Optional[str] = None) -> RunState:
-    """Spawn run.sh for the given module. Raises RunnerError on validation."""
+def start_run(module: Optional[str], auto_push: bool, session_id: Optional[str] = None,
+              start_from_step: int = 1) -> RunState:
+    """Spawn run.sh for the given module. Raises RunnerError on validation.
+
+    start_from_step > 1 resumes an EXISTING session (session_id required —
+    it must already have valid output for every step before start_from_step)
+    instead of starting a fresh one. module can be omitted when resuming; it's
+    recovered from that session's own audit trail, since the original queue
+    .txt file may already have been moved to processed/ by the run being
+    resumed — feature_exists() would wrongly reject a legitimate resume.
+    """
     global _active_session_id
 
-    if not module:
-        raise RunnerError("module is required")
+    resuming = start_from_step > 1
 
-    # Module file must exist in the queue (writable via /queue endpoint).
-    if feature_exists(module) is None:
-        raise RunnerError(
-            f"module file not found: {module}.txt — create it first via "
-            f"POST /agents/{AGENT}/queue",
-            status=404,
-        )
+    if resuming:
+        if not session_id:
+            raise RunnerError("session_id is required to resume from a step > 1")
+        if not (AUTHORING_AUDIT_DIR / session_id).exists():
+            raise RunnerError(f"session not found: {session_id}", status=404)
+        if not module:
+            existing = _get_session(session_id)
+            module = existing.get("module") if existing else None
+            if not module:
+                raise RunnerError(
+                    f"could not determine module for session {session_id}", status=500
+                )
+    else:
+        if not module:
+            raise RunnerError("module is required")
+        # Module file must exist in the queue (writable via /queue endpoint).
+        if feature_exists(module) is None:
+            raise RunnerError(
+                f"module file not found: {module}.txt — create it first via "
+                f"POST /agents/{AGENT}/queue",
+                status=404,
+            )
 
     if not AUTHORING_RUN_SH.exists():
         raise RunnerError(
@@ -211,9 +245,13 @@ def start_run(module: str, auto_push: bool, session_id: Optional[str] = None) ->
             active = _runs.get(_active_session_id)
             if active and active.status == "running":
                 # Queue instead of rejecting — generate session_id now so it's stable
+                # (resuming reuses the session_id it was given rather than minting one).
                 with _queue_lock:
-                    queued_session_id = _make_session_id(module)
-                    _pending_queue.append({"module": module, "auto_push": auto_push, "session_id": queued_session_id})
+                    queued_session_id = session_id if resuming else _make_session_id(module)
+                    _pending_queue.append({
+                        "module": module, "auto_push": auto_push,
+                        "session_id": queued_session_id, "start_from_step": start_from_step,
+                    })
                     position = len(_pending_queue)
                 raise _QueuedNotification(position, queued_session_id)
 
@@ -226,6 +264,8 @@ def start_run(module: str, auto_push: bool, session_id: Optional[str] = None) ->
         env["AUTO_PUSH"] = "true" if auto_push else "false"
         env["SESSION_ID"] = session_id
         env["AUDIT_DIR"] = str(audit_dir)
+        if start_from_step > 1:
+            env["START_FROM_STEP"] = str(start_from_step)
 
         try:
             proc = subprocess.Popen(
@@ -249,6 +289,7 @@ def start_run(module: str, auto_push: bool, session_id: Optional[str] = None) ->
             started_at=time.time(),
             proc=proc,
             pid=proc.pid,
+            start_from_step=start_from_step,
         )
         _runs[session_id] = run
         _active_session_id = session_id
@@ -260,6 +301,7 @@ def start_run(module: str, auto_push: bool, session_id: Optional[str] = None) ->
         "auto_push": auto_push,
         "status": "running",
         "started_at": run.started_at,
+        "start_from_step": start_from_step,
     })
 
     storage.upsert(run.snapshot())

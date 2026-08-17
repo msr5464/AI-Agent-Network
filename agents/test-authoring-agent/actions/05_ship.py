@@ -234,6 +234,17 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
     # Test result section
     if test_passed:
         test_section = "✅ Generated test was run and passed before this PR was created."
+    elif fix_data.get("stuck"):
+        # Distinct from the infra-skip case below: this test WAS run, repeatedly,
+        # and genuinely failed every time — a fix attempt just had zero effect on
+        # the exact failure location, so the loop stopped early rather than burn
+        # the rest of the budget on a diagnosis that wasn't converging.
+        test_section = (
+            f"❌ Test is reproducibly failing at the same location after "
+            f"{fix_attempts} fix attempt(s) — the last fix had no effect on it. "
+            "Stopped early rather than retry further; see root_cause in the audit "
+            "trail for what was already tried. Please review manually."
+        )
     elif fix_data.get("skipped"):
         test_section = "⚠️ Test could not be run (Maven not available or infra issue)."
     else:
@@ -294,7 +305,14 @@ def build_slack_message(gen_data: dict, fix_data: dict, pr_url: Optional[str], f
     files_count   = len(gen_data.get("files_written", []))
     test_passed   = fix_data.get("passed", False)
 
-    if fix_gate == "skipped":
+    if fix_gate == "stuck":
+        # This is a genuine, reproducible failure — must go to the alert channel
+        # like any other failure, not the "generated (test not run)" notify-only
+        # path, which would hide a known-broken test from whoever watches alerts.
+        channel = SLACK_ALERT_CHANNEL or SLACK_NOTIFY_CHANNEL
+        icon    = ":warning:"
+        status  = "generated but stuck — test reproducibly failing, fix attempts stopped early, needs review"
+    elif fix_gate == "skipped":
         channel = SLACK_NOTIFY_CHANNEL
         icon    = ":large_yellow_circle:"
         status  = "generated (test not run)"

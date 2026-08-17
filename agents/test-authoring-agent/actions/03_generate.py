@@ -125,6 +125,90 @@ def write_file(rel_path: str, content: str) -> None:
     log(f"  Wrote: {rel_path}")
 
 
+# write_credential_property() lives in shared/credential_properties.py — 04_run_and_fix.py
+# reuses the exact same function as a defensive re-check before diagnosing a
+# CODE_ERROR failure, so the logic (and the file-location/key-naming rules it
+# encodes) exists in exactly one place.
+from shared.credential_properties import write_credential_property  # noqa: E402
+
+
+# ── Guards ────────────────────────────────────────────────────────────────────
+
+# Escape hatch for the rare case where generating against inferred locators really
+# is what you want (e.g. the site is unreachable and you only need the scaffolding).
+ALLOW_MISSING_SELECTORS = os.environ.get("ALLOW_MISSING_SELECTORS", "false").lower() == "true"
+
+
+def _guard_web_validation(test_type, web_data, selectors, page_elements,
+                          interaction_hints) -> None:
+    """Refuse to generate a web module when step 02 confirmed nothing.
+
+    Without this, a failed validation is silent: step 02 still reports ✓, and
+    step 03 happily writes page objects full of guessed locators that only fail
+    much later in step 04 — or worse, land in a PR.
+    """
+    if test_type not in ("web", "both"):
+        return
+    if selectors or page_elements or interaction_hints:
+        return
+
+    status = web_data.get("status", "unknown")
+    reason = web_data.get("reason") or "no reason recorded"
+
+    # A deliberate skip (API-only run, no web steps in the plan) is not a failure.
+    if web_data.get("skipped") and status == "skipped":
+        log(f"Web validation was skipped ({reason}) — generating with inferred locators")
+        return
+
+    log("ERROR: web validation produced zero confirmed selectors, page elements, "
+        "and interaction hints.")
+    log(f"  step 02 outcome: {status} — {reason}")
+    log("  Generating now would write page objects against guessed locators.")
+
+    if ALLOW_MISSING_SELECTORS:
+        log("  ALLOW_MISSING_SELECTORS=true — proceeding anyway with inferred locators.")
+        return
+
+    log("  → FIX: re-run step 02 (see its warning above for the specific cause).")
+    log("  → Or set ALLOW_MISSING_SELECTORS=true to generate against inferred locators.")
+    sys.exit(1)
+
+
+def _warn_page_coverage(web_pages, selectors, interaction_hints) -> list:
+    """Flag individual pages that step 02 never confirmed a single locator for.
+
+    The guard above only catches a run that came back completely empty. A
+    partial run — e.g. login validated fine but every page past it got zero
+    coverage — passes that guard silently (selectors is non-empty overall), so
+    step 03 quietly infers 100% of a specific page's locators without that
+    being visible anywhere. Surface it per page instead.
+
+    Returns the list of (class_name, needed_locators) pairs with zero coverage,
+    so the caller can persist it into the durable 03-generate.json audit trail
+    instead of it existing only as a console line that scrolls away.
+    """
+    # Both SELECTOR_FOUND (selectors) and INTERACTION_HINT (interaction_hints)
+    # are live-DOM-confirmed data step 03's own codegen prompt treats as equally
+    # authoritative — crediting only one under-counts real coverage.
+    confirmed = set(selectors.keys()) | {h["name"] for h in interaction_hints if h.get("name")}
+    uncovered = []
+    for page_def in web_pages:
+        needed = page_def.get("locators_needed", [])
+        if needed and not (confirmed & set(needed)):
+            uncovered.append((page_def.get("class_name", "?"), needed))
+
+    if uncovered:
+        log("WARNING: the following pages have ZERO confirmed selectors — step 03 "
+            "will infer ALL locators for them from naming conventions alone. "
+            "(Note: this check is name-based across the whole flow — if a page "
+            "reuses a locator name that was only confirmed on a DIFFERENT page, "
+            "it may be under- or over-reported here.)")
+        for class_name, needed in uncovered:
+            log(f"  - {class_name}: needs {needed}")
+
+    return uncovered
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -145,11 +229,20 @@ def main() -> None:
     country        = plan.get("country", "SG")
     user_type      = plan.get("user_type", "Admin")
     feature_enum   = plan.get("feature_enum", "CARD")
-    selectors         = web_data.get("selectors", {})
-    page_elements     = web_data.get("page_elements", {})
-    interaction_hints = web_data.get("interaction_hints", [])
+    web_pages         = plan.get("web_pages", [])
+    # `.get(key, {})` only supplies the default when the KEY is absent — an
+    # explicit `null` value (key present) would pass the default through and
+    # crash the first `.keys()`/`.items()` call downstream, so guard both cases.
+    selectors         = web_data.get("selectors") or {}
+    page_elements     = web_data.get("page_elements") or {}
+    interaction_hints = web_data.get("interaction_hints") or []
 
     log(f"Generating code for {feature_class} | type={test_type} | existing={existing}")
+
+    _guard_web_validation(test_type, web_data, selectors, page_elements, interaction_hints)
+    pages_with_zero_coverage = []
+    if test_type in ("web", "both"):
+        pages_with_zero_coverage = _warn_page_coverage(web_pages, selectors, interaction_hints)
 
     refs = read_reference_files()
     ref_section = "\n".join(
@@ -168,12 +261,14 @@ def main() -> None:
                         "Infer locators using [data-cy='...'] attribute naming convention " \
                         "based on the locator names in the plan."
 
-    # Build rich DOM context from live page inspection
+    # Build rich DOM context from live page inspection. page_elements is keyed
+    # by the STEP DESCRIPTION active when the snapshot was taken (usually the
+    # step that failed), not a page name — label it generically to match.
     dom_context = ""
     if page_elements:
         dom_context += "\n\nConfirmed page elements from live DOM inspection:\n"
-        for page_name, elements in page_elements.items():
-            dom_context += f"\n{page_name} page:\n"
+        for context_label, elements in page_elements.items():
+            dom_context += f"\nAt '{context_label}':\n"
             for el in elements[:40]:  # cap at 40 per page to avoid prompt bloat
                 tag = el.get("tag", "")
                 # Build a concise element description with whatever identifiers are present
@@ -225,6 +320,16 @@ def main() -> None:
                 )
         except Exception:
             pass
+
+    # For a NEW web module with no CSV file, the codegen prompt below (rule 7b)
+    # instructs Claude to call config.getRunTimeProperty("{feature}.username"/
+    # ".password") — the SAME condition used here. Write the actual property so
+    # that call resolves to a real value instead of silently returning null.
+    credential_property_status = "not applicable"
+    if not existing and test_type in ("web", "both") and not csv_roles_hint:
+        credential_property_status = write_credential_property(
+            AUTOMATION_FRAMEWORK_DIR, feature.lower(), plan.get("demo_credentials", {}), log=log
+        )
 
     # Determine which files to generate / update
     files_to_generate = _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, feature)
@@ -358,6 +463,11 @@ Return ONLY a JSON object, no prose:
         "automation_framework_dir": str(AUTOMATION_FRAMEWORK_DIR),
         "test_class": _infer_test_class(written, test_type),
         "test_method": _infer_test_method(plan, test_type),
+        # Persisted so a page that shipped with 100% guessed locators has a
+        # durable trace beyond a console line that scrolls away — was silently
+        # invisible before this field existed.
+        "pages_with_zero_coverage": [name for name, _needed in pages_with_zero_coverage],
+        "credential_property_status": credential_property_status,
     }
     (AUDIT_DIR / "03-generate.json").write_text(json.dumps(result, indent=2))
 
@@ -367,9 +477,16 @@ Return ONLY a JSON object, no prose:
         f"Feature:   {feature_class}",
         f"Test type: {test_type}",
         f"Files:     {len(written)}",
+        f"Credentials property: {credential_property_status}",
         "",
         "## Files Written",
     ] + [f"- `{f}`" for f in written]
+    if pages_with_zero_coverage:
+        summary_lines += [
+            "",
+            "## ⚠️ Pages Generated with ZERO Confirmed Selectors",
+            "All locators below are guessed from naming conventions, not validated:",
+        ] + [f"- `{name}`" for name, _needed in pages_with_zero_coverage]
     (AUDIT_DIR / "03-generate.md").write_text("\n".join(summary_lines))
 
 

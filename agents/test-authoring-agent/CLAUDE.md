@@ -6,7 +6,7 @@ Read this file first. Every time. Before doing anything else.
 
 Takes plain English test steps from a `.txt` file in the queue, generates complete
 framework-compliant Java test code for the Jarvis automation repository, validates
-generated web flows with a headless Playwright script, runs the generated test via Maven,
+generated web flows by driving a real browser via Playwright MCP, runs the generated test via Maven,
 fixes any failures iteratively, and raises a GitHub PR.
 
 Runs independently. One session = one module input file = one PR (or Slack alert if tests fail).
@@ -19,7 +19,7 @@ Runs independently. One session = one module input file = one PR (or Slack alert
 run.sh (orchestrator)
   │
   ├─ 01_parse.py          [Python + Claude]   Plain text → structured generation plan
-  ├─ 02_validate_web.py   [Python + Claude]   Generate + run headless Playwright Node.js script → selector map
+  ├─ 02_validate_web.py   [Python + Claude]   Drive browser via Playwright MCP → selector map
   ├─ 03_generate.py       [Python + Claude]   Write Java files to Thanos-pw repo
   ├─ 04_run_and_fix.py    [Python + Claude]   Run mvn test → fix failures → retry loop
   └─ 05_ship.py           [Python only]       Git branch + commit + push + gh pr create
@@ -32,7 +32,7 @@ run.sh (orchestrator)
 | Step | Owns | Does NOT do |
 |------|------|-------------|
 | **01 Parse** | Read plain text, call Claude, produce plan JSON | No file writes to Thanos-pw |
-| **02 Validate Web** | Generate + run Node.js Playwright script, collect selectors | No Java codegen |
+| **02 Validate Web** | Drive the browser via Playwright MCP, collect confirmed selectors | No Java codegen |
 | **03 Generate** | Write all Java files to Thanos-pw | No test running |
 | **04 Run+Fix** | Run mvn test, call Claude to fix failures, retry | No git push |
 | **05 Ship** | Branch + commit + push + PR creation | No AI calls |
@@ -111,7 +111,7 @@ Web Steps:
 | `00-session-init.md` | run.sh | Session metadata, env snapshot |
 | `01-parse.json` + `.md` | Parse | Generation plan |
 | `02-validate-web.json` + `.md` | Validate Web | Selector map, step results |
-| `02-validate-web.js` | Validate Web | The generated Playwright script |
+| `claude-*.log` | Validate Web | Raw `claude -p` stream, for diagnosing empty runs |
 | `03-generate.json` + `.md` | Generate | List of files written |
 | `04-run-and-fix.json` + `.md` | Run+Fix | Test output, applied fixes |
 | `.fix-passed` | Run+Fix | Gate: true / false / skipped |
@@ -137,11 +137,18 @@ Web Steps:
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) | `true` |
 | `AUTOCREATE_ENVIRONMENT` | Maven `-Denvironment=` value | `staging` |
 | `AUTOCREATE_COUNTRY` | Maven `-Dcountry=` value | `SG` |
-| `PLAYWRIGHT_TIMEOUT_MS` | Timeout for Playwright validation steps | `30000` |
+| `MAVEN_TEST_TIMEOUT_S` | Timeout (s) for a single `mvn test` run in step 04 | `300` |
+| `TEST_RESULTS_DIR_NAME` | Java framework's report/screenshot output dir name | `test-output` |
+| `PLAYWRIGHT_TIMEOUT_MS` | Timeout (ms) for each individual browser action | `30000` |
+| `VALIDATE_WEB_TIMEOUT_S` | Wall-clock budget (s) for the whole step-02 run | `1800` |
+| `VALIDATE_WEB_RETRY_ATTEMPTS` | Extra full re-runs step 02 attempts on recoverable failures | `1` |
+| `PLAYWRIGHT_HEADLESS` | Set `false` to watch the browser during step 02 | `true` |
+| `ALLOW_MISSING_SELECTORS` | Let step 03 generate when step 02 confirmed nothing | `false` |
 | `SLACK_BOT_TOKEN` | Slack bot token | optional |
 | `SLACK_NOTIFY_CHANNEL` | Slack channel for success notifications | optional |
 | `SLACK_ALERT_CHANNEL` | Slack channel for failure alerts | optional |
 | `SESSION_ID`, `AUDIT_DIR`, `INPUT_FILE`, `MODULE` | Set by run.sh — do not set manually | — |
+| `START_FROM_STEP` | Resume an existing session from step 1-5 instead of a fresh run (see "Resuming a Session" below) | `1` |
 
 ---
 
@@ -165,6 +172,32 @@ AUTO_PUSH=false make run AGENT=test-authoring-agent MODULE=payments
 make audit AGENT=test-authoring-agent
 make audit AGENT=test-authoring-agent SESSION=20260330-143022-create-payments
 ```
+
+### Resuming a Session
+
+If a session got through some steps successfully but failed at (or you just want to
+re-run) a later step, resume it in place instead of starting over from Parse. This reuses
+the existing session's audit dir — steps before `START_FROM_STEP` are reused as-is, and
+any stale output for `START_FROM_STEP` onward (including per-attempt fix files from a
+prior failed try) is cleared before it re-runs.
+
+```bash
+# Re-run step 4 (Run & Fix) and 05 (Ship) for a session that failed there,
+# reusing its 01-parse.json / 02-validate-web.json / 03-generate.json as-is.
+START_FROM_STEP=4 SESSION_ID=20260330-143022-create-payments \
+  make run AGENT=test-authoring-agent
+```
+
+`MODULE` is recovered automatically from the session's own `00-session-init.md` if not
+given — the original queue `.txt` file may already have moved to `processed/` by the run
+being resumed, so it isn't required to still exist. Resuming fails fast with a clear error
+if the step immediately before `START_FROM_STEP` never actually completed in that session
+(e.g. `START_FROM_STEP=4` requires `03-generate.json` to exist).
+
+The same capability is exposed to `qa_agents_server` as
+`POST /agents/test-authoring-agent/sessions/<session_id>/retry` with body
+`{"from_step": 4}` — this is what a "Retry from step N" action in a UI would call; wiring
+up that UI button is a separate change in the AI-Test-Studio frontend, not in this repo.
 
 ---
 

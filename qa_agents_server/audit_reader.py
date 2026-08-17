@@ -76,7 +76,16 @@ def _step_has_error(data: Optional[Dict]) -> bool:
     """Return True if a step JSON signals a hard failure."""
     if not isinstance(data, dict):
         return False
-    return "error" in data or data.get("status") == "failed"
+    if "error" in data or data.get("status") == "failed":
+        return True
+    # 02-validate-web.json's own status vocabulary (ok/timeout/error/empty/
+    # skipped) never uses the literal string "failed" — without this, a
+    # validation that crashed, timed out, or came back completely empty
+    # showed up identically to a normal successful step everywhere this
+    # helper is used (session status, per-step status in replay_events).
+    if data.get("status") in ("timeout", "error", "empty"):
+        return True
+    return False
 
 
 def _derive_status(session_dir: Path, ship_data: Optional[Dict]) -> str:
@@ -283,6 +292,8 @@ def _summarise_step(key: str, data: Dict) -> Dict:
     if key == "validate_web":
         return {
             "skipped": data.get("skipped", False),
+            "status": data.get("status"),
+            "attempts": data.get("attempts"),
             "reason": data.get("reason"),
             "steps_passed": len(data.get("steps_passed") or []),
             "steps_failed": len(data.get("steps_failed") or []),

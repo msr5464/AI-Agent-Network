@@ -104,6 +104,7 @@ def run_active():
         "status": run.status,
         "started_at": run.started_at,
         "step_progress": run.step_progress,
+        "start_from_step": run.start_from_step,
     })
 
 
@@ -113,6 +114,50 @@ def run_cancel(session_id: str):
     if not ok:
         return jsonify({"error": "run not found or already finished"}), 404
     return jsonify({"status": "cancelling", "session_id": session_id})
+
+
+@qa_bp.route(f"{_BASE}/sessions/<session_id>/retry", methods=["POST"])
+def session_retry(session_id: str):
+    """Re-run an existing (usually finished/failed) session starting from a
+    specific step, reusing its steps-before-that output rather than starting
+    the whole 01→05 pipeline over. body: {"from_step": 2-5, "auto_push": bool}.
+
+    from_step must be >= 2 — resuming "from step 1" isn't a resume at all
+    (there's nothing prior to reuse); that's just a fresh run, via POST /run.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        from_step = int(body.get("from_step", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "from_step must be an integer 2-5"}), 400
+    if not (2 <= from_step <= 5):
+        return jsonify({
+            "error": "from_step must be between 2 and 5 — to restart from the "
+                     "beginning, use POST /run instead"
+        }), 400
+    auto_push = bool(body.get("auto_push", False))
+
+    try:
+        run = runner.start_run(module=None, auto_push=auto_push,
+                               session_id=session_id, start_from_step=from_step)
+    except runner._QueuedNotification as q:
+        return jsonify({
+            "queued": True,
+            "position": q.position,
+            "session_id": q.session_id,
+            "start_from_step": from_step,
+        }), 202
+    except runner.RunnerError as e:
+        return jsonify({"error": str(e)}), e.status
+    return jsonify({
+        "queued": False,
+        "session_id": run.session_id,
+        "module": run.module,
+        "auto_push": run.auto_push,
+        "status": run.status,
+        "started_at": run.started_at,
+        "start_from_step": from_step,
+    }), 201
 
 
 # ── Live + history stream (unified endpoint) ──────────────────────────────────
