@@ -100,7 +100,7 @@ if [[ "$START_FROM_STEP" -gt 1 ]]; then
   # `declare -A`; the rest of this script only ever uses `declare -a`.)
   case "$START_FROM_STEP" in
     2) _prereqs="01-parse.json" ;;
-    3) _prereqs="01-parse.json 02-validate-web.json" ;;
+    3) _prereqs="01-parse.json 02-validate-api.json 02-validate-web.json" ;;
     4) _prereqs="01-parse.json 03-generate.json" ;;
     5) _prereqs="03-generate.json 04-run-and-fix.json" ;;
     *) _prereqs="" ;;
@@ -211,11 +211,23 @@ if [[ -z "$WORKSPACE_DIR" ]]; then
   log "ERROR: WORKSPACE_DIR is not set — cannot sync automation repo"
   exit 1
 fi
+# Auth via a URL built fresh for each remote-talking command — never
+# persisted to .git/config, never left as origin's own stored URL. Confirmed
+# by direct testing against a real GitHub remote: when origin has no
+# embedded credentials, git tries to interactively negotiate a
+# username/password, which fails hard here (no TTY) — and neither a bare
+# token-only URL NOR `-c http.extraHeader` avoids that. Only a URL with a
+# username AND password both already present skips git's own credential
+# negotiation entirely. "x-access-token" is a fixed, non-secret placeholder
+# username (the same convention GitHub Actions itself uses); the token is
+# the real secret, held only in this process's environment.
+export GIT_TERMINAL_PROMPT=0
+_PUSH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/${GITHUB_REPO_AUTOMATION}.git"
+
 if [[ ! -d "$AUTOMATION_FRAMEWORK_DIR/.git" ]]; then
   log "Automation repo not found at $AUTOMATION_FRAMEWORK_DIR — cloning from GitHub ..."
   mkdir -p "$WORKSPACE_DIR"
-  CLONE_URL="https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/${GITHUB_REPO_AUTOMATION}.git"
-  if ! git clone "$CLONE_URL" "$AUTOMATION_FRAMEWORK_DIR"; then
+  if ! git clone "$_PUSH_URL" "$AUTOMATION_FRAMEWORK_DIR"; then
     log "ERROR: Failed to clone $GITHUB_ORG/$GITHUB_REPO_AUTOMATION into $AUTOMATION_FRAMEWORK_DIR"
     exit 1
   fi
@@ -225,13 +237,13 @@ fi
 log "Prerequisite: syncing $AUTOMATION_FRAMEWORK_DIR to origin/$GITHUB_DEFAULT_BRANCH ..."
 if ! git -C "$AUTOMATION_FRAMEWORK_DIR" checkout -f "$GITHUB_DEFAULT_BRANCH" 2>&1; then
   log "Prerequisite: checkout failed — fetching from origin and retrying ..."
-  git -C "$AUTOMATION_FRAMEWORK_DIR" fetch origin
+  git -C "$AUTOMATION_FRAMEWORK_DIR" fetch "$_PUSH_URL" "$GITHUB_DEFAULT_BRANCH"
   if ! git -C "$AUTOMATION_FRAMEWORK_DIR" checkout -f "$GITHUB_DEFAULT_BRANCH" 2>&1; then
     log "ERROR: Could not checkout $GITHUB_DEFAULT_BRANCH in $AUTOMATION_FRAMEWORK_DIR — aborting"
     exit 1
   fi
 fi
-if ! git -C "$AUTOMATION_FRAMEWORK_DIR" pull origin "$GITHUB_DEFAULT_BRANCH" 2>&1; then
+if ! git -C "$AUTOMATION_FRAMEWORK_DIR" pull "$_PUSH_URL" "$GITHUB_DEFAULT_BRANCH" 2>&1; then
   log "ERROR: git pull origin/$GITHUB_DEFAULT_BRANCH failed — aborting to avoid stale base"
   exit 1
 fi
@@ -254,7 +266,7 @@ else
   _cache_save "01-parse.md"
 fi
 
-# ── Step 02 — Validate Web (skip for API-only) ────────────────────────────────
+# ── Step 02 — Validate API + Validate Web (each self/env-gated by test_type) ──
 TEST_TYPE=$(python3 -c "
 import json, os
 from pathlib import Path
@@ -263,10 +275,37 @@ print(d.get('test_type', 'api'))
 ")
 
 if [[ "$START_FROM_STEP" -gt 2 ]]; then
+  log "✓ [02/05] Validate API — reused from resumed session"
+  STEP_NAMES+=("[02/05] Validate API")
+  STEP_DURATIONS+=(0)
   log "✓ [02/05] Validate Web — reused from resumed session"
   STEP_NAMES+=("[02/05] Validate Web")
   STEP_DURATIONS+=(0)
-elif [[ "$TEST_TYPE" == "web" || "$TEST_TYPE" == "both" ]]; then
+else
+
+# -- Validate API — 02_validate_api.py self-skips (writes a "skipped" stub) when
+# test_type isn't api/both, so it's always safe to invoke unconditionally. --
+if _cache_hit "02-validate-api.json"; then
+  _cache_restore "02-validate-api.json"
+  [[ -f "$CACHE_DIR/02-validate-api.md" ]] && cp "$CACHE_DIR/02-validate-api.md" "$AUDIT_DIR/02-validate-api.md"
+  log "✓ [02/05] Validate API — skipped (TESTING_MODE cache hit)"
+  STEP_NAMES+=("[02/05] Validate API")
+  STEP_DURATIONS+=(0)
+else
+  run_step "[02/05] Validate API" "python3 '$AGENT_DIR/actions/02_validate_api.py'"
+  # Only cache if it actually ran a real validation (not skipped as non-API/no-endpoints)
+  if python3 -c "
+import json, os, sys
+from pathlib import Path
+d = json.loads(Path(os.environ['AUDIT_DIR']).joinpath('02-validate-api.json').read_text())
+sys.exit(0 if not d.get('skipped', True) else 1)
+" 2>/dev/null; then
+    _cache_save "02-validate-api.json"
+    _cache_save "02-validate-api.md"
+  fi
+fi
+
+if [[ "$TEST_TYPE" == "web" || "$TEST_TYPE" == "both" ]]; then
   if _cache_hit "02-validate-web.json"; then
     _cache_restore "02-validate-web.json"
     [[ -f "$CACHE_DIR/02-validate-web.md" ]] && cp "$CACHE_DIR/02-validate-web.md" "$AUDIT_DIR/02-validate-web.md"
@@ -300,6 +339,8 @@ Path(os.environ['AUDIT_DIR']).joinpath('02-validate-web.json').write_text(
 "
 fi
 
+fi  # end START_FROM_STEP -gt 2 else-branch (Validate API + Validate Web)
+
 # ── Step 03 — Generate ────────────────────────────────────────────────────────
 if [[ "$START_FROM_STEP" -gt 3 ]]; then
   log "✓ [03/05] Generate — reused from resumed session"
@@ -309,7 +350,7 @@ else
   run_step "[03/05] Generate" "python3 '$AGENT_DIR/actions/03_generate.py'"
 fi
 
-# ── Step 04 — Run and Fix (with retry loop) ───────────────────────────────────
+# ── Step 04 — Run & Fix (with retry loop) ─────────────────────────────────────
 MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-3}"
 
 if [[ "$START_FROM_STEP" -gt 4 ]]; then
@@ -318,7 +359,7 @@ if [[ "$START_FROM_STEP" -gt 4 ]]; then
   STEP_DURATIONS+=(0)
 else
   # Initial test run — not counted as a fix attempt
-  run_step "[04/05] Run (initial)" \
+  run_step "[04/05] Run & Fix (initial)" \
     "FIX_ATTEMPT=0 python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
 
   FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
@@ -326,7 +367,7 @@ else
   if [[ "$FIX_RESULT" != "true" && "$FIX_RESULT" != "skipped" && "$FIX_RESULT" != "stuck" ]]; then
     FIX_ATTEMPT=1
     while true; do
-      run_step "[04/05] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
+      run_step "[04/05] Run & Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
         "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
 
       FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")

@@ -17,8 +17,24 @@
 
 SESSION_START=$(date +%s)
 
+# Defense-in-depth redaction — mirrors shared/log.py's Python-side redaction.
+# The real fix for the one known leak (a token embedded in a git remote URL,
+# echoed by git's own error output) is in run.sh/shared/git.py, which now
+# never embeds a token in a URL at all; this is a backstop in case some other
+# command's raw output ever contains a secret literal.
+_redact_secrets() {
+  local msg="$1"
+  if [[ -n "${GITHUB_TOKEN:-}" && ${#GITHUB_TOKEN} -ge 8 ]]; then
+    msg="${msg//$GITHUB_TOKEN/***REDACTED(GITHUB_TOKEN)***}"
+  fi
+  if [[ -n "${SLACK_BOT_TOKEN:-}" && ${#SLACK_BOT_TOKEN} -ge 8 ]]; then
+    msg="${msg//$SLACK_BOT_TOKEN/***REDACTED(SLACK_BOT_TOKEN)***}"
+  fi
+  printf '%s' "$msg"
+}
+
 log() {
-  echo "[$(date +%H:%M:%S)] $*"
+  echo "[$(date +%H:%M:%S)] $(_redact_secrets "$*")"
 }
 
 elapsed_since() {

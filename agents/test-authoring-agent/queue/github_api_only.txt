@@ -1,0 +1,26 @@
+Module: github
+Type: api
+API URL: https://api.github.com
+
+Steps:
+1. Send a GET request to /users/octocat.
+2. Verify the response status code is 200.
+3. Verify login is "octocat".
+4. Verify public_repos is greater than or equal to 0.
+5. Verify location is not empty.
+6. Verify avatar_url is not empty and is a valid URL.
+7. Send a GET request to /repos/octocat/Hello-World.
+8. Verify the response status code is 200.
+9. Verify name is "Hello-World".
+10. Verify owner login is "octocat".
+11. Verify description is not empty.
+12. Verify html_url is not empty and is a valid GitHub URL.
+13. Verify stargazers_count is greater than or equal to 0.
+14. Send a GET request to /repos/octocat/Hello-World/branches.
+15. Verify the response status code is 200.
+16. Verify the response contains at least one branch.
+17. Verify the "master" or "main" branch exists.
+18. Send a GET request to /repos/octocat/Hello-World/contributors.
+19. Verify the response status code is 200.
+20. Verify the response contains at least one contributor.
+21. Verify "octocat" exists in the contributors list.

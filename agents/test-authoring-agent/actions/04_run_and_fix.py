@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 04 — Run and Fix
+Step 04 — Run & Fix
 Two-phase design driven by FIX_ATTEMPT (set by run.sh):
 
   FIX_ATTEMPT=0  (initial run)
@@ -30,6 +30,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
@@ -341,8 +342,19 @@ def build_failure_context(test_class: str, test_method: str, test_output: str,
 
 # ── Infrastructure helpers ────────────────────────────────────────────────────
 
-def classify_failure(output: str) -> str:
-    """Returns 'INFRA_BUILD' | 'INFRA_DB' | 'INFRA_USER' | 'INFRA_CREDENTIALS' | 'CODE_ERROR'."""
+def _extract_host(url: str) -> str:
+    """Return 'host' or 'host:port' from a URL, or '' if unparseable/empty."""
+    if not url:
+        return ""
+    try:
+        return urlparse(url).netloc
+    except ValueError:
+        return ""
+
+
+def classify_failure(output: str, api_base_url: str = "") -> str:
+    """Returns 'INFRA_BUILD' | 'INFRA_DB' | 'INFRA_USER' | 'INFRA_CREDENTIALS' |
+    'INFRA_API_CONNECTION' | 'INFRA_API_AUTH' | 'CODE_ERROR'."""
     infra_build_signals = [
         "There is no POM in this directory",
         "requires a project to execute",
@@ -373,6 +385,28 @@ def classify_failure(output: str) -> str:
     infra_credentials_signals = [
         "value: expected string, got undefined",
     ]
+    # Common REST-client phrasings for an auth rejection. Kept multi-word/prefixed
+    # (never a bare "401"/"403") so this can't collide with an unrelated line
+    # number or byte offset elsewhere in Maven output.
+    infra_api_auth_signals = [
+        "401 Unauthorized", "HTTP/1.1 401", "statusCode=401", "\"status\":401",
+        "status code: 401", "status code 401", "Response status:401",
+        "403 Forbidden", "HTTP/1.1 403", "statusCode=403", "\"status\":403",
+        "status code: 403", "status code 403", "Response status:403",
+    ]
+
+    # "Connection refused" is ambiguous — it fires for BOTH a dead local DB and
+    # an unreachable REST API. Disambiguate using api_base_url's own host so an
+    # unreachable API is never misrouted into try_fix_infra_db() (which would
+    # attempt to auto-configure a local MySQL — never the right fix here).
+    # Checked before the generic infra_db_signals loop below.
+    api_host = _extract_host(api_base_url)
+    if api_host and "Connection refused" in output and api_host in output:
+        return "INFRA_API_CONNECTION"
+
+    for signal in infra_api_auth_signals:
+        if signal in output:
+            return "INFRA_API_AUTH"
     for signal in infra_build_signals:
         if signal in output:
             return "INFRA_BUILD"
@@ -532,6 +566,8 @@ def main() -> None:
     test_class    = gen_data.get("test_class", "")
     test_method   = gen_data.get("test_method", "")
     plan_data     = json.loads((AUDIT_DIR / "01-parse.json").read_text())
+    api_val_path  = AUDIT_DIR / "02-validate-api.json"
+    api_validation = json.loads(api_val_path.read_text()) if api_val_path.exists() else {}
 
     if not test_class:
         log("No test class found in generate output — skipping test run")
@@ -603,7 +639,7 @@ def main() -> None:
     else:
         prev_failure_message, prev_screenshot, prev_summary_lines = "", "", []
 
-    failure_class = classify_failure(prev_output)
+    failure_class = classify_failure(prev_output, plan_data.get("api_base_url", ""))
     log(f"Failure classified as: {failure_class}")
 
     if failure_class == "INFRA_DB":
@@ -624,7 +660,7 @@ def main() -> None:
                     "infra_repair": "INFRA_DB",
                 }, files_written, FIX_ATTEMPT)
                 return
-            failure_class = classify_failure(test_output)
+            failure_class = classify_failure(test_output, plan_data.get("api_base_url", ""))
 
     if failure_class == "INFRA_USER":
         log("Detected user pool error — attempting demo user auto-insert")
@@ -644,7 +680,7 @@ def main() -> None:
                     "infra_repair": "INFRA_USER",
                 }, files_written, FIX_ATTEMPT)
                 return
-            failure_class = classify_failure(test_output)
+            failure_class = classify_failure(test_output, plan_data.get("api_base_url", ""))
 
     if failure_class == "INFRA_CREDENTIALS":
         log("Detected a null-credential error signature — checking the demo-credential property")
@@ -664,7 +700,7 @@ def main() -> None:
                     "infra_repair": "INFRA_CREDENTIALS",
                 }, files_written, FIX_ATTEMPT)
                 return
-            failure_class = classify_failure(test_output)
+            failure_class = classify_failure(test_output, plan_data.get("api_base_url", ""))
         else:
             # The property was already correct (or there were no demo_credentials
             # to write at all) — this signature match wasn't actually a missing-
@@ -674,6 +710,43 @@ def main() -> None:
             log("Credential property was already correct — not a credentials issue; "
                 "treating as a normal code failure")
             failure_class = "CODE_ERROR"
+
+    api_auth_prevalidated_ok = api_validation.get("auth", {}).get("status") == "ok"
+    api_auth_code_bug_hint = False  # surfaced to the Claude fix prompt below
+    if failure_class == "INFRA_API_AUTH":
+        if api_auth_prevalidated_ok:
+            # Step 02 already proved these exact credentials work via a direct
+            # HTTP call before codegen — a 401/403 now, with nothing else
+            # changed, points at the GENERATED code (wrong header name/prefix,
+            # token not attached, etc.), not the credentials or the API itself.
+            # Fall through to the normal CODE_ERROR/Claude-fix path; the extra
+            # context injected into the prompt below tells Claude as much.
+            log("Detected an API 401/403, but step 02 pre-validated this exact "
+                "auth recipe as working — treating as a code bug, not an infra issue")
+            failure_class = "CODE_ERROR"
+            api_auth_code_bug_hint = True
+        else:
+            log(f"Detected an API 401/403 — and step 02's auth pre-check did not "
+                f"confirm it working either ({api_validation.get('auth', {}).get('status', 'not run')}: "
+                f"{api_validation.get('auth', {}).get('detail', 'n/a')}) — not auto-resolvable")
+
+    if failure_class in ("INFRA_API_AUTH", "INFRA_API_CONNECTION"):
+        reason = (f"API auth not resolvable: {api_validation.get('auth', {}).get('detail', 'see test output')}"
+                  if failure_class == "INFRA_API_AUTH" else
+                  f"API at {plan_data.get('api_base_url', '?')} is unreachable — check network/VPN access")
+        log(f"Infrastructure error not auto-resolvable ({failure_class}) — skipping Claude fix loop")
+        _write_gate("skipped")
+        _write_result({
+            "attempt": FIX_ATTEMPT,
+            "test_class": test_class,
+            "test_method": test_method,
+            "passed": False,
+            "skipped": True,
+            "reason": f"Infrastructure error: {failure_class} — {reason}",
+            "test_output": prev_output,
+            "fixes_applied": [],
+        }, files_written, FIX_ATTEMPT)
+        return
 
     if failure_class == "INFRA_BUILD":
         log(f"ERROR: Maven project not found — check WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
@@ -747,6 +820,22 @@ def main() -> None:
                 f"  {ln}" for ln in prev_summary_lines
             ) + "\n"
         structured_section += "</structured_failure_report>\n"
+
+    if api_auth_code_bug_hint:
+        api_auth = plan_data.get("api_auth", {})
+        structured_section += (
+            "\n<api_auth_note>\n"
+            f"This test is failing with a 401/403, but step 02 (Validate API) already "
+            f"confirmed THIS EXACT auth recipe works via a direct HTTP call: "
+            f"{api_validation.get('auth', {}).get('detail', '')}\n"
+            f"api_auth from the plan: {json.dumps(api_auth)}\n"
+            "Since the credentials and endpoint are already proven to work outside the "
+            "generated code, look for a bug in how the generated Helper/ApiHelper code "
+            "builds and attaches the auth header (wrong header name, missing 'Bearer ' "
+            "prefix, token not actually set before the call, wrong request going out) "
+            "rather than treating this as a credentials or environment problem.\n"
+            "</api_auth_note>\n"
+        )
 
     retry_section = ""
     if FIX_ATTEMPT > 1:
@@ -902,7 +991,7 @@ def _write_result(data: dict, files_written: list, attempt: int) -> None:
 
     result_label = "PASSED" if passed else "SKIPPED" if skipped else "STUCK" if stuck else "FAILED"
     lines = [
-        "# Run and Fix Results",
+        "# Run & Fix Results",
         "",
         f"Attempt:  {attempt}",
         f"Result:   {result_label}",

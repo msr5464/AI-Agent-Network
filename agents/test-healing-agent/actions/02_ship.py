@@ -159,7 +159,7 @@ Every fixed test was re-run locally and passed before this PR was created.
 """
 
     log("Creating PR...")
-    pr_url = create_pr(
+    pr_url, pr_err = create_pr(
         workspace=workspace,
         full_repo=full_repo,
         title=pr_title,
@@ -169,7 +169,7 @@ Every fixed test was re-run locally and passed before this PR was created.
         reviewers=GITHUB_PR_REVIEWERS,
     )
     if not pr_url:
-        log("PR creation failed")
+        log(f"PR creation failed: {pr_err}")
         return None
     log(f"PR created: {pr_url}")
     return pr_url

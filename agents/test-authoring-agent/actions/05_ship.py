@@ -38,6 +38,7 @@ WORKSPACE_DIR          = Path(os.environ.get("WORKSPACE_DIR", str(REPO_ROOT.pare
 AUTOMATION_FRAMEWORK_DIR          = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
 
 AUTO_PUSH              = os.environ.get("AUTO_PUSH", "true").lower() == "true"
+GITHUB_TOKEN           = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_ORG             = os.environ.get("GITHUB_ORG", "")
 GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
 GITHUB_DEFAULT_BRANCH  = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
@@ -58,9 +59,23 @@ def log(msg: str) -> None: _log("05-ship", msg)
 def send_slack(channel: str, text: str) -> bool:
     return _send_slack(SLACK_BOT_TOKEN, channel, text)
 
-def git(args: list, cwd: Path) -> tuple:
-    """Thin wrapper returning (returncode, stdout, stderr) for backward compat."""
-    ok, stdout, stderr = _run_git(args, cwd)
+def _push_url() -> str:
+    # "x-access-token" is a fixed, non-secret placeholder username (the same
+    # convention GitHub Actions itself uses) — the real secret is the token,
+    # held only in memory for the one push call that uses this.
+    return f"https://x-access-token:{GITHUB_TOKEN}@github.com/{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}.git"
+
+
+def git(args: list, cwd: Path, use_token: bool = False) -> tuple:
+    """Thin wrapper returning (returncode, stdout, stderr) for backward compat.
+
+    use_token=True substitutes a credential-bearing URL for "origin" on THIS
+    call only (see shared/git.py's run_git docstring for why — a plain
+    "origin" push otherwise triggers an interactive credential prompt with
+    no TTY to answer it). Local-only commands (add, commit, diff) never need
+    this.
+    """
+    ok, stdout, stderr = _run_git(args, cwd, push_url=_push_url() if use_token else None)
     return (0 if ok else 1), stdout, stderr
 
 
@@ -190,23 +205,38 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
     return branch_name, final_sha.strip()
 
 
-def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Optional[str]:
-    """Push branch and create GitHub PR. Returns PR URL or None."""
+def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tuple:
+    """Push branch and create GitHub PR.
+
+    Returns (pr_url, ship_status, ship_detail):
+      ship_status is one of:
+        "shipped"    — pushed and PR created successfully
+        "dry_run"    — AUTO_PUSH=false or GITHUB_ORG unset; nothing attempted,
+                       not a failure — this is an intentional no-op mode
+        "push_failed"— push was attempted and failed; the code exists on a
+                       local branch but nobody can see or review it — a real
+                       failure, must not be reported as APPROVED
+        "pr_failed"  — push succeeded but `gh pr create` failed — branch is
+                       on GitHub but no PR was opened; also a real failure
+      ship_detail carries the actual error text for the failure cases (empty
+      otherwise) — so a human (or the Slack alert / audit trail) sees WHY,
+      not just that something failed.
+    """
     if not AUTO_PUSH:
         log("AUTO_PUSH=false — skipping push (dry-run)")
-        return None
+        return None, "dry_run", ""
 
     if not GITHUB_ORG:
         log("GITHUB_ORG not set — skipping PR")
-        return None
+        return None, "dry_run", ""
 
     full_repo = f"{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}"
     log(f"Pushing {branch_name} to {full_repo}...")
 
-    rc, _, err = git(["push", "-u", "origin", branch_name], AUTOMATION_FRAMEWORK_DIR)
+    rc, _, err = git(["push", "-u", "origin", branch_name], AUTOMATION_FRAMEWORK_DIR, use_token=True)
     if rc != 0:
         log(f"Push failed: {err}")
-        return None
+        return None, "push_failed", err
 
     files_written = gen_data.get("files_written", [])
     files_fixed   = [f for f in fix_data.get("fixes_applied", []) if not f.startswith("auto:")]
@@ -283,7 +313,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
 """
 
     log("Creating PR...")
-    pr_url = create_pr(
+    pr_url, pr_err = create_pr(
         workspace=AUTOMATION_FRAMEWORK_DIR,
         full_repo=full_repo,
         title=pr_title,
@@ -293,19 +323,31 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> Opti
         reviewers=GITHUB_PR_REVIEWERS,
     )
     if not pr_url:
-        log("PR creation failed")
-        return None
+        log(f"PR creation failed: {pr_err}")
+        return None, "pr_failed", pr_err
     log(f"PR created: {pr_url}")
-    return pr_url
+    return pr_url, "shipped", ""
 
 
-def build_slack_message(gen_data: dict, fix_data: dict, pr_url: Optional[str], fix_gate: str) -> tuple:
+def build_slack_message(gen_data: dict, fix_data: dict, pr_url: Optional[str], fix_gate: str,
+                         ship_status: str = "dry_run", ship_detail: str = "") -> tuple:
     """Returns (channel, text)."""
     feature_class = gen_data.get("feature_class", MODULE.capitalize())
     files_count   = len(gen_data.get("files_written", []))
     test_passed   = fix_data.get("passed", False)
+    ship_failed   = ship_status in ("push_failed", "pr_failed")
 
-    if fix_gate == "stuck":
+    if ship_failed:
+        # Shipping itself failed — needs attention regardless of whether the
+        # generated test passed; nobody can review code stuck on a local
+        # branch. Distinct from (and takes priority over) a test-quality
+        # problem, since it's the reason there's nothing to review at all.
+        channel = SLACK_ALERT_CHANNEL or SLACK_NOTIFY_CHANNEL
+        icon    = ":x:"
+        what    = "push to GitHub" if ship_status == "push_failed" else "PR creation"
+        status  = (f"generated and tests {'pass' if test_passed else 'ran'}, but {what} FAILED — "
+                   "code is stuck on a local branch, needs manual intervention")
+    elif fix_gate == "stuck":
         # This is a genuine, reproducible failure — must go to the alert channel
         # like any other failure, not the "generated (test not run)" notify-only
         # path, which would hide a known-broken test from whoever watches alerts.
@@ -332,8 +374,11 @@ def build_slack_message(gen_data: dict, fix_data: dict, pr_url: Optional[str], f
     ]
     if pr_url:
         lines.append(f"PR: {pr_url}")
-    elif not AUTO_PUSH:
-        lines.append("_(AUTO_PUSH=false — no PR created)_")
+    elif ship_status == "dry_run":
+        lines.append("_(AUTO_PUSH=false or no GitHub org configured — no PR created)_")
+    elif ship_failed:
+        lines.append(f"_Ship error: {ship_detail[:300]}_" if ship_detail
+                     else "_(no further detail captured — see audit trail)_")
     lines.append(f"_Audit: `{AUDIT_DIR.name}`_")
 
     return channel, "\n".join(lines)
@@ -357,6 +402,8 @@ def main() -> None:
     commit_sha  = None
     pr_url      = None
     slack_sent  = False
+    ship_status = "dry_run"  # overwritten below if a push/PR was actually attempted
+    ship_detail = ""
 
     # Load per-attempt audit files for per-step commits in create_branch_and_commit
     fix_attempts_data = []
@@ -377,24 +424,39 @@ def main() -> None:
         branch_name, commit_sha = create_branch_and_commit(gen_data, fix_attempts_data)
 
         if branch_name and commit_sha:
-            pr_url = push_and_create_pr(branch_name, gen_data, fix_data)
+            pr_url, ship_status, ship_detail = push_and_create_pr(branch_name, gen_data, fix_data)
         elif branch_name and not commit_sha:
             log("Nothing staged — skipping push")
+            # Nothing to ship, not a failure — e.g. a resumed session where
+            # this step already committed everything on a prior attempt.
+            ship_status = "dry_run"
         else:
             log("Branch creation failed — skipping push")
+            # Code generated fine but couldn't even get a local branch/commit
+            # made — same category as a failed push: it exists, but nobody
+            # can see or review it. A real failure, not a dry run.
+            ship_status = "push_failed"
+            ship_detail = "git branch/commit creation failed — see log above"
     else:
         log("No files generated — skipping git operations")
 
     # Slack
     if SLACK_NOTIFY_CHANNEL or SLACK_ALERT_CHANNEL:
-        channel, text = build_slack_message(gen_data, fix_data, pr_url, fix_gate)
+        channel, text = build_slack_message(gen_data, fix_data, pr_url, fix_gate, ship_status, ship_detail)
         if channel and text:
             slack_sent = send_slack(channel, text)
 
-    # Verdict gate
-    verdict = "APPROVED" if (test_passed or fix_gate == "skipped") else "NEEDS-REVIEW"
+    # Verdict gate — APPROVED requires BOTH the test passing (or being
+    # deliberately skipped) AND shipping actually succeeding (or being a
+    # deliberate dry-run). A push/PR/branch failure means the generated code
+    # exists but nobody can see or review it — that's never APPROVED,
+    # regardless of whether the test itself passed.
+    ship_failed = ship_status in ("push_failed", "pr_failed")
+    verdict = "APPROVED" if ((test_passed or fix_gate == "skipped") and not ship_failed) else "NEEDS-REVIEW"
     (AUDIT_DIR / ".verdict").write_text(verdict)
     log(f"Verdict: {verdict}")
+    if ship_failed:
+        log(f"  → Ship failed ({ship_status}): {ship_detail}")
 
     # Write result JSON
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -407,6 +469,8 @@ def main() -> None:
         "branch":           branch_name,
         "commit":           commit_sha,
         "pr_url":           pr_url,
+        "ship_status":      ship_status,
+        "ship_detail":      ship_detail,
         "verdict":          verdict,
         "slack_notified":   slack_sent,
         "files_count":      len(files_written),
@@ -429,8 +493,22 @@ def main() -> None:
         f"| Commit | `{commit_sha or 'N/A'}` |",
         f"| PR | {pr_url or 'Not created'} |",
         f"| Test result | {'✅ Passed' if test_passed else '⚠️ Not run' if fix_gate == 'skipped' else '❌ Failed'} |",
+        f"| Ship status | {ship_status} |",
         f"| Slack | {'Sent' if slack_sent else 'Skipped'} |",
     ]
+    if ship_failed:
+        md_lines += [
+            "",
+            "## ⚠️ Ship Failed",
+            "",
+            f"Generated code was committed to a local branch (`{branch_name}`), but "
+            f"{'the push to GitHub' if ship_status == 'push_failed' else 'PR creation'} "
+            "failed — nobody can see or review it until this is resolved:",
+            "",
+            "```",
+            ship_detail or "(no further detail captured)",
+            "```",
+        ]
     (AUDIT_DIR / "05-ship.md").write_text("\n".join(md_lines))
 
     log(f"Done — verdict={verdict} | PR={pr_url or 'none'}")

@@ -4,6 +4,7 @@ The agent writes a fixed set of files to `agents/test-authoring-agent/audit/<ses
 
     00-session-init.md
     01-parse.json + .md
+    02-validate-api.json + .md        (or "skipped" — runs alongside validate-web)
     02-validate-web.json + .md        (or "skipped")
     02-validate-web.js                (Playwright script, optional)
     03-generate.json + .md
@@ -26,9 +27,15 @@ from typing import Dict, List, Optional, Tuple
 from qa_agents_server.paths import AUTHORING_AUDIT_DIR
 
 # Ordered list of (step_key, json_filename, display_name) for the UI progress bar.
+# display_name for "validate_web" is just "Validate" (not "Validate Web") because
+# this slot's badge in the frontend covers BOTH validate_web AND validate_api —
+# they run under the same numbered step-2 slot (see run.sh) but only validate_web
+# is tracked here for live progress/SSE events; validate_api is exposed separately,
+# History-modal-only, via get_session()'s "steps" dict below. Keep this display
+# name in sync with AI-Test-Studio/frontend/customer/index.html's STEP_LABELS.
 STEPS: List[Tuple[str, str, str]] = [
     ("parse", "01-parse.json", "Parse"),
-    ("validate_web", "02-validate-web.json", "Validate Web"),
+    ("validate_web", "02-validate-web.json", "Validate"),
     ("generate", "03-generate.json", "Generate"),
     ("run_and_fix", "04-run-and-fix.json", "Run & Fix"),
     ("ship", "05-ship.json", "Ship"),
@@ -84,6 +91,22 @@ def _step_has_error(data: Optional[Dict]) -> bool:
     # showed up identically to a normal successful step everywhere this
     # helper is used (session status, per-step status in replay_events).
     if data.get("status") in ("timeout", "error", "empty"):
+        return True
+    # 04-run-and-fix.json has no "status"/"error" key at all — its own
+    # vocabulary is "passed"/"skipped"/"stuck". A test that's still failing
+    # (passed=False) and wasn't deliberately skipped for an infra reason is a
+    # genuine failure for this step — "stuck" included, since that's still a
+    # test that never passed. Without this, the Run & Fix badge showed
+    # "done" (green) for a test that never actually passed.
+    if data.get("passed") is False and not data.get("skipped"):
+        return True
+    # 05-ship.json also has no "status"/"error" key — its vocabulary is
+    # "verdict"/"ship_status". A push/PR failure is a genuine hard failure
+    # for THIS step even when the underlying test passed fine (verdict alone
+    # can't distinguish that from a plain test failure — see 05_ship.py).
+    # Without this, the Ship badge showed "done" (green) for a run that had
+    # just failed to ship at all — the exact bug this fixes.
+    if data.get("ship_status") in ("push_failed", "pr_failed"):
         return True
     return False
 
@@ -158,6 +181,7 @@ def get_session(session_id: str) -> Optional[Dict]:
     init_md = _read_text(session_dir / "00-session-init.md")
     parse = _safe_load_json(session_dir / "01-parse.json")
     validate = _safe_load_json(session_dir / "02-validate-web.json")
+    validate_api = _safe_load_json(session_dir / "02-validate-api.json")
     generate = _safe_load_json(session_dir / "03-generate.json")
     run_and_fix = _safe_load_json(session_dir / "04-run-and-fix.json")
     ship = _safe_load_json(session_dir / "05-ship.json")
@@ -175,6 +199,10 @@ def get_session(session_id: str) -> Optional[Dict]:
         "steps": {
             "parse": parse,
             "validate_web": validate,
+            # Runs alongside validate_web in the SAME numbered step-2 slot (see
+            # run.sh) — not in STEPS (progress-bar polling stays on the 5-step
+            # model), but exposed here so the History detail view can show it.
+            "validate_api": validate_api,
             "generate": generate,
             "run_and_fix": run_and_fix,
             "ship": ship,
@@ -243,6 +271,8 @@ def replay_events(session_id: str) -> Optional[List[Dict]]:
             "pr_url": ship.get("pr_url"),
             "test_passed": ship.get("test_passed"),
             "files_count": ship.get("files_count"),
+            "ship_status": ship.get("ship_status"),
+            "ship_detail": ship.get("ship_detail"),
             "duration_s": duration_s,
         })
     else:
@@ -252,6 +282,8 @@ def replay_events(session_id: str) -> Optional[List[Dict]]:
             "pr_url": None,
             "test_passed": None,
             "files_count": None,
+            "ship_status": None,
+            "ship_detail": None,
             "duration_s": duration_s,
         })
 
@@ -313,5 +345,7 @@ def _summarise_step(key: str, data: Dict) -> Dict:
             "pr_url": data.get("pr_url"),
             "branch": data.get("branch"),
             "files_count": data.get("files_count"),
+            "ship_status": data.get("ship_status"),
+            "ship_detail": data.get("ship_detail"),
         }
     return {}

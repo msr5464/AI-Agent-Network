@@ -19,6 +19,7 @@ Runs independently. One session = one module input file = one PR (or Slack alert
 run.sh (orchestrator)
   │
   ├─ 01_parse.py          [Python + Claude]   Plain text → structured generation plan
+  ├─ 02_validate_api.py   [Python only]       Real HTTP calls: confirm auth + safe endpoints
   ├─ 02_validate_web.py   [Python + Claude]   Drive browser via Playwright MCP → selector map
   ├─ 03_generate.py       [Python + Claude]   Write Java files to Thanos-pw repo
   ├─ 04_run_and_fix.py    [Python + Claude]   Run mvn test → fix failures → retry loop
@@ -32,9 +33,10 @@ run.sh (orchestrator)
 | Step | Owns | Does NOT do |
 |------|------|-------------|
 | **01 Parse** | Read plain text, call Claude, produce plan JSON | No file writes to Thanos-pw |
+| **02 Validate API** | Real HTTP auth + safe-endpoint calls against `api_base_url`, no LLM | Never call unsafe (POST/PUT/DELETE or path-param) endpoints |
 | **02 Validate Web** | Drive the browser via Playwright MCP, collect confirmed selectors | No Java codegen |
 | **03 Generate** | Write all Java files to Thanos-pw | No test running |
-| **04 Run+Fix** | Run mvn test, call Claude to fix failures, retry | No git push |
+| **04 Run & Fix** | Run mvn test, call Claude to fix failures, retry | No git push |
 | **05 Ship** | Branch + commit + push + PR creation | No AI calls |
 
 ---
@@ -46,6 +48,7 @@ queue/<module>.txt  (plain English test steps)
     ↓
 01-parse.json            (structured generation plan: classes, fields, methods)
     ↓
+02-validate-api.json     (confirmed auth + endpoint shapes, or skipped if not an API test)
 02-validate-web.json     (confirmed DOM selectors, or empty if not a web test)
     ↓
 03-generate.json         (list of Java files written to Thanos-pw)
@@ -110,11 +113,12 @@ Web Steps:
 |------|-----------|---------|
 | `00-session-init.md` | run.sh | Session metadata, env snapshot |
 | `01-parse.json` + `.md` | Parse | Generation plan |
+| `02-validate-api.json` + `.md` | Validate API | Auth status, confirmed endpoint response shapes |
 | `02-validate-web.json` + `.md` | Validate Web | Selector map, step results |
 | `claude-*.log` | Validate Web | Raw `claude -p` stream, for diagnosing empty runs |
 | `03-generate.json` + `.md` | Generate | List of files written |
-| `04-run-and-fix.json` + `.md` | Run+Fix | Test output, applied fixes |
-| `.fix-passed` | Run+Fix | Gate: true / false / skipped |
+| `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes |
+| `.fix-passed` | Run & Fix | Gate: true / false / skipped |
 | `05-ship.json` + `.md` | Ship | PR URL, Slack status |
 | `.verdict` | Ship | APPROVED / NEEDS-REVIEW |
 
@@ -143,6 +147,8 @@ Web Steps:
 | `VALIDATE_WEB_TIMEOUT_S` | Wall-clock budget (s) for the whole step-02 run | `1800` |
 | `VALIDATE_WEB_RETRY_ATTEMPTS` | Extra full re-runs step 02 attempts on recoverable failures | `1` |
 | `PLAYWRIGHT_HEADLESS` | Set `false` to watch the browser during step 02 | `true` |
+| `VALIDATE_API_REQUEST_TIMEOUT_S` | Timeout (s) for each real HTTP call in Validate API | `15` |
+| `VALIDATE_API_RETRY_ON_ERROR` | Set `false` to disable the one connection-error retry in Validate API | `true` |
 | `ALLOW_MISSING_SELECTORS` | Let step 03 generate when step 02 confirmed nothing | `false` |
 | `SLACK_BOT_TOKEN` | Slack bot token | optional |
 | `SLACK_NOTIFY_CHANNEL` | Slack channel for success notifications | optional |
@@ -182,8 +188,8 @@ any stale output for `START_FROM_STEP` onward (including per-attempt fix files f
 prior failed try) is cleared before it re-runs.
 
 ```bash
-# Re-run step 4 (Run & Fix) and 05 (Ship) for a session that failed there,
-# reusing its 01-parse.json / 02-validate-web.json / 03-generate.json as-is.
+# Re-run step 4 (Run & Fix) and 05 (Ship) for a session that failed there, reusing
+# its 01-parse.json / 02-validate-api.json / 02-validate-web.json / 03-generate.json as-is.
 START_FROM_STEP=4 SESSION_ID=20260330-143022-create-payments \
   make run AGENT=test-authoring-agent
 ```

@@ -1,0 +1,24 @@
+Module: github
+Type: api
+API URL: https://api.github.com
+URL: https://github.com
+
+Steps:
+1. Send a GET request to /users/octocat.
+2. Verify response status is 200.
+3. Verify login is "octocat".
+4. Verify public_repos is greater than or equal to 0.
+5. Capture location and avatar_url from the response.
+6. Send a GET request to /repos/octocat/Hello-World.
+7. Verify response status is 200.
+8. Capture description, html_url, and stargazers_count from the response.
+9. Verify description is not empty.
+10. Verify html_url is not empty and is a valid GitHub URL.
+11. Verify stargazers_count is greater than or equal to 0.
+12. Navigate to the GitHub profile page for octocat.
+13. Verify the displayed location matches the location returned by the User API.
+14. Verify the profile avatar is visible.
+15. Verify the avatar image URL matches the avatar_url returned by the User API.
+16. Navigate to the GitHub repository page using the html_url captured from the Repository API.
+17. Verify the repository description matches the description returned by the Repository API.
+18. Verify the current page URL matches the html_url returned by the Repository API.

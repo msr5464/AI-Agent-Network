@@ -33,7 +33,12 @@ from pathlib import Path
 from typing import Deque, Dict, Generator, List, Optional
 
 from qa_agents_server import storage
-from qa_agents_server.audit_reader import STEPS, get_session as _get_session
+from qa_agents_server.audit_reader import (
+    STEPS,
+    get_session as _get_session,
+    _safe_load_json,
+    _step_has_error,
+)
 from qa_agents_server.feature_files import feature_exists
 from qa_agents_server.paths import (
     AUTHORING_AUDIT_DIR,
@@ -267,6 +272,11 @@ def start_run(module: Optional[str], auto_push: bool, session_id: Optional[str] 
         if start_from_step > 1:
             env["START_FROM_STEP"] = str(start_from_step)
 
+        # Captured BEFORE Popen() (not after) — _audit_watcher uses this as the
+        # cutoff for "did THIS run's own subprocess actually write this file,
+        # or is it a stale leftover from a previous attempt" (see there for
+        # why that distinction matters for a resumed/retried session).
+        started_at = time.time()
         try:
             proc = subprocess.Popen(
                 ["bash", str(AUTHORING_RUN_SH)],
@@ -286,7 +296,7 @@ def start_run(module: Optional[str], auto_push: bool, session_id: Optional[str] 
             module=module,
             auto_push=auto_push,
             audit_dir=audit_dir,
-            started_at=time.time(),
+            started_at=started_at,
             proc=proc,
             pid=proc.pid,
             start_from_step=start_from_step,
@@ -422,49 +432,96 @@ def _stdout_reader(run: RunState) -> None:
         _append_event(run, "error", {"source": "stdout_reader", "message": str(e)})
 
 
+def _step_file_is_fresh(run: RunState, idx: int, file_path: Path) -> bool:
+    """True if file_path is safe to treat as this run's own output for the
+    step at STEPS[idx].
+
+    For a resumed/retried run (start_from_step > 1), steps BEFORE
+    start_from_step are deliberately reused as-is — their existing file, of
+    whatever age, is exactly what we want. But for the step run.sh is
+    actually RESUMING FROM (and everything after it), the OLD file from the
+    attempt being retried still sits on disk the instant this run's
+    subprocess spawns — run.sh only deletes it moments later, as its own
+    first real action (see run.sh's stale-artifact cleanup). If this thread
+    scans in that window, it would read the PREVIOUS attempt's stale result
+    (e.g. a push failure) and permanently mark the step from it, since
+    step_progress then blocks ever looking at that key again — even after
+    run.sh finishes rewriting the file with the real, current outcome. A
+    file with an mtime from before this run started is exactly that stale
+    leftover, not this run's own output.
+    """
+    step_num = idx + 1
+    if step_num < run.start_from_step:
+        return True  # reused step — existing file is valid regardless of age
+    try:
+        return file_path.stat().st_mtime >= run.started_at
+    except OSError:
+        return False
+
+
 def _audit_watcher(run: RunState) -> None:
-    """Poll the audit dir and emit step events as JSON files appear."""
-    seen: Dict[str, bool] = {key: False for key, _, _ in STEPS}
-    # Mark the first unseen step as "running" up front so the UI lights up.
+    """Poll the audit dir and emit step events as JSON files appear.
+
+    run.step_progress (not a local dict) is the single source of truth for
+    "have I already emitted an event for this key" — it's shared with
+    _wait_and_reap, which does its own authoritative catch-up sweep right
+    before the terminal "done" event (see there for why: this thread's poll
+    interval can lose the race against a fast-finishing run). Consulting the
+    same shared dict here means neither thread re-emits for a step the other
+    one already handled, and this thread does its OWN final sweep once the
+    process exits — _wait_and_reap's later sweep covers anything left over.
+    """
+    # Mark the actual first-to-run step as "running" up front so the UI
+    # lights up immediately — for a resumed run (start_from_step > 1),
+    # that's NOT "parse": steps before start_from_step are reused as-is,
+    # not re-executed, so marking "parse" here was actively wrong (a
+    # spurious "running" flicker on a step that isn't running at all).
     if STEPS:
-        first_key, _, first_display = STEPS[0]
-        run.step_progress[first_key] = "running"
-        _append_event(run, "step", {
-            "key": first_key, "display": first_display, "status": "running",
-        })
+        bootstrap_idx = min(max(run.start_from_step - 1, 0), len(STEPS) - 1)
+        first_key, _, first_display = STEPS[bootstrap_idx]
+        if run.step_progress.get(first_key) is None:
+            run.step_progress[first_key] = "running"
+            _append_event(run, "step", {
+                "key": first_key, "display": first_display, "status": "running",
+            })
 
     while True:
         if run.proc is None:
             return
         # Scan for new step files
-        for key, fname, display in STEPS:
-            if seen[key]:
+        for idx, (key, fname, display) in enumerate(STEPS):
+            if run.step_progress.get(key) in ("done", "failed"):
                 continue
-            if (run.audit_dir / fname).exists():
-                seen[key] = True
-                run.step_progress[key] = "done"
+            file_path = run.audit_dir / fname
+            if file_path.exists() and _step_file_is_fresh(run, idx, file_path):
+                # File existing only means the step's process finished — it
+                # says nothing about whether the step's OWN outcome was good
+                # (e.g. 04-run-and-fix.json exists whether the test passed or
+                # never did; 05-ship.json exists whether the push succeeded
+                # or failed). _step_has_error() reads each step's own result
+                # vocabulary to tell the two apart.
+                step_status = "failed" if _step_has_error(_safe_load_json(file_path)) else "done"
+                run.step_progress[key] = step_status
                 _append_event(run, "step", {
-                    "key": key, "display": display, "status": "done",
+                    "key": key, "display": display, "status": step_status,
                 })
-                # Mark the next step as running (if any)
-                idx = [k for k, _, _ in STEPS].index(key)
+                # Mark the next step as running (if any, and regardless of
+                # whether THIS step failed — the pipeline still runs the next
+                # step either way), but only if nobody (including
+                # _wait_and_reap's sweep) has touched it yet.
                 if idx + 1 < len(STEPS):
                     next_key, _, next_display = STEPS[idx + 1]
-                    if not seen.get(next_key) and run.step_progress.get(next_key) != "running":
+                    if run.step_progress.get(next_key) is None:
                         run.step_progress[next_key] = "running"
                         _append_event(run, "step", {
                             "key": next_key, "display": next_display, "status": "running",
                         })
-        # Exit when the process is gone AND all steps checked (let the reap thread handle terminal state)
         if run.proc.poll() is not None:
-            # One final sweep after the process exits
-            for key, fname, display in STEPS:
-                if not seen[key] and (run.audit_dir / fname).exists():
-                    seen[key] = True
-                    run.step_progress[key] = "done"
-                    _append_event(run, "step", {
-                        "key": key, "display": display, "status": "done",
-                    })
+            # Nothing left to do here — _wait_and_reap runs its own
+            # authoritative sweep for any step this loop didn't catch before
+            # it emits the terminal "done" event, guaranteeing every step's
+            # "done" lands ahead of "done" itself regardless of which thread
+            # gets there first.
             return
         time.sleep(AUDIT_POLL_INTERVAL)
 
@@ -516,12 +573,39 @@ def _wait_and_reap(run: RunState) -> None:
         final_status = "failed"
     run.status = final_status
 
+    # Authoritative final sweep — _audit_watcher polls on its own schedule
+    # (every AUDIT_POLL_INTERVAL) and can lose the race against THIS thread for
+    # a fast-finishing run: proc.wait() above returns the instant the process
+    # exits, but _audit_watcher might not wake up again for up to
+    # AUDIT_POLL_INTERVAL seconds — long enough for the terminal "done" event
+    # below to already be in the buffer and the SSE stream to close before
+    # _audit_watcher ever gets to emit that last step's "done"/"failed" event.
+    # Doing the same file-existence + outcome check here, BEFORE the terminal
+    # event, guarantees every step's final status is in the buffer ahead of
+    # "done" itself — a harmless duplicate if _audit_watcher's own sweep also
+    # catches it first. The process has already exited by this point, so the
+    # file is definitely this run's own final output, not the stale-leftover
+    # race _step_file_is_fresh guards against in _audit_watcher — but this
+    # calls it too anyway for defense-in-depth/consistency between the two.
+    for _idx, (_key, _fname, _display) in enumerate(STEPS):
+        if run.step_progress.get(_key) in ("done", "failed"):
+            continue
+        _file_path = run.audit_dir / _fname
+        if _file_path.exists() and _step_file_is_fresh(run, _idx, _file_path):
+            _step_status = "failed" if _step_has_error(_safe_load_json(_file_path)) else "done"
+            run.step_progress[_key] = _step_status
+            _append_event(run, "step", {
+                "key": _key, "display": _display, "status": _step_status,
+            })
+
     # Load ship data for the terminal event payload
     ship_path = run.audit_dir / "05-ship.json"
     pr_url = None
     verdict = None
     test_passed = None
     files_count = None
+    ship_status = None
+    ship_detail = None
     if ship_path.exists():
         import json as _json
         try:
@@ -530,6 +614,8 @@ def _wait_and_reap(run: RunState) -> None:
             verdict = ship.get("verdict")
             test_passed = ship.get("test_passed")
             files_count = ship.get("files_count")
+            ship_status = ship.get("ship_status")
+            ship_detail = ship.get("ship_detail")
         except (OSError, _json.JSONDecodeError):
             pass
 
@@ -540,6 +626,8 @@ def _wait_and_reap(run: RunState) -> None:
         "pr_url": pr_url,
         "test_passed": test_passed,
         "files_count": files_count,
+        "ship_status": ship_status,
+        "ship_detail": ship_detail,
         "ended_at": run.ended_at,
         "duration": run.ended_at - run.started_at,
     })

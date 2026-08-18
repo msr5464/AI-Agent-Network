@@ -16,7 +16,6 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -43,13 +42,13 @@ VALIDATE_RETRY_ATTEMPTS = int(os.environ.get("VALIDATE_WEB_RETRY_ATTEMPTS", "1")
 sys.path.insert(0, str(REPO_ROOT / "shared"))
 from claude import call_claude_ex       # noqa: E402  (after sys.path update)
 from mcp_config import write_playwright_mcp_config  # noqa: E402
+from log import log as _log             # noqa: E402  (shared, redacts known secrets)
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
 def log(msg: str) -> None:
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] [02-validate-web] {msg}", flush=True)
+    _log("02-validate-web", msg)
 
 
 def _fmt_budget(seconds: int) -> str:
@@ -639,7 +638,7 @@ def _write_result(selectors, steps_passed, steps_failed,
         data["raw_output_tail"] = raw_output
     (AUDIT_DIR / "02-validate-web.json").write_text(json.dumps(data, indent=2))
 
-    lines = ["# Web Validation Results", ""]
+    lines = ["# Validate Web Results", ""]
     if skipped:
         lines.append(f"Skipped: {reason}")
     else:

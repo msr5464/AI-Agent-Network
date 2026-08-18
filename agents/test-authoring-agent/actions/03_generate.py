@@ -7,8 +7,14 @@ writes them directly into the Thanos-pw repository.
 For new modules: creates Data, Builder, Helper, Api enum, Page objects, Test classes.
 For existing modules: adds new methods / new test class only.
 
+When plan["flow_style"] == "interleaved" (set by 01_parse.py when a test_type=="both"
+input describes ONE sequence mixing real API and web actions, rather than two
+independent flows), generates a single combined test class following
+plan["interleaved_steps"]'s order instead of separate Api/Web test classes.
+
 Reads:  $AUDIT_DIR/01-parse.json
         $AUDIT_DIR/02-validate-web.json
+        $AUDIT_DIR/02-validate-api.json (if present — API validation hints)
 Writes: Java files into Thanos-pw repo
         $AUDIT_DIR/03-generate.json
         $AUDIT_DIR/03-generate.md
@@ -209,11 +215,55 @@ def _warn_page_coverage(web_pages, selectors, interaction_hints) -> list:
     return uncovered
 
 
+def _build_api_hint(test_type: str, api_data: dict) -> str:
+    """Turn 02-validate-api.json into a codegen hint — confirmed auth status and
+    real response shapes for endpoints that were actually called, mirroring what
+    selector_hint/dom_context do for web (see module docstring)."""
+    if test_type not in ("api", "both") or api_data.get("skipped"):
+        return ""
+
+    lines = ["\n\nAPI validation results (from a real pre-codegen call against the live API):"]
+
+    auth = api_data.get("auth") or {}
+    auth_status = auth.get("status")
+    if auth_status == "ok":
+        lines.append(f"  Auth: confirmed working — {auth.get('detail')}")
+    elif auth_status and auth_status != "skipped":
+        lines.append(
+            f"  Auth: NOT confirmed ({auth_status} — {auth.get('detail')}). "
+            "Generate the auth code from the plan's api_auth as usual, but note "
+            "step 04's real `mvn test` run is what will actually prove it works."
+        )
+
+    for ep in api_data.get("endpoints_checked", []):
+        if ep.get("error"):
+            lines.append(f"  {ep['method']} {ep['path']}: call failed — {ep['error']}")
+            continue
+        mark = "matched expected status" if ep.get("matched_expected") else "DID NOT match expected status"
+        lines.append(
+            f"  {ep['method']} {ep['path']}: real call returned {ep['actual_status']} "
+            f"(expected {ep.get('expected_status')}, {mark})"
+            + (f", response JSON keys: {ep['response_keys']}" if ep.get("response_keys") else "")
+        )
+        if not ep.get("matched_expected"):
+            lines.append(
+                f"    → the plan's expected_status for this endpoint may be wrong; "
+                f"prefer the real observed status ({ep['actual_status']}) when generating assertions."
+            )
+
+    for ep in api_data.get("endpoints_not_checked", []):
+        lines.append(f"  {ep['method']} {ep['path']}: not independently checked — {ep['reason']}")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     plan = json.loads((AUDIT_DIR / "01-parse.json").read_text())
     web_data = json.loads((AUDIT_DIR / "02-validate-web.json").read_text())
+    api_data_path = AUDIT_DIR / "02-validate-api.json"
+    api_data = json.loads(api_data_path.read_text()) if api_data_path.exists() else {"skipped": True}
     # Read Jarvis/CLAUDE.md — single source of truth for framework conventions.
     fw_claude_md_path = AUTOMATION_FRAMEWORK_DIR / "CLAUDE.md"
     claude_md = fw_claude_md_path.read_text() if fw_claude_md_path.exists() else ""
@@ -243,6 +293,8 @@ def main() -> None:
     pages_with_zero_coverage = []
     if test_type in ("web", "both"):
         pages_with_zero_coverage = _warn_page_coverage(web_pages, selectors, interaction_hints)
+
+    api_hint = _build_api_hint(test_type, api_data)
 
     refs = read_reference_files()
     ref_section = "\n".join(
@@ -352,7 +404,7 @@ def main() -> None:
 <generation_plan>
 {json.dumps(plan, indent=2)}
 </generation_plan>
-{selector_hint}{dom_context}
+{selector_hint}{dom_context}{api_hint}
 
 Generate the following Java files and return them as a single JSON object where
 keys are relative file paths (from Thanos-pw repo root) and values are the complete
@@ -370,8 +422,24 @@ Rules (MANDATORY — violations will cause compilation failures):
 4. API enum: implements ApiDetails. Include withPath(String param, String value) method.
 5. Helper: extends ApiHelper (import automation.core.api.ApiHelper). Pass customBaseUrl to super(config, BASE_URL).
    API methods call execute()/executeAndVerify()/executeRaw().
-   For token auth: call setAuthToken(token) on the helper after construction.
    Web methods only if they orchestrate 2+ page objects.
+5b. API AUTH — source this ONLY from plan["api_auth"].type below; never invent a different auth
+   mechanism or guess at field names not present in api_auth:
+   a) type == "none": no auth headers at all — do not call setAuthToken or add any auth logic.
+   b) type == "bearer_token": call api_auth.login_endpoint (method/path/body_fields) to obtain a
+      token, extract it via api_auth.token_json_path, then apply it using api_auth.header_name /
+      api_auth.header_prefix (defaults: "Authorization" / "Bearer "). If those are the defaults,
+      the framework's ApiHelper.setAuthToken(token) after construction is the normal path (see
+      <reference_implementations>). If api_auth specifies a NON-default header_name, look at
+      ApiHelper's real methods in <reference_implementations> for how to set an arbitrary header —
+      do not assume setAuthToken covers a non-"Authorization" header.
+   c) type == "basic": send HTTP Basic auth (base64 of "username:password" from demo_credentials)
+      on every request — do NOT run a login call or token flow for this type.
+   d) type == "api_key": send demo_credentials.api_key as a static header named by
+      api_auth.header_name on every request — no login call, no token.
+   If api_hint below reports the auth as already confirmed working (step 02 pre-validated it via a
+   real HTTP call), it's safe to assume the recipe itself is correct — any resulting 401/403 in the
+   generated test points at how this code applies auth, not at the credentials or the API.
 6. Page objects: extend BasePage. Define all locators in constructor using page.locator().
    Call waitUntilLoaded() LAST in constructor. waitUntilLoaded() uses WaitHelper.
    All interactions use BasePage methods (click, fillText, getText, isElementDisplayed).
@@ -379,7 +447,7 @@ Rules (MANDATORY — violations will cause compilation failures):
 7. Test classes: extend TestBase. Use @Test(dataProvider="getConfig", groups={{...}}).
    Every @Test method has @TestVariables(automatedBy = QA.Mukesh).
    Use config.logStep() in test methods only.
-   CREDENTIALS — follow this priority order:
+   WEB LOGIN CREDENTIALS (not API auth — see rule 5b for that) — follow this priority order:
    a) For EXISTING modules: scan every @Test method in the existing test class shown in
       <existing_file_contents> and find how they load credentials. Copy that pattern exactly.
       Do NOT look at what methods are available on the helper — look at what the existing test
@@ -412,6 +480,18 @@ Rules (MANDATORY — violations will cause compilation failures):
     additional logic. For example: a method that only calls getCredentials(role) then doLogin() adds
     zero value — the test can call those two methods directly. Only add helper methods when they
     genuinely orchestrate ≥2 distinct page objects or encapsulate non-trivial multi-step logic.
+15. INTERLEAVED FLOWS — when generation_plan["flow_style"] == "interleaved", generate exactly ONE
+    test method (do NOT split into separate Api/Web test classes) in the single test class listed
+    under "Files to generate". Follow generation_plan["interleaved_steps"] IN ORDER: for each step,
+    call the Helper's API methods (execute()/executeAndVerify()/etc., per rule 5) when
+    "interface": "api", and drive the Page Objects via the Helper's web orchestration methods
+    (per rule 6) when "interface": "web" — all within one @Test method named
+    generation_plan["interleaved_test_method_name"]. Data an earlier API step produced (e.g. an id
+    from a create call) must be threaded into later steps exactly as a real caller would, not
+    re-fetched or re-derived redundantly. For this method, the Helper is EXPECTED to have both API
+    methods (rule 5) and web orchestration methods (rule 6) — that is correct here, not a violation
+    of rule 5's "web methods only if they orchestrate 2+ page objects" guidance, since the method
+    orchestrates real cross-interface state, not just page objects.
 
 Return ONLY a JSON object, no prose:
 {{
@@ -496,9 +576,10 @@ def _find_existing_test_class(feature_lower: str, test_type: str) -> str:
     Returns the relative path (from repo root) if found, empty string otherwise.
 
     Selection rules:
-    - test_type == "api"  → prefer *ApiTest.java
-    - test_type == "web"  → prefer *WebTest.java or *LoginTest.java (anything without "Api" in stem)
-    - Multiple matches    → alphabetically first (deterministic)
+    - test_type == "api"         → prefer *ApiTest.java
+    - test_type == "web"         → prefer *WebTest.java or *LoginTest.java (anything without "Api" in stem)
+    - test_type == "interleaved" → prefer *FlowTest.java (see _plan_files' interleaved branch)
+    - Multiple matches           → alphabetically first (deterministic)
     """
     test_dir = AUTOMATION_FRAMEWORK_DIR / "src" / "test" / "java" / "automation" / feature_lower
     if not test_dir.exists():
@@ -520,7 +601,13 @@ def _find_existing_test_class(feature_lower: str, test_type: str) -> str:
                 return str(f.relative_to(AUTOMATION_FRAMEWORK_DIR))
         return ""  # all found classes are Api ones — create a new Web class
 
-    return ""  # "both" → caller handles api + web separately
+    if test_type == "interleaved":
+        for f in candidates:
+            if "Flow" in f.stem:
+                return str(f.relative_to(AUTOMATION_FRAMEWORK_DIR))
+        return ""  # no existing flow class — create a new one
+
+    return ""  # "both"/parallel → caller handles api + web separately
 
 
 def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, feature) -> list:
@@ -548,7 +635,18 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
                 page_path = f"src/main/java/automation/modules/{feature_lower}/web/{class_name}.java"
                 files.append(page_path)
 
-    # Test classes — for existing modules, prefer adding to an existing class
+    # Test classes — for existing modules, prefer adding to an existing class.
+    # Interleaved "both" flows get ONE combined test class instead of the usual
+    # separate Api/Web pair — see 01_parse.py rule 7b for how flow_style is set.
+    if test_type == "both" and plan.get("flow_style") == "interleaved":
+        existing_flow = _find_existing_test_class(feature_lower, "interleaved") if existing else ""
+        if existing_flow:
+            log(f"  Reusing existing flow test class: {existing_flow}")
+            files.append(existing_flow)
+        else:
+            files.append(f"src/test/java/automation/{feature_lower}/{feature_class}FlowTest.java")
+        return files
+
     if test_type in ("api", "both"):
         existing_api = _find_existing_test_class(feature_lower, "api") if existing else ""
         if existing_api:
@@ -588,6 +686,8 @@ def _infer_test_class(written: list, test_type: str) -> str:
 
 def _infer_test_method(plan: dict, test_type: str) -> str:
     """Find the first test method name from the plan."""
+    if test_type == "both" and plan.get("flow_style") == "interleaved":
+        return plan.get("interleaved_test_method_name", "")
     if test_type in ("api", "both"):
         methods = plan.get("api_test_methods", [])
         if methods:
