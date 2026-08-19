@@ -171,6 +171,24 @@ log "module=$MODULE"
 log "input=$INPUT_FILE"
 log "session=$SESSION_ID"
 [[ "$MODE" == "resume" ]] && log "resuming from step $START_FROM_STEP"
+# Show what's actually being automated right up front, before step 01 even
+# starts — credentials masked. This is generic pattern-based masking only
+# (matches "password:"/"token:"/etc. style lines) — the stronger,
+# value-based pass (using 01_parse.py's own extracted demo_credentials)
+# isn't possible yet here, since Parse hasn't run — that fuller redaction is
+# what the PR description shows once it's available. Best-effort: silently
+# skipped if the input file can't be found (e.g. a resumed session whose
+# original file already moved to processed/).
+if [[ -f "$INPUT_FILE" ]]; then
+  echo ""
+  echo "── Test Case (credentials masked) ──"
+  python3 -c "
+import os, sys
+sys.path.insert(0, os.environ['REPO_ROOT'])
+from shared.credential_masking import mask_credential_lines
+print(mask_credential_lines(open(os.environ['INPUT_FILE']).read()).rstrip())
+"
+fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 

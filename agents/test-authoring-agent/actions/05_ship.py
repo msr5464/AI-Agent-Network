@@ -28,6 +28,7 @@ from shared.log import log as _log
 from shared.slack import send_slack as _send_slack
 from shared.git import run_git as _run_git
 from shared.github import create_pr
+from shared.credential_masking import mask_credentials
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR  = Path(os.environ["AUDIT_DIR"])
@@ -205,6 +206,28 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
     return branch_name, final_sha.strip()
 
 
+def _read_original_test_case(plan: dict) -> str:
+    """Best-effort read of the raw input file's original text, for showing
+    the actual test case in the PR description.
+
+    Falls back gracefully — not a hard requirement, just advisory context for
+    reviewers: the file may already have moved to queue/processed/ by the
+    time this runs (e.g. a retried session's step 05 runs again well after
+    the original run already moved it).
+    """
+    raw_path = plan.get("_input_file")
+    if not raw_path:
+        return ""
+    candidates = [Path(raw_path), AGENT_DIR / "queue" / "processed" / Path(raw_path).name]
+    for candidate in candidates:
+        if candidate.exists():
+            try:
+                return candidate.read_text()
+            except OSError:
+                continue
+    return ""
+
+
 def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tuple:
     """Push branch and create GitHub PR.
 
@@ -283,9 +306,34 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
             "Please review the generated code manually."
         )
 
+    # Original test case — masked and shown up top so a reviewer sees WHAT was
+    # actually asked for before anything else, without needing to dig through
+    # the audit trail. Best-effort: absent entirely if the input file can no
+    # longer be found (see _read_original_test_case) or is empty.
+    test_case_section = ""
+    parse_path = AUDIT_DIR / "01-parse.json"
+    if parse_path.exists():
+        try:
+            plan = json.loads(parse_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            plan = {}
+        raw_case = _read_original_test_case(plan)
+        if raw_case.strip():
+            masked_case = mask_credentials(raw_case, plan.get("demo_credentials", {}))
+            test_case_section = f"""### Test Case
+<details open>
+<summary>Original request (credentials masked)</summary>
+
+```
+{masked_case.strip()}
+```
+</details>
+
+"""
+
     pr_body = f"""## QA Auto-Create — {feature_class}
 
-### Summary
+{test_case_section}### Summary
 | | Value |
 |---|---|
 | Module | {feature_class} |
