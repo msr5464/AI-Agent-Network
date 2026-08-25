@@ -1,0 +1,31 @@
+{
+  "build_tag": "local-GitHubLoginTest",
+  "created_at": "2026-08-25T18:17:23.342562Z",
+  "source_session": "20260825-234622-fix-GitHubLoginTest",
+  "source_audit_dir": "/Users/mukesh/msr5464/QA-Agent-Network/agents/test-healing-agent/audit/20260825-234622-fix-GitHubLoginTest",
+  "origin": "standalone",
+  "automation_issues": [
+    {
+      "test_name": "automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "ELEMENT_NOT_FOUND",
+      "root_cause": "Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage",
+      "failure_signature": "FAILED: Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage",
+      "recommended_action": "Update the broken locator",
+      "error_type": "TestFailure",
+      "error_message": "Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage",
+      "stack_trace": "DashboardPage.java:19",
+      "execution_log": "h=0 in DashboardPage\n[23:47:20] ------------END OF EXECUTION------------\n[23:47:21] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/screenshots/verifyLoginOnGitHubUsingStoredSession_234720.png' target='_blank' style='color:#2563EB;'>&#128247; View Screenshot</a>\n[23:47:21] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/dom/verifyLoginOnGitHubUsingStoredSession_234721.html' target='_blank' style='color:#2563EB;'>&#128196; View DOM Snapshot</a>\nFinished test - 'verifyLoginOnGitHubUsingStoredSession' from class - 'automation.github.GitHubLoginTest' in 50s\n[23:47:21] WARNING: Could not stop tracing: Error {\n  message='Must start tracing before stopping\n  name='Error\n  stack='Error: Must start tracing before stopping\n    at Tracing.stopChunk (/private/var/folders/xd/_5fp0wn17b708gfkl85rgg7m0000gn/T/playwright-java-8002163731289204723/package/lib/server/trace/recorder/tracing.js:283:15)\n    at TracingDispatcher.tracingStopChunk (/private/var/folders/xd/_5fp0wn17b708gfkl85rgg7m0000gn/T/playwright-java-8002163731289204723/package/lib/server/dispatchers/tracingDispatcher.js:49:54)\n    at /private/var/folders/xd/_5fp0wn17b708gfkl85rgg7m0000gn/T/playwright-java-8002163731289204723/package/lib/server/dispatchers/dispatcher.js:91:61\n    at ProgressController.run (/private/var/folders/xd/_5fp0wn17b708gfkl85rgg7m0000gn/T/playwright-java-8002163731289204723/package/lib/server/progress.js:138:23)\n    at TracingDispatcher._runCommand (/private/var/folders/xd/_5fp0wn17b708gfkl85rgg7m0000gn/T/playwright-java-8002163731289204723/package/lib/server/dispatchers/dispatcher.js:91:31)\n    at DispatcherConnection.dispatch (/private/var/folders/xd/_5fp0wn17b708gfkl85rgg7m0000gn/T/playwright-java-8002163731289204723/package/lib/server/dispatchers/dispatcher.js:322:39)\n}\n[Video] Recorded: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/videos/1140ed08d3388596c367a944f99552f8.webm\n[23:47:22] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/videos/1140ed08d3388596c367a944f99552f8.webm' target='_blank' style='color:#2563EB;'>&#127909; View Recording</a>\n[JsonTestReporter] Results written to: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/report.json\nTest Suite Finished: Surefire test\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 52.43 s <<< FAILURE! -- in automation.github.GitHubLoginTest\n[ERROR] automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession[automation.core.Config@707194ba](1) -- Time elapsed: 49.42 s <<< FAILURE!\njava.lang.AssertionError: Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage\n\tat automation.modules.github.web.DashboardPage.<init>(DashboardPage.java:19)\n\tat automation.modules.github.GitHubHelper.loginWithStoredSession(GitHubHelper.java:98)\n\tat automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession(GitHubLoginTest.java:25)\n\n[INFO] Results:\n[ERROR] Failures: \n[ERROR]   GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession:25 Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.2.5:test (default-test) on project jarvis-automation: There are test failures.\n[ERROR] \n[ERROR] Please refer to /Users/mukesh/msr5464/Playwright-Automation-Framework/target/surefire-reports for the individual test results.\n[ERROR] Please refer to dump files (if any exist) [date].dump, [date]-jvmRun[N].dump and [date].dumpstream.\n[ERROR] -> [Help 1]\n[ERROR] \n[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.\n[ERROR] Re-run Maven using the -X switch to enable full debug logging.\n[ERROR] \n[ERROR] For more information about the errors and possible solutions, please read the following articles:\n[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException",
+      "class_name": "automation.github.GitHubLoginTest",
+      "method_name": "verifyLoginOnGitHubUsingStoredSession",
+      "full_name": "automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession",
+      "dom_snapshot": "/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/dom/verifyLoginOnGitHubUsingStoredSession_234721.html",
+      "failure_url": "https://github.com/",
+      "trace_path": "",
+      "failed_selector": "",
+      "cause_group_key": "",
+      "cause_group_size": 1
+    }
+  ]
+}

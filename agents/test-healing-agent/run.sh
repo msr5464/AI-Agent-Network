@@ -230,6 +230,42 @@ echo ""
 for i in "${!STEP_NAMES[@]}"; do
   printf "  %-50s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
 done
+
+# What each attempt actually changed. The step logs interleave this with the
+# build output, so by the end you would have to scroll through several minutes
+# of maven to answer "what did it try?" — especially after a reverted attempt.
+if [[ -f "$AUDIT_DIR/01-fix.json" ]]; then
+  python3 - "$AUDIT_DIR/01-fix.json" <<'PYSUM' || true
+import json, sys
+from pathlib import Path
+try:
+    data = json.loads(Path(sys.argv[1]).read_text())
+except Exception:
+    sys.exit(0)
+history = data.get("attempts") or []
+if not any(a.get("entries") for a in history):
+    sys.exit(0)
+print("")
+print("  Changes attempted:")
+for a in history:
+    n = a.get("attempt")
+    if not a.get("entries"):
+        print(f"    attempt {n}: nothing applied")
+        continue
+    for e in a["entries"]:
+        verdict = e.get("outcome", "?")
+        if e.get("reverted"):
+            verdict += ", reverted"
+        tgt = Path(e["target_file"]).name if e.get("target_file") else "-"
+        print(f"    attempt {n}: {tgt} — {verdict}")
+        why = e.get("fix_description") or e.get("unfixable_reason") or ""
+        if why:
+            print(f"      {why[:150]}")
+        for line in (e.get("fix_diff") or "").splitlines():
+            if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+                print(f"      {line[:150]}")
+PYSUM
+fi
 echo ""
 log "Audit: $AUDIT_DIR"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

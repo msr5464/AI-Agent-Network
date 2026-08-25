@@ -20,7 +20,8 @@ import time
 from pathlib import Path
 from typing import Generator
 
-from flask import Blueprint, Response, jsonify, request, stream_with_context
+from flask import (Blueprint, Response, jsonify, request, send_file,
+                   stream_with_context)
 
 from qa_agents_server import agent_settings, audit_reader, feature_files, runner
 from shared import test_catalog
@@ -375,6 +376,64 @@ def sessions_list(agent: str):
         limit, offset = 50, 0
     return jsonify({"items": audit_reader.list_sessions(limit=limit, offset=offset,
                                                     agent=spec.name)})
+
+
+# Artefacts the framework wrote next to a failure — screenshot, DOM snapshot,
+# trace zip, video. The console logs them as absolute paths, but a browser will
+# not follow a file:// link from an http:// page, so they have to be served.
+_ARTEFACT_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webm": "video/webm", ".mp4": "video/mp4",
+    ".html": "text/html", ".htm": "text/html", ".json": "application/json",
+    ".zip": "application/zip", ".txt": "text/plain", ".log": "text/plain",
+    ".md": "text/markdown",
+}
+
+
+def _artefact_roots(spec) -> list:
+    """Directories an artefact may legitimately come from."""
+    roots = [spec.audit_dir]
+    workspace = _automation_workspace()
+    if workspace:
+        roots.append(Path(workspace) / "test-output")
+    return [r.resolve() for r in roots if r and Path(r).exists()]
+
+
+@qa_bp.route(f"{_BASE}/artifact", methods=["GET"])
+def artifact(agent: str):
+    """Serve one artefact file by absolute path, confined to known roots.
+
+    The path arrives from a log line, so it is untrusted: resolve it first (which
+    collapses any ..) and require the result to sit inside an allowed root, then
+    check the suffix. Without both checks this is an arbitrary-file-read hole.
+    """
+    spec, err = _resolve(agent)
+    if err:
+        return err
+
+    raw = request.args.get("path", "")
+    if not raw:
+        return jsonify({"error": "path is required"}), 400
+
+    try:
+        target = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return jsonify({"error": "bad path"}), 400
+
+    roots = _artefact_roots(spec)
+    if not any(target == r or r in target.parents for r in roots):
+        return jsonify({"error": "path is outside the artefact directories"}), 403
+    if target.suffix.lower() not in _ARTEFACT_TYPES:
+        return jsonify({"error": f"unsupported artefact type: {target.suffix}"}), 403
+    if not target.is_file():
+        return jsonify({"error": "not found"}), 404
+
+    # A captured DOM snapshot is a full page from the app under test; rendering
+    # it inline would execute its scripts in the dashboard's origin.
+    inline = target.suffix.lower() not in (".html", ".htm")
+    return send_file(str(target), mimetype=_ARTEFACT_TYPES[target.suffix.lower()],
+                     as_attachment=not inline,
+                     download_name=target.name)
 
 
 @qa_bp.route(f"{_BASE}/sessions/<session_id>/events", methods=["GET"])

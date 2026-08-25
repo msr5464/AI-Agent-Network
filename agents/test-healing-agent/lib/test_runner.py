@@ -12,6 +12,7 @@ reported as a pass.
 import os
 import re
 import signal
+import time
 import subprocess
 import threading
 from pathlib import Path
@@ -211,6 +212,12 @@ def _run_streaming(cmd: List[str], workspace: Path, timeout_s: int,
         except ValueError:
             pass        # not the main thread; the watchdog still covers timeouts
 
+    # Bracket the build so a viewer can fold it. Everything is still streamed —
+    # the markers only say where the build starts and ends, so a UI can collapse
+    # it by default and a plain terminal still reads fine.
+    started = time.time()
+    log(f"[build:start] {' '.join(cmd)}")
+
     lines: List[str] = []
     try:
         for line in proc.stdout:
@@ -230,6 +237,8 @@ def _run_streaming(cmd: List[str], workspace: Path, timeout_s: int,
                 pass
 
     output = "\n".join(lines)[-8000:]
+    verdict = "timed out" if timed_out.is_set() else ("passed" if returncode == 0 else "failed")
+    log(f"[build:end] {verdict} in {int(time.time() - started)}s")
     if timed_out.is_set():
         return "failed", f"Test timed out after {timeout_s}s\n{output}"
     return ("passed" if returncode == 0 else "failed"), output

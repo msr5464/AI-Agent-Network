@@ -1,0 +1,10 @@
+{
+  "timestamp": "2026-08-25T18:17:23.343082Z",
+  "test_name": "GitHubLoginTest",
+  "status": "queued",
+  "headline": "1 failing test(s) queued for fixing",
+  "detail": "",
+  "repair_mode": false,
+  "forced": false,
+  "issues_found": 1
+}

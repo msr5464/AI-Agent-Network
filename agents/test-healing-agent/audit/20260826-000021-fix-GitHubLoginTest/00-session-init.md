@@ -1,0 +1,25 @@
+# Session Init
+
+Mode: local
+Session ID: 20260826-000021-fix-GitHubLoginTest
+Build Tag: 
+Handoff File: 
+Started: 2026-08-26T00:00:22
+
+## Env Snapshot (keys only)
+AUTO_FIX_MAX_FIXES_PER_RUN=<set>
+AUTO_PUSH=<set>
+AUTOFIX_BRANCH_PREFIX=<set>
+AUTOFIX_MODEL=<set>
+CLAUDE_CLI_PATH=<set>
+GITHUB_DEFAULT_BRANCH=<set>
+GITHUB_ORG=<set>
+GITHUB_PR_REVIEWERS=<set>
+GITHUB_REPO_AUTOMATION=<set>
+GITHUB_TOKEN=<set>
+MAX_FIX_ATTEMPTS=<set>
+MAX_REVIEW_ROUNDS=<set>
+SLACK_ALERT_CHANNEL=<set>
+SLACK_BOT_TOKEN=<set>
+SLACK_NOTIFY_CHANNEL=<set>
+WORKSPACE_DIR=<set>

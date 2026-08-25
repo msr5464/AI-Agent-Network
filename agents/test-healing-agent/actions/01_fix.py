@@ -1216,6 +1216,77 @@ def extract_fix_json(response: str) -> dict | None:
 
 # ── Fix application + safety guard ────────────────────────────────────────────
 
+def _line_of(text: str, needle: str) -> int:
+    """1-based line where needle starts, or 0."""
+    idx = text.find(needle)
+    return text.count("\n", 0, idx) + 1 if idx >= 0 else 0
+
+
+def _condense(value: str, width: int = 100) -> str:
+    """One readable line: collapse whitespace, elide the middle if long."""
+    flat = " ".join((value or "").split())
+    if len(flat) <= width:
+        return flat
+    return flat[: width - 20] + " … " + flat[-17:]
+
+
+def _attempt_history(result: dict) -> list:
+    """Append this attempt's outcome to whatever earlier attempts recorded.
+
+    Reads the previous 01-fix.json before it is overwritten. Each entry stays
+    small — the description, the file, the diff and the verdict — so the history
+    is readable even after several retries.
+    """
+    history = []
+    prev_path = AUDIT_DIR / "01-fix.json"
+    if prev_path.exists():
+        try:
+            history = (json.loads(prev_path.read_text()) or {}).get("attempts") or []
+        except (json.JSONDecodeError, OSError):
+            history = []
+
+    entries = []
+    for bucket, outcome in (("fixes", "verified"),
+                            ("unverified_fixes", "applied but unverified"),
+                            ("failed_fixes", "failed")):
+        for f in result.get(bucket) or []:
+            if f.get("fix_attempt") not in (None, FIX_ATTEMPT):
+                continue        # carried forward from an earlier attempt
+            entries.append({
+                "test_name": f.get("test_name"),
+                "target_file": f.get("target_file"),
+                "fix_description": f.get("fix_description") or "",
+                "unfixable_reason": f.get("unfixable_reason") or "",
+                "fix_diff": (f.get("fix_diff") or "")[:4000],
+                "status": f.get("status"),
+                "outcome": outcome,
+                "reverted": outcome == "failed" and bool(f.get("fix_diff")),
+            })
+
+    history = [h for h in history if h.get("attempt") != FIX_ATTEMPT]
+    history.append({"attempt": FIX_ATTEMPT, "timestamp": result.get("timestamp"),
+                    "entries": entries})
+    return sorted(history, key=lambda h: h.get("attempt", 0))
+
+
+def log_edits(target_file, original: str, edits: list, log_fn) -> None:
+    """Print what actually changed, file and line, before -> after.
+
+    The prose fix_description says WHY; without this nobody could see WHAT.
+    Reading a run meant scrolling maven output hunting for the new selector in
+    the next failure message, and a reverted attempt left no record at all.
+    """
+    total = len(edits or [])
+    for n, edit in enumerate(edits or [], 1):
+        old = edit.get("old_string", "")
+        new = edit.get("new_string", "")
+        line = _line_of(original, old)
+        where = f"{target_file.name}:{line}" if line else target_file.name
+        log_fn(f"    edit {n}/{total} — {where}")
+        log_fn(f"      - {_condense(old)}")
+        log_fn(f"      + {_condense(new)}")
+
+
 def apply_edits(original: str, edits: list) -> tuple:
     """Apply search/replace edits. Returns (updated_text, error).
 
@@ -1605,6 +1676,7 @@ def main():
         fix_diff = compute_diff(target_original, fixed_content, target_file.name)
         fix_description = fix_json.get("fix_description", "")
         log(f"  Fix: {fix_description}")
+        log_edits(target_file, target_original, fix_json.get("edits") or [], log)
 
         try:
             target_file.write_text(fixed_content, encoding="utf-8")
@@ -1652,8 +1724,12 @@ def main():
             try:
                 target_file.write_text(target_original, encoding="utf-8")
                 invalidate_file(target_file)
-            except Exception:
-                pass
+                # Otherwise the next attempt looks like it mysteriously went back
+                # to the original selector, with nothing saying the edit was undone.
+                log(f"  ↩︎  Reverted {target_file.name} — the file is back to its "
+                    f"pre-fix state, so attempt {FIX_ATTEMPT + 1} starts clean")
+            except Exception as e:
+                log(f"  WARNING: could not revert {target_file.name}: {e}")
             for member_name, member_output, member in still_failing:
                 slim = {k: v for k, v in member.items() if k != "repo_conventions"}
                 failed_fixes.append({**slim, "status": "test_failed", "verified": False,
@@ -1761,6 +1837,12 @@ def main():
         "unverified_fixes": unverified_fixes,
         "failed_fixes":   failed_fixes,
     }
+    # Every attempt overwrote this file, so a retry destroyed the record of what
+    # the previous attempt had actually tried. The only trace of a reverted edit
+    # was incidental — buried inside the next prompt's prev_test_output. Keep a
+    # compact, append-only history so "what did fix 1 change?" stays answerable.
+    result["attempts"] = _attempt_history(result)
+
     json_path = AUDIT_DIR / "01-fix.json"
     json_path.write_text(json.dumps(result, indent=2, default=str))
     log(f"Wrote 01-fix.json ({json_path.stat().st_size // 1024}KB)")
@@ -1778,6 +1860,31 @@ def main():
         f"**PR Branch:** `{pr_branch or 'none'}`",
         "",
     ]
+
+    # What each attempt actually changed — the question the console log could
+    # not answer once an attempt had been reverted.
+    history = result.get("attempts") or []
+    if len(history) > 1 or any(h.get("entries") for h in history):
+        md_lines += ["## What each attempt changed", ""]
+        for h in history:
+            md_lines.append(f"**Attempt {h.get('attempt')}**")
+            if not h.get("entries"):
+                md_lines += ["", "- nothing was applied", ""]
+                continue
+            for e in h["entries"]:
+                verdict = e.get("outcome", "?")
+                if e.get("reverted"):
+                    verdict += " — reverted"
+                tgt = Path(e["target_file"]).name if e.get("target_file") else "(no file)"
+                md_lines.append(f"- `{e.get('test_name')}` → **{verdict}** in `{tgt}`")
+                if e.get("fix_description"):
+                    md_lines.append(f"  - {e['fix_description']}")
+                if e.get("unfixable_reason"):
+                    md_lines.append(f"  - _{e['unfixable_reason']}_")
+                if e.get("fix_diff"):
+                    md_lines += ["", "  ```diff", *(f"  {ln}" for ln in
+                                 e["fix_diff"].splitlines()[:40]), "  ```"]
+            md_lines.append("")
 
     def fix_block(f: dict, icon: str) -> list:
         # Entries carried forward from an earlier attempt are rehydrated from

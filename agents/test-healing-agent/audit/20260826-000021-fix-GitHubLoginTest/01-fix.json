@@ -1,0 +1,352 @@
+{
+  "timestamp": "2026-08-25T18:36:47.529075Z",
+  "build_tag": "local-GitHubLoginTest",
+  "fix_attempt": 2,
+  "eligible_count": 1,
+  "attempted": 1,
+  "succeeded": 0,
+  "unverified": 0,
+  "failed": 1,
+  "distinct_fixes": 0,
+  "distinct_unverified": 0,
+  "pr_branch": null,
+  "candidates": [
+    {
+      "test_name": "automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession",
+      "class_name": "GitHubLoginTest",
+      "method_name": "verifyLoginOnGitHubUsingStoredSession",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "ELEMENT_NOT_FOUND",
+      "root_cause": "Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage",
+      "failure_signature": "FAILED: Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage",
+      "cause_group_key": "",
+      "recommended_action": "Update the broken locator",
+      "error_type": "TestFailure",
+      "error_message": "Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage",
+      "stack_trace": "DashboardPage.java:19",
+      "execution_log": " auto detected provider org.apache.maven.surefire.testng.TestNGProvider\n[INFO] Running automation.github.GitHubLoginTest\nSLF4J: Failed to load class \"org.slf4j.impl.StaticLoggerBinder\".\nSLF4J: Defaulting to no-operation (NOP) logger implementation\nSLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.\nTest Suite Started: Surefire test\nRunning test - 'verifyLoginOnGitHubUsingStoredSession' from class - 'automation.github.GitHubLoginTest'...\n[00:00:32] <b style='font-size:13px;padding:2px 6px;background-color:#2196F3;border-radius:3px;'>Description: verify if user is able to login to GitHub using Stored Session</b>\n[00:00:33] STEP: Loading stored GitHub session from: GitHubLoginStorage.json\n[00:00:49] Loaded stored session: src/test/resources/github/loginStorage/GitHubLoginStorage.json\n[00:00:49] Browser initialized with stored session: chromium\n[00:00:49] ACTION: Navigating to: https://github.com/\n[00:01:20] Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage\n[00:01:20] ------------END OF EXECUTION------------\n[00:01:22] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/screenshots/verifyLoginOnGitHubUsingStoredSession_000120.png' target='_blank' style='color:#2563EB;'>&#128247; View Screenshot</a>\n[00:01:22] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/dom/verifyLoginOnGitHubUsingStoredSession_000122.html' target='_blank' style='color:#2563EB;'>&#128196; View DOM Snapshot</a>\nFinished test - 'verifyLoginOnGitHubUsingStoredSession' from class - 'automation.github.GitHubLoginTest' in 50s\n[00:01:22] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/traces/verifyLoginOnGitHubUsingStoredSession_000122.zip' target='_blank' style='color:#2563EB;'>&#128269; View Trace</a>\n[Video] Recorded: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/videos/c02470ae35f7043343378fddf4ed7028.webm\n[00:01:23] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/videos/c02470ae35f7043343378fddf4ed7028.webm' target='_blank' style='color:#2563EB;'>&#127909; View Recording</a>\n[JsonTestReporter] Results written to: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/report.json\nTest Suite Finished: Surefire test\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 51.23 s <<< FAILURE! -- in automation.github.GitHubLoginTest\n[ERROR] automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession[automation.core.Config@707194ba](1) -- Time elapsed: 48.21 s <<< FAILURE!\njava.lang.AssertionError: Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage\n\tat automation.modules.github.web.DashboardPage.<init>(DashboardPage.java:19)\n\tat automation.modules.github.GitHubHelper.loginWithStoredSession(GitHubHelper.java:98)\n\tat automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession(GitHubLoginTest.java:25)\n\n[INFO] Results:\n[ERROR] Failures:",
+      "likely_location": "DashboardPage.java:19",
+      "page_url": "https://github.com/",
+      "dom_snapshot_path": "/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/dom/verifyLoginOnGitHubUsingStoredSession_000122.html",
+      "dom_snapshot": {},
+      "trace_path": "/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/traces/verifyLoginOnGitHubUsingStoredSession_000122.zip",
+      "failed_selector": "img[class*='avatar'] >> nth=0",
+      "trace_timeline": "The selector that failed at runtime: img[class*='avatar'] >> nth=0\n  (Frame.isVisible \u2014 polled 57x without ever becoming visible; inferred from the trace \u2014 it was re-checked until the test gave up)\n\nFull action timeline (selectors that worked, then the one that did not):\n  \u2026 20 earlier action(s) omitted\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Page.screenshot          ",
+      "test_file": "/Users/mukesh/msr5464/Playwright-Automation-Framework/src/test/java/automation/github/GitHubLoginTest.java",
+      "test_method_code": "/**\n     * Verifies that login is not required when a stored session exists.\n     * Run storeFirstTimeLoginOnGitHub first to generate the session file.\n     */\n    @Test(description=\"verify if user is able to login to GitHub using Stored Session\",dataProvider = \"getConfig\", groups = {GROUP_REGRESSION, GROUP_WEB})\n    @TestVariables(testrailData = \"1:C1001:WEB\", automatedBy = QA.Mukesh)\n    public void verifyLoginOnGitHubUsingStoredSession(Config config)\n    {\n        GitHubHelper github = new GitHubHelper(config);\n        DashboardPage dashboard = github.loginWithStoredSession();\n\n        AssertHelper.assertTrue(config, dashboard.isLoggedIn(),\n            \"User should be logged in to GitHub using stored session\");\n    }",
+      "element_names": [],
+      "page_objects": [],
+      "related_files": [
+        {
+          "import": "automation.core.AssertHelper",
+          "path": "src/main/java/automation/core/AssertHelper.java",
+          "snippet": "package automation.core;\n\npublic class AssertHelper {\n\n// ========== ASSERTIONS (soft \u2014 execution continues, test fails at end) ==========\n\n    public static void assertEquals(Config config, String actual, String expected, String message) {\n        if (actual != null && actual.equals(expected)) {\n            String msg = message.contains(\"should be\") ? message.replace(\"should be\", \"is\") : message + \" is \" + actual;\n            Log.pass(config, \"\u2714 PASS: Verified \" + msg);\n        } else {\n            Log.fail(config, \"\u2718 FAIL: \" + message + \" | Expected: '\" + expected + \"' | Actual: '\" + actual + \"'\");\n        }\n    }\n\npublic static void assertEquals(Config config, int actual, int expected, String message) {\n        if (actual == expected) {\n            String msg = message.contains(\"should be\") ? message.replace(\"should be\", \"is\") : message + \" is \" + actual;\n            Log.pass(config, \"\u2714 PASS: Verified \" + msg);\n        } else {\n            Log.fail(config, \"\u2718 FAIL: \" + message + \" | Expected: \" + expected + \" | Actual: \" + actual);\n        }\n    }\n\n// \u2026 13 method(s) omitted to fit the context budget. All field/locator declarations above are complete."
+        },
+        {
+          "import": "automation.core.Config",
+          "path": "src/main/java/automation/core/Config.java",
+          "snippet": "package automation.core;\n\n* Central configuration class combining static global settings with per-test\n * instance state.\n * Loads properties in order: config.properties -> environment-specific\n * properties -> system.properties.\n */\npublic class Config {\n\n// ---------------------------------------------------------------------------\n    // Static / Global Settings\n    // ---------------------------------------------------------------------------\n    // Null means \"not yet set by @BeforeSuite\" \u2014 Config constructor fills from\n    // property files only when null.\n    public static String browserName = null;\n\npublic static String environment = null;\n\npublic static String country = null;\n\npublic static String appLanguage = null;\n\npublic static String projectName = null;\n\npublic static String groupName = null;\n\npublic static String branchName = null;\n\npublic static String resultsDirectory = null;\n\npublic static Boolean isDebugMode = null;\n\npublic static Boolean isRemoteExecution = null;\n\npublic static Boolean isBrowserStackExecution = null;\n\npublic static final String mainResourcesPath = \"src/main/resources/\";\n\npublic static final String testResourcesPath = \"src/test/resources/\";\n\n// ---------------------------------------------------------------------------\n    // Instance Fields \u2013 Playwright objects (per-test)\n    // ---------------------------------------------------------------------------\n    public Playwright playwright;\n\npublic Browser browser;\n\npublic BrowserContext browserContext;\n\npublic Page page;\n\n// ---------------------------------------------------------------------------\n    // Instance Fields \u2013 Mobile / Appium objects (per-test)\n    // ---------------------------------------------------------------------------\n    public AppiumDriver appiumDriver;\n\npublic AppiumDriverLocalService appiumServer;\n\n// ---------------------------------------------------------------------------\n    // Instance Fields \u2013 Test state\n    // ---------------------------------------------------------------------------\n    public String testcaseName;\n\npublic String testcaseClass;\n\npublic String testStartTime;\n\npublic String testEndTime;\n\npublic String testLog = \"\";\n\npublic String videoPath = null;\n\n// set by BrowserHelper after context closes; read by afterMethod\n    public String domSnapshotPath = null;\n\n// set by BrowserHelper on failure; read by the QA agent network\n    public String failureUrl = null;\n\n// page URL at the moment of failure\n    public String tracePath = null;\n\n// Playwright trace zip, retained per traceMode\n    public boolean tracingStarted = false;\n\n// set by BrowserHelper.startTracing; stop is a no-op without it\n    public int cdpPort = 0;\n\n// remote-debugging port, when repairMode is on\n    public long repairBrowserPid = 0;\n\n// detached browser process, so it can be reaped\n    public boolean keepBrowserOpen = false;\n\n// repairMode: park the browser at failure\n    public HashMap<String, String> testData = new HashMap<>();\n\n// ---------------------------------------------------------------------------\n    // Instance Fields \u2013 Control flags\n    // ---------------------------------------------------------------------------\n    public boolean endExecutionOnFailure = true;\n\npublic boolean enableScreenshot = true;\n\npublic boolean testResult = true;\n\npublic boolean retry = true;\n\npublic java.util.ArrayList<Integer> userId = new java.util.ArrayList<>();\n\npublic boolean isAndroid = false;\n\npublic boolean isIos = false;\n\npublic boolean isProd = false;\n\n// ---------------------------------------------------------------------------\n    // Constructor\n    // ---------------------------------------------------------------------------\n\n    /**\n     * Loads configuration in the following order (later values override earlier\n     * ones):\n     * 1. parameters/config.properties \u2013 flat base settings\n     * 2. parameters/{environment}/config.properties \u2013 env-subdirectory base\n     * settings\n     * 3. parameters/{environment}-{country}.properties \u2013 flat env+country overrides\n     * 4. parameters/{environment}/{environment}-{country}.properties \u2013 subdirectory\n     * env+country overrides\n     * 5. parameters/system.properties \u2013 local developer overrides (git-ignored)\n     */\n    public Config() {\n        // 1. Flat base config \u2014 loads property file defaults\n        loadPropertiesFile(\"config.properties\", \"parameters\");\n\n        // Static fields set by @BeforeSuite take precedence.\n        // If they are still null (beforeSuite hasn't run yet or didn't receive the\n        // param),\n        // fall back to the property file value, then a hardcoded default.\n        // Keys match config.properties and @BeforeSuite @Parameters exactly\n        if (environment == null)\n            environment = runTimeProperties.getProperty(\"environme\n// \u2026 truncated"
+        }
+      ],
+      "base_class_info": {
+        "base_class_name": "TestBase",
+        "base_class_file": "src/main/java/automation/core/TestBase.java",
+        "public_methods": "public void logStep(Config config, String message)\npublic Object[][] getConfig(Method method)\npublic Object[][] getTwoConfigs(Method method)\npublic Object[][] getMultipleConfigs(Method method)\npublic void beforeSuite(@Optional String environment,\n            @Optional String browserName,\n            @Optional String projectName,\n            @Optional String country,\n            @Optional String appLanguage,\n            @Optional String groupName,\n            @Optional String branchName,\n            @Optional String resultsDirectory,\n            @Optional String debugMode)\npublic void afterMethod(ITestResult result)\npublic void afterSuite()"
+      },
+      "dom_findings": {},
+      "prev_test_output": "n-Framework/test-output/videos/555548c8fe8e5714ee897a1a0688023d.webm' target='_blank' style='color:#2563EB;'>&#127909; View Recording</a>\n[JsonTestReporter] Results written to: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/report.json\nTest Suite Finished: Surefire test\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 51.19 s <<< FAILURE! -- in automation.github.GitHubLoginTest\n[ERROR] automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession[automation.core.Config@49e5f737](1) -- Time elapsed: 48.06 s <<< FAILURE!\njava.lang.AssertionError: Failed to load Element Locator@.AppHeader-user, [data-login] >> nth=0 in DashboardPage\n\tat automation.modules.github.web.DashboardPage.<init>(DashboardPage.java:19)\n\tat automation.modules.github.GitHubHelper.loginWithStoredSession(GitHubHelper.java:98)\n\tat automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession(GitHubLoginTest.java:25)\n\n[INFO] Results:\n[ERROR] Failures: \n[ERROR]   GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession:25 Failed to load Element Locator@.AppHeader-user, [data-login] >> nth=0 in DashboardPage\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.2.5:test (default-test) on project jarvis-automation: There are test failures.\n[ERROR] \n[ERROR] Please refer to /Users/mukesh/msr5464/Playwright-Automation-Framework/target/surefire-reports for the individual test re",
+      "fix_attempt": 2
+    }
+  ],
+  "fixes": [],
+  "unverified_fixes": [],
+  "failed_fixes": [
+    {
+      "test_name": "automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession",
+      "class_name": "GitHubLoginTest",
+      "method_name": "verifyLoginOnGitHubUsingStoredSession",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "ELEMENT_NOT_FOUND",
+      "root_cause": "Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage",
+      "failure_signature": "FAILED: Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage",
+      "cause_group_key": "",
+      "recommended_action": "Update the broken locator",
+      "error_type": "TestFailure",
+      "error_message": "Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage",
+      "stack_trace": "DashboardPage.java:19",
+      "execution_log": " auto detected provider org.apache.maven.surefire.testng.TestNGProvider\n[INFO] Running automation.github.GitHubLoginTest\nSLF4J: Failed to load class \"org.slf4j.impl.StaticLoggerBinder\".\nSLF4J: Defaulting to no-operation (NOP) logger implementation\nSLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.\nTest Suite Started: Surefire test\nRunning test - 'verifyLoginOnGitHubUsingStoredSession' from class - 'automation.github.GitHubLoginTest'...\n[00:00:32] <b style='font-size:13px;padding:2px 6px;background-color:#2196F3;border-radius:3px;'>Description: verify if user is able to login to GitHub using Stored Session</b>\n[00:00:33] STEP: Loading stored GitHub session from: GitHubLoginStorage.json\n[00:00:49] Loaded stored session: src/test/resources/github/loginStorage/GitHubLoginStorage.json\n[00:00:49] Browser initialized with stored session: chromium\n[00:00:49] ACTION: Navigating to: https://github.com/\n[00:01:20] Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage\n[00:01:20] ------------END OF EXECUTION------------\n[00:01:22] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/screenshots/verifyLoginOnGitHubUsingStoredSession_000120.png' target='_blank' style='color:#2563EB;'>&#128247; View Screenshot</a>\n[00:01:22] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/dom/verifyLoginOnGitHubUsingStoredSession_000122.html' target='_blank' style='color:#2563EB;'>&#128196; View DOM Snapshot</a>\nFinished test - 'verifyLoginOnGitHubUsingStoredSession' from class - 'automation.github.GitHubLoginTest' in 50s\n[00:01:22] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/traces/verifyLoginOnGitHubUsingStoredSession_000122.zip' target='_blank' style='color:#2563EB;'>&#128269; View Trace</a>\n[Video] Recorded: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/videos/c02470ae35f7043343378fddf4ed7028.webm\n[00:01:23] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/videos/c02470ae35f7043343378fddf4ed7028.webm' target='_blank' style='color:#2563EB;'>&#127909; View Recording</a>\n[JsonTestReporter] Results written to: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/report.json\nTest Suite Finished: Surefire test\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 51.23 s <<< FAILURE! -- in automation.github.GitHubLoginTest\n[ERROR] automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession[automation.core.Config@707194ba](1) -- Time elapsed: 48.21 s <<< FAILURE!\njava.lang.AssertionError: Failed to load Element Locator@img[class*='avatar'] >> nth=0 in DashboardPage\n\tat automation.modules.github.web.DashboardPage.<init>(DashboardPage.java:19)\n\tat automation.modules.github.GitHubHelper.loginWithStoredSession(GitHubHelper.java:98)\n\tat automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession(GitHubLoginTest.java:25)\n\n[INFO] Results:\n[ERROR] Failures:",
+      "likely_location": "DashboardPage.java:19",
+      "page_url": "https://github.com/",
+      "dom_snapshot_path": "/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/dom/verifyLoginOnGitHubUsingStoredSession_000122.html",
+      "dom_snapshot": {
+        "url": "https://github.com/",
+        "captured_at": "2026-08-26T00:01:22",
+        "test": "verifyLoginOnGitHubUsingStoredSession",
+        "elements": [
+          {
+            "tag": "a",
+            "href": "#start-of-content",
+            "text": "Skip to content",
+            "suggested_selector": "a:has-text(\"Skip to content\")"
+          },
+          {
+            "tag": "button",
+            "aria-label": "Close navigation menu",
+            "type": "button",
+            "suggested_selector": "[aria-label='Close navigation menu']"
+          },
+          {
+            "tag": "button",
+            "aria-label": "Toggle navigation",
+            "type": "button",
+            "suggested_selector": "[aria-label='Toggle navigation']"
+          },
+          {
+            "tag": "a",
+            "aria-label": "Homepage",
+            "href": "/",
+            "suggested_selector": "[aria-label='Homepage']"
+          },
+          {
+            "tag": "a",
+            "href": "/login",
+            "text": "Sign in",
+            "suggested_selector": "a:has-text(\"Sign in\")"
+          },
+          {
+            "tag": "button",
+            "type": "button",
+            "text": "Platform",
+            "suggested_selector": "button:has-text(\"Platform\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/features/copilot",
+            "text": "GitHub Copilot Write better code with AI",
+            "suggested_selector": "a:has-text(\"GitHub Copilot Write better code with AI\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/features/ai/github-app",
+            "text": "GitHub Copilot app Direct agents from issue to merge",
+            "suggested_selector": "a:has-text(\"GitHub Copilot app Direct agents from is\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/mcp",
+            "text": "MCP Registry Integrate external tools",
+            "suggested_selector": "a:has-text(\"MCP Registry Integrate external tools\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/features/actions",
+            "text": "Actions Automate any workflow",
+            "suggested_selector": "a:has-text(\"Actions Automate any workflow\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/features/codespaces",
+            "text": "Codespaces Instant dev environments",
+            "suggested_selector": "a:has-text(\"Codespaces Instant dev environments\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/features/issues",
+            "text": "Issues Plan and track work",
+            "suggested_selector": "a:has-text(\"Issues Plan and track work\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/features/code-review",
+            "text": "Code Review Manage code changes",
+            "suggested_selector": "a:has-text(\"Code Review Manage code changes\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/features/code-quality",
+            "text": "Code Quality Enforce quality at merge",
+            "suggested_selector": "a:has-text(\"Code Quality Enforce quality at merge\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/security/advanced-security",
+            "text": "GitHub Advanced Security Find and fix vulnerabilities",
+            "suggested_selector": "a:has-text(\"GitHub Advanced Security Find and fix vu\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/security/advanced-security/code-security",
+            "text": "Code security Secure your code as you build",
+            "suggested_selector": "a:has-text(\"Code security Secure your code as you bu\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/security/advanced-security/secret-protection",
+            "text": "Secret protection Stop leaks before they start",
+            "suggested_selector": "a:has-text(\"Secret protection Stop leaks before they\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/why-github",
+            "text": "Why GitHub",
+            "suggested_selector": "a:has-text(\"Why GitHub\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://docs.github.com",
+            "text": "Documentation",
+            "suggested_selector": "a:has-text(\"Documentation\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.blog",
+            "text": "Blog",
+            "suggested_selector": "a:has-text(\"Blog\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.blog/changelog",
+            "text": "Changelog",
+            "suggested_selector": "a:has-text(\"Changelog\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/marketplace",
+            "text": "Marketplace",
+            "suggested_selector": "a:has-text(\"Marketplace\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/features",
+            "text": "View all features",
+            "suggested_selector": "a:has-text(\"View all features\")"
+          },
+          {
+            "tag": "button",
+            "type": "button",
+            "text": "Solutions",
+            "suggested_selector": "button:has-text(\"Solutions\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/enterprise",
+            "text": "Enterprises",
+            "suggested_selector": "a:has-text(\"Enterprises\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/team",
+            "text": "Small and medium teams",
+            "suggested_selector": "a:has-text(\"Small and medium teams\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/enterprise/startups",
+            "text": "Startups",
+            "suggested_selector": "a:has-text(\"Startups\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/solutions/industry/nonprofits",
+            "text": "Nonprofits",
+            "suggested_selector": "a:has-text(\"Nonprofits\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/solutions/use-case/app-modernization",
+            "text": "App Modernization",
+            "suggested_selector": "a:has-text(\"App Modernization\")"
+          },
+          {
+            "tag": "a",
+            "href": "https://github.com/solutions/use-case/devsecops",
+            "text": "DevSecOps",
+            "suggested_selector": "a:has-text(\"DevSecOps\")"
+          }
+        ],
+        "likely_matches": [],
+        "total_elements": 234,
+        "error": ""
+      },
+      "trace_path": "/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/traces/verifyLoginOnGitHubUsingStoredSession_000122.zip",
+      "failed_selector": "img[class*='avatar'] >> nth=0",
+      "trace_timeline": "The selector that failed at runtime: img[class*='avatar'] >> nth=0\n  (Frame.isVisible \u2014 polled 57x without ever becoming visible; inferred from the trace \u2014 it was re-checked until the test gave up)\n\nFull action timeline (selectors that worked, then the one that did not):\n  \u2026 20 earlier action(s) omitted\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Frame.isVisible          img[class*='avatar'] >> nth=0\n  Page.screenshot          ",
+      "test_file": "/Users/mukesh/msr5464/Playwright-Automation-Framework/src/test/java/automation/github/GitHubLoginTest.java",
+      "test_method_code": "/**\n     * Verifies that login is not required when a stored session exists.\n     * Run storeFirstTimeLoginOnGitHub first to generate the session file.\n     */\n    @Test(description=\"verify if user is able to login to GitHub using Stored Session\",dataProvider = \"getConfig\", groups = {GROUP_REGRESSION, GROUP_WEB})\n    @TestVariables(testrailData = \"1:C1001:WEB\", automatedBy = QA.Mukesh)\n    public void verifyLoginOnGitHubUsingStoredSession(Config config)\n    {\n        GitHubHelper github = new GitHubHelper(config);\n        DashboardPage dashboard = github.loginWithStoredSession();\n\n        AssertHelper.assertTrue(config, dashboard.isLoggedIn(),\n            \"User should be logged in to GitHub using stored session\");\n    }",
+      "element_names": [],
+      "page_objects": [],
+      "related_files": [
+        {
+          "import": "automation.core.AssertHelper",
+          "path": "src/main/java/automation/core/AssertHelper.java",
+          "snippet": "package automation.core;\n\npublic class AssertHelper {\n\n// ========== ASSERTIONS (soft \u2014 execution continues, test fails at end) ==========\n\n    public static void assertEquals(Config config, String actual, String expected, String message) {\n        if (actual != null && actual.equals(expected)) {\n            String msg = message.contains(\"should be\") ? message.replace(\"should be\", \"is\") : message + \" is \" + actual;\n            Log.pass(config, \"\u2714 PASS: Verified \" + msg);\n        } else {\n            Log.fail(config, \"\u2718 FAIL: \" + message + \" | Expected: '\" + expected + \"' | Actual: '\" + actual + \"'\");\n        }\n    }\n\npublic static void assertEquals(Config config, int actual, int expected, String message) {\n        if (actual == expected) {\n            String msg = message.contains(\"should be\") ? message.replace(\"should be\", \"is\") : message + \" is \" + actual;\n            Log.pass(config, \"\u2714 PASS: Verified \" + msg);\n        } else {\n            Log.fail(config, \"\u2718 FAIL: \" + message + \" | Expected: \" + expected + \" | Actual: \" + actual);\n        }\n    }\n\n// \u2026 13 method(s) omitted to fit the context budget. All field/locator declarations above are complete."
+        },
+        {
+          "import": "automation.core.Config",
+          "path": "src/main/java/automation/core/Config.java",
+          "snippet": "package automation.core;\n\n* Central configuration class combining static global settings with per-test\n * instance state.\n * Loads properties in order: config.properties -> environment-specific\n * properties -> system.properties.\n */\npublic class Config {\n\n// ---------------------------------------------------------------------------\n    // Static / Global Settings\n    // ---------------------------------------------------------------------------\n    // Null means \"not yet set by @BeforeSuite\" \u2014 Config constructor fills from\n    // property files only when null.\n    public static String browserName = null;\n\npublic static String environment = null;\n\npublic static String country = null;\n\npublic static String appLanguage = null;\n\npublic static String projectName = null;\n\npublic static String groupName = null;\n\npublic static String branchName = null;\n\npublic static String resultsDirectory = null;\n\npublic static Boolean isDebugMode = null;\n\npublic static Boolean isRemoteExecution = null;\n\npublic static Boolean isBrowserStackExecution = null;\n\npublic static final String mainResourcesPath = \"src/main/resources/\";\n\npublic static final String testResourcesPath = \"src/test/resources/\";\n\n// ---------------------------------------------------------------------------\n    // Instance Fields \u2013 Playwright objects (per-test)\n    // ---------------------------------------------------------------------------\n    public Playwright playwright;\n\npublic Browser browser;\n\npublic BrowserContext browserContext;\n\npublic Page page;\n\n// ---------------------------------------------------------------------------\n    // Instance Fields \u2013 Mobile / Appium objects (per-test)\n    // ---------------------------------------------------------------------------\n    public AppiumDriver appiumDriver;\n\npublic AppiumDriverLocalService appiumServer;\n\n// ---------------------------------------------------------------------------\n    // Instance Fields \u2013 Test state\n    // ---------------------------------------------------------------------------\n    public String testcaseName;\n\npublic String testcaseClass;\n\npublic String testStartTime;\n\npublic String testEndTime;\n\npublic String testLog = \"\";\n\npublic String videoPath = null;\n\n// set by BrowserHelper after context closes; read by afterMethod\n    public String domSnapshotPath = null;\n\n// set by BrowserHelper on failure; read by the QA agent network\n    public String failureUrl = null;\n\n// page URL at the moment of failure\n    public String tracePath = null;\n\n// Playwright trace zip, retained per traceMode\n    public boolean tracingStarted = false;\n\n// set by BrowserHelper.startTracing; stop is a no-op without it\n    public int cdpPort = 0;\n\n// remote-debugging port, when repairMode is on\n    public long repairBrowserPid = 0;\n\n// detached browser process, so it can be reaped\n    public boolean keepBrowserOpen = false;\n\n// repairMode: park the browser at failure\n    public HashMap<String, String> testData = new HashMap<>();\n\n// ---------------------------------------------------------------------------\n    // Instance Fields \u2013 Control flags\n    // ---------------------------------------------------------------------------\n    public boolean endExecutionOnFailure = true;\n\npublic boolean enableScreenshot = true;\n\npublic boolean testResult = true;\n\npublic boolean retry = true;\n\npublic java.util.ArrayList<Integer> userId = new java.util.ArrayList<>();\n\npublic boolean isAndroid = false;\n\npublic boolean isIos = false;\n\npublic boolean isProd = false;\n\n// ---------------------------------------------------------------------------\n    // Constructor\n    // ---------------------------------------------------------------------------\n\n    /**\n     * Loads configuration in the following order (later values override earlier\n     * ones):\n     * 1. parameters/config.properties \u2013 flat base settings\n     * 2. parameters/{environment}/config.properties \u2013 env-subdirectory base\n     * settings\n     * 3. parameters/{environment}-{country}.properties \u2013 flat env+country overrides\n     * 4. parameters/{environment}/{environment}-{country}.properties \u2013 subdirectory\n     * env+country overrides\n     * 5. parameters/system.properties \u2013 local developer overrides (git-ignored)\n     */\n    public Config() {\n        // 1. Flat base config \u2014 loads property file defaults\n        loadPropertiesFile(\"config.properties\", \"parameters\");\n\n        // Static fields set by @BeforeSuite take precedence.\n        // If they are still null (beforeSuite hasn't run yet or didn't receive the\n        // param),\n        // fall back to the property file value, then a hardcoded default.\n        // Keys match config.properties and @BeforeSuite @Parameters exactly\n        if (environment == null)\n            environment = runTimeProperties.getProperty(\"environme\n// \u2026 truncated"
+        }
+      ],
+      "base_class_info": {
+        "base_class_name": "TestBase",
+        "base_class_file": "src/main/java/automation/core/TestBase.java",
+        "public_methods": "public void logStep(Config config, String message)\npublic Object[][] getConfig(Method method)\npublic Object[][] getTwoConfigs(Method method)\npublic Object[][] getMultipleConfigs(Method method)\npublic void beforeSuite(@Optional String environment,\n            @Optional String browserName,\n            @Optional String projectName,\n            @Optional String country,\n            @Optional String appLanguage,\n            @Optional String groupName,\n            @Optional String branchName,\n            @Optional String resultsDirectory,\n            @Optional String debugMode)\npublic void afterMethod(ITestResult result)\npublic void afterSuite()"
+      },
+      "dom_findings": {
+        "status": "not needed \u2014 failure-time DOM snapshot available",
+        "selectors": {},
+        "page_dump": "",
+        "absent": [],
+        "raw": ""
+      },
+      "prev_test_output": "n-Framework/test-output/videos/555548c8fe8e5714ee897a1a0688023d.webm' target='_blank' style='color:#2563EB;'>&#127909; View Recording</a>\n[JsonTestReporter] Results written to: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/report.json\nTest Suite Finished: Surefire test\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 51.19 s <<< FAILURE! -- in automation.github.GitHubLoginTest\n[ERROR] automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession[automation.core.Config@49e5f737](1) -- Time elapsed: 48.06 s <<< FAILURE!\njava.lang.AssertionError: Failed to load Element Locator@.AppHeader-user, [data-login] >> nth=0 in DashboardPage\n\tat automation.modules.github.web.DashboardPage.<init>(DashboardPage.java:19)\n\tat automation.modules.github.GitHubHelper.loginWithStoredSession(GitHubHelper.java:98)\n\tat automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession(GitHubLoginTest.java:25)\n\n[INFO] Results:\n[ERROR] Failures: \n[ERROR]   GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession:25 Failed to load Element Locator@.AppHeader-user, [data-login] >> nth=0 in DashboardPage\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.2.5:test (default-test) on project jarvis-automation: There are test failures.\n[ERROR] \n[ERROR] Please refer to /Users/mukesh/msr5464/Playwright-Automation-Framework/target/surefire-reports for the individual test re",
+      "fix_attempt": 2,
+      "affected_tests": [
+        "automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession"
+      ],
+      "status": "test_failed",
+      "verified": false,
+      "target_file": "/Users/mukesh/msr5464/Playwright-Automation-Framework/src/main/java/automation/modules/github/web/DashboardPage.java",
+      "fix_description": "The constructor used the user avatar as the assertPageLoaded anchor, so the constructor itself threw when the session was not active (avatar never rendered). Replaced the load anchor with the GitHub homepage link (always present in the nav), and updated isLoggedIn() to check for the [data-login] attribute element that GitHub renders only for authenticated users.",
+      "fix_diff": "--- a/DashboardPage.java\n+++ b/DashboardPage.java\n@@ -8,15 +8,17 @@\n public class DashboardPage extends BasePage\n {\n \n+    private final Locator pageAnchor;\n     private final Locator avatarWidget;\n     private final Locator userMenu;\n \n     public DashboardPage(Config config)\n     {\n         super(config);\n-        avatarWidget = page.locator(\"img[class*='avatar']\").first();\n+        pageAnchor   = page.locator(\"a[aria-label='Homepage']\");\n+        avatarWidget = page.locator(\"[data-login]\").first();\n         userMenu     = page.locator(\"summary[aria-label*='View profile'], .AppHeader-user\");\n-        assertPageLoaded(avatarWidget);\n+        assertPageLoaded(pageAnchor);\n     }\n \n     public boolean isLoggedIn()\n",
+      "test_passed": false,
+      "test_output": "] Recorded: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/videos/a8cf4bcecc0ef19d516f93dea5fd3cf2.webm\n[00:06:47] <a href='/Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/videos/a8cf4bcecc0ef19d516f93dea5fd3cf2.webm' target='_blank' style='color:#2563EB;'>&#127909; View Recording</a>\n[JsonTestReporter] Results written to: /Users/mukesh/msr5464/Playwright-Automation-Framework/test-output/report.json\nTest Suite Finished: Surefire test\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 21.21 s <<< FAILURE! -- in automation.github.GitHubLoginTest\n[ERROR] automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession[automation.core.Config@49e5f737](1) -- Time elapsed: 18.86 s <<< FAILURE!\njava.lang.AssertionError: \nThe following asserts failed:\n\t\u2718 FAIL: User should be logged in to GitHub using stored session expected [true] but found [false]\n\n[INFO] Results:\n[ERROR] Failures: \n[ERROR]   GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession The following asserts failed:\n\t\u2718 FAIL: User should be logged in to GitHub using stored session expected [true] but found [false]\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.2.5:test (default-test) on project jarvis-automation: There are test failures.\n[ERROR] \n[ERROR] Please refer to /Users/mukesh/msr5464/Playwright-Automation-Framework/target/surefire-reports for the individual test results.\n[ERROR] Please refer to dump files (if any exist) [date].dump, [date]-jvmRun[N].dump and [date].dumpstream.\n[ERROR] -> [Help 1]\n[ERROR] \n[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.\n[ERROR] Re-run Maven using the -X switch to enable full debug logging.\n[ERROR] \n[ERROR] For more information about the errors and possible solutions, please read the following articles:\n[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException"
+    }
+  ],
+  "attempts": [
+    {
+      "attempt": 1,
+      "timestamp": "2026-08-25T18:33:46.466119Z",
+      "entries": [
+        {
+          "test_name": "automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession",
+          "target_file": "/Users/mukesh/msr5464/Playwright-Automation-Framework/src/main/java/automation/modules/github/web/DashboardPage.java",
+          "fix_description": "The locator `img[class*='avatar']` was too broad \u2014 it matches any avatar image on the page (org icons, contributor thumbnails, etc.) rather than the authenticated user's nav widget. Replaced `avatarWidget` with a selector targeting the authenticated user header (`.AppHeader-user, [data-login]`) and updated both `assertPageLoaded` and `isLoggedIn()` to use it.",
+          "unfixable_reason": "",
+          "fix_diff": "--- a/DashboardPage.java\n+++ b/DashboardPage.java\n@@ -14,7 +14,7 @@\n     public DashboardPage(Config config)\n     {\n         super(config);\n-        avatarWidget = page.locator(\"img[class*='avatar']\").first();\n+        avatarWidget = page.locator(\".AppHeader-user, [data-login]\").first();\n         userMenu     = page.locator(\"summary[aria-label*='View profile'], .AppHeader-user\");\n         assertPageLoaded(avatarWidget);\n     }\n",
+          "status": "test_failed",
+          "outcome": "failed",
+          "reverted": true
+        }
+      ]
+    },
+    {
+      "attempt": 2,
+      "timestamp": "2026-08-25T18:36:47.529075Z",
+      "entries": [
+        {
+          "test_name": "automation.github.GitHubLoginTest.verifyLoginOnGitHubUsingStoredSession",
+          "target_file": "/Users/mukesh/msr5464/Playwright-Automation-Framework/src/main/java/automation/modules/github/web/DashboardPage.java",
+          "fix_description": "The constructor used the user avatar as the assertPageLoaded anchor, so the constructor itself threw when the session was not active (avatar never rendered). Replaced the load anchor with the GitHub homepage link (always present in the nav), and updated isLoggedIn() to check for the [data-login] attribute element that GitHub renders only for authenticated users.",
+          "unfixable_reason": "",
+          "fix_diff": "--- a/DashboardPage.java\n+++ b/DashboardPage.java\n@@ -8,15 +8,17 @@\n public class DashboardPage extends BasePage\n {\n \n+    private final Locator pageAnchor;\n     private final Locator avatarWidget;\n     private final Locator userMenu;\n \n     public DashboardPage(Config config)\n     {\n         super(config);\n-        avatarWidget = page.locator(\"img[class*='avatar']\").first();\n+        pageAnchor   = page.locator(\"a[aria-label='Homepage']\");\n+        avatarWidget = page.locator(\"[data-login]\").first();\n         userMenu     = page.locator(\"summary[aria-label*='View profile'], .AppHeader-user\");\n-        assertPageLoaded(avatarWidget);\n+        assertPageLoaded(pageAnchor);\n     }\n \n     public boolean isLoggedIn()\n",
+          "status": "test_failed",
+          "outcome": "failed",
+          "reverted": true
+        }
+      ]
+    }
+  ]
+}

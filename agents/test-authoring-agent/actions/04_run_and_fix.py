@@ -100,7 +100,10 @@ def run_maven_test(test_class: str, test_method: str) -> tuple:
         f"-Dheadless={'true' if HEADLESS else 'false'}",
         "--no-transfer-progress",
     ]
-    log(f"Running: {' '.join(cmd)}")
+    # Same build markers the healing agent emits, so the dashboard can fold the
+    # build output for either agent with one rule.
+    log(f"[build:start] {' '.join(cmd)}")
+    _build_started = time.time()
 
     try:
         proc = subprocess.Popen(
@@ -136,10 +139,13 @@ def run_maven_test(test_class: str, test_method: str) -> tuple:
     reader.join(timeout=5)
 
     if timed_out:
+        log(f"[build:end] timed out in {int(time.time() - _build_started)}s")
         log(f"ERROR: mvn test timed out ({MAVEN_TEST_TIMEOUT_S}s)")
         return False, "\n".join(all_lines) + f"\nERROR: Maven test timed out after {MAVEN_TEST_TIMEOUT_S} seconds."
 
     passed = proc.returncode == 0
+    log(f"[build:end] {'passed' if passed else 'failed'} in "
+        f"{int(time.time() - _build_started)}s")
     log(f"Test exit code: {proc.returncode} ({'PASS' if passed else 'FAIL'})")
     # Return the full captured output (last 6000 chars keeps tail for Claude context)
     return passed, "\n".join(all_lines)[-6000:]
