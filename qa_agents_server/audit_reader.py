@@ -19,12 +19,15 @@ This module is purely read-only — it does not mutate session state in any way.
 from __future__ import annotations
 
 import json
+import os
+import time
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from qa_agents_server.paths import AUTHORING_AUDIT_DIR
+from qa_agents_server.agents import DEFAULT_AGENT, get_agent
 
 # Ordered list of (step_key, json_filename, display_name) for the UI progress bar.
 # display_name for "validate_web" is just "Validate" (not "Validate Web") because
@@ -33,13 +36,9 @@ from qa_agents_server.paths import AUTHORING_AUDIT_DIR
 # is tracked here for live progress/SSE events; validate_api is exposed separately,
 # History-modal-only, via get_session()'s "steps" dict below. Keep this display
 # name in sync with AI-Test-Studio/frontend/customer/index.html's STEP_LABELS.
-STEPS: List[Tuple[str, str, str]] = [
-    ("parse", "01-parse.json", "Parse"),
-    ("validate_web", "02-validate-web.json", "Validate"),
-    ("generate", "03-generate.json", "Generate"),
-    ("run_and_fix", "04-run-and-fix.json", "Run & Fix"),
-    ("ship", "05-ship.json", "Ship"),
-]
+# The authoring step model, kept here for backwards compatibility. Per-agent
+# steps live in qa_agents_server/agents.py — read them via get_agent(name).steps.
+STEPS: List[Tuple[str, str, str]] = get_agent(DEFAULT_AGENT).steps
 
 _SESSION_RE = re.compile(r"^(\d{8}-\d{6})-(create-)?(.+)$")
 
@@ -123,6 +122,9 @@ def _derive_status(session_dir: Path, ship_data: Optional[Dict]) -> str:
     # Explicit cancellation marker written by runner._wait_and_reap
     if (session_dir / ".cancelled").exists():
         return "cancelled"
+    # The server stopped this run when it shut down or reaped it on boot.
+    if (session_dir / ".interrupted").exists():
+        return "interrupted"
 
     # No ship.json — check if any step JSON carries an error flag.
     for _, fname, _ in STEPS:
@@ -130,22 +132,31 @@ def _derive_status(session_dir: Path, ship_data: Optional[Dict]) -> str:
         if data is not None and _step_has_error(data):
             return "failed"
 
-    # Session init file exists → run started, just hasn't finished step 1 yet
+    # Session init file exists → run started, just hasn't finished step 1 yet.
+    # But a session nothing has written to in a long time is not still running —
+    # a killed server or a crashed agent leaves one behind, and reporting it as
+    # "running" forever is wrong (sessions from months earlier still showed as
+    # live). The healing path already made this distinction; authoring did not.
     if (session_dir / "00-session-init.md").exists():
-        return "running"
+        return "interrupted" if _looks_abandoned(session_dir) else "running"
     parse_json = session_dir / "01-parse.json"
     if not parse_json.exists():
         return "unknown"
-    return "in_progress"
+    return "interrupted" if _looks_abandoned(session_dir) else "in_progress"
 
 
-def list_sessions(limit: int = 50, offset: int = 0) -> List[Dict]:
-    """Return session summaries, newest first."""
-    if not AUTHORING_AUDIT_DIR.exists():
+def list_sessions(limit: int = 50, offset: int = 0,
+                  agent: str = DEFAULT_AGENT) -> List[Dict]:
+    """Return session summaries for one agent, newest first."""
+    spec = get_agent(agent)
+    if spec.name != DEFAULT_AGENT:
+        return _list_healing_sessions(spec, limit, offset)
+
+    if not spec.audit_dir.exists():
         return []
 
     sessions: List[Dict] = []
-    for entry in AUTHORING_AUDIT_DIR.iterdir():
+    for entry in spec.audit_dir.iterdir():
         if not entry.is_dir():
             continue
         ship = _safe_load_json(entry / "05-ship.json")
@@ -171,9 +182,12 @@ def list_sessions(limit: int = 50, offset: int = 0) -> List[Dict]:
     return sessions[offset : offset + limit]
 
 
-def get_session(session_id: str) -> Optional[Dict]:
+def get_session(session_id: str, agent: str = DEFAULT_AGENT) -> Optional[Dict]:
     """Return the full contents of an audit session, or None if missing."""
-    session_dir = AUTHORING_AUDIT_DIR / session_id
+    spec = get_agent(agent)
+    if spec.name != DEFAULT_AGENT:
+        return _get_healing_session(spec, session_id)
+    session_dir = spec.audit_dir / session_id
     if not session_dir.exists() or not session_dir.is_dir():
         return None
 
@@ -210,14 +224,21 @@ def get_session(session_id: str) -> Optional[Dict]:
     }
 
 
-def replay_events(session_id: str) -> Optional[List[Dict]]:
+def replay_events(session_id: str,
+                  agent: str = DEFAULT_AGENT) -> Optional[List[Dict]]:
     """Reconstruct an SSE-shape event stream from a completed session.
 
     Returns a list of events in the same shape as runner.Event.to_dict() so the
     frontend can use the same rendering path for live and historical runs.
     Returns None if the session doesn't exist.
+
+    Agent-aware: the audit directory, the step list and the terminal event all
+    come from the agent's own spec. Without that, replay only ever found
+    authoring sessions, so a finished healing run's Logs link 404ed and its
+    output could not be shown in the live card at all.
     """
-    session_dir = AUTHORING_AUDIT_DIR / session_id
+    spec = get_agent(agent)
+    session_dir = spec.audit_dir / session_id
     if not session_dir.exists() or not session_dir.is_dir():
         return None
 
@@ -248,7 +269,7 @@ def replay_events(session_id: str) -> Optional[List[Dict]]:
             pass
 
     # Each step's presence becomes a 'step' event — status reflects error if present
-    for key, fname, display in STEPS:
+    for key, fname, display in spec.steps:
         data = _safe_load_json(session_dir / fname)
         if data is None:
             continue
@@ -259,6 +280,27 @@ def replay_events(session_id: str) -> Optional[List[Dict]]:
             "status": step_status,
             "summary": _summarise_step(key, data),
         })
+
+    if spec.name != DEFAULT_AGENT:
+        # Healing: reuse the same summary the history table and the live card's
+        # own result panel read, so a replayed run reports exactly what a live
+        # one did rather than a second, drifting derivation of "what happened".
+        summary = _healing_summary(spec, session_dir)
+        emit("done", {
+            "status": summary.get("status"),
+            "verdict": summary.get("fix_gate"),
+            "pr_url": summary.get("pr_url"),
+            "test_passed": None,
+            "files_count": None,
+            "ship_status": None,
+            "ship_detail": summary.get("failure_headline"),
+            "duration_s": _compute_duration_s(
+                session_id,
+                _safe_load_json(session_dir / "02-ship.json")
+                or _safe_load_json(session_dir / "01-fix.json")
+                or _safe_load_json(session_dir / "00-reproduce.json")),
+        })
+        return events
 
     # Terminal event from ship + verdict
     ship = _safe_load_json(session_dir / "05-ship.json")
@@ -349,3 +391,157 @@ def _summarise_step(key: str, data: Dict) -> Dict:
             "ship_detail": data.get("ship_detail"),
         }
     return {}
+
+
+# ── Healing sessions ──────────────────────────────────────────────────────────
+#
+# Deliberately reads the same fields scripts/audit_viewer.py::_get_healing_session
+# reads — succeeded / unverified / failed / distinct_fixes — so the two dashboards
+# cannot drift apart and disagree about the same run.
+
+def _healing_counts(fix_data: Dict) -> Dict[str, int]:
+    return {
+        "distinct_fixes": fix_data.get("distinct_fixes", len(fix_data.get("fixes", []))),
+        "tests_fixed": fix_data.get("succeeded", 0),
+        "tests_unverified": fix_data.get("unverified", 0),
+        "tests_failed": fix_data.get("failed", 0),
+    }
+
+
+# A session whose process died leaves no gate file, so it reads as "running"
+# forever and the history table fills with phantom rows. Nothing here can see the
+# process table, so fall back to staleness: untouched for this long with no
+# verdict means it is not running, it is abandoned.
+# How long a session can go untouched before it is treated as abandoned
+# rather than running. Applies to both agents (the old healing-specific
+# name is still honoured so existing deployments keep working).
+_DEFAULT_STALE_AFTER_SECONDS = 900
+
+
+def _stale_after() -> int:
+    """Read per call so the admin Agent Settings page can change it without a restart."""
+    try:
+        return int(
+            os.environ.get("QA_AGENT_STALE_AFTER_SECONDS")
+            or os.environ.get("QA_HEALING_STALE_AFTER_SECONDS")
+            or _DEFAULT_STALE_AFTER_SECONDS
+        )
+    except ValueError:
+        return _DEFAULT_STALE_AFTER_SECONDS
+
+
+def _looks_abandoned(session_dir: Path) -> bool:
+    try:
+        newest = max((f.stat().st_mtime for f in session_dir.iterdir()), default=0.0)
+    except OSError:
+        return False
+    return bool(newest) and (time.time() - newest) > _stale_after()
+
+
+# What the gate file says is an internal value; "skipped" collapses three very
+# different outcomes into one word. Split them by what the reproduce step found.
+_SHAPE_STATUS = {
+    "passing": "nothing_to_fix",
+    "ASSERTION": "not_a_locator",
+    "UNKNOWN": "not_a_locator",
+}
+
+
+def _skipped_status(shape: str) -> str:
+    if not shape:
+        return "skipped"                      # pipeline run with nothing eligible
+    if shape.startswith("INFRA"):
+        return "blocked"                      # could not even run the test
+    return _SHAPE_STATUS.get(shape, "not_a_locator")
+
+
+def _healing_status(session_dir: Path, fix_gate: Optional[str],
+                    ship_data: Optional[Dict], counts: Dict[str, int],
+                    shape: str = "") -> str:
+    if (ship_data or {}).get("pr_url"):
+        return "pr_created"
+    if (session_dir / ".crashed").exists():
+        return "crashed"
+    if (session_dir / ".cancelled").exists():
+        return "cancelled"
+    if (session_dir / ".interrupted").exists():
+        return "interrupted"
+    gate = (fix_gate or "").strip()
+    if gate == "true":
+        # A run where nothing could be verified is not a success, even though
+        # the gate passed — mirror how the PR body reports it.
+        return "unverified" if counts["tests_unverified"] and not counts["tests_fixed"] else "fixed"
+    if gate == "false":
+        return "needs_review"
+    if gate == "skipped":
+        return _skipped_status(shape)
+    if gate:
+        return "unknown"
+    return "interrupted" if _looks_abandoned(session_dir) else "running"
+
+
+def _healing_summary(spec, session_dir: Path) -> Dict:
+    reproduce = _safe_load_json(session_dir / "00-reproduce.json")
+    fix = _safe_load_json(session_dir / "01-fix.json") or {}
+    ship = _safe_load_json(session_dir / "02-ship.json")
+    fix_gate = (_read_text(session_dir / ".fix-passed") or "").strip() or None
+    counts = _healing_counts(fix)
+    parsed = _parse_session_id(session_dir.name)
+    shape = (reproduce or {}).get("status") or ""
+
+    # The failure shape is what decides whether the UI offers "Try anyway", so it
+    # belongs in the summary rather than only inside the reproduce step blob.
+    return {
+        "session_id": session_dir.name,
+        "agent": spec.name,
+        "failure_shape": shape,
+        "failure_headline": (reproduce or {}).get("headline", ""),
+        "forced": bool((reproduce or {}).get("forced")),
+        # A run the gate stopped: not a locator problem, nothing was attempted.
+        "gate_stopped": bool(shape) and shape not in ("queued", "passing"),
+        # `module` keeps the shape the frontend already renders for authoring.
+        "module": fix.get("build_tag") or (reproduce or {}).get("test_name") or parsed["module"],
+        "build_tag": fix.get("build_tag"),
+        "test_name": (reproduce or {}).get("test_name"),
+        "mode": "standalone" if reproduce else "pipeline",
+        "started_at": parsed["timestamp"],
+        "status": _healing_status(session_dir, fix_gate, ship, counts, shape),
+        "fix_gate": fix_gate,
+        "pr_url": (ship or {}).get("pr_url"),
+        "timestamp": (ship or fix or {}).get("timestamp"),
+        **counts,
+    }
+
+
+def _list_healing_sessions(spec, limit: int, offset: int) -> List[Dict]:
+    if not spec.audit_dir.exists():
+        return []
+    sessions = [_healing_summary(spec, entry)
+                for entry in spec.audit_dir.iterdir() if entry.is_dir()]
+    sessions.sort(key=lambda s: s.get("session_id") or "", reverse=True)
+    return sessions[offset: offset + limit]
+
+
+def _get_healing_session(spec, session_id: str) -> Optional[Dict]:
+    session_dir = spec.audit_dir / session_id
+    if not session_dir.is_dir():
+        return None
+
+    summary = _healing_summary(spec, session_dir)
+    summary["init_md"] = _read_text(session_dir / "00-session-init.md")
+    summary["steps"] = {
+        "reproduce": _safe_load_json(session_dir / "00-reproduce.json"),
+        "fix": _safe_load_json(session_dir / "01-fix.json"),
+        "ship": _safe_load_json(session_dir / "02-ship.json"),
+    }
+    # Markdown reports are what a human actually wants to read in the detail view.
+    # The raw console is deliberately NOT included: it is served incrementally by
+    # /run/<sid>/stream into the Live Run card, so shipping a second copy here
+    # made every row click pay for the whole log — and a real run's maven output
+    # is the largest thing in the session by far.
+    summary["reports"] = {
+        "reproduce_md": _read_text(session_dir / "00-reproduce.md"),
+        "fix_md": _read_text(session_dir / "01-fix.md"),
+        "ship_md": _read_text(session_dir / "02-ship.md"),
+    }
+    return summary

@@ -52,6 +52,8 @@ run.sh (orchestrator)
 05-ship.json             (report_path, handoff_path, slack_notified)
     ↓
 agents/test-healing-agent/queue/<build_tag>.json   ← consumed by test-healing-agent
+audit/<session>/dom/<method>.html                 ← failure-time DOM, referenced by the handoff
+audit/<session>/traces/<method>.zip               ← Playwright trace, referenced by the handoff
 ```
 
 **Handoff criteria** (written only when verdict=APPROVED):
@@ -178,3 +180,49 @@ Minor disagreements on LOW/MEDIUM confidence tests do NOT require NEEDS-HUMAN.
 Static review prompt sections are loaded from `config/prompts/review.md` at runtime.
 Classification conventions are documented in `config/skills/qa-conventions.md`.
 To change review criteria, edit those files — no Python changes needed.
+
+---
+
+## DOM Snapshots
+
+When the automation framework captured the page's HTML at the moment of failure
+(`BrowserHelper.captureDomSnapshot` → `{resultsDirectory}/dom/<method>_<time>.html`),
+step 05 copies it into `audit/<session>/dom/<method>.html` and puts that path plus
+the failure URL into the handoff.
+
+Copying rather than referencing matters: CI cleans up the report directory, and
+the handoff has to stay valid until test-healing-agent picks it up. That snapshot
+is what lets the healing agent fix a locator that broke deep inside a user journey
+without replaying the flow, logging in, or reconstructing the test data.
+
+Missing snapshots are never fatal — the fields are simply left empty.
+
+Step 05 also copies the Playwright trace (`traces/<method>_<time>.zip`) when the
+framework recorded one, reads the failing selector straight out of its action
+timeline into `failed_selector`, and references the zip as `trace_path`. Whoever
+reviews the PR can open that zip in Playwright Trace Viewer and step through the
+whole flow.
+
+---
+
+## Root-Cause Grouping (step 03)
+
+Before classifying, failures are grouped by a normalized signature — error type
+plus the error message with run-specific noise (uuids, timestamps, durations,
+ids) stripped out. One representative per group is classified, and the verdict is
+shared with its siblings.
+
+This is not only about cost. Classifying the same defect thirty times gives
+thirty independent answers: the same broken locator can come back HIGH confidence
+for one test and MEDIUM for another, and since the handoff filter requires HIGH,
+only some siblings reach the healing agent. The rest stay red with no explanation.
+One judgement per defect makes that impossible.
+
+Sharing is deliberately restricted. A verdict is only inherited when the category
+is `ELEMENT_NOT_FOUND` or `TIMEOUT` **and** confidence is HIGH or MEDIUM.
+Assertion failures with identical messages can have unrelated causes, so their
+siblings are marked LOW confidence and flagged for individual review instead.
+
+Each classification carries `cause_group_key`, `cause_group_size` and
+`is_group_representative`, and these flow into the handoff so the healing agent
+starts with the grouping already known.

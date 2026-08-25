@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""
+Step 00 — Reproduce  (standalone mode only)
+
+Runs a named test locally, reproduces its failure, and writes the same handoff
+file that test-triaging-agent would have produced. Everything downstream — the
+clustering, DOM grounding, safety guard, verification and PR — then runs exactly
+as it does for a pipeline-fed run, because it cannot tell the difference.
+
+Reads:   TEST_NAME (Class#method | Class.method | pkg.Class.method | Class)
+Outputs: audit/<session>/00-handoff.json + 00-reproduce.json + .md
+         .fix-passed=skipped when there is nothing to fix
+
+Exits 0 in every non-crash case. "The test passes" and "this is not a locator
+failure" are both legitimate outcomes, not errors.
+"""
+
+import os, sys, json, re
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → shared.*
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → lib.*
+
+from shared.log import log as _log
+def log(msg): _log("reproduce", msg)
+
+import warnings, urllib3
+urllib3.disable_warnings(urllib3.exceptions.NotOpenSSLWarning)
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+import logging
+logging.basicConfig(level=logging.WARNING)
+
+from lib.test_runner import run_test, split_test_name
+from lib.code_analyzer import CodeAnalyzer
+from shared.dom_snapshot import find_snapshot, parse_header
+from shared.playwright_trace import read_actions, failing_action
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
+REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
+TEST_NAME = os.environ.get("TEST_NAME", "").strip()
+
+GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "")
+WORKSPACE_DIR          = os.environ.get("WORKSPACE_DIR", str(REPO_ROOT.parent))
+TEST_RESULTS_DIR_NAME  = os.environ.get("TEST_RESULTS_DIR_NAME", "test-output")
+
+REPAIR = os.environ.get("REPAIR", "false").lower() == "true"
+FORCE  = os.environ.get("FORCE", "false").lower() == "true"
+REPRODUCE_TIMEOUT_S = int(os.environ.get("AUTOFIX_REPRODUCE_TIMEOUT_S", "900"))
+
+# ── Failure-shape detection ───────────────────────────────────────────────────
+#
+# Deciding this before calling Claude is what stops the agent confidently
+# "fixing" a locator when the real problem is a wrong expected value or a dead
+# database. Signals are taken from what these frameworks actually emit.
+
+_LOCATOR_SIGNALS = [
+    # The Playwright framework's own wrappers. BasePage.assertPageLoaded raises a
+    # java.lang.AssertionError, so this must be matched BEFORE the assertion
+    # signals below or a genuine broken locator is dismissed as a bad expectation.
+    "element not visible after timeout",
+    "failed to load element",
+    # The Selenium/Thanos wrapper phrasing
+    "is not visible", "is not clickable", "is not displayed", "is not present",
+    # Playwright
+    "waiting for locator", "waiting for selector", "strict mode violation",
+    "locator.click", "locator.fill", "locator resolved to",
+    # Selenium
+    "nosuchelementexception", "elementnotinteractableexception",
+    "staleelementreferenceexception", "elementclickinterceptedexception",
+    "unable to locate element",
+]
+
+# Checked BEFORE the locator signals: a Playwright timeout looks locator-shaped
+# but an API/DB timeout is not something a locator edit can fix.
+_INFRA_SIGNALS = {
+    "INFRA_BUILD": ["there is no pom in this directory", "requires a project to execute",
+                    "could not find artifact", "compilation failure", "cannot find symbol"],
+    "INFRA_DB": ["communications link failure", "no suitable driver found",
+                 "could not connect to database", "jdbc:mysql://<"],
+    "INFRA_USER": ["failed to get free user after", "no free user available", "userquery["],
+    "INFRA_CREDENTIALS": ["value: expected string, got undefined"],
+    "INFRA_API_AUTH": ["401 unauthorized", "403 forbidden", "statuscode=401", "statuscode=403"],
+}
+
+_ASSERTION_SIGNALS = [
+    "assertionerror", "assertion failed", "expected [", "expected:", "but found",
+    "but was:", "did not equal", "assertequals", "asserttrue", "assertfalse",
+]
+
+
+def classify_failure_shape(text: str, trace_selector: str = "") -> tuple:
+    """Return (shape, reason). shape is LOCATOR / ASSERTION / INFRA_* / UNKNOWN."""
+    blob = (text or "").lower()
+
+    for shape, signals in _INFRA_SIGNALS.items():
+        for signal in signals:
+            if signal in blob:
+                return shape, f"matched infrastructure signal: {signal!r}"
+
+    # A trace whose failing action carried a selector is the strongest evidence
+    # available that this really is a locator problem.
+    if trace_selector:
+        return "LOCATOR", f"the failing action in the trace used selector {trace_selector!r}"
+
+    for signal in _LOCATOR_SIGNALS:
+        if signal in blob:
+            return "LOCATOR", f"matched locator signal: {signal!r}"
+
+    for signal in _ASSERTION_SIGNALS:
+        if signal in blob:
+            return "ASSERTION", f"matched assertion signal: {signal!r}"
+
+    return "UNKNOWN", "no recognisable locator, assertion or infrastructure signal"
+
+# ── Workspace + report parsing ────────────────────────────────────────────────
+
+def get_workspace() -> Path | None:
+    workspace = Path(WORKSPACE_DIR)
+    if GITHUB_REPO_AUTOMATION:
+        candidate = workspace / GITHUB_REPO_AUTOMATION
+        if candidate.exists():
+            return candidate
+    for candidate in workspace.iterdir() if workspace.exists() else []:
+        if candidate.is_dir() and (candidate / "src").exists() \
+                and candidate.resolve() != REPO_ROOT.resolve():
+            return candidate
+    return None
+
+
+def read_report_entries(results_dir: Path, class_simple: str, method: str) -> list:
+    """Failing entries from the framework's own report.json.
+
+    JsonTestReporter writes this specifically so an agent does not have to parse
+    HTML reports. Its screenshotPath is always empty (the framework never
+    cross-fills it), so artefacts are located by convention instead.
+    """
+    report_path = results_dir / "report.json"
+    if not report_path.exists():
+        log(f"  No report.json at {report_path} — falling back to raw output")
+        return []
+    try:
+        entries = json.loads(report_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"  Could not read report.json ({e}) — falling back to raw output")
+        return []
+    if not isinstance(entries, list):
+        return []
+
+    matched = [
+        e for e in entries
+        if isinstance(e, dict)
+        and (e.get("className", "").split(".")[-1] == class_simple
+             or e.get("className") == class_simple)
+        and (not method or e.get("testName") == method)
+    ]
+    return [e for e in matched if (e.get("status") or "").upper() not in ("PASSED", "PASS")]
+
+
+def attach_artifacts(issue: dict, results_dir: Path, method_name: str) -> str:
+    """Point the issue at the DOM snapshot and trace this run just produced."""
+    trace_selector = ""
+
+    snapshot = find_snapshot(results_dir, method_name)
+    if snapshot:
+        try:
+            text = snapshot.read_text(encoding="utf-8", errors="ignore")
+            issue["dom_snapshot"] = str(snapshot)
+            issue["failure_url"] = parse_header(text).get("url", "")
+            log(f"  DOM snapshot: {snapshot.name} ({len(text) // 1024}KB)")
+        except OSError as e:
+            log(f"  Could not read DOM snapshot: {e}")
+
+    traces = list(results_dir.rglob(f"traces/{method_name}_*.zip"))
+    if traces:
+        trace = max(traces, key=lambda p: p.stat().st_mtime)
+        issue["trace_path"] = str(trace)
+        failed = failing_action(read_actions(trace))
+        if failed and failed.get("selector"):
+            trace_selector = failed["selector"]
+            issue["failed_selector"] = trace_selector
+            log(f"  Trace: {trace.name} — failing selector {trace_selector}")
+        else:
+            log(f"  Trace: {trace.name}")
+
+    return trace_selector
+
+# ── Output helpers ────────────────────────────────────────────────────────────
+
+def finish(status: str, headline: str, detail: str = "", issues: list | None = None) -> None:
+    """Write the audit files and exit. Never raises."""
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    result = {
+        "timestamp": ts, "test_name": TEST_NAME, "status": status,
+        "headline": headline, "detail": detail,
+        "repair_mode": REPAIR, "forced": FORCE,
+        "issues_found": len(issues or []),
+    }
+    (AUDIT_DIR / "00-reproduce.json").write_text(json.dumps(result, indent=2))
+
+    lines = [f"# Reproduce — {TEST_NAME}", "", f"**Status:** `{status}`  ",
+             f"**Result:** {headline}", ""]
+    if detail:
+        lines += ["```", detail[-3000:], "```", ""]
+    if issues:
+        lines += ["## Failures queued for fixing", ""]
+        lines += [f"- `{i['test_name']}` — {i.get('error_type', '')}: "
+                  f"{(i.get('error_message') or '')[:120]}" for i in issues]
+    (AUDIT_DIR / "00-reproduce.md").write_text("\n".join(lines) + "\n")
+
+    if status != "queued":
+        (AUDIT_DIR / ".fix-passed").write_text("skipped")
+        (AUDIT_DIR / ".skip-reason").write_text(
+            "infra" if status.startswith("INFRA") else "no-work")
+    log(headline)
+    sys.exit(0)
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    if not TEST_NAME:
+        log("ERROR: TEST_NAME not set")
+        sys.exit(1)
+
+    full_class, class_simple, method = split_test_name(TEST_NAME)
+    log(f"Test: {full_class}" + (f"#{method}" if method else " (whole class)"))
+
+    workspace = get_workspace()
+    if not workspace:
+        finish("INFRA_WORKSPACE", "Automation repo workspace not found — "
+               "set WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
+    log(f"Workspace: {workspace}")
+
+    # Resolve the fully-qualified name so the handoff carries a package, which is
+    # what CodeAnalyzer needs later to find the test file again.
+    if "." not in full_class:
+        try:
+            found = CodeAnalyzer().find_test_file(f"{class_simple}.{method or 'x'}",
+                                                  str(workspace))
+            if found:
+                package = CodeAnalyzer()._extract_package(
+                    (workspace / found).read_text(encoding="utf-8", errors="ignore"))
+                if package:
+                    full_class = f"{package}.{class_simple}"
+                    log(f"Resolved: {full_class}")
+        except Exception as e:
+            log(f"  Could not resolve package ({e}) — continuing with the simple name")
+
+    # ── Run it ────────────────────────────────────────────────────────────────
+    properties = {"traceMode": "on"}
+    if REPAIR:
+        # Explicit opt-in only. Normally the fix step decides this for itself and
+        # parks a browser on retry, so the common path stays fast and headless.
+        properties["repairMode"] = "true"
+        log("REPAIR=true — parking the browser on the failing page")
+
+    log("Running the test to reproduce the failure...")
+    status, output = run_test(TEST_NAME, workspace, extra_properties=properties,
+                              timeout_s=REPRODUCE_TIMEOUT_S, log=log)
+
+    if status == "passed":
+        finish("passing", "Test passes — nothing to fix.")
+    if status == "unverified":
+        finish("INFRA_NO_RUNNER", "No test runner could be found, so the test was "
+               "never executed.", output)
+
+    log("Test failed as expected — collecting evidence")
+
+    results_dir = workspace / TEST_RESULTS_DIR_NAME
+
+    # ── Parse the failures ────────────────────────────────────────────────────
+    entries = read_report_entries(results_dir, class_simple, method)
+    if not entries:
+        # No structured report: still fixable from the raw output for the single
+        # named test, but not for a whole class (we cannot tell which failed).
+        if not method:
+            finish("UNKNOWN", "The class failed but report.json is missing, so the "
+                   "individual failing tests could not be identified.", output)
+        entries = [{"testName": method, "className": full_class,
+                    "failureMessage": output[-2000:], "failureLocation": ""}]
+        log("  Built a single failure entry from raw output")
+
+    log(f"{len(entries)} failing test(s) in this run")
+
+    issues, shapes = [], []
+    for entry in entries:
+        entry_method = entry.get("testName") or method
+        entry_class = entry.get("className") or full_class
+        message = entry.get("failureMessage") or ""
+        location = entry.get("failureLocation") or ""
+
+        issue = {
+            "test_name": f"{entry_class}.{entry_method}",
+            "classification": "AUTOMATION_ISSUE",
+            "confidence": "HIGH",
+            "root_cause_category": "ELEMENT_NOT_FOUND",
+            "root_cause": message[:400],
+            "failure_signature": f"{entry.get('status', 'FAILED')}: {message[:120]}",
+            "recommended_action": "Update the broken locator",
+            "error_type": (message.split(":")[0][:80] if ":" in message else "TestFailure"),
+            "error_message": message[:2000],
+            "stack_trace": location,
+            "execution_log": output[-4000:],
+            "class_name": entry_class,
+            "method_name": entry_method,
+            "full_name": f"{entry_class}.{entry_method}",
+            "dom_snapshot": "", "failure_url": "", "trace_path": "", "failed_selector": "",
+            "cause_group_key": "", "cause_group_size": 1,
+        }
+        trace_selector = attach_artifacts(issue, results_dir, entry_method)
+
+        shape, reason = classify_failure_shape(f"{message}\n{output[-4000:]}", trace_selector)
+        shapes.append((issue["test_name"], shape, reason))
+        if shape == "LOCATOR" or FORCE:
+            issues.append(issue)
+        log(f"  {entry_method}: {shape} — {reason}")
+
+    # ── Gate on failure shape ─────────────────────────────────────────────────
+    if not issues:
+        summary = "\n".join(f"{name}: {shape} — {reason}" for name, shape, reason in shapes)
+        worst = next((s for _, s, _ in shapes if s.startswith("INFRA")), shapes[0][1])
+        finish(worst,
+               f"Not a locator failure ({worst}) — stopping before any fix is attempted. "
+               f"Re-run with FORCE=true to try anyway.",
+               summary)
+
+    if FORCE and any(shape != "LOCATOR" for _, shape, _ in shapes):
+        log("FORCE=true — attempting a fix despite the failure not looking locator-shaped")
+
+    # ── Write the handoff ─────────────────────────────────────────────────────
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "-", f"{class_simple}-{method}" if method else class_simple)
+    handoff = {
+        "build_tag": f"local-{safe}",
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source_session": os.environ.get("SESSION_ID", ""),
+        "source_audit_dir": str(AUDIT_DIR),
+        "origin": "standalone",
+        "automation_issues": issues,
+    }
+    (AUDIT_DIR / "00-handoff.json").write_text(json.dumps(handoff, indent=2))
+    log(f"Handoff written: {len(issues)} issue(s) → 00-handoff.json")
+
+    finish("queued", f"{len(issues)} failing test(s) queued for fixing", "", issues)
+
+
+if __name__ == "__main__":
+    main()

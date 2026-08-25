@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → lib.*
 
 from shared.log import log as _log
+from lib.root_cause_groups import (group_failures, pick_representative,
+                                    is_groupable, signature as cause_signature)
 def log(msg): _log("classify", msg)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -255,10 +257,34 @@ def main():
     if len(deduplicated) != len(failures):
         log(f"Deduplicated: {len(failures)} → {len(deduplicated)} unique failures")
 
-    log(f"Classifying {len(deduplicated)} failures in batches of {BATCH_SIZE}...")
+    # ── Group by root cause before classifying ────────────────────────────────
+    # One broken locator fails every test that walks past it. Classifying each
+    # separately costs more AND is inconsistent — the same defect can come back
+    # HIGH for one test and MEDIUM for another, so only some siblings reach the
+    # healing agent and the rest stay red for no discoverable reason.
+    # One representative is classified; the verdict is shared with its siblings.
+    groups = group_failures(deduplicated)
+    representatives = [pick_representative(g) for g in groups.values()]
+    rep_to_group = {pick_representative(g)["full_name"]: g for g in groups.values()}
+
+    multi = {k: g for k, g in groups.items() if len(g) > 1}
+    if multi:
+        saved = len(deduplicated) - len(representatives)
+        log(f"Grouped by root cause: {len(deduplicated)} failures → {len(groups)} distinct "
+            f"cause(s) ({saved} redundant classification(s) avoided)")
+        for group in multi.values():
+            rep = pick_representative(group)
+            log(f"  ×{len(group)}  {(rep.get('error_type') or 'failure')}: "
+                f"{(rep.get('error_message') or '')[:70]}")
+            for f in group:
+                log(f"        {f['full_name']}")
+
+    log(f"Classifying {len(representatives)} representative failure(s) "
+        f"in batches of {BATCH_SIZE}...")
 
     all_classifications = []
-    batches = [deduplicated[i:i + BATCH_SIZE] for i in range(0, len(deduplicated), BATCH_SIZE)]
+    batches = [representatives[i:i + BATCH_SIZE]
+               for i in range(0, len(representatives), BATCH_SIZE)]
 
     for batch_num, batch in enumerate(batches, 1):
         log(f"Batch {batch_num}/{len(batches)} ({len(batch)} failures)...")
@@ -324,6 +350,58 @@ def main():
                     "recommended_action": "Manual review required",
                 })
 
+    # ── Share each verdict with the siblings it was decided for ───────────────
+    # Only the representative was classified. Its siblings get the same verdict,
+    # tagged so the report and the healing agent can see they are one defect —
+    # and so every test showing that defect reaches healing together, instead of
+    # some being dropped over an inconsistent confidence score.
+    fanned_out = []
+    for classification in all_classifications:
+        siblings = rep_to_group.get(classification["test_name"], [])
+        classification["cause_group_size"] = len(siblings) or 1
+        classification["cause_group_key"] = cause_signature(
+            next((f for f in siblings if f["full_name"] == classification["test_name"]), {})
+        )
+        classification["is_group_representative"] = True
+        fanned_out.append(classification)
+
+        if len(siblings) <= 1:
+            continue
+        if not is_groupable(classification):
+            # An assertion failure or a low-confidence guess must not be
+            # inherited by tests nobody actually looked at. Mark the siblings
+            # for individual review instead of copying a verdict onto them.
+            for failure in siblings:
+                if failure["full_name"] == classification["test_name"]:
+                    continue
+                fanned_out.append({
+                    **classification,
+                    "test_name": failure["full_name"],
+                    "confidence": "LOW",
+                    "is_group_representative": False,
+                    "recommended_action": (
+                        "Shares a failure signature with "
+                        f"{classification['test_name']}, but that verdict is not safe "
+                        "to inherit — review individually."),
+                })
+            continue
+
+        for failure in siblings:
+            if failure["full_name"] == classification["test_name"]:
+                continue
+            fanned_out.append({
+                **classification,
+                "test_name": failure["full_name"],
+                "is_group_representative": False,
+                "root_cause": (f"{classification['root_cause']} "
+                               f"(same root cause as {classification['test_name']})"),
+            })
+
+    if len(fanned_out) != len(all_classifications):
+        log(f"Verdicts shared across siblings: {len(all_classifications)} classified → "
+            f"{len(fanned_out)} tests covered")
+    all_classifications = fanned_out
+
     # Post-process with category_rules.py
     all_test_results = collect.get("test_results", [])
     all_classifications = apply_category_rules(all_classifications, all_test_results)
@@ -348,6 +426,7 @@ def main():
         "timestamp": ts,
         "build_tag": collect.get("build_tag"),
         "total_failures": len(deduplicated),
+        "distinct_root_causes": len(groups),
         "classifications": all_classifications,
         "summary": summary,
         "category_breakdown": category_breakdown,

@@ -417,6 +417,8 @@ Key endpoints (scoped to `test-authoring-agent` for v1):
 | `POST` | `/agents/test-authoring-agent/run/<id>/cancel` | SIGTERM the run |
 | `GET`  | `/agents/test-authoring-agent/sessions` | Audit history |
 | `GET`  | `/agents/test-authoring-agent/sessions/<id>` | Full session detail |
+| `GET`  | `/settings` | Agent settings schema + current values (secrets masked) |
+| `PUT`  | `/settings` | Save agent settings to `config/.env` |
 
 Environment overrides:
 
@@ -425,7 +427,8 @@ Environment overrides:
 | `QA_AGENT_SERVER_HOST` | `0.0.0.0` | Bind host |
 | `QA_AGENT_SERVER_PORT` | `8765` | Bind port |
 | `AI_TEST_STUDIO_URL` | `http://localhost:5001` | CORS allowlist |
-| `QA_AGENT_RUN_TIMEOUT_SECONDS` | `1800` | SIGKILL after this many seconds |
+| `QA_AGENT_RUN_TIMEOUT_SECONDS` | `7200` | SIGKILL after this many seconds |
+| `QA_AGENT_STALE_AFTER_SECONDS` | `900` | Untouched for this long ⇒ treated as abandoned, not running |
 
 ---
 
@@ -462,3 +465,34 @@ MIT — see [LICENSE](LICENSE)
 **Mukesh Rajput** · [LinkedIn](https://www.linkedin.com/in/mukesh-rajput/)
 
 <div align="center"><strong>Made with ❤️ for the Engineering Team</strong></div>
+
+### Agent Settings (Admin UI)
+
+The operational knobs in `config/.env` — GitHub org/repo/token, Slack channels,
+`WORKSPACE_DIR`, `AUTO_PUSH`, per-agent models, retry budgets, the triaging DB and
+its thresholds — are editable from **🤖 Agent Settings** on the AI-Test-Studio admin
+page, instead of hand-editing the file on the host.
+
+- Schema lives in `qa_agents_server/agent_settings.py`; the admin page renders
+  straight off it, so adding a field there is the only change a new setting needs.
+- `GET`/`PUT /settings` on this server do the work. AI-Test-Studio reaches them via
+  `/api/admin/agent-settings`, which is admin-gated — deliberately not through
+  `/api/agents/*`, which enforces no auth.
+- Saves write `config/.env` **and** the server's own `os.environ`, so a change
+  applies to the next agent run without a restart.
+- Secrets come back partially masked (`ghp**********f9c`). Submitting the mask
+  unchanged preserves the stored value; type a new one to replace it.
+- Per-invocation values (`TEST_NAME`, `BUILD_TAG`, `FORCE`, …) are deliberately not
+  exposed — they are set per run, and pinning them in `config/.env` would apply
+  them to every run.
+- A key also declared in `$REPO_ROOT/.env` or `agents/<agent>/.env` wins at run
+  time (see `shared/load_env.sh`); the page flags those fields rather than letting
+  the save look like it did nothing.
+
+### Agent HTTP API
+
+`qa_agents_server` serves every agent under `/agents/<agent>/*`
+(`test-authoring-agent`, `test-healing-agent`). Adding another means adding an
+`AgentSpec` to `qa_agents_server/agents.py` — the run registry, SSE streaming and
+cancellation are agent-agnostic. One run executes at a time across all agents,
+because they share the automation-repo checkout.

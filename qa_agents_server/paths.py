@@ -18,3 +18,6 @@ AUTHORING_RUN_SH: Path = AUTHORING_AGENT_DIR / "run.sh"
 
 SERVER_STORAGE_DIR: Path = REPO_ROOT / "qa_agents_server" / "storage"
 RUNS_REGISTRY_FILE: Path = SERVER_STORAGE_DIR / "agent_runs.json"
+
+CONFIG_DIR: Path = REPO_ROOT / "config"
+CONFIG_ENV_FILE: Path = CONFIG_DIR / ".env"

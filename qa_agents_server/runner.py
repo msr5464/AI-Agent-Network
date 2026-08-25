@@ -34,7 +34,6 @@ from typing import Deque, Dict, Generator, List, Optional
 
 from qa_agents_server import storage
 from qa_agents_server.audit_reader import (
-    STEPS,
     get_session as _get_session,
     _safe_load_json,
     _step_has_error,
@@ -47,7 +46,16 @@ from qa_agents_server.paths import (
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-AGENT = "test-authoring-agent"
+from qa_agents_server.agents import (
+    AgentConfigError,
+    AgentSpec,
+    DEFAULT_AGENT,
+    get_agent,
+)
+
+# Retained for backwards compatibility: callers that predate multi-agent support
+# assume the authoring agent.
+AGENT = DEFAULT_AGENT
 MAX_BUFFERED_EVENTS = 10_000
 AUDIT_POLL_INTERVAL = 0.5  # seconds
 CANCEL_GRACE_SECONDS = 5
@@ -57,7 +65,20 @@ CANCEL_GRACE_SECONDS = 5
 # step04's fix loop can take MAX_FIX_ATTEMPTS x ~600s = ~1800s; steps 01/03/05
 # add roughly another 1500s combined — so a 1800s default was already shorter
 # than step02 alone could legitimately take even before its retry loop existed.
-DEFAULT_RUN_TIMEOUT = int(os.getenv("QA_AGENT_RUN_TIMEOUT_SECONDS", "7200"))  # 2h
+DEFAULT_RUN_TIMEOUT = 7200  # 2h
+
+
+def run_timeout() -> int:
+    """Read the timeout per call, not once at import.
+
+    The admin Agent Settings page can change QA_AGENT_RUN_TIMEOUT_SECONDS at
+    runtime; a module-level constant would silently ignore every save until the
+    server was restarted.
+    """
+    try:
+        return int(os.environ.get("QA_AGENT_RUN_TIMEOUT_SECONDS") or DEFAULT_RUN_TIMEOUT)
+    except ValueError:
+        return DEFAULT_RUN_TIMEOUT
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 
 
@@ -77,7 +98,7 @@ class Event:
 @dataclass
 class RunState:
     session_id: str
-    module: str
+    module: str          # the run's headline label: module, test name, or build tag
     auto_push: bool
     audit_dir: Path
     started_at: float
@@ -91,12 +112,14 @@ class RunState:
     proc: Optional[subprocess.Popen] = None
     cond: threading.Condition = field(default_factory=threading.Condition)
     start_from_step: int = 1  # >1 means this run resumed an existing session
+    agent: str = DEFAULT_AGENT
+    payload: Dict = field(default_factory=dict)
 
     def snapshot(self) -> Dict:
         """Persistable snapshot (no Popen, no threading primitives)."""
         return {
             "session_id": self.session_id,
-            "agent": AGENT,
+            "agent": self.agent,
             "module": self.module,
             "auto_push": self.auto_push,
             "audit_dir": str(self.audit_dir),
@@ -115,8 +138,13 @@ _active_session_id: Optional[str] = None
 _registry_lock = threading.Lock()
 
 # ── Pending queue ─────────────────────────────────────────────────────────────
-# Each entry: {"module": str, "auto_push": bool}
+# Each entry: {"agent": str, "payload": dict, "module": str, "auto_push": bool}
 _pending_queue: List[Dict] = []
+# Set once shutdown begins. Killing the active run makes its reaper try to start
+# the next queued item, which would spawn fresh work while the server is on its
+# way out — and that run would then be orphaned, since shutdown has already
+# passed the point where it stops things.
+_shutting_down = threading.Event()
 _queue_lock = threading.Lock()
 
 
@@ -137,40 +165,189 @@ class _QueuedNotification(Exception):
 def _start_next_from_queue() -> None:
     """Pick the first pending item and start it. Runs in the reap thread."""
     with _queue_lock:
-        if not _pending_queue:
+        if _shutting_down.is_set() or not _pending_queue:
             return
         next_item = _pending_queue.pop(0)
     try:
-        start_run(next_item["module"], next_item["auto_push"],
+        start_run(next_item.get("payload", {}),
+                  agent=next_item.get("agent", DEFAULT_AGENT),
                   session_id=next_item.get("session_id"),
                   start_from_step=next_item.get("start_from_step", 1))
     except Exception as e:
-        print(f"[runner] failed to start queued run for {next_item['module']!r}: {e}")
+        print(f"[runner] failed to start queued run for {next_item.get('module')!r}: {e}")
 
 
-def get_queue() -> List[Dict]:
-    """Return a snapshot of pending queue items."""
+def _unique_session_id(spec, payload: dict) -> str:
+    """A session id no other run is using.
+
+    Session ids are timestamped to the second, so two runs submitted within the
+    same second produce the SAME id — and queueing makes that easy to hit, since
+    firing several runs back to back is exactly what the queue is for. They would
+    then share one audit directory and overwrite each other's step output, and the
+    runner's registry (keyed by session id) would hand the second run's live
+    stream to the first.
+
+    Callers must already hold BOTH _registry_lock and _queue_lock — this reads
+    _runs and _pending_queue without taking either. Re-acquiring _registry_lock
+    here would self-deadlock, since it is a plain Lock and both call sites are
+    already inside it; taking it in the other order would risk an ABBA deadlock
+    against the existing registry-then-queue ordering.
+    """
+    base = spec.make_session_id(payload)
+    taken = {item.get("session_id") for item in _pending_queue} | set(_runs.keys())
+
+    candidate = base
+    suffix = 2
+    while candidate in taken or (spec.audit_dir / candidate).exists():
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def get_queue(agent: Optional[str] = None) -> List[Dict]:
+    """
+    Return a snapshot of pending queue items.
+
+    The queue itself is global — the run slot is shared, because every agent
+    drives the same automation-repo checkout. But a caller asking on behalf of
+    one agent wants only its own rows, so `agent` filters them. Each row keeps
+    `index`, its position in the GLOBAL queue, which is what remove_from_queue
+    takes; `position` is only the 1-based rank within the filtered view and is
+    not a valid index once filtering is in play.
+    """
     with _queue_lock:
-        return [{"module": item["module"], "auto_push": item["auto_push"],
+        rows = [{"agent": item.get("agent", DEFAULT_AGENT),
+                 "module": item.get("module"), "auto_push": item.get("auto_push"),
                  "session_id": item.get("session_id"),
                  "start_from_step": item.get("start_from_step", 1),
-                 "position": i + 1}
+                 "index": i}
                 for i, item in enumerate(_pending_queue)]
+    if agent:
+        rows = [r for r in rows if r["agent"] == agent]
+    for rank, row in enumerate(rows):
+        row["position"] = rank + 1
+    return rows
 
 
-def remove_from_queue(index: int) -> bool:
-    """Remove item at 0-based index. Returns True if removed."""
+def remove_from_queue(index: int, agent: Optional[str] = None) -> bool:
+    """
+    Remove the item at 0-based GLOBAL index. Returns True if removed.
+
+    `agent`, when given, must match the item's own agent — one panel must not
+    be able to delete another agent's queued run by index collision.
+    """
     with _queue_lock:
-        if 0 <= index < len(_pending_queue):
-            _pending_queue.pop(index)
-            return True
-        return False
+        if not (0 <= index < len(_pending_queue)):
+            return False
+        if agent and _pending_queue[index].get("agent", DEFAULT_AGENT) != agent:
+            return False
+        _pending_queue.pop(index)
+        return True
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
+# An agent run is spawned with start_new_session=True, so the child is its own
+# process-group leader and pgid == pid. Signalling the GROUP is what actually
+# stops the work: run.sh itself does little, while its children (claude, mvn and
+# the JVM surefire forks) are what burn time and tokens. Signalling only the
+# direct child leaves those running.
+_KILL_GRACE_SECONDS = 5
+
+
+def _describe_pid(pid: int) -> str:
+    """The command line of a live pid, or '' if it is gone/unreadable."""
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _is_our_agent_process(pid: int) -> bool:
+    """Guard against PID reuse before signalling a pid we only know from disk.
+
+    A pid persisted by an earlier server process may since have been recycled by
+    something unrelated, and killing that would be considerably worse than
+    leaving an orphan. Only proceed when the command line still looks like one
+    of our agents' run.sh.
+    """
+    cmd = _describe_pid(pid)
+    return bool(cmd) and "run.sh" in cmd and "-agent/" in cmd
+
+
+def _kill_group(pid: int, label: str = "") -> bool:
+    """SIGTERM a process group, then SIGKILL whatever is left. True if signalled."""
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError):
+        return False
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return False
+
+    deadline = time.time() + _KILL_GRACE_SECONDS
+    while time.time() < deadline:
+        try:
+            os.killpg(pgid, 0)          # still alive?
+        except (ProcessLookupError, PermissionError):
+            print(f"[runner] stopped {label or pid} (SIGTERM)")
+            return True
+        time.sleep(0.2)
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        print(f"[runner] stopped {label or pid} (SIGKILL after "
+              f"{_KILL_GRACE_SECONDS}s grace)")
+    except (ProcessLookupError, PermissionError):
+        pass
+    return True
+
+
+def _mark_interrupted(audit_dir: Path) -> None:
+    """Leave a marker the status derivation can read.
+
+    Without it a killed run keeps reporting "running" until the staleness
+    window (15 min) elapses, so the history lies about what is happening right
+    after a restart — which is exactly when someone is looking.
+    """
+    try:
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        (audit_dir / ".interrupted").write_text("true\n")
+    except OSError:
+        pass
+
+
 def reconcile_on_boot() -> None:
-    """On server boot, mark any persisted 'running' runs as 'interrupted'."""
+    """Mark stranded runs interrupted AND kill any that are still alive.
+
+    A clean shutdown stops its own children, but SIGKILL of the server (crash,
+    `kill -9`, a container OOM) cannot run any handler — so the previous
+    process's run.sh and its claude/maven children survive, orphaned, still
+    working against the automation repo and still spending tokens. Nothing
+    tracked them any more: the registry is in memory and died with the process.
+    Their pids are on disk, so boot is the one place they can be reaped.
+    """
+    stranded = [e for e in storage.load_all() if e.get("status") == "running"]
+
+    killed = []
+    for entry in stranded:
+        pid = entry.get("pid")
+        sid = entry.get("session_id") or "?"
+        if not pid:
+            continue
+        if not _is_our_agent_process(int(pid)):
+            continue        # already gone, or the pid now belongs to something else
+        if _kill_group(int(pid), f"orphaned run {sid} (pid {pid})"):
+            killed.append(sid)
+            if entry.get("audit_dir"):
+                _mark_interrupted(Path(entry["audit_dir"]))
+
     interrupted = storage.mark_all_running_as_interrupted()
+    if killed:
+        print(f"[runner] killed {len(killed)} orphaned run(s) left by a previous "
+              f"server process: {', '.join(killed)}")
     if interrupted:
         print(
             f"[runner] marked {len(interrupted)} stranded run(s) as interrupted: "
@@ -179,18 +356,36 @@ def reconcile_on_boot() -> None:
 
 
 def shutdown_all() -> None:
-    """SIGTERM every tracked subprocess. Called from signal handler / atexit."""
+    """Stop every tracked run and its children. Signal handler / atexit."""
+    _shutting_down.set()
     with _registry_lock:
         runs = list(_runs.values())
+
+    stopped = []
     for run in runs:
         proc = run.proc
-        if proc is None:
+        if proc is None or proc.poll() is not None:
             continue
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+        # The whole group, not just run.sh — see _KILL_GRACE_SECONDS above.
+        if _kill_group(proc.pid, f"run {run.session_id} (pid {proc.pid})"):
+            stopped.append(run.session_id)
+        _mark_interrupted(run.audit_dir)
+        run.status = "interrupted"
+        run.ended_at = time.time()
+        try:
+            storage.upsert(run.snapshot())
+        except Exception:
+            pass
+
+    # Anything still waiting will never start; drop it so a restart does not
+    # silently resurrect work the operator thought they had stopped.
+    with _queue_lock:
+        dropped = len(_pending_queue)
+        _pending_queue.clear()
+
+    if stopped or dropped:
+        print(f"[runner] shutdown: stopped {len(stopped)} run(s), "
+              f"dropped {dropped} queued")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -202,75 +397,109 @@ def get_run(session_id: str) -> Optional[RunState]:
     return _runs.get(session_id)
 
 
-def start_run(module: Optional[str], auto_push: bool, session_id: Optional[str] = None,
-              start_from_step: int = 1) -> RunState:
-    """Spawn run.sh for the given module. Raises RunnerError on validation.
+def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
+              session_id: Optional[str] = None, start_from_step: int = 1,
+              **legacy) -> RunState:
+    """Spawn an agent's run.sh. Raises RunnerError on validation.
 
-    start_from_step > 1 resumes an EXISTING session (session_id required —
-    it must already have valid output for every step before start_from_step)
-    instead of starting a fresh one. module can be omitted when resuming; it's
-    recovered from that session's own audit trail, since the original queue
-    .txt file may already have been moved to processed/ by the run being
-    resumed — feature_exists() would wrongly reject a legitimate resume.
+    payload is the request body; each AgentSpec turns it into environment
+    variables, which is the only place the agents genuinely differ. Authoring
+    sends {module, auto_push}; healing sends {test, repair, force} for a
+    standalone run or {build_tag} for a queued handoff.
+
+    start_from_step > 1 resumes an EXISTING session (session_id required — it
+    must already have valid output for every step before start_from_step)
+    instead of starting a fresh one. Only the authoring agent supports this;
+    the healing agent has its own internal retry loop. On resume the label can
+    be omitted and is recovered from the session's own audit trail, since the
+    queue file may already have been moved to processed/.
+
+    **legacy accepts the pre-multi-agent keyword form start_run(module=..., auto_push=...).
     """
     global _active_session_id
 
+    payload = dict(payload or {})
+    if "module" in legacy or "auto_push" in legacy:
+        payload.setdefault("module", legacy.get("module"))
+        payload.setdefault("auto_push", legacy.get("auto_push", False))
+
+    try:
+        spec = get_agent(agent)
+    except AgentConfigError as e:
+        raise RunnerError(e.message, status=e.status)
+
     resuming = start_from_step > 1
+    if resuming and not spec.supports_resume:
+        raise RunnerError(f"{spec.name} does not support resuming from a step")
 
     if resuming:
         if not session_id:
             raise RunnerError("session_id is required to resume from a step > 1")
-        if not (AUTHORING_AUDIT_DIR / session_id).exists():
+        if not (spec.audit_dir / session_id).exists():
             raise RunnerError(f"session not found: {session_id}", status=404)
-        if not module:
+        if not payload.get("module"):
             existing = _get_session(session_id)
-            module = existing.get("module") if existing else None
-            if not module:
+            recovered = existing.get("module") if existing else None
+            if not recovered:
                 raise RunnerError(
                     f"could not determine module for session {session_id}", status=500
                 )
-    else:
+            payload["module"] = recovered
+        payload["start_from_step"] = start_from_step
+    elif spec.name == DEFAULT_AGENT:
+        # Authoring only: the module file must already exist in the queue.
+        module = payload.get("module")
         if not module:
             raise RunnerError("module is required")
-        # Module file must exist in the queue (writable via /queue endpoint).
         if feature_exists(module) is None:
             raise RunnerError(
                 f"module file not found: {module}.txt — create it first via "
-                f"POST /agents/{AGENT}/queue",
+                f"POST /agents/{spec.name}/queue",
                 status=404,
             )
 
-    if not AUTHORING_RUN_SH.exists():
-        raise RunnerError(
-            f"agent run.sh not found at {AUTHORING_RUN_SH}", status=500
-        )
+    if _shutting_down.is_set():
+        raise RunnerError("server is shutting down", status=503)
+
+    try:
+        agent_env = spec.build_env(payload)
+    except AgentConfigError as e:
+        raise RunnerError(e.message, status=e.status)
+
+    label = spec.describe_run(payload)
+
+    if not spec.run_sh.exists():
+        raise RunnerError(f"agent run.sh not found at {spec.run_sh}", status=500)
 
     with _registry_lock:
         if _active_session_id is not None:
             active = _runs.get(_active_session_id)
             if active and active.status == "running":
-                # Queue instead of rejecting — generate session_id now so it's stable
-                # (resuming reuses the session_id it was given rather than minting one).
+                # Queue instead of rejecting. The slot is deliberately global
+                # across agents: they all mutate the same automation-repo
+                # checkout, so overlapping runs would corrupt the working tree.
                 with _queue_lock:
-                    queued_session_id = session_id if resuming else _make_session_id(module)
+                    queued_session_id = (session_id if resuming
+                                         else _unique_session_id(spec, payload))
                     _pending_queue.append({
-                        "module": module, "auto_push": auto_push,
-                        "session_id": queued_session_id, "start_from_step": start_from_step,
+                        "agent": spec.name, "payload": payload,
+                        "module": label, "auto_push": bool(payload.get("auto_push")),
+                        "session_id": queued_session_id,
+                        "start_from_step": start_from_step,
                     })
                     position = len(_pending_queue)
                 raise _QueuedNotification(position, queued_session_id)
 
-        session_id = session_id or _make_session_id(module)
-        audit_dir = AUTHORING_AUDIT_DIR / session_id
+        if not session_id:
+            with _queue_lock:
+                session_id = _unique_session_id(spec, payload)
+        audit_dir = spec.audit_dir / session_id
         audit_dir.mkdir(parents=True, exist_ok=True)
 
         env = os.environ.copy()
-        env["MODULE"] = module
-        env["AUTO_PUSH"] = "true" if auto_push else "false"
+        env.update(agent_env)
         env["SESSION_ID"] = session_id
         env["AUDIT_DIR"] = str(audit_dir)
-        if start_from_step > 1:
-            env["START_FROM_STEP"] = str(start_from_step)
 
         # Captured BEFORE Popen() (not after) — _audit_watcher uses this as the
         # cutoff for "did THIS run's own subprocess actually write this file,
@@ -279,7 +508,7 @@ def start_run(module: Optional[str], auto_push: bool, session_id: Optional[str] 
         started_at = time.time()
         try:
             proc = subprocess.Popen(
-                ["bash", str(AUTHORING_RUN_SH)],
+                ["bash", str(spec.run_sh)],
                 cwd=str(REPO_ROOT),
                 env=env,
                 stdout=subprocess.PIPE,
@@ -293,8 +522,10 @@ def start_run(module: Optional[str], auto_push: bool, session_id: Optional[str] 
 
         run = RunState(
             session_id=session_id,
-            module=module,
-            auto_push=auto_push,
+            module=label,
+            auto_push=bool(payload.get("auto_push")),
+            agent=spec.name,
+            payload=payload,
             audit_dir=audit_dir,
             started_at=started_at,
             proc=proc,
@@ -307,8 +538,9 @@ def start_run(module: Optional[str], auto_push: bool, session_id: Optional[str] 
     # Emit initial status event
     _append_event(run, "status", {
         "session_id": session_id,
-        "module": module,
-        "auto_push": auto_push,
+        "agent": run.agent,
+        "module": run.module,
+        "auto_push": run.auto_push,
         "status": "running",
         "started_at": run.started_at,
         "start_from_step": start_from_step,
@@ -401,12 +633,6 @@ def subscribe_stream(session_id: str, offset: int) -> Generator[Event, None, Non
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
-def _make_session_id(module: str) -> str:
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe = re.sub(r"[^A-Za-z0-9_-]", "-", module)
-    return f"{ts}-create-{safe}"
-
-
 def _append_event(run: RunState, kind: str, data: dict) -> Event:
     with run.cond:
         run.seq_counter += 1
@@ -434,7 +660,7 @@ def _stdout_reader(run: RunState) -> None:
 
 def _step_file_is_fresh(run: RunState, idx: int, file_path: Path) -> bool:
     """True if file_path is safe to treat as this run's own output for the
-    step at STEPS[idx].
+    step at the agent's steps[idx].
 
     For a resumed/retried run (start_from_step > 1), steps BEFORE
     start_from_step are deliberately reused as-is — their existing file, of
@@ -476,9 +702,10 @@ def _audit_watcher(run: RunState) -> None:
     # that's NOT "parse": steps before start_from_step are reused as-is,
     # not re-executed, so marking "parse" here was actively wrong (a
     # spurious "running" flicker on a step that isn't running at all).
-    if STEPS:
-        bootstrap_idx = min(max(run.start_from_step - 1, 0), len(STEPS) - 1)
-        first_key, _, first_display = STEPS[bootstrap_idx]
+    steps = get_agent(run.agent).steps
+    if steps:
+        bootstrap_idx = min(max(run.start_from_step - 1, 0), len(steps) - 1)
+        first_key, _, first_display = steps[bootstrap_idx]
         if run.step_progress.get(first_key) is None:
             run.step_progress[first_key] = "running"
             _append_event(run, "step", {
@@ -489,7 +716,7 @@ def _audit_watcher(run: RunState) -> None:
         if run.proc is None:
             return
         # Scan for new step files
-        for idx, (key, fname, display) in enumerate(STEPS):
+        for idx, (key, fname, display) in enumerate(steps):
             if run.step_progress.get(key) in ("done", "failed"):
                 continue
             file_path = run.audit_dir / fname
@@ -509,8 +736,8 @@ def _audit_watcher(run: RunState) -> None:
                 # whether THIS step failed — the pipeline still runs the next
                 # step either way), but only if nobody (including
                 # _wait_and_reap's sweep) has touched it yet.
-                if idx + 1 < len(STEPS):
-                    next_key, _, next_display = STEPS[idx + 1]
+                if idx + 1 < len(steps):
+                    next_key, _, next_display = steps[idx + 1]
                     if run.step_progress.get(next_key) is None:
                         run.step_progress[next_key] = "running"
                         _append_event(run, "step", {
@@ -535,11 +762,12 @@ def _wait_and_reap(run: RunState) -> None:
         return
 
     try:
-        exit_code = proc.wait(timeout=DEFAULT_RUN_TIMEOUT)
+        timeout_s = run_timeout()
+        exit_code = proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         _append_event(run, "error", {
             "source": "timeout",
-            "message": f"run exceeded {DEFAULT_RUN_TIMEOUT}s — killing",
+            "message": f"run exceeded {timeout_s}s — killing",
         })
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -587,7 +815,7 @@ def _wait_and_reap(run: RunState) -> None:
     # file is definitely this run's own final output, not the stale-leftover
     # race _step_file_is_fresh guards against in _audit_watcher — but this
     # calls it too anyway for defense-in-depth/consistency between the two.
-    for _idx, (_key, _fname, _display) in enumerate(STEPS):
+    for _idx, (_key, _fname, _display) in enumerate(get_agent(run.agent).steps):
         if run.step_progress.get(_key) in ("done", "failed"):
             continue
         _file_path = run.audit_dir / _fname

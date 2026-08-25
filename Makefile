@@ -4,6 +4,7 @@
 #   make run AGENT=test-triaging-agent BUILD_TAG=ProdSanity-541    # direct mode
 #   make run AGENT=test-healing-agent                                  # fix queue mode
 #   make run AGENT=test-healing-agent BUILD_TAG=ProdSanity-541        # fix direct mode
+#   make run AGENT=test-healing-agent TEST=LoginTest#testLogin        # standalone: run + fix one test
 #   make audit AGENT=test-triaging-agent                            # list recent sessions
 #   make audit AGENT=test-triaging-agent SESSION=20260328-...       # view specific session
 #   make setup                                                   # install deps
@@ -20,7 +21,7 @@ AGENTS_DIR = agents
 run:
 	@if [ -z "$(AGENT)" ]; then echo "Usage: make run AGENT=test-triaging-agent  OR  make run AGENT=test-healing-agent"; exit 1; fi
 	@if [ ! -f "$(AGENTS_DIR)/$(AGENT)/run.sh" ]; then echo "Agent not found: $(AGENTS_DIR)/$(AGENT)/run.sh"; exit 1; fi
-	@BUILD_TAG="$(BUILD_TAG)" MODULE="$(MODULE)" bash "$(AGENTS_DIR)/$(AGENT)/run.sh" "$(BUILD_TAG)"
+	@BUILD_TAG="$(BUILD_TAG)" MODULE="$(MODULE)" TEST="$(TEST)" bash "$(AGENTS_DIR)/$(AGENT)/run.sh" "$(BUILD_TAG)"
 
 # ── Audit ──────────────────────────────────────────────────────────────────────
 .PHONY: audit
@@ -115,6 +116,11 @@ help:
 	@echo "  make run AGENT=test-healing-agent                         Fix queue mode (picks oldest)"
 	@echo "  make run AGENT=test-healing-agent BUILD_TAG=tag           Fix direct mode (specific build)"
 	@echo "  AUTO_PUSH=false make run AGENT=test-healing-agent         Dry-run (no PR)"
+	@echo ""
+	@echo "  make run AGENT=test-healing-agent TEST=Class#method        Standalone: run one test locally and fix it"
+	@echo "  make run AGENT=test-healing-agent TEST=Class               Standalone: whole class"
+	@echo "  REPAIR=true  make run AGENT=test-healing-agent TEST=...    Park the browser for live inspection"
+	@echo "  FORCE=true   make run AGENT=test-healing-agent TEST=...    Fix even if it is not a locator failure"
 	@echo ""
 	@echo "  make audit AGENT=test-triaging-agent                   List recent sessions"
 	@echo "  make audit AGENT=test-triaging-agent SESSION=...       View specific session"

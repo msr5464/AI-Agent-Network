@@ -157,12 +157,17 @@ def _get_healing_session(sd):
     fix_passed = load_text(sd / ".fix-passed").strip()
 
     build_tag = fix.get("build_tag", "") or sd.name.split("-", 2)[-1] if sd.name.count("-") >= 2 else sd.name
-    fixed = fix.get("fixed_count", 0)
-    failed = fix.get("failed_count", 0)
+    # 01-fix.json writes succeeded/unverified/failed; the older *_count names it
+    # is read under here never existed, so this panel always showed "0 fixed".
+    fixed = fix.get("succeeded", fix.get("fixed_count", 0))
+    failed = fix.get("failed", fix.get("failed_count", 0))
+    unverified = fix.get("unverified", 0)
     pr_url = ship.get("pr_url", "")
 
     if pr_url:
         status, status_cls = "PR Created", "shipped"
+    elif fix_passed == "true" and unverified and not fixed:
+        status, status_cls = "Applied (unverified)", "escalated"
     elif fix_passed == "true":
         status, status_cls = "Fixed", "shipped"
     elif fix_passed == "false":
@@ -178,8 +183,12 @@ def _get_healing_session(sd):
     dur = fmt_duration(min(all_ts), max(all_ts)) if len(all_ts) >= 2 else ""
 
     subtitle = ""
-    if fixed or failed:
-        subtitle = f"{fixed} fixed · {failed} failed"
+    if fixed or failed or unverified:
+        parts = [f"{fixed} fixed"]
+        if unverified:
+            parts.append(f"{unverified} unverified")
+        parts.append(f"{failed} failed")
+        subtitle = " · ".join(parts)
     if pr_url:
         subtitle += f" · PR created" if subtitle else "PR created"
 

@@ -3,25 +3,27 @@
 Step 01 — Fix
 For each AUTOMATION_ISSUE (HIGH confidence, ELEMENT_NOT_FOUND) in the handoff file:
   1. Build rich context  — extract method, element names, page object files, likely location
-  2. Generate fix prompt — targeted context: method + page objects + element names + conventions
-  3. Call Claude CLI     — get corrected file content
-  4. Apply + verify      — write file, run test, restore on failure
-  5. Commit all successes to a branch
+  2. Inspect the live page (optional) — drive a real browser via Playwright MCP to
+     read the element's ACTUAL selector instead of guessing from stale source
+  3. Generate fix prompt — targeted context: method + page objects + element names + conventions
+  4. Call Claude CLI     — get a minimal set of search/replace edits
+  5. Apply + verify      — edit file, run test, restore on failure
+  6. Commit all successes to a branch
 
 Reads: agents/test-healing-agent/queue/<build_tag>.json  (written by test-triaging-agent/05_ship.py)
 Outputs: audit/<session>/01-fix.json + 01-fix.md + .fix-passed
 
 Gate file: .fix-passed
-  - "true"    — all targeted fixes applied and tests pass
+  - "true"    — every attempted fix was applied (and passed, where a runner exists)
   - "false"   — one or more fixes failed tests (triggers retry loop in run.sh)
   - "skipped" — no eligible candidates or infrastructure not configured
 """
 
-import os, sys, json, subprocess, re, difflib
+import os, sys, json, subprocess, re, difflib, signal
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → shared.*
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → lib.*
 
 from shared.log import log as _log
@@ -29,10 +31,18 @@ def log(msg): _log("fix", msg)
 
 # CodeAnalyzer import — graceful fallback if not available
 try:
-    from lib.code_analyzer import CodeAnalyzer as _CodeAnalyzer
+    from lib.code_analyzer import (CodeAnalyzer as _CodeAnalyzer, split_class_members,
+                                   invalidate_file, reset_caches)
+    from lib.failure_clusters import build_clusters
+    from lib.test_runner import run_test
     _HAS_CODE_ANALYZER = True
 except ImportError:
     _HAS_CODE_ANALYZER = False
+    split_class_members = None
+    build_clusters = None
+    def invalidate_file(_path): pass
+    def reset_caches(): pass
+    from lib.test_runner import run_test  # required: verification cannot be skipped
     log("Warning: CodeAnalyzer not available — falling back to glob-only file search")
 
 import warnings, urllib3
@@ -51,8 +61,7 @@ FIX_ATTEMPT = int(os.environ.get("FIX_ATTEMPT", "1"))
 # Handoff file written by test-triaging-agent/05_ship.py
 HANDOFF_FILE = Path(os.environ["HANDOFF_FILE"])
 
-AUTOFIX_MODEL = os.environ.get("AUTOFIX_MODEL",
-                    os.environ.get("CLASSIFIER_MODEL", "claude-opus-4-6"))
+AUTOFIX_MODEL = os.environ.get("AUTOFIX_MODEL", "claude-opus-5")
 
 GITHUB_TOKEN           = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_ORG             = os.environ.get("GITHUB_ORG", "")
@@ -65,8 +74,32 @@ REPO_CONTEXT_FILE = os.environ.get("REPO_CONTEXT_FILE", "")
 MAX_FIXES         = int(os.environ.get("AUTO_FIX_MAX_FIXES_PER_RUN", "5"))
 MAX_LOG_CHARS     = 3000
 MAX_METHOD_CHARS  = 4000
-MAX_PAGE_OBJ_CHARS   = 2000
+# Page objects hold the locators being fixed — give them room. The extractor
+# keeps every field/constructor regardless and only drops methods to fit.
+MAX_PAGE_OBJ_CHARS   = int(os.environ.get("AUTOFIX_PAGE_OBJECT_CHARS", "8000"))
 MAX_BASE_CLASS_CHARS = 3000
+
+# Persistent domain context for the model, passed as --system-prompt-file.
+SYSTEM_PROMPT_FILE  = REPO_ROOT / "config" / "skills" / "automation-repo.md"
+# Static half of the fix prompt (instructions, output contract, checklist).
+FIX_RULES_FILE      = REPO_ROOT / "config" / "prompts" / "fix.md"
+
+# ── Live DOM inspection ───────────────────────────────────────────────────────
+# A locator breaks because the DOM changed, which means the correct new value is
+# not present anywhere in the source. Reading the real page is the only way to
+# find it rather than guess it.
+INSPECT_DOM        = os.environ.get("AUTOFIX_INSPECT_DOM", "true").lower() == "true"
+AUTOFIX_BASE_URL   = os.environ.get("AUTOFIX_BASE_URL", "")
+DOM_TIMEOUT_S      = int(os.environ.get("AUTOFIX_DOM_TIMEOUT_S", "600"))
+PW_HEADLESS        = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
+REPAIR_SESSION_FILE = os.environ.get("AUTOFIX_REPAIR_SESSION", "")
+LOGIN_USERNAME     = os.environ.get("AUTOFIX_LOGIN_USERNAME", "")
+LOGIN_PASSWORD     = os.environ.get("AUTOFIX_LOGIN_PASSWORD", "")
+
+# Reject a "fix" that rewrites far more than a locator.
+MAX_FIX_DIFF_LINES = int(os.environ.get("AUTOFIX_MAX_DIFF_LINES", "40"))
+
+TEST_TIMEOUT_S     = int(os.environ.get("AUTOFIX_TEST_TIMEOUT_S", "300"))
 
 # ── I/O helpers ───────────────────────────────────────────────────────────────
 
@@ -94,11 +127,46 @@ def is_known_issue(test_name: str, known_issues: list) -> bool:
 from shared.claude import call_claude as _call_claude
 from shared.git import run_git
 
-def call_claude(prompt: str, cwd: Path) -> str:
-    output = _call_claude(prompt, AUTOFIX_MODEL, str(cwd))
+try:
+    from shared.mcp_config import write_playwright_mcp_config
+    _HAS_MCP_CONFIG = True
+except ImportError:
+    _HAS_MCP_CONFIG = False
+
+from shared.dom_snapshot import distill as distill_dom, format_for_prompt as format_dom
+from shared.playwright_trace import read_actions, format_for_prompt as format_trace
+
+
+def call_claude(prompt: str, cwd: Path, use_system_prompt: bool = True, **kwargs) -> str:
+    """Call the Claude CLI for this agent.
+
+    use_system_prompt=False for the browser-inspection call: that task is about
+    reading a live DOM, and the Java framework context would only be noise.
+    """
+    system_prompt = (SYSTEM_PROMPT_FILE
+                     if use_system_prompt and SYSTEM_PROMPT_FILE.exists() else None)
+    output = _call_claude(prompt, AUTOFIX_MODEL, str(cwd),
+                          system_prompt_file=system_prompt,
+                          log_dir=str(AUDIT_DIR),
+                          **kwargs)
     if not output:
         log("Claude CLI returned empty response")
     return output
+
+
+def _repo_https_url() -> str:
+    return f"https://github.com/{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}.git"
+
+
+def _authenticated_url() -> str:
+    """Token-bearing remote URL, for one command only — never written to disk.
+
+    The username is a fixed non-secret placeholder; git needs both halves present
+    or it tries to negotiate credentials interactively and fails in a headless
+    subprocess. See shared/git.py for the full rationale.
+    """
+    return (f"https://x-access-token:{GITHUB_TOKEN}@github.com/"
+            f"{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}.git")
 
 
 def clone_automation_repo(workspace: Path) -> Path | None:
@@ -111,19 +179,26 @@ def clone_automation_repo(workspace: Path) -> Path | None:
         return None
 
     dest = workspace / GITHUB_REPO_AUTOMATION
-    clone_url = f"https://{GITHUB_TOKEN}@github.com/{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}.git"
     log(f"Cloning {GITHUB_ORG}/{GITHUB_REPO_AUTOMATION} into {workspace}...")
     workspace.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
-        ["git", "clone", "--depth", "1", "--branch", GITHUB_DEFAULT_BRANCH, clone_url, str(dest)],
+        ["git", "clone", "--depth", "1", "--branch", GITHUB_DEFAULT_BRANCH,
+         _authenticated_url(), str(dest)],
         capture_output=True, text=True, timeout=300,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
     )
     if result.returncode != 0:
         # Redact token from error output before logging
         err = result.stderr.replace(GITHUB_TOKEN, "***")
         log(f"Clone failed: {err[:400]}")
         return None
-    log(f"Cloned successfully → {dest}")
+
+    # git clone persists the URL it was given into .git/config. Strip the token
+    # back out so it does not sit in plaintext on disk for the life of the
+    # checkout; every later push supplies it per-invocation instead.
+    subprocess.run(["git", "remote", "set-url", "origin", _repo_https_url()],
+                   cwd=str(dest), capture_output=True, text=True, timeout=30)
+    log(f"Cloned successfully → {dest} (token not persisted in .git/config)")
     return dest
 
 
@@ -166,6 +241,37 @@ def extract_likely_location(stack_trace: str, execution_log: str) -> str:
     fq_match = re.search(r'at\s+([\w.]+)\((\w+\.java):(\d+)\)', combined)
     if fq_match:
         return f"{fq_match.group(2)}:{fq_match.group(3)}"
+    return ""
+
+
+def extract_page_url(issue: dict) -> str:
+    """Best-effort recovery of the URL the failing step was on.
+
+    Checked in order: an explicit AUTOFIX_BASE_URL override, a `url=` marker
+    (the shape test-authoring-agent's STEP_FAILED protocol emits), then any
+    http(s) URL in the log or error text.
+    """
+    # The URL the framework recorded at the moment of failure is exact; prefer it
+    # over an operator-supplied base URL or anything scraped out of the log.
+    if issue.get("failure_url"):
+        return issue["failure_url"]
+    if AUTOFIX_BASE_URL:
+        return AUTOFIX_BASE_URL
+
+    combined = "\n".join(str(issue.get(k) or "") for k in
+                         ("execution_log", "error_message", "stack_trace", "root_cause"))
+
+    marker = re.search(r'\burl\s*=\s*["\']?(https?://[^\s"\'\],)]+)', combined, re.IGNORECASE)
+    if marker:
+        return marker.group(1)
+
+    urls = re.findall(r'https?://[^\s"\'\],)]+', combined)
+    for url in urls:
+        # Skip infrastructure URLs that are never the page under test.
+        if any(skip in url for skip in ("selenium", "grid", "hub:", "localhost:4444",
+                                        "maven", "gradle", "schemas.")):
+            continue
+        return url.rstrip('.,;')
     return ""
 
 # ── Base class extractor ──────────────────────────────────────────────────────
@@ -230,6 +336,7 @@ def load_repo_conventions(workspace: Path) -> str:
         candidates.append(p)
     candidates += [
         workspace / "CONVENTIONS.md",          # conventions in the automation repo itself
+        workspace / "CLAUDE.md",               # framework rules, if the repo keeps them there
         workspace / "docs" / "TESTING.md",
         workspace / "TESTING.md",
         workspace / "CONTRIBUTING.md",
@@ -245,6 +352,495 @@ def load_repo_conventions(workspace: Path) -> str:
                 continue
     log("Warning: no conventions file found — fixes will use Claude's defaults")
     return ""
+
+# ── Live DOM inspection ───────────────────────────────────────────────────────
+
+def repair_possible(workspace: Path) -> tuple:
+    """Whether parking a browser is viable here. Returns (ok, why_not)."""
+    if os.environ.get("REPAIR", "").lower() == "false":
+        return False, "REPAIR=false"
+    if not os.environ.get("TEST_NAME"):
+        # A pipeline handoff was produced on another machine hours ago; there is
+        # no test run of ours to park.
+        return False, "not a standalone run"
+    if os.environ.get("CI"):
+        return False, "running under CI (no display, and the browser would strand)"
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        return False, "no DISPLAY"
+    port = os.environ.get("AUTOFIX_REPAIR_PORT", "9222")
+    if _cdp_alive(f"http://localhost:{port}"):
+        return False, f"port {port} already has a browser on it"
+    return True, ""
+
+
+def park_browser_for_repair(workspace: Path, test_name: str) -> dict:
+    """Re-run the failing test with the browser parked, then attach to it.
+
+    Only worth the extra test run once the cheap path has already failed: the
+    first attempt works from the failure-time DOM snapshot, which is enough for
+    most broken locators. When that attempt produced no working fix, a live
+    browser is the one thing that adds something the snapshot cannot — the fixer
+    can count how many elements a candidate selector matches, and try the
+    corrected locator for real before any code is edited.
+    """
+    ok, why_not = repair_possible(workspace)
+    if not ok:
+        log(f"  Repair mode not used: {why_not}")
+        return {}
+
+    log("  Re-running the test with the browser parked, for a live inspection...")
+    status, _ = run_test(
+        test_name, workspace,
+        extra_properties={"repairMode": "true", "traceMode": "on"},
+        timeout_s=int(os.environ.get("AUTOFIX_REPRODUCE_TIMEOUT_S", "900")),
+        log=log,
+    )
+    if status == "passed":
+        # It passed this time — flaky, not a broken locator.
+        log("  The test passed on the re-run; nothing to inspect")
+        return {}
+    return find_repair_session(workspace, test_name)
+
+
+def find_repair_session(workspace: Path, test_name: str) -> dict:
+    """A browser parked on this test's failing page, if one is live right now.
+
+    `repairMode` in the automation framework leaves the browser open at the point
+    of failure and publishes a CDP endpoint. Attaching to it is the strongest
+    evidence available: the page is genuinely in the failed state, so a candidate
+    selector can be counted for uniqueness and the corrected locator tried for
+    real before any Java is edited.
+
+    Only applies when the test run and this run share a machine — normally a
+    developer reproducing locally, not the CI pipeline.
+    """
+    candidates = []
+    if REPAIR_SESSION_FILE:
+        candidates.append(Path(REPAIR_SESSION_FILE))
+    candidates += [
+        workspace / "test-output" / ".repair-session.json",
+        workspace / os.environ.get("TEST_RESULTS_DIR_NAME", "test-output") / ".repair-session.json",
+    ]
+    seen = set()
+    for path in candidates:
+        # TEST_RESULTS_DIR_NAME often IS "test-output", so the candidates overlap.
+        resolved = str(path.resolve())
+        if resolved in seen or not path.exists():
+            continue
+        seen.add(resolved)
+        try:
+            session = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        # A stale file from an earlier run is worse than none: it would point the
+        # fixer at a different test's page, or at nothing.
+        if session.get("test") and session["test"].split(".")[-1] != test_name.split(".")[-1]:
+            log(f"  Repair session is for {session['test']} — not this test, ignoring")
+            continue
+        endpoint = session.get("cdpEndpoint", "")
+        if not endpoint or not _cdp_alive(endpoint):
+            log(f"  Repair session found but its browser is gone ({endpoint}) — ignoring")
+            try:
+                path.unlink()   # stale: would otherwise mislead every later run
+            except OSError:
+                pass
+            continue
+        log(f"  Live repair session: {endpoint} parked on {session.get('url', 'unknown URL')}")
+        session["_path"] = str(path)
+        return session
+    return {}
+
+
+def _cdp_alive(endpoint: str, timeout: float = 2.0) -> bool:
+    """True when a browser is actually listening on this CDP endpoint."""
+    import urllib.request, urllib.error
+    try:
+        with urllib.request.urlopen(f"{endpoint.rstrip('/')}/json/version", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def load_framework_properties(workspace: Path) -> dict:
+    """Read the automation framework's own properties files.
+
+    The tests get their URLs and logins from
+    `parameters/{environment}-{country}.properties` via
+    `config.getRunTimeProperty(...)`, so that file — already present in the
+    workspace — is the correct source for both. Asking an operator to re-enter
+    the same secrets as env vars would just be a second place to keep in sync.
+    """
+    environment = os.environ.get("AUTOFIX_ENVIRONMENT",
+                                 os.environ.get("AUTOCREATE_ENVIRONMENT", "staging")).lower()
+    country = os.environ.get("AUTOFIX_COUNTRY",
+                             os.environ.get("AUTOCREATE_COUNTRY", "SG")).lower()
+
+    props: dict = {}
+    for name in ("config.properties", f"{environment}-{country}.properties"):
+        path = workspace / "parameters" / name
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                props[key.strip()] = value.strip()
+        except Exception as e:
+            log(f"  Could not read {path.name}: {e}")
+    if props:
+        log(f"  Framework properties loaded: {len(props)} keys from parameters/")
+    return props
+
+
+def guess_module(ctx: dict) -> str:
+    """Best guess at the framework module a test belongs to.
+
+    Used to look up `{module}.username` / `{module}.url` and the module's saved
+    session. Derived from the page object's path first (most reliable), then the
+    test's own package.
+    """
+    for po in ctx.get("page_objects", []):
+        parts = Path(po["path"]).parts
+        if "modules" in parts:
+            idx = parts.index("modules")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    parts = ctx.get("test_name", "").split(".")
+    if len(parts) >= 3:
+        return parts[-3]
+    return ""
+
+
+def resolve_credentials(props: dict, module: str) -> dict:
+    """Credentials for the failing page: explicit env vars win, else properties."""
+    if LOGIN_USERNAME and LOGIN_PASSWORD:
+        return {"username": LOGIN_USERNAME, "password": LOGIN_PASSWORD,
+                "source": "AUTOFIX_LOGIN_* env vars"}
+    for key in ([f"{module}.username"] if module else []):
+        if props.get(key) and props.get(key.replace(".username", ".password")):
+            return {"username": props[key],
+                    "password": props[key.replace(".username", ".password")],
+                    "source": f"parameters/*.properties ({key})"}
+    return {}
+
+
+def find_storage_state(workspace: Path, module: str) -> Path | None:
+    """A session the framework already saved for this module, if one exists.
+
+    BrowserHelper.storeSession() writes these; reusing one means the inspection
+    browser starts logged in and no credential ever reaches the prompt.
+    """
+    if not module:
+        return None
+    session_dir = workspace / "src" / "test" / "resources" / module.lower() / "loginStorage"
+    if not session_dir.exists():
+        return None
+    sessions = sorted(session_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return sessions[0] if sessions else None
+
+
+_PARKED_PROMPT = """You are a QA automation agent. A test just failed because an element could not
+be found, and the browser has been LEFT OPEN on the exact page where it failed.
+
+Use the Playwright browser MCP tools to inspect the page that is already loaded.
+DO NOT navigate away, reload, or log in — you would destroy the state you are here
+to inspect. The current page IS the failure.
+
+ELEMENT(S) THE TEST COULD NOT FIND:
+{elements}
+
+FAILURE CONTEXT:
+{failure}
+{failed_selector}
+══════════════════════════════════════════════════════════════
+WHAT TO DO
+══════════════════════════════════════════════════════════════
+1. Snapshot the page as it currently stands.
+2. Find the element the test wanted, matching on visible text, role, placeholder
+   or nearby labels — NOT on the old selector, which no longer matches.
+3. Build a selector in this priority order:
+     a) [data-cy=...] / [data-testid=...] / [data-test=...]
+     b) [id=...]   c) [name=...]   d) [aria-label=...]   e) role   f) text
+4. UNIQUENESS CHECK — mandatory, and the reason a live browser is worth having:
+   count how many elements your candidate matches. Report it ONLY when the count
+   is exactly 1; otherwise narrow it and count again.
+5. If you can, confirm the element is actually usable (visible, enabled).
+
+══════════════════════════════════════════════════════════════
+OUTPUT — emit these markers on their own lines
+══════════════════════════════════════════════════════════════
+• SELECTOR_FOUND: <elementName>=<selector>
+• ELEMENT_ABSENT: <elementName>|<why it is genuinely not on this page>
+• PAGE_DUMP: <json array>
+  Up to 15 visible interactive elements, valid JSON on ONE line. Each object has
+  "tag" plus whichever of these it has: "data-testid", "id", "name",
+  "aria-label", "placeholder", "type", "text".
+
+Report only what you observed. Never invent a selector.
+"""
+
+
+def _reap_parked_browser(session: dict) -> None:
+    """Shut down the browser a repair session left running, and clear the file.
+
+    The framework launches it detached precisely so it outlives the test JVM, so
+    nothing else will ever close it — leaving it behind means a stray Chromium
+    (and a held CDP port) after every repair run.
+    """
+    pid = session.get("browserPid") or 0
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            log(f"  Parked browser closed (pid {pid})")
+        except ProcessLookupError:
+            pass  # already gone
+        except (OSError, ValueError) as e:
+            log(f"  Could not close the parked browser (pid {pid}): {e}")
+
+    path = session.get("_path")
+    if path:
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
+
+
+def _inspect_parked_browser(ctx: dict, session: dict) -> dict:
+    """Inspect the live page a repair session parked for us.
+
+    The browser is reaped on the way out whatever happens — a failed inspection
+    must not strand it either.
+    """
+    result = {"status": "skipped", "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
+    endpoint = session.get("cdpEndpoint", "")
+
+    elements = "\n".join(f"  - {e}" for e in ctx["element_names"][:6]) or "  - (none extracted)"
+    failure = (f"{ctx['error_type']}: {ctx['error_message']}\n"
+               f"Root cause: {ctx['root_cause']}")[:800]
+    failed_selector = ""
+    if ctx.get("failed_selector"):
+        failed_selector = (f"\nThe selector that failed at runtime was: "
+                           f"{ctx['failed_selector']}\nIt no longer matches — find what replaced it.\n")
+
+    mcp_path = write_playwright_mcp_config(AUDIT_DIR, cdp_endpoint=endpoint)
+    prompt = _PARKED_PROMPT.format(elements=elements, failure=failure,
+                                   failed_selector=failed_selector)
+
+    log(f"  Attaching to the parked browser at {endpoint}...")
+    try:
+        raw = call_claude(
+            prompt, AUDIT_DIR,
+            use_system_prompt=False,
+            timeout=DOM_TIMEOUT_S,
+            allowed_tools=["mcp__playwright__*"],
+            mcp_config=str(mcp_path),
+            strict_mcp_config=True,
+            stream_json=True,
+            partial_on_timeout=True,
+        )
+        result["raw"] = raw[-4000:] if raw else ""
+        if not raw:
+            result["status"] = "attached to the parked browser but it produced no output"
+            return result
+
+        _parse_browser_markers(raw, result)
+        if result["selectors"]:
+            result["status"] = "ok (live, parked on the failing page)"
+            log(f"  Live selectors confirmed against the failing page: {result['selectors']}")
+        elif result["status"] == "skipped":
+            result["status"] = "inspected the parked page but confirmed no selector"
+        return result
+    finally:
+        _reap_parked_browser(session)
+
+
+def _parse_browser_markers(raw: str, result: dict) -> None:
+    """Read the SELECTOR_FOUND / PAGE_DUMP protocol out of a browser run."""
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("SELECTOR_FOUND:"):
+            payload = line.split(":", 1)[1].strip()
+            if "=" in payload:
+                name, selector = payload.split("=", 1)
+                result["selectors"][name.strip()] = selector.strip()
+        elif line.startswith("ELEMENT_ABSENT:"):
+            result["absent"].append(line.split(":", 1)[1].strip())
+        elif line.startswith("PAGE_DUMP:"):
+            result["page_dump"] = line.split(":", 1)[1].strip()[:2000]
+        elif line.startswith("NAVIGATION_FAILED:"):
+            result["status"] = f"navigation failed: {line.split(':', 1)[1].strip()[:200]}"
+        elif line.startswith("UNREACHABLE_STATE:"):
+            result["status"] = ("page reached but the failing step's state could not be "
+                                f"reproduced from a cold start: {line.split(':', 1)[1].strip()[:200]}")
+
+
+_DOM_PROMPT = """You are a QA automation agent. A test failed because an element could not be found.
+Use the Playwright browser MCP tools to open the page and find what that element ACTUALLY looks like now.
+
+TARGET URL: {url}
+ELEMENT(S) THE TEST COULD NOT FIND:
+{elements}
+
+FAILURE CONTEXT:
+{failure}
+{credentials}
+══════════════════════════════════════════════════════════════
+WHAT TO DO
+══════════════════════════════════════════════════════════════
+1. Navigate to the target URL. If a login form appears and credentials are given
+   above, log in first. Dismiss any cookie banner or modal covering the page.
+2. Take a snapshot of the page and look for the element(s) listed above — match on
+   visible text, role, placeholder or nearby labels, not on the old selector.
+3. For each element you find, work out a selector using this priority order:
+     a) [data-cy=...] / [data-testid=...] / [data-test=...]
+     b) [id=...]      c) [name=...]      d) [aria-label=...]
+     e) role-based    f) text-based
+4. UNIQUENESS CHECK — mandatory. Before reporting a selector, use the browser
+   tools to count how many elements it matches. Only report it when the count is
+   exactly 1; otherwise narrow it (add a parent scope, combine attributes) and
+   count again.
+
+══════════════════════════════════════════════════════════════
+OUTPUT — emit these markers on their own lines, as you find them
+══════════════════════════════════════════════════════════════
+• SELECTOR_FOUND: <elementName>=<selector>
+• ELEMENT_ABSENT: <elementName>|<why it is genuinely not on the page>
+• PAGE_DUMP: <json array>
+  Up to 15 visible interactive elements, valid JSON on ONE line. Each object has
+  "tag" plus whichever of these it actually has (omit keys it lacks):
+  "data-testid", "id", "name", "aria-label", "placeholder", "type", "text".
+
+Report only what you actually observed in the browser. Never invent a selector.
+If you cannot reach the page at all, emit: NAVIGATION_FAILED: <reason>
+
+IMPORTANT — this failure may have happened partway through a longer journey. If
+the target URL loads but the element's surrounding state does not exist (the
+modal was never opened, the record was never created, the wizard step is not
+reachable from a cold start), do NOT guess at a selector from a similar-looking
+element. Emit:
+    UNREACHABLE_STATE: <what you could reach>|<what was missing>
+so the fix is made from source with that limitation known, rather than from a
+confident-looking but wrong observation.
+"""
+
+
+def inspect_live_dom(ctx: dict, url: str, workspace: Path, props: dict,
+                     repair_session: dict | None = None) -> dict:
+    """Open the real page and report what the missing element looks like now.
+
+    This is the fallback for when the framework captured no DOM on failure. It
+    can only reach pages addressable by URL — a locator that breaks midway
+    through a journey (after creating a record, opening a modal, paging through
+    a wizard) is not reachable this way, and the run will honestly report the
+    element as absent rather than invent a selector.
+
+    Returns {"status", "selectors", "page_dump", "absent", "raw"}. Any failure is
+    non-fatal — the fix step continues with static context only, and the audit
+    trail records that the DOM was never read.
+    """
+    result = {"status": "skipped", "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
+
+    if not _HAS_MCP_CONFIG:
+        result["status"] = "unavailable: shared.mcp_config not importable"
+        return result
+
+    repair_session = repair_session or {}
+    if repair_session:
+        return _inspect_parked_browser(ctx, repair_session)
+
+    module = guess_module(ctx)
+    if not url and module:
+        # The framework keeps each module's entry point in the same properties
+        # file the tests read it from.
+        url = props.get(f"{module}.url") or props.get(f"{module}Url") or ""
+    if not url:
+        result["status"] = "no page URL in the handoff, properties file, or AUTOFIX_BASE_URL"
+        return result
+
+    elements = "\n".join(f"  - {e}" for e in ctx["element_names"][:6]) or "  - (none extracted)"
+    failure = (f"{ctx['error_type']}: {ctx['error_message']}\n"
+               f"Root cause: {ctx['root_cause']}")[:800]
+
+    # A saved session beats handing the model a password: the browser simply
+    # starts logged in, and the credential never enters the prompt at all.
+    storage_state = find_storage_state(workspace, module)
+    credentials = ""
+    if storage_state:
+        log(f"  Reusing saved session: {storage_state.name} (no credentials needed)")
+        credentials = ("\nThe browser starts from a saved logged-in session, so skip any "
+                       "login step and navigate straight to the target URL.\n")
+    else:
+        creds = resolve_credentials(props, module)
+        if creds:
+            log(f"  Credentials from {creds['source']}")
+            credentials = (f"\nCREDENTIALS (use exactly these):\n"
+                           f"  username: {creds['username']}\n  password: {creds['password']}\n")
+
+    mcp_path = write_playwright_mcp_config(AUDIT_DIR, headless=PW_HEADLESS,
+                                           storage_state=storage_state)
+    prompt = _DOM_PROMPT.format(url=url, elements=elements, failure=failure,
+                                credentials=credentials)
+
+    log(f"  Inspecting live DOM at {url} ({'headless' if PW_HEADLESS else 'headed'})...")
+    raw = call_claude(
+        prompt, AUDIT_DIR,
+        use_system_prompt=False,
+        timeout=DOM_TIMEOUT_S,
+        allowed_tools=["mcp__playwright__*"],
+        mcp_config=str(mcp_path),
+        strict_mcp_config=True,
+        stream_json=True,
+        partial_on_timeout=True,
+    )
+    result["raw"] = raw[-4000:] if raw else ""
+
+    if not raw:
+        result["status"] = "browser run produced no output"
+        log("  DOM inspection returned nothing — continuing with static context only")
+        return result
+
+    _parse_browser_markers(raw, result)
+
+    if result["selectors"]:
+        result["status"] = "ok"
+        log(f"  Live selectors found: {result['selectors']}")
+    elif result["status"] == "skipped":
+        result["status"] = "page reached but no selector confirmed"
+        log("  DOM inspected but no selector confirmed")
+    return result
+
+def load_dom_snapshot(issue: dict, element_names: list) -> dict:
+    """Distil the DOM the framework captured when the test failed.
+
+    This is strictly better than re-opening the page: it is the real state at the
+    point of failure — correct session, correct test data, correct step of the
+    flow — so it works for locators that break deep inside a journey no direct
+    URL can reach. Returns {} when no snapshot was shipped in the handoff.
+    """
+    path = issue.get("dom_snapshot", "")
+    if not path:
+        return {}
+    snapshot = Path(path)
+    if not snapshot.exists():
+        log(f"  DOM snapshot referenced but missing on disk: {path}")
+        return {}
+    try:
+        text = snapshot.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        log(f"  Could not read DOM snapshot: {e}")
+        return {}
+
+    distilled = distill_dom(text, element_names)
+    if distilled.get("error"):
+        log(f"  DOM snapshot unusable: {distilled['error']}")
+        return {}
+    log(f"  DOM snapshot loaded: {distilled['total_elements']} interactive elements, "
+        f"{len(distilled['likely_matches'])} likely match(es) at {distilled.get('url') or 'unknown URL'}")
+    return distilled
+
 
 # ── Context builder ───────────────────────────────────────────────────────────
 
@@ -350,12 +946,19 @@ def build_candidate_context(issue: dict, workspace: Path, prev_test_output: str,
         "root_cause_category": issue.get("root_cause_category", ""),
         "root_cause":    issue.get("root_cause", ""),
         "failure_signature": issue.get("failure_signature", ""),
+        "cause_group_key": issue.get("cause_group_key", ""),
         "recommended_action": issue.get("recommended_action", ""),
         "error_type":    error_type,
         "error_message": error_message[:500],
         "stack_trace":   stack_trace[:800],
         "execution_log": execution_log[:MAX_LOG_CHARS],
         "likely_location": likely_location,
+        "page_url":      extract_page_url(issue),
+        "dom_snapshot_path": issue.get("dom_snapshot", ""),
+        "dom_snapshot":  {},
+        "trace_path":    issue.get("trace_path", ""),
+        "failed_selector": issue.get("failed_selector", ""),
+        "trace_timeline": "",
         "test_file":     test_file or "",
         "test_method_code": test_method_code,
         "element_names": element_names,
@@ -363,13 +966,78 @@ def build_candidate_context(issue: dict, workspace: Path, prev_test_output: str,
         "related_files": related_files,
         "base_class_info": base_class_info,
         "repo_conventions": repo_conventions,
+        "dom_findings":  {},
         "prev_test_output": prev_test_output[:1500] if prev_test_output else "",
         "fix_attempt":   FIX_ATTEMPT,
     }
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
 
-def build_fix_prompt(ctx: dict) -> str:
+_DEFAULT_FIX_RULES = """## Instructions
+1. Identify the EXACT broken locator (CSS selector, XPath, @FindBy, etc.)
+2. The broken element is most likely one of the extracted element names above
+3. Look in the page object files above for the declaration that needs updating —
+   an @FindBy annotation, a `By` constant, or a locator assigned in a constructor
+4. If the fix is in a page object file (not the test file), target the page object
+5. **IMPORTANT**: Use the wrapper methods from the base class — do NOT use raw Selenium/RestAssured
+6. **IMPORTANT**: Follow the project conventions shown above
+7. Do not refactor, rename, or change anything unrelated to the broken locator
+
+## Output Format (strict)
+Respond with a JSON object ONLY. No prose, no markdown fences around it.
+
+{
+  "fixable": true | false,
+  "unfixable_reason": "<reason if fixable=false, else null>",
+  "fix_description": "<1-2 sentences: what was broken and what you changed>",
+  "target_file": "<absolute path of the file to modify>",
+  "edits": [
+    {
+      "old_string": "<exact text to replace — must appear EXACTLY ONCE in the file>",
+      "new_string": "<replacement text>"
+    }
+  ]
+}
+
+Rules for `edits`:
+- Keep each edit as small as possible — ideally the single locator line.
+- `old_string` must match the file byte-for-byte, including indentation, and must
+  be unique in the file. Include a line of surrounding context if that is what it
+  takes to make it unique.
+- Do NOT return the whole file. Do NOT reformat untouched lines.
+
+## Self-Resolving Checklist (before declaring unfixable)
+Before setting `fixable: false`, you MUST exhaustively try:
+1. Re-read the full execution log and stack trace for the exact failing selector
+2. Check all page object files listed above for the declaration matching the element name
+3. Try alternative locator strategies in priority order: `id` > `name` > `css [data-cy]` > `css` > `xpath`
+4. Check related files for alternative element declarations (inner classes, static strings)
+5. Look for similar working locators in the same page object as a pattern reference
+
+Only declare `fixable: false` after all 5 checks are exhausted and you have a specific blocker.
+"""
+
+
+def load_fix_rules() -> str:
+    """Static half of the prompt — kept in config/prompts/fix.md so it can be
+    tuned without a code change. Falls back to the bundled default."""
+    if FIX_RULES_FILE.exists():
+        try:
+            text = FIX_RULES_FILE.read_text(encoding="utf-8")
+            # Drop the file's own documentation header (everything before the
+            # first "## Instructions" section) so only prompt content is sent.
+            # Anchored to line start so a mention of the heading inside the
+            # header prose does not match ahead of the real heading.
+            marker = re.search(r"^## Instructions\s*$", text, re.MULTILINE)
+            if marker:
+                return text[marker.start():]
+            return text
+        except Exception:
+            pass
+    return _DEFAULT_FIX_RULES
+
+
+def build_fix_prompt(ctx: dict, fix_rules: str) -> str:
     page_obj_text = ""
     for po in ctx["page_objects"]:
         page_obj_text += f"\n### Page Object: {po['path']}\n"
@@ -401,6 +1069,67 @@ These rules apply to every line you write or modify.
 
 {ctx['repo_conventions']}
 ---
+"""
+
+    # Observed DOM outranks everything else in this prompt: the source below is
+    # by definition the version that was already failing.
+    dom_text = ""
+    snapshot = ctx.get("dom_snapshot") or {}
+    dom = ctx.get("dom_findings") or {}
+
+    if snapshot:
+        dom_text = f"""
+## ✅ ACTUAL PAGE AT THE MOMENT OF FAILURE
+This is the real DOM, captured by the test framework the instant the test failed —
+same session, same test data, same step of the flow. It is the ground truth for
+what the element looks like now. **Base the fix on this, not on the source below.**
+
+```
+{format_dom(snapshot)}
+```
+
+If none of these elements is the one the test wanted, the element is genuinely
+gone rather than renamed — that is a product bug, so set `fixable: false` and say so.
+"""
+    elif dom.get("selectors"):
+        found = "\n".join(f"- `{name}` → `{sel}`" for name, sel in dom["selectors"].items())
+        dom_text = f"""
+## ✅ LIVE DOM — CONFIRMED SELECTORS (observed in a real browser just now)
+These were read from the actual page and each was verified to match exactly one
+element. **Prefer these over anything you infer from the source below.**
+
+{found}
+"""
+        if dom.get("page_dump"):
+            dom_text += f"\nVisible interactive elements on the page:\n```json\n{dom['page_dump']}\n```\n"
+    elif dom.get("absent"):
+        dom_text = f"""
+## ⚠️ LIVE DOM — ELEMENT GENUINELY ABSENT
+A real browser was opened on the failing page and these elements were not present:
+{chr(10).join('- ' + a for a in dom['absent'])}
+
+This may be a PRODUCT bug rather than a broken locator. If the element is simply
+gone rather than renamed, set `fixable: false` and say so.
+"""
+    elif dom.get("status") and dom["status"] != "skipped":
+        dom_text = f"""
+## ⚠️ LIVE DOM — NOT AVAILABLE
+The page could not be inspected ({dom['status']}). Everything below is static
+source that predates the failure — you are inferring the new selector, not
+observing it. Prefer a resilient strategy (id / data-* / name) over a brittle one
+(deep CSS path, positional XPath).
+"""
+
+    trace_text = ""
+    if ctx.get("trace_timeline"):
+        trace_text = f"""
+## 🔎 WHAT THE TEST ACTUALLY DID (Playwright trace)
+Recorded at runtime, so these are the selector strings the framework really used —
+not what the source appears to say.
+
+```
+{ctx['trace_timeline']}
+```
 """
 
     code_section = ""
@@ -445,7 +1174,7 @@ Work independently on this test case only.
 
 ## Extracted Element Names
 {chr(10).join(f"- {e}" for e in ctx['element_names']) if ctx['element_names'] else "- (none extracted)"}
-
+{dom_text}
 ## Execution Log (truncated)
 ```
 {ctx['execution_log']}
@@ -455,32 +1184,14 @@ Work independently on this test case only.
 ```
 {ctx['stack_trace']}
 ```
-{retry_text}
+{trace_text}{retry_text}
 ## Code to Fix
 
 {code_section}
 {page_obj_text}
 {related_text}
 
-## Instructions
-1. Identify the EXACT broken locator (CSS selector, XPath, @FindBy, etc.)
-2. The broken element is most likely one of the extracted element names above
-3. Look in the page object files above for the @FindBy annotation that needs updating
-4. If the fix is in a page object file (not the test file), target the page object
-5. **IMPORTANT**: Use the wrapper methods from the base class — do NOT use raw Selenium/RestAssured
-6. **IMPORTANT**: Follow the project conventions shown above
-7. Do not refactor, rename, or change anything unrelated to the broken locator
-
-## Output Format (strict)
-Respond with a JSON object ONLY. No prose, no markdown fences around it.
-
-{{
-  "fixable": true | false,
-  "unfixable_reason": "<reason if fixable=false, else null>",
-  "fix_description": "<1-2 sentences: what was broken and what you changed>",
-  "target_file": "<absolute path of the file to modify>",
-  "fixed_content": "<complete corrected file content, or null if fixable=false>"
-}}
+{fix_rules}
 """
 
 
@@ -503,43 +1214,82 @@ def extract_fix_json(response: str) -> dict | None:
             pass
     return None
 
+# ── Fix application + safety guard ────────────────────────────────────────────
+
+def apply_edits(original: str, edits: list) -> tuple:
+    """Apply search/replace edits. Returns (updated_text, error).
+
+    Every old_string must appear exactly once — an ambiguous match means the
+    model did not give enough context, and guessing which occurrence it meant is
+    how an autofix corrupts a file.
+    """
+    if not edits:
+        return None, "no edits supplied"
+
+    updated = original
+    for i, edit in enumerate(edits, 1):
+        if not isinstance(edit, dict):
+            return None, f"edit {i} is not an object"
+        old = edit.get("old_string")
+        new = edit.get("new_string")
+        if old is None or new is None:
+            return None, f"edit {i} missing old_string/new_string"
+        if old == new:
+            return None, f"edit {i} is a no-op"
+        count = updated.count(old)
+        if count == 0:
+            return None, f"edit {i}: old_string not found in file"
+        if count > 1:
+            return None, f"edit {i}: old_string matches {count} times — not unique"
+        updated = updated.replace(old, new, 1)
+
+    return updated, ""
+
+
+def validate_fix(original: str, updated: str, filename: str) -> tuple:
+    """Reject a 'locator fix' that is actually a rewrite. Returns (ok, reason).
+
+    The model only ever sees part of a large file, so a change far bigger than a
+    locator is the signature of it regenerating content it never read.
+    """
+    if not updated.strip():
+        return False, "fix produced an empty file"
+
+    changed = [line for line in difflib.unified_diff(
+        original.splitlines(), updated.splitlines(), lineterm="", n=0)
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
+    if not changed:
+        return False, "fix changed nothing"
+    if len(changed) > MAX_FIX_DIFF_LINES:
+        return False, (f"fix touches {len(changed)} lines (limit {MAX_FIX_DIFF_LINES}) — "
+                       f"too large for a locator change")
+
+    # Losing a method is the classic whole-file-rewrite failure: the model
+    # regenerates a file it only saw an excerpt of and silently drops the rest.
+    if split_class_members and filename.endswith((".java", ".kt")):
+        try:
+            before = {m["name"] for m in split_class_members(original)
+                      if m["kind"] in ("method", "constructor") and m["name"]}
+            after = {m["name"] for m in split_class_members(updated)
+                     if m["kind"] in ("method", "constructor") and m["name"]}
+            lost = before - after
+            if lost:
+                return False, f"fix removed method(s): {', '.join(sorted(lost))}"
+        except Exception:
+            pass  # never let the guard itself break a valid fix
+
+    return True, ""
+
 # ── Test runner ───────────────────────────────────────────────────────────────
 
 def run_single_test(test_name: str, workspace: Path) -> tuple:
-    parts = test_name.split(".")
-    class_part  = parts[-2] if len(parts) >= 2 else test_name
-    method_part = parts[-1] if len(parts) >= 2 else ""
+    """Verify one test. Returns (status, output) — passed / failed / unverified.
 
-    test_runner_cmd = os.environ.get("TEST_RUNNER_CMD", "")
-    if test_runner_cmd:
-        full_class = ".".join(parts[:-1]) if len(parts) >= 2 else test_name
-        expanded = (test_runner_cmd
-                    .replace("{test_name}", test_name)
-                    .replace("{class}", full_class)
-                    .replace("{class_simple}", class_part)
-                    .replace("{method}", method_part))
-        cmd = expanded.split()
-    elif (workspace / "gradlew").exists():
-        cmd = ["./gradlew", "test", "--tests", f"*.{class_part}.{method_part}", "-q",
-               "--rerun-tasks"]
-    elif (workspace / "build.gradle").exists() or (workspace / "build.gradle.kts").exists():
-        cmd = ["gradle", "test", "--tests", f"*.{class_part}.{method_part}", "-q"]
-    elif (workspace / "pom.xml").exists():
-        cmd = ["mvn", "test", f"-Dtest={class_part}#{method_part}", "-q",
-               "--no-transfer-progress"]
-    elif (workspace / "package.json").exists():
-        cmd = ["npx", "playwright", "test", "--grep", method_part, "-x"]
-    else:
-        return True, "No test runner detected — fix applied but not auto-verified"
-
-    try:
-        r = subprocess.run(cmd, cwd=str(workspace), capture_output=True, text=True, timeout=300)
-        output = (r.stdout + r.stderr)[-3000:]
-        return r.returncode == 0, output
-    except subprocess.TimeoutExpired:
-        return False, "Test timed out after 300s"
-    except Exception as e:
-        return False, f"Test runner error: {e}"
+    Delegates to lib.test_runner so the fix step and the reproduce step invoke
+    tests identically; a fix "verified" by a different command than the one that
+    produced the failure would prove nothing.
+    """
+    return run_test(test_name, workspace, timeout_s=TEST_TIMEOUT_S, log=log)
 
 
 def compute_diff(original: str, fixed: str, filename: str) -> str:
@@ -576,55 +1326,74 @@ def main():
     if len(eligible) != len(issues):
         log(f"Skipped {len(issues) - len(eligible)} known issues")
 
-    def write_skipped(reason: str):
+    def write_skipped(reason: str, infra: bool = False):
         ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         result = {
             "timestamp": ts, "build_tag": build_tag, "fix_attempt": FIX_ATTEMPT,
             "eligible_count": len(eligible), "skipped_reason": reason,
-            "attempted": 0, "succeeded": 0, "failed": 0,
-            "candidates": [], "fixes": [], "failed_fixes": [],
+            "skipped_for_infra": infra,
+            "attempted": 0, "succeeded": 0, "unverified": 0, "failed": 0,
+            "candidates": [], "fixes": [], "unverified_fixes": [], "failed_fixes": [],
         }
         (AUDIT_DIR / "01-fix.json").write_text(json.dumps(result, indent=2))
         (AUDIT_DIR / "01-fix.md").write_text(f"# Fix\n\nSkipped — {reason}.\n")
         write_gate("skipped")
+        # run.sh reads this to decide whether the handoff may be consumed. An
+        # infra skip means nothing was even attempted, so the work must stay queued.
+        (AUDIT_DIR / ".skip-reason").write_text("infra" if infra else "no-work")
         log(f"Gate: .fix-passed = skipped ({reason})")
 
     if not eligible:
         write_skipped("no eligible issues in handoff")
         return
 
-    eligible = eligible[:MAX_FIXES]
-    log(f"{len(eligible)} eligible issues (capped at MAX_FIXES={MAX_FIXES})")
-
     if not GITHUB_TOKEN or not GITHUB_REPO_AUTOMATION:
-        write_skipped("GitHub config not set (GITHUB_TOKEN / GITHUB_REPO_AUTOMATION)")
+        write_skipped("GitHub config not set (GITHUB_TOKEN / GITHUB_REPO_AUTOMATION)", infra=True)
         return
 
     workspace = get_workspace()
     if not workspace:
-        write_skipped("automation repo workspace not found")
+        write_skipped("automation repo workspace not found", infra=True)
         return
 
     log(f"Workspace: {workspace}")
 
-    # Load repo conventions once
+    # Load repo conventions and prompt rules once
     repo_conventions = load_repo_conventions(workspace)
+    framework_props = load_framework_properties(workspace)
+    fix_rules = load_fix_rules()
+    if SYSTEM_PROMPT_FILE.exists():
+        log(f"System prompt: {SYSTEM_PROMPT_FILE.relative_to(REPO_ROOT)}")
 
-    # Load previous fix failures for retry context
+    # Retry bookkeeping: only re-attempt what actually failed, and carry forward
+    # the fixes already committed by earlier attempts so they stay in the report.
     prev_test_outputs: dict = {}
+    carried_fixes: list = []
+    carried_unverified: list = []
     if FIX_ATTEMPT > 1:
         prev_path = AUDIT_DIR / "01-fix.json"
         if prev_path.exists():
             prev_data = json.loads(prev_path.read_text())
+            failed_names = set()
             for fix in prev_data.get("failed_fixes", []):
                 prev_test_outputs[fix["test_name"]] = fix.get("test_output", "")
+                failed_names.add(fix["test_name"])
+            carried_fixes = prev_data.get("fixes", [])
+            carried_unverified = prev_data.get("unverified_fixes", [])
+            if failed_names:
+                before = len(eligible)
+                eligible = [i for i in eligible if i["test_name"] in failed_names]
+                log(f"Retry attempt {FIX_ATTEMPT}: re-attempting {len(eligible)} of "
+                    f"{before} issue(s) — {len(carried_fixes)} already fixed and committed")
+
+    log(f"{len(eligible)} eligible failing test(s) to analyse")
 
     # Create / checkout fix branch
     # Branch name: <AUTOFIX_BRANCH_PREFIX>/<safe-build-tag>
     # On retry (FIX_ATTEMPT > 1), reuse the same branch so commits stack
     safe_tag    = re.sub(r"[^a-zA-Z0-9_-]", "-", build_tag).lower()
     branch_name = f"{AUTOFIX_BRANCH_PREFIX}/{safe_tag}"
-    ok, _, err  = run_git(["fetch", "origin"], workspace)
+    ok, _, err  = run_git(["fetch", "origin"], workspace, push_url=_authenticated_url())
     if ok:
         # FIX_ATTEMPT 1: reset to origin base so we always start clean
         # FIX_ATTEMPT > 1: reuse the existing branch (fixes accumulate across retries)
@@ -638,18 +1407,39 @@ def main():
                 run_git(["checkout", "-B", branch_name, f"origin/{GITHUB_DEFAULT_BRANCH}"], workspace)
         log(f"Branch: {branch_name} (attempt {FIX_ATTEMPT}, base: {GITHUB_DEFAULT_BRANCH})")
     else:
-        log(f"Warning: git fetch failed ({err}) — proceeding on current branch")
+        # Offline, or a bad token. Branch off whatever is checked out rather than
+        # committing onto it: "proceeding on current branch" quietly meant fixes
+        # landed as commits on main, which is not something an autofix should
+        # ever do to someone's working checkout.
+        log(f"Warning: git fetch failed ({err})")
+        ok_local, _, local_err = run_git(["checkout", "-B", branch_name], workspace)
+        if ok_local:
+            log(f"Branch: {branch_name} (created from the current HEAD — no remote base)")
+        else:
+            current, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace)[1:3]
+            log(f"ERROR: could not create {branch_name} ({local_err}) — refusing to "
+                f"commit onto the checked-out branch")
+            write_skipped("could not create a fix branch; refusing to commit to the "
+                          "current branch", infra=True)
+            return
 
-    candidates_json = []
-    fixes        = []
-    failed_fixes = []
+    candidates_json  = []
+    fixes            = []
+    unverified_fixes = []
+    failed_fixes     = []
 
+    # ── Phase A — understand every failure before fixing any of them ──────────
+    # No model calls here. Building all the contexts first is what makes it
+    # possible to see that several tests are dying on the SAME locator.
+    contexts, live_issues = [], []
     for issue in eligible:
         test_name = issue["test_name"]
-        log(f"Processing: {test_name}")
-
         prev_output = prev_test_outputs.get(test_name, "")
         ctx = build_candidate_context(issue, workspace, prev_output, repo_conventions)
+
+        if ctx["trace_path"]:
+            ctx["trace_timeline"] = format_trace(read_actions(Path(ctx["trace_path"])))
+
         ctx_slim = {k: v for k, v in ctx.items() if k != "repo_conventions"}
         candidates_json.append(ctx_slim)
 
@@ -659,163 +1449,316 @@ def main():
                                   "test_passed": False, "test_output": ""})
             continue
 
+        contexts.append(ctx)
+        live_issues.append(issue)
+
+    # ── Phase B — group failures by the locator that actually broke ───────────
+    clusters = build_clusters(contexts, live_issues)
+    if clusters:
+        log(f"{len(contexts)} failing test(s) → {len(clusters)} distinct broken locator(s)")
+        for cluster in clusters:
+            if cluster.size > 1:
+                log(f"  ×{cluster.size}  {cluster.describe()}")
+                for name in cluster.test_names:
+                    log(f"         {name}")
+
+    # ── Phase C — budget is per FIX, not per test ─────────────────────────────
+    # One edit can green several tests, so capping on tests would throw away work
+    # that costs nothing extra. Largest clusters first, so a capped run fixes
+    # whatever unblocks the most tests.
+    attempted, deferred = clusters[:MAX_FIXES], clusters[MAX_FIXES:]
+    if deferred:
+        deferred_tests = sum(c.size for c in deferred)
+        log(f"Attempting {len(attempted)} of {len(clusters)} locator fixes "
+            f"(MAX_FIXES={MAX_FIXES}) — {len(deferred)} deferred, "
+            f"covering {deferred_tests} test(s)")
+        for cluster in deferred:
+            for ctx_d in cluster.contexts:
+                failed_fixes.append({
+                    **{k: v for k, v in ctx_d.items() if k != "repo_conventions"},
+                    "status": "deferred", "fix_diff": "",
+                    "unfixable_reason": (f"not attempted this run — {len(clusters)} distinct "
+                                         f"locators found, MAX_FIXES={MAX_FIXES}"),
+                    "test_passed": False, "test_output": "",
+                })
+
+    # ── Phase D — one investigation, one edit, per broken locator ─────────────
+    for cluster in attempted:
+        ctx = cluster.representative
+        test_name = ctx["test_name"]
+        # The model should reason about the element, not one test's view of it.
+        ctx["element_names"] = cluster.merged_element_names()
+        ctx["affected_tests"] = cluster.test_names
+        issue = cluster.issues[cluster.contexts.index(ctx)]
+
+        if cluster.size > 1:
+            log(f"Fixing: {cluster.describe()} — affects {cluster.size} tests")
+        else:
+            log(f"Fixing: {test_name}")
         log(f"  File: {ctx['test_file']}")
         if ctx["element_names"]:
             log(f"  Elements: {ctx['element_names'][:5]}")
         if ctx["page_objects"]:
             log(f"  Page objects: {[po['path'] for po in ctx['page_objects']]}")
-        if ctx["likely_location"]:
-            log(f"  Likely location: {ctx['likely_location']}")
+        else:
+            log("  WARNING: no page object matched — Claude will have no locator "
+                "declarations to work from")
 
-        try:
-            Path(ctx["test_file"]).read_text(encoding="utf-8")
-        except Exception as e:
-            log(f"  Cannot read file: {e} — skipping")
-            failed_fixes.append({**ctx_slim, "status": "no_file", "fix_diff": "",
-                                  "test_passed": False, "test_output": str(e)})
-            continue
+        # Ground the fix in the real DOM rather than in stale source. Four tiers,
+        # best first:
+        #   1. a browser still parked on the failing page (repairMode) — live and
+        #      interactive, so a candidate selector can be counted for uniqueness;
+        #   2. the DOM captured at the moment of failure — correct mid-flow state;
+        #   3. re-opening the page in a browser — URL-addressable pages only;
+        #   4. none of the above: the prompt says so and Claude infers.
+        # A browser someone already parked (a developer ran with -DrepairMode=true)
+        # always wins. Otherwise the agent parks one itself, but only from the
+        # second attempt on — see park_browser_for_repair for why.
+        repair_session = find_repair_session(workspace, test_name) if INSPECT_DOM else {}
+        if not repair_session and INSPECT_DOM:
+            explicit = os.environ.get("REPAIR", "").lower() == "true"
+            if explicit or FIX_ATTEMPT > 1:
+                repair_session = park_browser_for_repair(workspace, test_name)
 
-        # Call Claude
-        prompt = build_fix_prompt(ctx)
-        log(f"  Calling Claude for fix...")
+        ctx["dom_snapshot"] = load_dom_snapshot(issue, ctx["element_names"])
+
+        if repair_session:
+            ctx["dom_findings"] = inspect_live_dom(ctx, ctx["page_url"], workspace,
+                                                   framework_props, repair_session)
+        elif ctx["dom_snapshot"]:
+            ctx["dom_findings"] = {
+                "status": "not needed — failure-time DOM snapshot available",
+                "selectors": {}, "page_dump": "", "absent": [], "raw": "",
+            }
+        elif INSPECT_DOM:
+            ctx["dom_findings"] = inspect_live_dom(ctx, ctx["page_url"], workspace,
+                                                   framework_props)
+        else:
+            ctx["dom_findings"] = {"status": "disabled (AUTOFIX_INSPECT_DOM=false)",
+                                   "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
+
+        ctx_slim = {k: v for k, v in ctx.items() if k != "repo_conventions"}
+
+        def fail_cluster(status: str, reason: str = "", output: str = "", diff: str = ""):
+            """Record every test in this cluster as unfixed for the same reason."""
+            for member in cluster.contexts:
+                slim = {k: v for k, v in member.items() if k != "repo_conventions"}
+                failed_fixes.append({**slim, "status": status, "fix_diff": diff,
+                                     "unfixable_reason": reason,
+                                     "test_passed": False, "test_output": output})
+
+        prompt = build_fix_prompt(ctx, fix_rules)
+        log("  Calling Claude for fix...")
         response = call_claude(prompt, workspace)
-
         if not response:
-            log(f"  Empty Claude response — skipping")
-            failed_fixes.append({**ctx_slim, "status": "no_response", "fix_diff": "",
-                                  "test_passed": False, "test_output": ""})
+            log("  Empty Claude response — skipping")
+            fail_cluster("no_response")
             continue
 
         fix_json = extract_fix_json(response)
         if not fix_json:
-            log(f"  Could not parse fix JSON — skipping")
-            failed_fixes.append({**ctx_slim, "status": "parse_error", "fix_diff": "",
-                                  "test_passed": False, "test_output": response[:500]})
+            log("  Could not parse fix JSON — skipping")
+            fail_cluster("parse_error", output=response[:500])
             continue
 
         if not fix_json.get("fixable", False):
             reason = fix_json.get("unfixable_reason", "Claude declared unfixable")
             log(f"  Unfixable: {reason}")
-            failed_fixes.append({**ctx_slim, "status": "unfixable", "unfixable_reason": reason,
-                                  "fix_description": fix_json.get("fix_description", ""),
-                                  "fix_diff": "", "test_passed": False, "test_output": ""})
+            fail_cluster("unfixable", reason=reason)
             continue
 
-        target_file_str = fix_json.get("target_file") or ctx["test_file"]
-        target_file = Path(target_file_str)
+        target_file = Path(fix_json.get("target_file") or ctx["test_file"])
         if not target_file.is_absolute():
-            target_file = workspace / target_file_str
+            target_file = workspace / target_file
 
         if not target_file.exists():
             log(f"  Target file not found: {target_file} — skipping")
-            failed_fixes.append({**ctx_slim, "status": "target_not_found", "fix_diff": "",
-                                  "fix_description": fix_json.get("fix_description", ""),
-                                  "test_passed": False, "test_output": ""})
-            continue
-
-        fixed_content = fix_json.get("fixed_content") or ""
-        if not fixed_content.strip():
-            log(f"  Empty fixed_content — skipping")
-            failed_fixes.append({**ctx_slim, "status": "empty_fix", "fix_diff": "",
-                                  "test_passed": False, "test_output": ""})
+            fail_cluster("target_not_found", reason=str(target_file))
             continue
 
         try:
             target_original = target_file.read_text(encoding="utf-8")
-        except Exception:
-            target_original = ""
+        except Exception as e:
+            log(f"  Cannot read target file: {e}")
+            fail_cluster("no_file", output=str(e))
+            continue
+
+        if fix_json.get("edits"):
+            fixed_content, edit_err = apply_edits(target_original, fix_json["edits"])
+        elif fix_json.get("fixed_content"):
+            fixed_content, edit_err = fix_json["fixed_content"], ""
+        else:
+            fixed_content, edit_err = None, "response contained neither edits nor fixed_content"
+
+        if not fixed_content:
+            log(f"  Cannot apply fix: {edit_err}")
+            fail_cluster("edit_failed", reason=edit_err, output=edit_err)
+            continue
+
+        valid, invalid_reason = validate_fix(target_original, fixed_content, target_file.name)
+        if not valid:
+            log(f"  Rejected by safety guard: {invalid_reason}")
+            fail_cluster("rejected_unsafe", reason=invalid_reason, output=invalid_reason,
+                         diff=compute_diff(target_original, fixed_content, target_file.name))
+            continue
 
         fix_diff = compute_diff(target_original, fixed_content, target_file.name)
         fix_description = fix_json.get("fix_description", "")
         log(f"  Fix: {fix_description}")
 
-        # Apply fix
         try:
             target_file.write_text(fixed_content, encoding="utf-8")
+            invalidate_file(target_file)   # later clusters must see the edited file
         except Exception as e:
             log(f"  Cannot write fix: {e}")
-            failed_fixes.append({**ctx_slim, "status": "write_error", "fix_diff": "",
-                                  "test_passed": False, "test_output": str(e)})
+            fail_cluster("write_error", output=str(e))
             continue
 
-        # Run test to verify
-        log(f"  Running test to verify...")
-        passed, test_output = run_single_test(test_name, workspace)
+        # ── Phase E — one edit, but every affected test must prove it ─────────
+        # A fix claiming to green 5 tests is only credited for the ones that
+        # actually pass. Members that still fail keep their own failure record
+        # so the next attempt re-investigates them separately.
+        passed, still_failing, unverified = [], [], []
+        for member in cluster.contexts:
+            member_name = member["test_name"]
+            log(f"  Verifying {member_name}...")
+            member_status, member_output = run_single_test(member_name, workspace)
+            if member_status == "passed":
+                passed.append(member_name)
+            elif member_status == "unverified":
+                unverified.append((member_name, member_output))
+            else:
+                still_failing.append((member_name, member_output, member))
 
-        if passed:
-            log(f"  ✅ Fix verified: {test_name}")
-            fixes.append({
-                **ctx_slim,
-                "status": "success",
-                "target_file": str(target_file),
-                "fix_description": fix_description,
-                "fix_diff": fix_diff,
-                "test_passed": True,
-                "test_output": test_output[-500:],
-            })
-        else:
-            log(f"  ❌ Fix failed test: {test_name}")
+        record = {
+            **ctx_slim,
+            "target_file": str(target_file),
+            "fix_description": fix_description,
+            "fix_diff": fix_diff,
+            "cluster_size": cluster.size,
+            "cluster_description": cluster.describe(),
+            "dom_verified": bool((ctx.get("dom_findings") or {}).get("selectors")
+                                 or ctx.get("dom_snapshot")),
+            "dom_source": (
+                "live-parked-browser" if "parked" in (ctx.get("dom_findings") or {}).get("status", "")
+                else "failure-snapshot" if ctx.get("dom_snapshot")
+                else "live-browser" if (ctx.get("dom_findings") or {}).get("selectors")
+                else "none"),
+        }
+
+        if not passed and not unverified:
+            # The edit helped nobody — put the file back exactly as it was.
+            log(f"  ❌ Fix failed every test in the cluster ({cluster.size})")
             try:
                 target_file.write_text(target_original, encoding="utf-8")
+                invalidate_file(target_file)
             except Exception:
                 pass
-            failed_fixes.append({
-                **ctx_slim,
-                "status": "test_failed",
-                "target_file": str(target_file),
-                "fix_description": fix_description,
-                "fix_diff": fix_diff,
-                "test_passed": False,
-                "test_output": test_output[-2000:],
-            })
+            for member_name, member_output, member in still_failing:
+                slim = {k: v for k, v in member.items() if k != "repo_conventions"}
+                failed_fixes.append({**slim, "status": "test_failed", "verified": False,
+                                     "target_file": str(target_file),
+                                     "fix_description": fix_description, "fix_diff": fix_diff,
+                                     "test_passed": False, "test_output": member_output[-2000:]})
+            continue
 
-    # Commit successful fixes
+        if passed:
+            log(f"  ✅ Fix verified — {len(passed)}/{cluster.size} test(s) now passing")
+            fixes.append({**record, "status": "success", "verified": True,
+                          "test_name": passed[0], "test_names": passed,
+                          "test_passed": True,
+                          "test_output": f"{len(passed)} test(s) passed"})
+        if unverified:
+            log(f"  ⚠️  {len(unverified)} test(s) applied but NOT verified")
+            unverified_fixes.append({**record, "status": "applied_unverified", "verified": False,
+                                     "test_name": unverified[0][0],
+                                     "test_names": [n for n, _ in unverified],
+                                     "test_passed": False, "test_output": unverified[0][1][-500:]})
+        for member_name, member_output, member in still_failing:
+            # The fix worked for its cluster but not this test — a different
+            # root cause hiding behind the same symptom. Keep it separate.
+            log(f"  ❌ Still failing after the cluster fix: {member_name}")
+            slim = {k: v for k, v in member.items() if k != "repo_conventions"}
+            failed_fixes.append({**slim, "status": "test_failed", "verified": False,
+                                 "target_file": str(target_file),
+                                 "fix_description": fix_description, "fix_diff": fix_diff,
+                                 "test_passed": False, "test_output": member_output[-2000:]})
+
+    # Merge in anything earlier attempts already committed, so a later attempt
+    # never reports a landed fix as missing.
+    def merge(current: list, carried: list) -> list:
+        seen = {f["test_name"] for f in current}
+        return current + [f for f in carried if f["test_name"] not in seen]
+
+    fixes            = merge(fixes, carried_fixes)
+    unverified_fixes = merge(unverified_fixes, carried_unverified)
+
+    # Commit everything that was applied this attempt (carried entries are
+    # already committed, and git add on an unchanged file is a no-op anyway).
     pr_branch = None
-    if fixes:
-        for fix in fixes:
+    applied = [f for f in fixes + unverified_fixes if f.get("target_file")]
+    if applied:
+        for fix in applied:
             ok, _, err = run_git(["add", fix["target_file"]], workspace)
             if not ok:
                 log(f"Warning: git add failed for {fix['target_file']}: {err}")
 
-        fixed_names = ", ".join(f['test_name'].split(".")[-1] for f in fixes[:5])
+        fixed_names = ", ".join(f['test_name'].split(".")[-1] for f in applied[:5])
         commit_msg = (
-            f"fix(automation): update locators for {len(fixes)} test(s)\n\n"
+            f"fix(automation): update locators for {len(applied)} test(s)\n\n"
             f"Build tag: {build_tag}\n"
             f"Fixed: {fixed_names}"
         )
-        ok, _, err = run_git(["commit", "-m", commit_msg], workspace)
+        ok, out, err = run_git(["commit", "-m", commit_msg], workspace)
         if ok:
-            log(f"Committed {len(fixes)} fix(es) to {branch_name}")
+            log(f"Committed {len(applied)} fix(es) to {branch_name}")
+            pr_branch = branch_name
+        elif "nothing to commit" in f"{out}{err}".lower():
+            # Everything applied this attempt was already committed by an earlier
+            # one. git reports this on stdout, not stderr.
+            log("Nothing new to commit — reusing existing branch")
             pr_branch = branch_name
         else:
-            log(f"Warning: commit failed: {err}")
+            log(f"Warning: commit failed: {err or out}")
 
     # Gate
-    if not fixes and not failed_fixes:
+    if not fixes and not unverified_fixes and not failed_fixes:
         gate = "skipped"
-    elif failed_fixes and not fixes:
-        gate = "false"
     elif failed_fixes:
         gate = "false"
     else:
         gate = "true"
 
     write_gate(gate)
-    log(f"Gate: .fix-passed = {gate} ({len(fixes)} succeeded, {len(failed_fixes)} failed)")
+    _tests_fixed = sum(len(f.get("test_names") or [f.get("test_name")]) for f in fixes)
+    log(f"Gate: .fix-passed = {gate} ({len(fixes)} edit(s) → {_tests_fixed} test(s) verified, "
+        f"{len(unverified_fixes)} unverified, {len(failed_fixes)} failed)")
 
     # Write JSON
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    def test_count(entries: list) -> int:
+        """Fix entries can cover several tests; failures are always one each."""
+        return sum(len(e.get("test_names") or [e.get("test_name")]) for e in entries)
+
+    tests_fixed      = test_count(fixes)
+    tests_unverified = test_count(unverified_fixes)
+
     result = {
         "timestamp":      ts,
         "build_tag":      build_tag,
         "fix_attempt":    FIX_ATTEMPT,
         "eligible_count": len(eligible),
-        "attempted":      len(fixes) + len(failed_fixes),
-        "succeeded":      len(fixes),
+        "attempted":      tests_fixed + tests_unverified + len(failed_fixes),
+        "succeeded":      tests_fixed,
+        "unverified":     tests_unverified,
         "failed":         len(failed_fixes),
+        # How much rework clustering avoided: one edit can green several tests.
+        "distinct_fixes":     len(fixes),
+        "distinct_unverified": len(unverified_fixes),
         "pr_branch":      pr_branch,
         "candidates":     candidates_json,
         "fixes":          fixes,
+        "unverified_fixes": unverified_fixes,
         "failed_fixes":   failed_fixes,
     }
     json_path = AUDIT_DIR / "01-fix.json"
@@ -828,34 +1771,53 @@ def main():
         "",
         f"**Build Tag:** {build_tag}  ",
         f"**Attempt:** {FIX_ATTEMPT}  ",
-        f"**Eligible:** {len(eligible)} | **Succeeded:** {len(fixes)} | **Failed:** {len(failed_fixes)}  ",
+        f"**Eligible tests:** {len(eligible)} | **Distinct locator fixes:** {len(fixes)} | "
+        f"**Tests verified:** {tests_fixed} | "
+        f"**Applied but unverified:** {tests_unverified} | **Failed:** {len(failed_fixes)}  ",
         f"**Gate:** `{gate}`  ",
         f"**PR Branch:** `{pr_branch or 'none'}`",
         "",
     ]
+
+    def fix_block(f: dict, icon: str) -> list:
+        # Entries carried forward from an earlier attempt are rehydrated from
+        # JSON and may predate a field, so every lookup here is defensive.
+        dom = " _(selector confirmed in a live browser)_" if f.get("dom_verified") else ""
+        names = f.get("test_names") or [f.get("test_name", "(unknown test)")]
+        heading = (f"{f.get('cluster_description', names[0])} — {len(names)} tests"
+                   if len(names) > 1 else names[0])
+        covered = ("\n".join(f"  - `{n}`" for n in names) + "\n") if len(names) > 1 else ""
+        return [
+            f"### {icon} {heading}",
+            covered,
+            f"- **File:** `{f.get('target_file') or f.get('test_file') or '(unknown)'}`",
+            f"- **Root Cause:** {f.get('root_cause') or '(not recorded)'}",
+            f"- **Fix:** {f.get('fix_description', '')}{dom}",
+            "",
+            "```diff",
+            (f.get("fix_diff") or "")[:2000] or "(no diff)",
+            "```",
+            "",
+        ]
+
     if fixes:
-        md_lines += ["## Successful Fixes", ""]
+        md_lines += ["## Verified Fixes", ""]
         for f in fixes:
-            md_lines += [
-                f"### ✅ {f['test_name']}",
-                f"- **File:** `{f.get('target_file', f['test_file'])}`",
-                f"- **Root Cause:** {f['root_cause']}",
-                f"- **Fix:** {f['fix_description']}",
-                "",
-                "```diff",
-                f["fix_diff"][:2000] or "(no diff)",
-                "```",
-                "",
-            ]
+            md_lines += fix_block(f, "✅")
+    if unverified_fixes:
+        md_lines += ["## Applied but NOT Verified", "",
+                     "> No test runner was available, so these changes were never executed.", ""]
+        for f in unverified_fixes:
+            md_lines += fix_block(f, "⚠️")
     if failed_fixes:
         md_lines += ["## Failed Fixes", ""]
         for f in failed_fixes:
             status = f.get("status", "unknown")
             md_lines += [
-                f"### ❌ {f['test_name']} (`{status}`)",
-                f"- **Root Cause:** {f['root_cause']}",
+                f"### ❌ {f.get('test_name', '(unknown test)')} (`{status}`)",
+                f"- **Root Cause:** {f.get('root_cause') or '(not recorded)'}",
             ]
-            if status == "unfixable":
+            if status in ("unfixable", "rejected_unsafe", "edit_failed"):
                 md_lines.append(f"- **Reason:** {f.get('unfixable_reason', '')}")
             elif status == "test_failed":
                 md_lines.append("- **Fix applied but test still failing**")
@@ -863,7 +1825,8 @@ def main():
             md_lines.append("")
 
     (AUDIT_DIR / "01-fix.md").write_text("\n".join(md_lines) + "\n")
-    log(f"Done — {len(fixes)} fixed, {len(failed_fixes)} failed")
+    log(f"Done — {len(fixes)} edit(s) fixed {tests_fixed} test(s), "
+        f"{tests_unverified} unverified, {len(failed_fixes)} failed")
 
 
 if __name__ == "__main__":
