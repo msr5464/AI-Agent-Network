@@ -111,7 +111,13 @@ def _step_has_error(data: Optional[Dict]) -> bool:
 
 
 def _derive_status(session_dir: Path, ship_data: Optional[Dict]) -> str:
-    """Compute a UI status: running / completed / failed / cancelled / unknown."""
+    """Compute a UI status: running / completed / diagnosed / failed / cancelled / unknown."""
+    # A run that identified why a test fails, and correctly declined to edit
+    # anything, has succeeded at its job. Reporting it red trains people to
+    # ignore exactly the runs worth reading.
+    if (_read_text(session_dir / ".skip-reason") or "").strip() in _DIAGNOSED_SKIP_REASONS:
+        return "diagnosed"
+
     if ship_data is not None:
         verdict = ship_data.get("verdict")
         if verdict == "APPROVED":
@@ -172,6 +178,7 @@ def list_sessions(limit: int = 50, offset: int = 0,
             "status": status,
             "verdict": (verdict or "").strip() or None,
             "fix_gate": (fix_gate or "").strip() or None,
+            "diagnosis": _diagnosis_outcome(entry, fix_gate),
             "test_passed": (ship or {}).get("test_passed"),
             "pr_url": (ship or {}).get("pr_url"),
             "files_count": (ship or {}).get("files_count"),
@@ -209,6 +216,7 @@ def get_session(session_id: str, agent: str = DEFAULT_AGENT) -> Optional[Dict]:
         "status": _derive_status(session_dir, ship),
         "verdict": verdict,
         "fix_gate": fix_gate,
+        "diagnosis": _diagnosis_outcome(session_dir, fix_gate),
         "init_md": init_md,
         "steps": {
             "parse": parse,
@@ -399,6 +407,56 @@ def _summarise_step(key: str, data: Dict) -> Dict:
 # reads — succeeded / unverified / failed / distinct_fixes — so the two dashboards
 # cannot drift apart and disagree about the same run.
 
+# A run that produced a diagnosis instead of a fix is a result, not a failure.
+# Without this it renders as "0 fixed / could not fix" — the same unhelpful
+# outcome as before any of this existed, with the actual answer buried in an
+# audit file nobody opens.
+_DIAGNOSED_SKIP_REASONS = ("diagnosed",)
+
+# Verdicts the diagnosis engine reaches from measured evidence. Offering "try a
+# locator fix anyway" on one of these re-enables precisely the behaviour the gate
+# exists to prevent, so the override is re-labelled rather than presented as the
+# obvious next step.
+#
+# Imported rather than restated: this file already carries three "keep in sync"
+# comments against copies elsewhere, and nothing enforces any of them.
+try:
+    from shared.diagnosis import STOP as _STOP_VERDICTS
+except ImportError:  # server started without the repo root on the path
+    _STOP_VERDICTS = ()
+
+
+def _diagnosis_outcome(session_dir: Path, fix_gate: Optional[str]) -> Optional[Dict]:
+    """The diagnosis a skipped run reached, when that is why it skipped."""
+    if (fix_gate or "").strip() != "skipped":
+        return None
+    reason = (_read_text(session_dir / ".skip-reason") or "").strip()
+    if reason not in _DIAGNOSED_SKIP_REASONS:
+        return None
+
+    verdict, remediation, reasons = "", "", []
+    for name in ("00-reproduce.json", "01-fix.json"):
+        data = _safe_load_json(session_dir / name) or {}
+        recorded = data.get("diagnosis") or {}
+        verdict = verdict or recorded.get("verdict") or ""
+        remediation = remediation or recorded.get("remediation") or ""
+        reasons = reasons or list(recorded.get("reasons") or [])
+        # Standalone records the verdict as the run's status; the fix step records
+        # it per cluster.
+        if data.get("status") and data["status"] not in ("queued", "passing"):
+            verdict = verdict or data["status"]
+        for entry in (data.get("failed_fixes") or []):
+            diagnosis = entry.get("diagnosis") or {}
+            verdict = verdict or diagnosis.get("verdict") or ""
+            remediation = remediation or diagnosis.get("remediation") or ""
+            reasons = reasons or list(diagnosis.get("reasons") or [])
+        headline = data.get("headline")
+        if headline and not remediation:
+            remediation = headline
+    return {"verdict": verdict or "DIAGNOSED", "remediation": remediation,
+            "reasons": reasons[:4]}
+
+
 def _healing_counts(fix_data: Dict) -> Dict[str, int]:
     return {
         "distinct_fixes": fix_data.get("distinct_fixes", len(fix_data.get("fixes", []))),
@@ -452,6 +510,10 @@ def _skipped_status(shape: str) -> str:
         return "skipped"                      # pipeline run with nothing eligible
     if shape.startswith("INFRA"):
         return "blocked"                      # could not even run the test
+    if shape in _STOP_VERDICTS:
+        # The run reached a measured conclusion. "not a locator" says what it was
+        # not; "diagnosed" says it found out what it was.
+        return "diagnosed"
     return _SHAPE_STATUS.get(shape, "not_a_locator")
 
 
@@ -474,6 +536,11 @@ def _healing_status(session_dir: Path, fix_gate: Optional[str],
     if gate == "false":
         return "needs_review"
     if gate == "skipped":
+        # A handoff gated in the fix step has no reproduce output to read a shape
+        # from — pipeline runs skip that step entirely — so the skip reason is the
+        # only place the conclusion is recorded.
+        if (_read_text(session_dir / ".skip-reason") or "").strip() in _DIAGNOSED_SKIP_REASONS:
+            return "diagnosed"
         return _skipped_status(shape)
     if gate:
         return "unknown"
@@ -497,6 +564,16 @@ def _healing_summary(spec, session_dir: Path) -> Dict:
         "failure_shape": shape,
         "failure_headline": (reproduce or {}).get("headline", ""),
         "forced": bool((reproduce or {}).get("forced")),
+        # What the diagnosis concluded, so the panel can say why rather than only
+        # that nothing happened — and so it can tell a measured cause apart from
+        # an unrecognised one when deciding whether to offer the override.
+        "diagnosis": _diagnosis_outcome(session_dir, fix_gate),
+        # Pipeline runs never produce a reproduce shape, so the verdict recorded
+        # by the fix step is the only signal that the conclusion was measured.
+        "diagnosis_confident": (
+            shape in _STOP_VERDICTS
+            or (_diagnosis_outcome(session_dir, fix_gate) or {}).get("verdict", "")
+            in _STOP_VERDICTS),
         # A run the gate stopped: not a locator problem, nothing was attempted.
         "gate_stopped": bool(shape) and shape not in ("queued", "passing"),
         # `module` keeps the shape the frontend already renders for authoring.

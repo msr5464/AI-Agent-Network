@@ -98,6 +98,11 @@ LOGIN_PASSWORD     = os.environ.get("AUTOFIX_LOGIN_PASSWORD", "")
 
 # Reject a "fix" that rewrites far more than a locator.
 MAX_FIX_DIFF_LINES = int(os.environ.get("AUTOFIX_MAX_DIFF_LINES", "40"))
+# shadow: diagnose and log only. enforce: a stop verdict skips the cluster.
+DIAGNOSIS_MODE = os.environ.get("DIAGNOSIS_MODE", "shadow").strip().lower()
+# The operator's override. A diagnosis is evidence, not an authority — when
+# someone has looked at it and still wants a fix attempted, they get one.
+FORCE = os.environ.get("FORCE", "false").strip().lower() == "true"
 
 TEST_TIMEOUT_S     = int(os.environ.get("AUTOFIX_TEST_TIMEOUT_S", "300"))
 
@@ -134,6 +139,8 @@ except ImportError:
     _HAS_MCP_CONFIG = False
 
 from shared.dom_snapshot import distill as distill_dom, format_for_prompt as format_dom
+from shared.page_identity import normalize_selector as _normalize_selector
+from shared import diagnosis, verdict_feedback
 from shared.playwright_trace import read_actions, format_for_prompt as format_trace
 
 
@@ -1071,6 +1078,31 @@ These rules apply to every line you write or modify.
 ---
 """
 
+    # What the evidence says went wrong, worked out before this prompt was built.
+    # Without it the model is asked "what should the new locator be?" and has no
+    # way to answer "the locator was never the problem".
+    diagnosis_text = ""
+    verdict = ctx.get("diagnosis") or {}
+    if verdict.get("verdict") and verdict["verdict"] != "INSUFFICIENT_EVIDENCE":
+        reasons = "\n".join(f"- {reason}" for reason in verdict.get("reasons") or [])
+        diagnosis_text = f"""
+## 🔬 DIAGNOSIS — {verdict['verdict']} ({verdict.get('confidence', '')} confidence)
+Worked out from the DOM captured at failure, the page object's own locators, the
+network log and the step timeline — before you were called.
+
+{reasons}
+
+**What you are being asked to do: {verdict.get('action') or 'assess whether a fix is possible'}.**
+"""
+        if verdict["verdict"] == "LOCATOR_STALE":
+            diagnosis_text += (
+                "\nThe page is confirmed correct and its other locators still match, "
+                "so a replacement for the failing one does exist on the page below.\n")
+        elif not verdict.get("actionable"):
+            diagnosis_text += (
+                "\nThis is **not** a stale locator. Do not propose a new selector: "
+                "return `fixable: false` with this cause as the reason.\n")
+
     # Observed DOM outranks everything else in this prompt: the source below is
     # by definition the version that was already failing.
     dom_text = ""
@@ -1088,8 +1120,10 @@ what the element looks like now. **Base the fix on this, not on the source below
 {format_dom(snapshot)}
 ```
 
-If none of these elements is the one the test wanted, the element is genuinely
-gone rather than renamed — that is a product bug, so set `fixable: false` and say so.
+If none of these elements is the one the test wanted, do not settle for the
+closest-looking one. Either the element was removed (a product bug) or this is not
+the page the test was supposed to reach — both mean `fixable: false`, with which
+one it is stated as the reason.
 """
     elif dom.get("selectors"):
         found = "\n".join(f"- `{name}` → `{sel}`" for name, sel in dom["selectors"].items())
@@ -1150,8 +1184,21 @@ Previous fix did not resolve the test. Different test output:
 ```
 {ctx['prev_test_output']}
 ```
-Try a different locator strategy — do NOT repeat the previous approach.
 """
+        # Telling the model to "try something different" unconditionally is what
+        # walks it down the ladder from a precise selector to a broad one. A
+        # second failure on the same element is evidence about the diagnosis, not
+        # an invitation to guess wider.
+        if verdict.get("verdict") == "LOCATOR_STALE":
+            retry_text += ("Try a different locator strategy — do NOT repeat the "
+                           "previous approach, and do NOT widen the selector to "
+                           "make it match.\n")
+        else:
+            retry_text += ("Two attempts have now failed on the same element. That "
+                           "is evidence the original diagnosis was wrong rather "
+                           "than a reason to guess again. If you cannot identify a "
+                           "specific, verified replacement, return `fixable: false` "
+                           "and say what you would need to decide.\n")
 
     return f"""You are fixing a broken locator in a Selenium/RestAssured test automation file.
 Work independently on this test case only.
@@ -1162,6 +1209,7 @@ Work independently on this test case only.
 - **Method:** {ctx['method_name']}
 - **File:** {ctx['test_file']}
 
+{diagnosis_text}
 ## Failure Information
 - **Classification:** {ctx['classification']} ({ctx['confidence']} confidence)
 - **Root Cause Category:** {ctx['root_cause_category']}
@@ -1350,6 +1398,114 @@ def validate_fix(original: str, updated: str, filename: str) -> tuple:
             pass  # never let the guard itself break a valid fix
 
     return True, ""
+
+
+
+def _snapshot_soup(issue: dict):
+    """Parse the failure DOM once, for the guards. None when there is none."""
+    path = issue.get("dom_snapshot") or ""
+    if not path or not Path(path).exists():
+        return None
+    try:
+        from shared.page_identity import parse as _parse_dom
+        return _parse_dom(Path(path).read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+# ── Fix-integrity guards ──────────────────────────────────────────────────────
+#
+# The verification loop cannot catch a fix built on a wrong diagnosis, because
+# the easiest way to make a page assertion pass is to weaken it. A run that had
+# already been told the avatar was missing "fixed" it by moving the page-load
+# anchor onto a link that exists on the logged-out page too — and that would have
+# gone green while the login was still broken. These guards are what the re-run
+# cannot do for us.
+
+# Selectors that assert *which page* we are on. Broadening one of these turns a
+# real failure into a silent pass.
+_IDENTITY_CALL = re.compile(r"assertPageLoaded\s*\(")
+
+# A quoted selector, so a replacement can be compared against what it replaced.
+_QUOTED = re.compile(r"""(["'])((?:\\.|(?!\1).)+)\1""")
+
+
+def _selectors_in(text: str) -> list:
+    return [m.group(2) for m in _QUOTED.finditer(text or "")]
+
+
+def _is_broader(before: str, after: str) -> bool:
+    """Whether `after` is a strictly weaker version of `before`.
+
+    Only the unambiguous cases: adding comma-alternatives, dropping attribute or
+    class constraints, or collapsing to a bare tag. A different-but-equally-tight
+    selector is a normal fix and must pass.
+    """
+    if not before or not after or before == after:
+        return False
+    if "," in after and "," not in before:
+        return True
+    def tightness(selector):
+        return (selector.count("[") + selector.count("#") + selector.count(".")
+                + selector.count(":"))
+    if tightness(after) == 0 and tightness(before) > 0:
+        return True
+    return False
+
+
+def validate_diagnosis_fit(original: str, updated: str, verdict: str,
+                           snapshot_soup=None) -> tuple:
+    """Reject an edit that does not match what the diagnosis actually found.
+
+    Returns (ok, reason). Runs before the test does, so a fix that could only
+    pass by weakening the test never reaches a runner at all.
+    """
+    changed = [line for line in difflib.unified_diff(
+        original.splitlines(), updated.splitlines(), lineterm="", n=0)
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
+    removed = [line[1:] for line in changed if line.startswith("-")]
+    added = [line[1:] for line in changed if line.startswith("+")]
+
+    # 1. Never weaken a page-identity assertion unless the locator really is the
+    #    thing that broke.
+    if verdict != "LOCATOR_STALE":
+        touched_identity = any(_IDENTITY_CALL.search(line) for line in removed + added)
+        if touched_identity:
+            return False, (f"fix changes a page-load assertion, but the diagnosis is "
+                           f"{verdict or 'unknown'} rather than a stale locator — "
+                           f"weakening a page check would make the test pass on the "
+                           f"wrong page. Re-run with FORCE=true to override.")
+
+    # 2. Never broaden a selector. That is how a wrong-page failure gets papered
+    #    over into a pass.
+    for before, after in zip(_selectors_in("\n".join(removed)),
+                             _selectors_in("\n".join(added))):
+        if _is_broader(before, after):
+            return False, (f"fix broadens the selector {before!r} to {after!r}, "
+                           f"which would make the assertion weaker rather than correct")
+
+    # 3. A genuinely stale locator has a replacement that exists on the page we
+    #    were actually on. One matching nothing is a guess, and the failure-time
+    #    DOM can say so before maven spends a minute discovering it.
+    if verdict == "LOCATOR_STALE" and snapshot_soup is not None:
+        candidates = _selectors_in("\n".join(added))
+        checked, matched = 0, 0
+        for candidate in candidates:
+            normalized = _normalize_selector(candidate)
+            if not normalized:
+                continue
+            try:
+                checked += 1
+                if snapshot_soup.select(normalized, limit=1):
+                    matched += 1
+            except Exception:
+                checked -= 1
+        if checked and not matched:
+            return False, ("the replacement selector matches nothing in the DOM "
+                           "captured at failure, so it is a guess rather than a fix")
+
+    return True, ""
+
 
 # ── Test runner ───────────────────────────────────────────────────────────────
 
@@ -1575,6 +1731,40 @@ def main():
             log("  WARNING: no page object matched — Claude will have no locator "
                 "declarations to work from")
 
+        def fail_cluster(status: str, reason: str = "", output: str = "", diff: str = ""):
+            """Record every test in this cluster as unfixed for the same reason."""
+            for member in cluster.contexts:
+                slim = {k: v for k, v in member.items() if k != "repo_conventions"}
+                failed_fixes.append({**slim, "status": status, "fix_diff": diff,
+                                     "unfixable_reason": reason,
+                                     "test_passed": False, "test_output": output})
+
+        # Ask why the element was missing before assuming the locator is at
+        # fault. A handoff from triaging never runs step 00, so this is the only
+        # place the pipeline path gets asked the question at all.
+        ctx["diagnosis"] = {}
+        snapshot_soup = None
+        try:
+            evidence = diagnosis.collect(issue, workspace=workspace,
+                                         page_objects=ctx.get("page_objects"))
+            verdict = diagnosis.diagnose(evidence)
+            ctx["diagnosis"] = verdict
+            snapshot_soup = _snapshot_soup(issue)
+            for line in diagnosis.describe(verdict, evidence):
+                log(f"  {line}")
+            if verdict["verdict"] in diagnosis.STOP:
+                if FORCE:
+                    log("  (FORCE=true — attempting a fix anyway)")
+                elif DIAGNOSIS_MODE == "enforce":
+                    fail_cluster(verdict["verdict"].lower(),
+                                 reason="; ".join(verdict.get("reasons") or []),
+                                 output=verdict.get("remediation", ""))
+                    continue
+                log(f"  (shadow mode: would have stopped here — {verdict['verdict']}. "
+                    f"Set DIAGNOSIS_MODE=enforce to act on it.)")
+        except Exception as exc:
+            log(f"  Diagnosis failed ({exc}) — continuing with the locator fix")
+
         # Ground the fix in the real DOM rather than in stale source. Four tiers,
         # best first:
         #   1. a browser still parked on the failing page (repairMode) — live and
@@ -1609,14 +1799,6 @@ def main():
                                    "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
 
         ctx_slim = {k: v for k, v in ctx.items() if k != "repo_conventions"}
-
-        def fail_cluster(status: str, reason: str = "", output: str = "", diff: str = ""):
-            """Record every test in this cluster as unfixed for the same reason."""
-            for member in cluster.contexts:
-                slim = {k: v for k, v in member.items() if k != "repo_conventions"}
-                failed_fixes.append({**slim, "status": status, "fix_diff": diff,
-                                     "unfixable_reason": reason,
-                                     "test_passed": False, "test_output": output})
 
         prompt = build_fix_prompt(ctx, fix_rules)
         log("  Calling Claude for fix...")
@@ -1667,6 +1849,20 @@ def main():
             continue
 
         valid, invalid_reason = validate_fix(target_original, fixed_content, target_file.name)
+        if FORCE and (ctx.get("diagnosis") or {}).get("verdict") in diagnosis.STOP:
+            # Remember that this run overrode a stop verdict, so that a fix which
+            # then verifies can be recorded as evidence the verdict was wrong.
+            ctx["_forced_over_verdict"] = ctx["diagnosis"].get("verdict", "")
+
+        if valid and not FORCE:
+            # The re-run cannot catch a fix built on a wrong diagnosis, because
+            # the easiest way to make an assertion pass is to weaken it. This
+            # also applies when the diagnosis abstained: the asymmetry is that a
+            # blocked fix is visible and retryable, while a weakened assertion
+            # ships a permanently green broken test. FORCE is the way past it.
+            valid, invalid_reason = validate_diagnosis_fit(
+                target_original, fixed_content,
+                (ctx.get("diagnosis") or {}).get("verdict", ""), snapshot_soup)
         if not valid:
             log(f"  Rejected by safety guard: {invalid_reason}")
             fail_cluster("rejected_unsafe", reason=invalid_reason, output=invalid_reason,
@@ -1740,6 +1936,18 @@ def main():
 
         if passed:
             log(f"  ✅ Fix verified — {len(passed)}/{cluster.size} test(s) now passing")
+            overridden = ctx.get("_forced_over_verdict")
+            if overridden:
+                # Someone read the diagnosis, overrode it, and the fix worked. That
+                # is the only direct evidence available that a stop verdict was
+                # wrong, and nothing else in the system would have noticed.
+                verdict_feedback.record(
+                    KNOWN_ISSUES_FILE, "false_stop", ctx["test_name"], overridden,
+                    detail="a forced locator fix verified, so this verdict should "
+                           "not have stopped the run",
+                    session=os.environ.get("SESSION_ID", ""))
+                log(f"  Recorded a false stop for {overridden} in "
+                    f"feedback/known-issues.json")
             fixes.append({**record, "status": "success", "verified": True,
                           "test_name": passed[0], "test_names": passed,
                           "test_passed": True,
@@ -1798,10 +2006,23 @@ def main():
             log(f"Warning: commit failed: {err or out}")
 
     # Gate
+    _stop_statuses = {v.lower() for v in diagnosis.STOP}
+    _diagnosed = [f for f in failed_fixes if f.get("status") in _stop_statuses]
+    _real_failures = [f for f in failed_fixes if f.get("status") not in _stop_statuses]
+
     if not fixes and not unverified_fixes and not failed_fixes:
         gate = "skipped"
-    elif failed_fixes:
+    elif _real_failures:
         gate = "false"
+    elif _diagnosed and not fixes and not unverified_fixes:
+        # Nothing was attempted and nothing is pending: the run produced a
+        # diagnosis instead of a fix. That is an outcome, not a failure, so it
+        # must not retry or page anyone.
+        gate = "skipped"
+        (AUDIT_DIR / ".skip-reason").write_text(
+            diagnosis.skip_reason(_diagnosed[0]["status"].upper()))
+        log(f"Diagnosed {len(_diagnosed)} cluster(s) as not locator-shaped — "
+            f"no fix attempted")
     else:
         gate = "true"
 

@@ -28,6 +28,8 @@ logging.basicConfig(level=logging.WARNING)
 
 from shared.log import log as _log
 from shared.dom_snapshot import find_snapshot, parse_header
+from shared import diagnosis
+from lib import artifacts
 from shared.playwright_trace import read_actions, failing_action
 from shared.slack import send_slack as _send_slack
 def log(msg): _log("ship", msg)
@@ -90,65 +92,17 @@ def record_skip(build_tag: str, verdict: str):
 
 
 
-def attach_dom_snapshot(issue: dict, report_dir: Path, method_name: str) -> None:
-    """Copy the failure-time DOM into this session and reference it in the issue.
+def attach_artifacts(issue: dict, report_dir: Path, method_name: str) -> None:
+    """Preserve this failure's artefacts, unless collect already did.
 
-    The framework writes it under the report dir on failure. Copying it into the
-    audit session means the handoff stays valid after CI cleans up the report,
-    and test-healing-agent then never has to reach the page itself — the DOM it
-    needs was already captured in the right session, at the right step, with the
-    right test data.
+    Collect attaches these now, so that classification can see them. Ship still
+    runs the same code for handoffs built from an older collect output, and
+    because the copies it makes are the ones that survive CI cleaning up the
+    report directory.
     """
-    if not report_dir or not method_name:
+    if issue.get("dom_snapshot") and Path(issue["dom_snapshot"]).exists():
         return
-    try:
-        snapshot = find_snapshot(report_dir, method_name)
-        if not snapshot:
-            return
-        text = snapshot.read_text(encoding="utf-8", errors="ignore")
-        dom_dir = AUDIT_DIR / "dom"
-        dom_dir.mkdir(parents=True, exist_ok=True)
-        preserved = dom_dir / f"{method_name}.html"
-        preserved.write_text(text, encoding="utf-8")
-
-        issue["dom_snapshot"] = str(preserved)
-        issue["failure_url"] = parse_header(text).get("url", "")
-        log(f"  DOM snapshot attached for {method_name} "
-            f"({len(text) // 1024}KB) → {preserved.name}")
-    except Exception as e:
-        # Never let a missing artefact block the handoff — the healing agent
-        # falls back to live inspection or static inference.
-        log(f"  Could not attach DOM snapshot for {method_name}: {e}")
-
-
-def attach_trace(issue: dict, report_dir: Path, method_name: str) -> None:
-    """Copy the Playwright trace for this test into the session, if one exists.
-
-    The trace names the selector that actually failed at runtime, which beats
-    inferring it from an error message, and it keeps the whole flow available in
-    Trace Viewer for whoever reviews the PR.
-    """
-    if not report_dir or not method_name:
-        return
-    try:
-        traces = [p for p in Path(report_dir).rglob(f"traces/{method_name}_*.zip")]
-        if not traces:
-            return
-        trace = max(traces, key=lambda p: p.stat().st_mtime)
-        trace_dir = AUDIT_DIR / "traces"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        preserved = trace_dir / f"{method_name}.zip"
-        preserved.write_bytes(trace.read_bytes())
-
-        issue["trace_path"] = str(preserved)
-        failed = failing_action(read_actions(preserved))
-        if failed and failed.get("selector"):
-            issue["failed_selector"] = failed["selector"]
-            log(f"  Trace attached for {method_name} — failing selector: {failed['selector']}")
-        else:
-            log(f"  Trace attached for {method_name}")
-    except Exception as e:
-        log(f"  Could not attach trace for {method_name}: {e}")
+    artifacts.attach_all(issue, report_dir, method_name, AUDIT_DIR, log)
 
 
 def write_handoff(build_tag: str, classify_data: dict, collect_data: dict) -> str | None:
@@ -158,11 +112,18 @@ def write_handoff(build_tag: str, classify_data: dict, collect_data: dict) -> st
     Returns the queue file path if written, else None.
     """
     all_classifications = classify_data.get("classifications", [])
+    # Select on what the healing agent can actually act on, not on one category
+    # name. ELEMENT_NOT_FOUND alone forwarded stale locators and nothing else, so
+    # a page that was merely slow or covered — both fixable — stayed red forever
+    # under TIMEOUT, while wrong-page failures came through wearing the label of
+    # a locator problem.
+    actionable = set(diagnosis.ACTIONS) | {"ELEMENT_NOT_FOUND"}
     eligible = [
         c for c in all_classifications
         if c.get("classification") == "AUTOMATION_ISSUE"
         and c.get("confidence") == "HIGH"
-        and c.get("root_cause_category") == "ELEMENT_NOT_FOUND"
+        and c.get("root_cause_category") in actionable
+        and c.get("root_cause_category") not in diagnosis.STOP
     ]
 
     if not eligible:
@@ -208,8 +169,7 @@ def write_handoff(build_tag: str, classify_data: dict, collect_data: dict) -> st
             "failed_selector": "",
         }
         method = failure.get("method_name") or test_name.split(".")[-1]
-        attach_dom_snapshot(issue, report_dir, method)
-        attach_trace(issue, report_dir, method)
+        attach_artifacts(issue, report_dir, method)
         automation_issues.append(issue)
 
     handoff = {
@@ -404,7 +364,8 @@ def main():
                 1 for c in classify_data.get("classifications", [])
                 if c.get("classification") == "AUTOMATION_ISSUE"
                 and c.get("confidence") == "HIGH"
-                and c.get("root_cause_category") == "ELEMENT_NOT_FOUND"
+                and c.get("root_cause_category") in actionable
+                and c.get("root_cause_category") not in diagnosis.STOP
             )
             lines.append(f":wrench: {eligible_count} automation issue(s) queued for test-healing-agent")
         else:

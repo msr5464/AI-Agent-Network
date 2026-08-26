@@ -13,6 +13,11 @@ apply to them.
 """
 
 import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from shared import diagnosis as _diagnosis
 from typing import Dict, List
 
 # Anything run-specific must be stripped, or two identical failures look different.
@@ -28,7 +33,11 @@ _VOLATILE = [
 # Categories where "same message" genuinely means "same defect". An assertion
 # failure saying "expected 5 but got 4" can arise from unrelated causes, so those
 # are never merged.
-_GROUPABLE_CATEGORIES = {"ELEMENT_NOT_FOUND", "TIMEOUT"}
+# Categories where "same message" genuinely means "same defect". Extended with
+# the diagnosis verdicts, which are stronger evidence of a shared cause than a
+# matching message ever was: they were measured rather than read.
+_GROUPABLE_CATEGORIES = ({"ELEMENT_NOT_FOUND", "TIMEOUT"}
+                         | set(_diagnosis.STOP) | set(_diagnosis.ACTIONS))
 
 
 def normalize(text: str) -> str:

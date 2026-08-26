@@ -4,8 +4,45 @@ Read this file first. Every time. Before doing anything else.
 
 ## What This Agent Does
 
-Picks up automation issues queued by `test-triaging-agent`, fixes broken locators via Claude,
-verifies each fix by running the test, and ships a GitHub PR with all successful fixes.
+Works out **why** a test could not find an element, and acts only where that answer
+permits. Where the cause is a stale locator it fixes it via Claude, verifies the fix by
+running the test, and ships a GitHub PR. Where it is not, it stops and says what the
+cause actually was.
+
+That distinction is the whole point. An element is missing identically however it went
+missing — the page was still loading, a request failed, an earlier click silently did
+nothing, an overlay covered it, the wait was two seconds short, the session expired and
+left the flow on a page it was never meant to reach. The agent used to hold one
+hypothesis for all of them, and the verification loop could not catch the mistake:
+the easiest way to make a page assertion pass is to weaken it, so a fix built on a wrong
+diagnosis goes green and ships a permanently broken test.
+
+## Diagnosis
+
+`shared/diagnosis.py` combines evidence that already existed and was never read — the
+DOM captured at failure, the page object's own locator coverage, the network log inside
+the Playwright trace, the step timeline, the framework's structured failure context, and
+a baseline of what the page looked like when the test last passed.
+
+| Verdict | Meaning | What the agent may do |
+|---|---|---|
+| `LOCATOR_STALE` | Right page, element renamed or moved | edit the selector |
+| `NOT_READY` | Page still rendering when the wait expired | add a readiness wait |
+| `TOO_SLOW` | Element arrived after the budget ran out | raise the wait budget |
+| `BLOCKED` | Present but covered or off-screen | dismiss the obstruction |
+| `WRONG_PAGE`, `PRIOR_STEP_FAILED`, `ERROR_STATE`, `ENV_UNREACHABLE`, `DATA_PRECONDITION`, `FLAKY_TRANSIENT`, `ELEMENT_GONE` | Not fixable by editing this file | **stop**, report cause and remediation |
+| `INSUFFICIENT_EVIDENCE` | Cannot tell | fall through to the pre-existing behaviour |
+
+Two rules keep it honest. **Unevaluable is not absent** — a selector that could not be
+tested, a trace that could not be read and an artefact that was never referenced all
+contribute nothing, rather than contributing zero. And **abstaining is a valid answer**:
+a weak signal must never block a genuine fix.
+
+Verdicts below HIGH confidence are **measured, not assumed**. One targeted re-run either
+confirms or refutes them (`lib/probes.py`), and for `TOO_SLOW` / `NOT_READY` that probe
+is the experiment itself — a run with a larger budget that passes has proved the fix
+before a line is edited. A refuted verdict falls back to abstention rather than flipping
+to its opposite: a probe that disagrees says the reasoning was wrong, not what is right.
 
 Runs independently — no DB access required. All context comes from the handoff file.
 
@@ -297,6 +334,9 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `AUTOFIX_ENVIRONMENT`, `AUTOFIX_COUNTRY` | Which `parameters/{environment}-{country}.properties` to read (default: `staging` / `SG`) |
 | `AUTOFIX_REPAIR_SESSION` | Explicit path to a `.repair-session.json`. Unset → looked for under the workspace's `test-output/` |
 | `AUTOFIX_MAX_DIFF_LINES` | Reject a fix whose diff exceeds this many lines (default: 40) |
+| `DIAGNOSIS_PROBE` | `false` to skip confirmation probes (default: on). A probe costs one test run and buys a measured verdict instead of an assumed one |
+| `BASELINE_DIR` | Where page baselines are read from. Unset → `<workspace>/test-output/baselines`. Point CI at a path that survives between builds, or baselines are discarded with every report directory |
+| `DIAGNOSIS_MODE` | `shadow` (default) — diagnose and log, but let the old behaviour decide. `enforce` — a stop verdict skips the work before any model call. Shadow exists so the verdicts can be measured against real outcomes before they refuse work the agent used to do |
 | `AUTOFIX_PAGE_OBJECT_CHARS` | Budget per page object shown to Claude (default: 8000). Declarations are always kept in full |
 | `PAGE_OBJECT_DIRS` | Comma-separated page-object search dirs. Unset → derived from the repo layout |
 | `AUTOFIX_TEST_TIMEOUT_S` | Timeout for one verification test run (default: 300) |
@@ -343,7 +383,11 @@ make audit AGENT=test-healing-agent SESSION=20260328-143022-fix-ProdSanity-All-T
 
 ## Key Rules
 
-1. **Only fix AUTOMATION_ISSUE + HIGH + ELEMENT_NOT_FOUND** — handoff already filtered
+1. **Diagnose before editing.** `shared/diagnosis.py` decides *why* the element was
+   missing — a stale locator is one answer among several, and only `LOCATOR_STALE`
+   authorises a selector edit. Stop verdicts exit without a model call. Abstention
+   (`INSUFFICIENT_EVIDENCE`) falls through to the pre-existing behaviour, so a weak
+   signal never blocks a genuine fix
 2. **Every fix must pass the test before it is committed** — restore original on failure
 3. **Write audit entry before any irreversible action** (git commit, push)
 4. **Use wrapper methods, not raw Selenium** — CONVENTIONS.md teaches Claude the patterns

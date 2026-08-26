@@ -32,9 +32,11 @@ import logging
 logging.basicConfig(level=logging.WARNING)
 
 from lib.test_runner import run_test, split_test_name
+from lib import probes
 from lib.code_analyzer import CodeAnalyzer
 from shared.dom_snapshot import find_snapshot, parse_header
 from shared.playwright_trace import read_actions, failing_action
+from shared import diagnosis
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -49,6 +51,16 @@ TEST_RESULTS_DIR_NAME  = os.environ.get("TEST_RESULTS_DIR_NAME", "test-output")
 REPAIR = os.environ.get("REPAIR", "false").lower() == "true"
 FORCE  = os.environ.get("FORCE", "false").lower() == "true"
 REPRODUCE_TIMEOUT_S = int(os.environ.get("AUTOFIX_REPRODUCE_TIMEOUT_S", "900"))
+
+# shadow: run the diagnosis and log it, but let the old behaviour decide.
+# enforce: a stop verdict actually stops the run before any model call.
+# Shadow is the default because this gate can refuse work the agent used to
+# do successfully, and that risk deserves a measurement rather than a leap.
+DIAGNOSIS_MODE = os.environ.get("DIAGNOSIS_MODE", "shadow").strip().lower()
+# A probe costs one test run. Off by default in the reproduce step only when
+# explicitly disabled, since the run has already paid for a workspace and a
+# build here and the marginal cost is the run itself.
+PROBE_ENABLED = os.environ.get("DIAGNOSIS_PROBE", "true").strip().lower() != "false"
 
 # ── Failure-shape detection ───────────────────────────────────────────────────
 #
@@ -91,7 +103,8 @@ _ASSERTION_SIGNALS = [
 ]
 
 
-def classify_failure_shape(text: str, trace_selector: str = "") -> tuple:
+def classify_failure_shape(text: str, trace_selector: str = "",
+                           trace_selector_inferred: bool = False) -> tuple:
     """Return (shape, reason). shape is LOCATOR / ASSERTION / INFRA_* / UNKNOWN."""
     blob = (text or "").lower()
 
@@ -100,9 +113,12 @@ def classify_failure_shape(text: str, trace_selector: str = "") -> tuple:
             if signal in blob:
                 return shape, f"matched infrastructure signal: {signal!r}"
 
-    # A trace whose failing action carried a selector is the strongest evidence
-    # available that this really is a locator problem.
-    if trace_selector:
+    # A trace whose failing action genuinely errored with a selector is strong
+    # evidence of a locator problem. One *inferred* by `_polled_to_death` is not:
+    # that fires whenever a wait loop ran out of patience, which is equally what
+    # a page that never loaded looks like. Inferred selectors fall through to the
+    # signal lists below rather than short-circuiting them.
+    if trace_selector and not trace_selector_inferred:
         return "LOCATOR", f"the failing action in the trace used selector {trace_selector!r}"
 
     for signal in _LOCATOR_SIGNALS:
@@ -181,15 +197,58 @@ def attach_artifacts(issue: dict, results_dir: Path, method_name: str) -> str:
         if failed and failed.get("selector"):
             trace_selector = failed["selector"]
             issue["failed_selector"] = trace_selector
-            log(f"  Trace: {trace.name} — failing selector {trace_selector}")
+            issue["failed_selector_inferred"] = bool(failed.get("inferred"))
+            how = " (inferred from repeated polling)" if failed.get("inferred") else ""
+            log(f"  Trace: {trace.name} — failing selector {trace_selector}{how}")
         else:
             log(f"  Trace: {trace.name}")
 
     return trace_selector
 
+
+def wait_budget_seconds(workspace: Path) -> int | None:
+    """The framework's configured element timeout, so a wait that ran the clock
+    out can be told apart from one that gave up early."""
+    for name in ("parameters/config.properties", "config.properties"):
+        candidate = workspace / name
+        if not candidate.exists():
+            continue
+        try:
+            for line in candidate.read_text(encoding="utf-8", errors="ignore").splitlines():
+                key, _, value = line.partition("=")
+                if key.strip() == "ObjectWaitTime":
+                    return int(value.strip())
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+
+def gate_decision(shape: str, reason: str, verdict: dict, mode: str,
+                  force: bool) -> tuple:
+    """Fold a diagnosis into the failure shape. Returns (shape, reason, note).
+
+    Shadow mode is deliberately inert: it reports what it would have done and
+    changes nothing, so the verdicts can be measured against real outcomes before
+    they are allowed to refuse work the agent used to do successfully.
+    """
+    if not verdict or verdict.get("verdict") not in diagnosis.STOP:
+        return shape, reason, ""
+    if force:
+        return shape, reason, (f"diagnosis says {verdict['verdict']}, but FORCE=true "
+                               f"— attempting a fix anyway")
+    if mode != "enforce":
+        return shape, reason, (f"shadow mode: would have stopped here — "
+                               f"{verdict['verdict']}. Set DIAGNOSIS_MODE=enforce "
+                               f"to act on it.")
+    return (verdict["verdict"],
+            verdict["reasons"][0] if verdict.get("reasons") else reason, "")
+
+
 # ── Output helpers ────────────────────────────────────────────────────────────
 
-def finish(status: str, headline: str, detail: str = "", issues: list | None = None) -> None:
+def finish(status: str, headline: str, detail: str = "", issues: list | None = None,
+           verdict: dict | None = None) -> None:
     """Write the audit files and exit. Never raises."""
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     result = {
@@ -198,6 +257,17 @@ def finish(status: str, headline: str, detail: str = "", issues: list | None = N
         "repair_mode": REPAIR, "forced": FORCE,
         "issues_found": len(issues or []),
     }
+    # The remediation is the sentence a person actually needs, so it has to be a
+    # field rather than prose inside the headline — the UI reads this, and a run
+    # that says only "not a locator problem" has told them nothing they can act on.
+    if verdict:
+        result["diagnosis"] = {
+            "verdict": verdict.get("verdict", ""),
+            "confidence": verdict.get("confidence", ""),
+            "reasons": verdict.get("reasons") or [],
+            "remediation": verdict.get("remediation", ""),
+            "actionable": verdict.get("actionable", False),
+        }
     (AUDIT_DIR / "00-reproduce.json").write_text(json.dumps(result, indent=2))
 
     lines = [f"# Reproduce — {TEST_NAME}", "", f"**Status:** `{status}`  ",
@@ -212,8 +282,13 @@ def finish(status: str, headline: str, detail: str = "", issues: list | None = N
 
     if status != "queued":
         (AUDIT_DIR / ".fix-passed").write_text("skipped")
-        (AUDIT_DIR / ".skip-reason").write_text(
-            "infra" if status.startswith("INFRA") else "no-work")
+        if status.startswith("INFRA"):
+            reason = "infra"
+        elif status in diagnosis.STOP:
+            reason = diagnosis.skip_reason(status)
+        else:
+            reason = "no-work"
+        (AUDIT_DIR / ".skip-reason").write_text(reason)
     log(headline)
     sys.exit(0)
 
@@ -284,7 +359,9 @@ def main():
 
     log(f"{len(entries)} failing test(s) in this run")
 
-    issues, shapes = [], []
+    budget_s = wait_budget_seconds(workspace)
+
+    issues, shapes, diagnoses = [], [], {}
     for entry in entries:
         entry_method = entry.get("testName") or method
         entry_class = entry.get("className") or full_class
@@ -311,7 +388,48 @@ def main():
         }
         trace_selector = attach_artifacts(issue, results_dir, entry_method)
 
-        shape, reason = classify_failure_shape(f"{message}\n{output[-4000:]}", trace_selector)
+        # Ask why the element was missing before assuming the locator is at fault.
+        # Everything this reads was already on disk; it costs no model call.
+        verdict = {}
+        try:
+            evidence = diagnosis.collect(issue, workspace=workspace, budget_s=budget_s)
+            verdict = diagnosis.diagnose(evidence)
+            for line in diagnosis.describe(verdict, evidence):
+                log(f"  {line}")
+            # Measure anything short of HIGH before acting on it. One targeted
+            # re-run costs less than the model call plus speculative edit plus
+            # verification run plus revert that acting on a wrong verdict does.
+            if PROBE_ENABLED and diagnosis.needs_probe(verdict):
+                kind = diagnosis.PROBES[verdict["verdict"]]["kind"]
+                outcome = probes.run(kind, TEST_NAME, workspace, results_dir,
+                                     issue.get("dom_snapshot"), log=log)
+                verdict = diagnosis.apply_probe(verdict, outcome)
+                log(f"  probe result: {outcome} → {verdict['verdict']} "
+                    f"({verdict['confidence']})")
+
+            issue["diagnosis"] = {k: verdict[k] for k in
+                                  ("verdict", "confidence", "reasons", "remediation",
+                                   "action", "actionable", "rule")}
+            issue["diagnosis"]["probe"] = verdict.get("probe", {})
+            diagnoses[issue["test_name"]] = verdict
+        except Exception as exc:
+            log(f"  Diagnosis failed ({exc}) — falling back to signal matching")
+
+        shape, reason = classify_failure_shape(
+            f"{message}\n{output[-4000:]}", trace_selector,
+            bool(issue.get("failed_selector_inferred")))
+
+        shape, reason, note = gate_decision(shape, reason, verdict,
+                                            DIAGNOSIS_MODE, FORCE)
+        if note:
+            log(f"  ({note})")
+
+        if verdict.get("verdict") == "LOCATOR_STALE":
+            issue["root_cause_category"] = "ELEMENT_NOT_FOUND"
+        elif verdict.get("verdict") and verdict["verdict"] != diagnosis.ABSTAIN:
+            issue["root_cause_category"] = verdict["verdict"]
+            issue["recommended_action"] = verdict.get("action") or verdict.get("remediation", "")
+
         shapes.append((issue["test_name"], shape, reason))
         if shape == "LOCATOR" or FORCE:
             issues.append(issue)
@@ -319,12 +437,26 @@ def main():
 
     # ── Gate on failure shape ─────────────────────────────────────────────────
     if not issues:
-        summary = "\n".join(f"{name}: {shape} — {reason}" for name, shape, reason in shapes)
+        parts = []
+        for name, shape, reason in shapes:
+            parts.append(f"{name}: {shape} — {reason}")
+            verdict = diagnoses.get(name) or {}
+            for extra in (verdict.get("reasons") or [])[1:]:
+                parts.append(f"    {extra}")
+            if verdict.get("remediation"):
+                parts.append(f"    REMEDIATION: {verdict['remediation']}")
+        summary = "\n".join(parts)
         worst = next((s for _, s, _ in shapes if s.startswith("INFRA")), shapes[0][1])
-        finish(worst,
-               f"Not a locator failure ({worst}) — stopping before any fix is attempted. "
-               f"Re-run with FORCE=true to try anyway.",
-               summary)
+        if worst in diagnosis.STOP:
+            headline = (f"{worst} — this is not something a locator edit can fix. "
+                        f"Stopping before any model call. Re-run with FORCE=true "
+                        f"to attempt one anyway.")
+        else:
+            headline = (f"Not a locator failure ({worst}) — stopping before any fix "
+                        f"is attempted. Re-run with FORCE=true to try anyway.")
+        worst_verdict = next((diagnoses[name] for name, shape, _ in shapes
+                              if shape == worst and name in diagnoses), None)
+        finish(worst, headline, summary, verdict=worst_verdict)
 
     if FORCE and any(shape != "LOCATOR" for _, shape, _ in shapes):
         log("FORCE=true — attempting a fix despite the failure not looking locator-shaped")

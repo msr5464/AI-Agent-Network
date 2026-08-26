@@ -62,6 +62,15 @@ when you are certain the fix is a locator/code change, not a product defect.
 | Category | Description | Error Examples |
 |---|---|---|
 | `ELEMENT_NOT_FOUND` | Locator doesn't match DOM | `NoSuchElementException`, `ElementNotFound` |
+| `LOCATOR_STALE` | Right page, element renamed or moved — the page object's other locators still match | measured, not inferred |
+| `WRONG_PAGE` | The flow never reached this page; none of its locators are present | 0 of N page-object locators match |
+| `NOT_READY` | Page still rendering when the wait expired | `readyState` not complete, DOM still changing |
+| `TOO_SLOW` | Element arrived after the budget ran out | anchor present, DOM still changing |
+| `BLOCKED` | Element present but covered or off-screen | anchor count > 0, never visible |
+| `ERROR_STATE` | The application served an error in place of the page | 4xx/5xx on the document, fatal JS error |
+| `ENV_UNREACHABLE` | Host or network down | document request never completed |
+| `DATA_PRECONDITION` | A fixture the test depends on is stale or missing | expired stored session |
+| `INSUFFICIENT_EVIDENCE` | Not enough signal to judge — fall back to the previous behaviour | |
 | `TIMEOUT` | Wait exceeded | `TimeoutException`, "NOT loaded after X seconds" |
 | `ASSERTION_FAILURE` | Expected vs actual mismatch | `AssertionError`, `ComparisonFailure` |
 | `ENVIRONMENT_ISSUE` | Infrastructure/API connectivity | `ConnectionRefused`, API 500, DB timeout |
@@ -75,7 +84,10 @@ when you are certain the fix is a locator/code change, not a product defect.
 Only failures meeting ALL THREE criteria are queued for test-healing-agent:
 1. `classification = AUTOMATION_ISSUE`
 2. `confidence = HIGH`
-3. `root_cause_category = ELEMENT_NOT_FOUND`
+3. `root_cause_category` is one the healing agent can act on — see the table
+   above. Only `LOCATOR_STALE` / `ELEMENT_NOT_FOUND` authorise a selector edit;
+   `NOT_READY`, `TOO_SLOW` and `BLOCKED` are fixed with waits, not selectors;
+   everything else stops the run with a diagnosis.
 
 **Never queue:**
 - PRODUCT_BUG (regardless of confidence)

@@ -14,6 +14,14 @@ Domain context (framework patterns, imports, wrapper methods) lives separately i
 ---
 
 ## Instructions
+
+0. **Confirm this is the right page before touching any selector.** If a DIAGNOSIS
+   section appears above, it has already been worked out from the DOM captured at
+   failure, the page object's own locators, the network log and the step timeline.
+   Work within it. When it says the failure is not a stale locator, the correct
+   answer is `fixable: false` naming that cause — not the closest-looking element
+   on a page the test never meant to be on. A selector that "looks right" is how a
+   broken login gets shipped green.
 1. Identify the EXACT broken locator (CSS selector, XPath, @FindBy, etc.)
 2. The broken element is most likely one of the extracted element names above
 3. Look in the page object files above for the declaration that needs updating —
@@ -29,6 +37,7 @@ Respond with a JSON object ONLY. No prose, no markdown fences around it.
 ```
 {
   "fixable": true | false,
+  "verdict": "LOCATOR_STALE" | "NOT_READY" | "TOO_SLOW" | "BLOCKED" | "STOP",
   "unfixable_reason": "<reason if fixable=false, else null>",
   "fix_description": "<1-2 sentences: what was broken and what you changed>",
   "target_file": "<absolute path of the file to modify>",
@@ -40,6 +49,15 @@ Respond with a JSON object ONLY. No prose, no markdown fences around it.
   ]
 }
 ```
+
+Rules for `verdict`:
+- `LOCATOR_STALE` — right page, right state, the element was renamed or moved.
+  This is the only verdict under which a selector edit is accepted.
+- `NOT_READY` / `TOO_SLOW` / `BLOCKED` — the element exists but was not visible in
+  time or was covered. Fix the wait or the obstruction, never the selector.
+- `STOP` — nothing here is fixable by editing this file. Set `fixable: false`.
+- A guard rejects a selector edit whose verdict is not `LOCATOR_STALE`, and one
+  that broadens what it replaces, before the test is ever run.
 
 Rules for `edits`:
 - Keep each edit as small as possible — ideally the single locator line.
@@ -61,6 +79,9 @@ Before setting `fixable: false`, you MUST exhaustively try:
 3. Try alternative locator strategies in priority order: `id` > `name` > `css [data-cy]` > `css` > `xpath`
 4. Check related files for alternative element declarations (inner classes, static strings)
 5. Look for similar working locators in the same page object as a pattern reference
+
+0. Confirm the page identity first. An element missing because the test never
+   arrived is not a locator problem, and no amount of searching will make it one.
 
 If a **LIVE DOM** section appears above, its selectors were observed in a real
 browser and verified to match exactly one element — prefer them over anything you

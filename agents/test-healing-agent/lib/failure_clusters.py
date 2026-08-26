@@ -49,12 +49,23 @@ def _element_key(context: dict) -> str:
 
 
 def cluster_key(context: dict) -> str:
-    """The key two failures must share to be one fix.
+    """The key two failures must share to be one unit of work.
 
     Pairs the file that has to change with the element inside it. Two tests
     failing on the same element of the same page object are one fix; the same
     element name in two different page objects is not.
+
+    A diagnosis changes what "unit of work" means. Grouping on (file, element) is
+    right for locator breaks, and wrong for everything else: thirty tests failing
+    because the environment is down are one cause but thirty different elements,
+    so they would each consume a slot and then be truncated into "deferred" by
+    AUTO_FIX_MAX_FIXES_PER_RUN. Non-locator verdicts therefore group on the cause
+    itself, and are reported once.
     """
+    verdict = (context.get("diagnosis") or {}).get("verdict") or ""
+    if verdict and verdict not in ("LOCATOR_STALE", "INSUFFICIENT_EVIDENCE"):
+        return f"cause:{verdict}"
+
     page_objects = context.get("page_objects") or []
     target = page_objects[0]["path"] if page_objects else ""
     element = _element_key(context)
@@ -76,6 +87,9 @@ def evidence_rank(context: dict) -> tuple:
     a trace, which beats matched page objects, which beats nothing.
     """
     return (
+        # A member that already carries a diagnosis can see why the element was
+        # missing, not just that it was. That outranks every raw artefact.
+        1 if (context.get("diagnosis") or {}).get("verdict") else 0,
         # dom_snapshot_path is known during Phase A; dom_snapshot only after
         # grounding — check both so ranking works before a cluster is fixed.
         1 if (context.get("dom_snapshot") or context.get("dom_snapshot_path")) else 0,

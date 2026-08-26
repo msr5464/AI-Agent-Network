@@ -204,8 +204,10 @@ def format_for_prompt(distilled: Dict, max_chars: int = 6000) -> str:
 
     shown = set()
     if distilled.get("likely_matches"):
-        lines.append("MOST LIKELY REPLACEMENTS for the missing element "
-                     "(ranked by name similarity):")
+        lines.append("Candidate elements, ranked by name similarity to the missing "
+                     "one. Similarity is not evidence that this is the right page — "
+                     "check the page identity above before treating any of these as "
+                     "a replacement:")
         for element in distilled["likely_matches"]:
             lines.append(render(element))
             shown.add(key(element))

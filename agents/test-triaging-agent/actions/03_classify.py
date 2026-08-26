@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → lib.*
 
 from shared.log import log as _log
+from shared import diagnosis
 from lib.root_cause_groups import (group_failures, pick_representative,
                                     is_groupable, signature as cause_signature)
 def log(msg): _log("classify", msg)
@@ -71,7 +72,13 @@ def extract_json_block(text: str) -> list | dict | None:
 
 VALID_CLASSIFICATIONS = {"PRODUCT_BUG", "AUTOMATION_ISSUE", "UNKNOWN"}
 VALID_CONFIDENCE      = {"HIGH", "MEDIUM", "LOW"}
-VALID_CATEGORIES      = {"ELEMENT_NOT_FOUND", "TIMEOUT", "ASSERTION_FAILURE", "ENVIRONMENT_ISSUE", "CODE_ISSUE", "OTHER"}
+# The original six, plus the verdicts the diagnosis engine can now distinguish.
+# The old values stay valid: historical reports, category_rules.py and the HTML
+# report all key off them, and ELEMENT_NOT_FOUND remains what an LLM answers
+# when it only has the error text to go on.
+_LEGACY_CATEGORIES = {"ELEMENT_NOT_FOUND", "TIMEOUT", "ASSERTION_FAILURE",
+                      "ENVIRONMENT_ISSUE", "CODE_ISSUE", "OTHER"}
+VALID_CATEGORIES      = _LEGACY_CATEGORIES | set(diagnosis.STOP) | set(diagnosis.ACTIONS)
 
 
 def validate_classification(c: dict) -> dict:
@@ -221,6 +228,42 @@ def apply_category_rules(classifications: list[dict], all_failures: list[dict]) 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def diagnose_failures(failures: list, report_dir: str) -> dict:
+    """Deterministic verdicts for the failures whose evidence supports one.
+
+    Runs before the model. Where the engine is confident it is authoritative — it
+    measured the page, while the classifier can only read the sentence describing
+    it — and the model is left to judge what the engine abstained on. On a large
+    build this also removes most of the classification work entirely.
+    """
+    verdicts = {}
+    for failure in failures:
+        try:
+            evidence = diagnosis.collect(failure, workspace=report_dir or None)
+            verdict = diagnosis.diagnose(evidence)
+        except Exception as e:
+            log(f"  Diagnosis failed for {failure.get('full_name')}: {e}")
+            continue
+        if verdict["verdict"] == diagnosis.ABSTAIN or verdict["confidence"] != "HIGH":
+            continue
+        verdicts[failure["full_name"]] = {
+            "test_name": failure["full_name"],
+            # A measured non-locator cause is an automation issue only when the
+            # automation is what went wrong. An error page or a dead host is the
+            # environment, and a product bug is neither.
+            "classification": ("PRODUCT_BUG" if verdict["verdict"] == "ELEMENT_GONE"
+                               else "AUTOMATION_ISSUE"),
+            "confidence": "HIGH",
+            "root_cause_category": verdict["verdict"],
+            "root_cause": "; ".join(verdict.get("reasons") or [])[:400],
+            "failure_signature": f"{verdict['verdict']}: {failure.get('error_type', '')}",
+            "recommended_action": verdict.get("action") or verdict.get("remediation", ""),
+            "source": "diagnosis",
+            "actionable": verdict.get("actionable", False),
+        }
+    return verdicts
+
+
 def main():
     collect = load_json("02-collect.json")
     failures = collect.get("failures", [])
@@ -279,10 +322,28 @@ def main():
             for f in group:
                 log(f"        {f['full_name']}")
 
+    # ── Diagnose deterministically first ──────────────────────────────────────
+    # The engine measured the page; the classifier can only read the sentence
+    # describing it. Where the engine is confident, it is the better answer and
+    # the model is not asked at all.
+    diagnosed = diagnose_failures(representatives, collect.get("report_dir", ""))
+    if diagnosed:
+        log(f"Diagnosed {len(diagnosed)} of {len(representatives)} representative(s) "
+            f"from evidence — no model call needed for those")
+        for verdict in diagnosed.values():
+            log(f"  {verdict['test_name'].split('.')[-1]}: "
+                f"{verdict['root_cause_category']}")
+    representatives = [r for r in representatives
+                       if r["full_name"] not in diagnosed]
+
+    all_classifications = list(diagnosed.values())
+
+    if not representatives:
+        log("Every representative was diagnosed from evidence — skipping classification")
+
     log(f"Classifying {len(representatives)} representative failure(s) "
         f"in batches of {BATCH_SIZE}...")
 
-    all_classifications = []
     batches = [representatives[i:i + BATCH_SIZE]
                for i in range(0, len(representatives), BATCH_SIZE)]
 

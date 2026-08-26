@@ -31,8 +31,8 @@ run.sh (orchestrator)
 | Step | Owns | Does NOT do |
 |------|------|-------------|
 | **01 Scout** | Query DB for buildTags, score by failure count & recency, skip known ones | No HTML parsing, no AI |
-| **02 Collect** | DB query, HTML log parse, flaky detection, trend analysis | No AI calls |
-| **03 Classify** | Batch classify each failure via Claude CLI | No DB writes, no git |
+| **02 Collect** | DB query, HTML log parse, flaky detection, trend analysis, **attach DOM snapshot / trace / failure context** | No AI calls |
+| **03 Classify** | Run `shared/diagnosis.py` on the evidence, then batch classify whatever it abstained on via Claude CLI | No DB writes, no git |
 | **04 Review** | Independent review of classifications, multi-round debate, .verdict | No DB, no code changes |
 | **05 Ship** | HTML report, write handoff.json to test-healing-agent queue, Slack notify | No AI, no code changes, no PR |
 
@@ -44,8 +44,12 @@ run.sh (orchestrator)
 01-scout.json
     ↓ .selected-buildtag
 02-collect.json          (test_results, flaky_tests, trend, summary)
-    ↓
-03-classify.json         (classifications with confidence, root_cause_category, signature)
+    ↓                    (failures now carry dom_snapshot / trace_path / failure_context —
+                          attached here, because the classifier decides what kind of
+                          failure each one is and cannot do that without the evidence)
+03-classify.json         (classifications with confidence, root_cause_category, signature;
+                          deterministic verdicts from the diagnosis engine come first and
+                          are not sent to the model at all)
     ↓
 .verdict                 (APPROVED or NEEDS-HUMAN)
     ↓
@@ -59,7 +63,14 @@ audit/<session>/traces/<method>.zip               ← Playwright trace, referenc
 **Handoff criteria** (written only when verdict=APPROVED):
 - `classification = AUTOMATION_ISSUE`
 - `confidence = HIGH`
-- `root_cause_category = ELEMENT_NOT_FOUND`
+- `root_cause_category` is something the healing agent can act on — a stale
+  locator, or a page that was merely slow, still loading, or covered. Stop
+  verdicts (`WRONG_PAGE`, `DATA_PRECONDITION`, `ERROR_STATE`, …) are never
+  forwarded: no code edit can fix them.
+
+Selecting on `ELEMENT_NOT_FOUND` alone used to do both halves of this wrong. It
+forwarded wrong-page failures wearing a locator's label, and it dropped slow and
+obstructed elements — both fixable — because they landed in `TIMEOUT`.
 
 ---
 
@@ -86,7 +97,12 @@ audit/<session>/traces/<method>.zip               ← Playwright trace, referenc
 - **LOW**: Ambiguous, needs human review
 
 ### Root Cause Categories
-- `ELEMENT_NOT_FOUND` — NoSuchElementException, locator issues
+- `ELEMENT_NOT_FOUND` — NoSuchElementException, locator issues (what an LLM answers
+  when it has only the error text; the diagnosis engine refines it into the verdicts below)
+- `LOCATOR_STALE` / `NOT_READY` / `TOO_SLOW` / `BLOCKED` — measured, and fixable
+- `WRONG_PAGE` / `PRIOR_STEP_FAILED` / `ERROR_STATE` / `ENV_UNREACHABLE` /
+  `DATA_PRECONDITION` / `FLAKY_TRANSIENT` / `ELEMENT_GONE` — measured, and not fixable
+  by editing a test
 - `TIMEOUT` — TimeoutException, page load waits
 - `ASSERTION_FAILURE` — expected vs actual mismatches
 - `ENVIRONMENT_ISSUE` — API 500 errors, server connectivity

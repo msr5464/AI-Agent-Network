@@ -34,6 +34,7 @@ AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 
+from lib import artifacts
 from lib.settings import Config
 
 INPUT_DIR = os.environ.get("INPUT_DIR", Config.INPUT_DIR)
@@ -209,6 +210,21 @@ def main():
         recurring = filtered_recurring
         log(f"After filtering: {len(recurring)} flaky tests match current run")
 
+    # ── 7. Attach artefacts, before anything classifies these failures ────────
+    # The DOM snapshot, trace and failure context used to be collected two steps
+    # later, in ship. That left the classifier deciding what kind of failure each
+    # one was while structurally unable to see the evidence that distinguishes a
+    # stale locator from a page the test never reached — and its verdict is what
+    # gates everything downstream.
+    failure_dicts = [test_result_to_dict(r) for r in failures]
+    if report_dir.exists():
+        for issue in failure_dicts:
+            method = issue.get("method_name") or ""
+            if method:
+                artifacts.attach_all(issue, report_dir, method, AUDIT_DIR, log)
+        attached = sum(1 for f in failure_dicts if f.get("dom_snapshot"))
+        log(f"Artefacts attached for {attached}/{len(failure_dicts)} failure(s)")
+
     # ── Write JSON ─────────────────────────────────────────────────────────────
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     result = {
@@ -222,7 +238,7 @@ def main():
         "flaky_tests": recurring,
         "html_links": merged_html_links,
         "test_results": [test_result_to_dict(r) for r in test_results],
-        "failures": [test_result_to_dict(r) for r in failures],
+        "failures": failure_dicts,
         "failure_count": len(failures),
         "total_count": summary.total,
     }
