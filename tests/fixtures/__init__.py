@@ -111,3 +111,38 @@ def issue(dom_snapshot="", execution_log="", failed_selector="",
     }
     base.update(overrides)
     return base
+
+
+def context(page_object="DashboardPage", anchors=None, navigation=None,
+            coverage=None, ready_state="complete", dom_changed=False,
+            elapsed_ms=30029, budget_ms=30000, **overrides):
+    """A structured failure context in the shape automation.core.FailureContext writes."""
+    payload = {
+        "schema": 1, "test": "app.tests.SomeTest.verifySomething",
+        "failedAt": "2026-08-26T00:00:00",
+        "failure": {"kind": "PAGE_NOT_LOADED", "pageObject": page_object,
+                    "anchors": anchors if anchors is not None
+                               else [{"selector": "img.avatar", "count": 0, "visible": False}],
+                    "elapsedMs": elapsed_ms, "budgetMs": budget_ms},
+        "page": {"url": "https://app.example.com/", "title": "T",
+                 "bodyClass": "", "readyState": ready_state, "ariaBusy": ""},
+        "pageObjectCoverage": {page_object: coverage if coverage is not None
+                               else {"matched": 0, "evaluable": 2,
+                                     "details": {"avatarWidget": 0, "userMenu": 0}}},
+        "domVolatility": {"changedDuringWait": dom_changed},
+        "navigation": navigation if navigation is not None
+                      else ["https://app.example.com/"],
+        "httpErrors": [], "jsErrors": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def baseline_record(page_object="DashboardPage", coverage=None,
+                    url="https://app.example.com/", title="Dashboard · Example",
+                    body_class="logged-in"):
+    """A recorded good-run fingerprint, as automation.core.Baseline writes it."""
+    return {"pageObject": page_object, "recordedAt": "2026-08-01T00:00:00",
+            "urlShape": url, "title": title, "bodyClass": body_class,
+            "coverage": coverage if coverage is not None
+                        else {"avatarWidget": 1, "userMenu": 1}}

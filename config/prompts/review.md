@@ -54,3 +54,25 @@ End your response with EXACTLY one of these lines:
 
 Use NEEDS-HUMAN if: >20% of classifications seem wrong, or if any HIGH-confidence AUTOMATION_ISSUE
 looks like it could be a PRODUCT_BUG.
+
+
+---
+
+## Diagnosis verdicts
+
+Some classifications come from `shared/diagnosis.py` rather than from a model, and
+carry `"source": "diagnosis"`. Their categories say what was measured:
+
+| Verdict | Measured |
+|---|---|
+| `LOCATOR_STALE` | right page — some of the page object's own locators still match, the failing one does not |
+| `WRONG_PAGE` | none of them match, and another page object does |
+| `PRIOR_STEP_FAILED` | the last action was an interaction and the page never navigated |
+| `NOT_READY` / `TOO_SLOW` / `BLOCKED` | the element was present or the page still rendering when the wait expired |
+| `ERROR_STATE` / `ENV_UNREACHABLE` | the document request returned an error, or never completed |
+| `DATA_PRECONDITION` | a fixture the test loads is stale or missing |
+| `ELEMENT_GONE` | right page, and the element was absent on the last passing run too |
+| `FLAKY_TRANSIENT` | nothing structural, and this test has recovered before unaided |
+
+Only `LOCATOR_STALE` authorises an automated fix. Everything else stops with a
+remediation for a human, so misclassifying *into* it is the expensive direction.

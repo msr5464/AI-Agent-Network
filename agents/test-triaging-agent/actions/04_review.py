@@ -75,6 +75,25 @@ def build_reviewer_prompt(classify_data: dict, round_num: int) -> str:
     sample = classifications[:30]
     sample_text = json.dumps(sample, indent=2)
 
+    # Some of these were measured rather than inferred: the diagnosis engine read
+    # the captured DOM, the page object's own locator coverage and the network log.
+    # A reviewer working from the error text alone cannot out-argue that, and
+    # letting it try is how a correct verdict gets talked out of.
+    measured = [c for c in sample if c.get("source") == "diagnosis"]
+    measured_note = ""
+    if measured:
+        names = ", ".join(c["test_name"].split(".")[-1] for c in measured[:6])
+        measured_note = f"""
+## Measured, not inferred — {len(measured)} of these
+{names}{" …" if len(measured) > 6 else ""}
+
+These carry `"source": "diagnosis"`. They were decided by measurement, not by
+reading the error message: how many of the page object's own locators were present
+in the captured DOM, what the document request returned, whether the page was still
+rendering. Challenge one only if you can point at evidence it contradicts — not
+because the error text reads differently. Their `root_cause` lists what was measured.
+"""
+
     # Include previous rounds if any
     prev_context = ""
     if round_num > 1:
@@ -97,6 +116,7 @@ def build_reviewer_prompt(classify_data: dict, round_num: int) -> str:
 
     return f"""You are a senior QA lead performing an independent review of AI-generated test failure classifications.
 You were NOT part of the original classification — you have zero context bias.
+{measured_note}
 
 Your job: validate that PRODUCT_BUG vs AUTOMATION_ISSUE classifications are correct and actionable.
 Focus on cases where the classification would mislead the engineering team.

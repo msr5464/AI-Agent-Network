@@ -189,6 +189,12 @@ def attach_artifacts(issue: dict, results_dir: Path, method_name: str) -> str:
         except OSError as e:
             log(f"  Could not read DOM snapshot: {e}")
 
+    # Located by convention: JsonTestReporter leaves screenshotPath empty by design.
+    shots = [p for p in results_dir.rglob(f"screenshots/{method_name}_*.png") if p.is_file()]
+    if shots:
+        issue["screenshot"] = str(max(shots, key=lambda p: p.stat().st_mtime))
+        log(f"  Screenshot: {Path(issue['screenshot']).name}")
+
     traces = list(results_dir.rglob(f"traces/{method_name}_*.zip"))
     if traces:
         trace = max(traces, key=lambda p: p.stat().st_mtime)
@@ -384,6 +390,7 @@ def main():
             "method_name": entry_method,
             "full_name": f"{entry_class}.{entry_method}",
             "dom_snapshot": "", "failure_url": "", "trace_path": "", "failed_selector": "",
+            "screenshot": "",
             "cause_group_key": "", "cause_group_size": 1,
         }
         trace_selector = attach_artifacts(issue, results_dir, entry_method)
@@ -392,7 +399,8 @@ def main():
         # Everything this reads was already on disk; it costs no model call.
         verdict = {}
         try:
-            evidence = diagnosis.collect(issue, workspace=workspace, budget_s=budget_s)
+            evidence = diagnosis.collect(issue, workspace=workspace, budget_s=budget_s,
+                                         audit_dir=AUDIT_DIR.parent)
             verdict = diagnosis.diagnose(evidence)
             for line in diagnosis.describe(verdict, evidence):
                 log(f"  {line}")
@@ -474,7 +482,12 @@ def main():
     (AUDIT_DIR / "00-handoff.json").write_text(json.dumps(handoff, indent=2))
     log(f"Handoff written: {len(issues)} issue(s) → 00-handoff.json")
 
-    finish("queued", f"{len(issues)} failing test(s) queued for fixing", "", issues)
+    # Record the verdict on the way through as well as on the way out. A soak that
+    # only sees the runs that stopped can measure false stops and nothing else —
+    # and the costlier mistake is a fix attempted on a page the test never reached.
+    proceeding = next((diagnoses[name] for name, _, _ in shapes if name in diagnoses), None)
+    finish("queued", f"{len(issues)} failing test(s) queued for fixing", "", issues,
+           verdict=proceeding)
 
 
 if __name__ == "__main__":

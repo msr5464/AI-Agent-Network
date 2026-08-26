@@ -144,7 +144,8 @@ from shared import diagnosis, verdict_feedback
 from shared.playwright_trace import read_actions, format_for_prompt as format_trace
 
 
-def call_claude(prompt: str, cwd: Path, use_system_prompt: bool = True, **kwargs) -> str:
+def call_claude(prompt: str, cwd: Path, use_system_prompt: bool = True,
+                artifact_dir: str = "", **kwargs) -> str:
     """Call the Claude CLI for this agent.
 
     use_system_prompt=False for the browser-inspection call: that task is about
@@ -154,6 +155,14 @@ def call_claude(prompt: str, cwd: Path, use_system_prompt: bool = True, **kwargs
                      if use_system_prompt and SYSTEM_PROMPT_FILE.exists() else None)
     output = _call_claude(prompt, AUTOFIX_MODEL, str(cwd),
                           system_prompt_file=system_prompt,
+                          # Reading an image needs a tool, and granting Read
+                          # grants it broadly: --add-dir was measured and is
+                          # additive, not a sandbox. Accepted because this call is
+                          # already handed the test and page-object source in the
+                          # prompt, so Read is not new reach — but it is not the
+                          # confinement an earlier comment here claimed.
+                          allowed_tools=(["Read"] if artifact_dir else None),
+                          add_dir=(artifact_dir or None),
                           log_dir=str(AUDIT_DIR),
                           **kwargs)
     if not output:
@@ -962,6 +971,7 @@ def build_candidate_context(issue: dict, workspace: Path, prev_test_output: str,
         "likely_location": likely_location,
         "page_url":      extract_page_url(issue),
         "dom_snapshot_path": issue.get("dom_snapshot", ""),
+        "screenshot":    issue.get("screenshot", ""),
         "dom_snapshot":  {},
         "trace_path":    issue.get("trace_path", ""),
         "failed_selector": issue.get("failed_selector", ""),
@@ -1154,6 +1164,19 @@ observing it. Prefer a resilient strategy (id / data-* / name) over a brittle on
 (deep CSS path, positional XPath).
 """
 
+    # An image settles "what is covering this element" and "is this an error page"
+    # in a glance. The framework has always taken one; nothing has ever looked at it.
+    screenshot_text = ""
+    if ctx.get("screenshot"):
+        screenshot_text = f"""
+## 📸 SCREENSHOT AT FAILURE
+`{ctx['screenshot']}`
+
+Read this file before deciding what went wrong. It shows the page exactly as the
+test left it — an overlay, an error page or an empty state is visible here even
+when the DOM below looks unremarkable.
+"""
+
     trace_text = ""
     if ctx.get("trace_timeline"):
         trace_text = f"""
@@ -1209,7 +1232,7 @@ Work independently on this test case only.
 - **Method:** {ctx['method_name']}
 - **File:** {ctx['test_file']}
 
-{diagnosis_text}
+{diagnosis_text}{screenshot_text}
 ## Failure Information
 - **Classification:** {ctx['classification']} ({ctx['confidence']} confidence)
 - **Root Cause Category:** {ctx['root_cause_category']}
@@ -1399,6 +1422,31 @@ def validate_fix(original: str, updated: str, filename: str) -> tuple:
 
     return True, ""
 
+
+
+
+def should_gate(verdict: dict, mode: str, force: bool) -> tuple:
+    """Whether this verdict may stop the pipeline path. Returns (gate, note).
+
+    Extracted so the asymmetry between the two entry points is testable rather
+    than implied. Probes run on the standalone path only, so a verdict reached
+    here has never been measured — it rests on inference. This path therefore
+    gates at HIGH alone, where several independent channels agreed; standalone
+    gates at MEDIUM because a probe stands behind it. The property that holds in
+    both: nothing blocks work unless it was measured or corroborated.
+    """
+    name = (verdict or {}).get("verdict")
+    if name not in diagnosis.STOP:
+        return False, ""
+    if force:
+        return False, "FORCE=true — attempting a fix anyway"
+    if (verdict or {}).get("confidence") != "HIGH":
+        return False, (f"{name} at {verdict.get('confidence')} confidence and unprobed "
+                       f"on this path — reporting, not gating")
+    if mode != "enforce":
+        return False, (f"shadow mode: would have stopped here — {name}. "
+                       f"Set DIAGNOSIS_MODE=enforce to act on it.")
+    return True, ""
 
 
 def _snapshot_soup(issue: dict):
@@ -1746,22 +1794,28 @@ def main():
         snapshot_soup = None
         try:
             evidence = diagnosis.collect(issue, workspace=workspace,
-                                         page_objects=ctx.get("page_objects"))
+                                         page_objects=ctx.get("page_objects"),
+                                         audit_dir=AUDIT_DIR.parent)
             verdict = diagnosis.diagnose(evidence)
             ctx["diagnosis"] = verdict
             snapshot_soup = _snapshot_soup(issue)
             for line in diagnosis.describe(verdict, evidence):
                 log(f"  {line}")
-            if verdict["verdict"] in diagnosis.STOP:
-                if FORCE:
-                    log("  (FORCE=true — attempting a fix anyway)")
-                elif DIAGNOSIS_MODE == "enforce":
-                    fail_cluster(verdict["verdict"].lower(),
-                                 reason="; ".join(verdict.get("reasons") or []),
-                                 output=verdict.get("remediation", ""))
-                    continue
-                log(f"  (shadow mode: would have stopped here — {verdict['verdict']}. "
-                    f"Set DIAGNOSIS_MODE=enforce to act on it.)")
+            # Probes run on the standalone path only, so a verdict reached here has
+            # never been measured — it rests on inference alone. Part 1 also turned
+            # more verdicts into stops, which means more chances to block a fix on a
+            # guess. So this path gates only on HIGH confidence, where several
+            # independent channels agreed; MEDIUM says what it would have done and
+            # lets the existing behaviour proceed. The property that holds in both
+            # paths: nothing blocks work unless it was measured or corroborated.
+            gate, note = should_gate(verdict, DIAGNOSIS_MODE, FORCE)
+            if note:
+                log(f"  ({note})")
+            if gate:
+                fail_cluster(verdict["verdict"].lower(),
+                             reason="; ".join(verdict.get("reasons") or []),
+                             output=verdict.get("remediation", ""))
+                continue
         except Exception as exc:
             log(f"  Diagnosis failed ({exc}) — continuing with the locator fix")
 
@@ -1802,7 +1856,9 @@ def main():
 
         prompt = build_fix_prompt(ctx, fix_rules)
         log("  Calling Claude for fix...")
-        response = call_claude(prompt, workspace)
+        response = call_claude(prompt, workspace,
+                               artifact_dir=(str(Path(ctx["screenshot"]).parent)
+                                             if ctx.get("screenshot") else ""))
         if not response:
             log("  Empty Claude response — skipping")
             fail_cluster("no_response")

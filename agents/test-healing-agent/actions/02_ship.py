@@ -135,10 +135,26 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
         target = f.get("target_file") or f.get("test_file")
         return Path(target).name if target else "unknown file"
 
+    def evidence_links(f: dict) -> str:
+        """Point the reviewer at what the agent looked at.
+
+        A PR that says "updated the selector" asks to be trusted. One that links
+        the page as the test left it lets the reviewer check in a glance whether
+        the agent was even on the right page — which is the failure mode no amount
+        of green CI will surface.
+        """
+        links = []
+        for label, key in (("screenshot", "screenshot"), ("DOM", "dom_snapshot_path")):
+            path = f.get(key)
+            if path:
+                links.append(f"[{label}]({Path(path).as_uri()})")
+        return " — " + " · ".join(links) if links else ""
+
     def fixed_line(f: dict) -> str:
         dom = " _(selector confirmed in a live browser)_" if f.get("dom_verified") else ""
         return (f"- ✅ `{short_name(f.get('test_name', 'unknown'))}` — "
-                f"{f.get('fix_description', '')} (`{target_name(f)}`){dom}")
+                f"{f.get('fix_description', '')} (`{target_name(f)}`){dom}"
+                f"{evidence_links(f)}")
 
     fixed_lines = "\n".join(fixed_line(f) for f in fixes) or "_(none)_"
 

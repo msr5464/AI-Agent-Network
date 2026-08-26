@@ -26,17 +26,33 @@ a baseline of what the page looked like when the test last passed.
 
 | Verdict | Meaning | What the agent may do |
 |---|---|---|
-| `LOCATOR_STALE` | Right page, element renamed or moved | edit the selector |
-| `NOT_READY` | Page still rendering when the wait expired | add a readiness wait |
-| `TOO_SLOW` | Element arrived after the budget ran out | raise the wait budget |
-| `BLOCKED` | Present but covered or off-screen | dismiss the obstruction |
-| `WRONG_PAGE`, `PRIOR_STEP_FAILED`, `ERROR_STATE`, `ENV_UNREACHABLE`, `DATA_PRECONDITION`, `FLAKY_TRANSIENT`, `ELEMENT_GONE` | Not fixable by editing this file | **stop**, report cause and remediation |
+| `LOCATOR_STALE` | Right page, element renamed or moved | **edit the selector — the only verdict that authorises a change** |
+| `WRONG_PAGE` | None of the page object's own locators are here | stop |
+| `PRIOR_STEP_FAILED` | An earlier interaction happened and the page never moved | stop |
+| `NOT_READY` | Page still rendering when the wait expired | stop — suggests a readiness wait |
+| `TOO_SLOW` | Element arrived after the budget ran out | stop — suggests raising `ObjectWaitTime` deliberately |
+| `BLOCKED` | Present but covered or off-screen | stop — suggests dismissing the obstruction |
+| `ERROR_STATE` / `ENV_UNREACHABLE` | The application or its host failed | stop |
+| `DATA_PRECONDITION` | A fixture the test loads is stale or missing | stop |
+| `ELEMENT_GONE` | Right page, and absent on the last passing run too | stop |
+| `FLAKY_TRANSIENT` | Nothing structural, and it has recovered before unaided | stop |
 | `INSUFFICIENT_EVIDENCE` | Cannot tell | fall through to the pre-existing behaviour |
+
+Timing and obstruction were briefly in the fixable column. They came out on a
+constraint that only appeared during implementation: `WaitHelper.getTimeout` reads
+the global `ObjectWaitTime`, so there is no way to give one element more time
+without slowing every test — and a change like that hides the thing most worth
+knowing, which is that the page got slower. They now report precisely and stop.
 
 Two rules keep it honest. **Unevaluable is not absent** — a selector that could not be
 tested, a trace that could not be read and an artefact that was never referenced all
 contribute nothing, rather than contributing zero. And **abstaining is a valid answer**:
 a weak signal must never block a genuine fix.
+
+**Gating differs by path, deliberately.** Standalone runs gate at MEDIUM because a
+probe stands behind the verdict. Pipeline runs never probe, so they gate only at
+HIGH, where several independent channels agreed. The property that holds in both:
+nothing blocks work unless it was measured or corroborated.
 
 Verdicts below HIGH confidence are **measured, not assumed**. One targeted re-run either
 confirms or refutes them (`lib/probes.py`), and for `TOO_SLOW` / `NOT_READY` that probe

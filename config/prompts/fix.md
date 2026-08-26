@@ -37,7 +37,7 @@ Respond with a JSON object ONLY. No prose, no markdown fences around it.
 ```
 {
   "fixable": true | false,
-  "verdict": "LOCATOR_STALE" | "NOT_READY" | "TOO_SLOW" | "BLOCKED" | "STOP",
+  "verdict": "LOCATOR_STALE" | "STOP",
   "unfixable_reason": "<reason if fixable=false, else null>",
   "fix_description": "<1-2 sentences: what was broken and what you changed>",
   "target_file": "<absolute path of the file to modify>",
@@ -52,10 +52,10 @@ Respond with a JSON object ONLY. No prose, no markdown fences around it.
 
 Rules for `verdict`:
 - `LOCATOR_STALE` — right page, right state, the element was renamed or moved.
-  This is the only verdict under which a selector edit is accepted.
-- `NOT_READY` / `TOO_SLOW` / `BLOCKED` — the element exists but was not visible in
-  time or was covered. Fix the wait or the obstruction, never the selector.
-- `STOP` — nothing here is fixable by editing this file. Set `fixable: false`.
+  **This is the only verdict under which any edit is accepted.**
+- `STOP` — nothing here is fixable by editing this file: the page was never
+  reached, the element exists but was covered or arrived late, the environment
+  failed, a fixture was stale. Set `fixable: false` and name which.
 - A guard rejects a selector edit whose verdict is not `LOCATOR_STALE`, and one
   that broadens what it replaces, before the test is ever run.
 

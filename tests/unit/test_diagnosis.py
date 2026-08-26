@@ -117,6 +117,11 @@ class TestRouting:
     def test_every_actionable_verdict_names_its_action(self):
         assert all(action for action in diagnosis.ACTIONS.values())
 
+    def test_only_a_stale_locator_authorises_an_edit(self):
+        # Anything else the agent can diagnose, it reports. Widening this set is a
+        # decision about what the agent is allowed to change, not a refactor.
+        assert set(diagnosis.ACTIONS) == {"LOCATOR_STALE"}
+
     def test_describe_marks_stop_verdicts(self, tmp_path):
         verdict, evidence = _diagnose(fx.DASHBOARD_LOGGED_OUT, tmp_path)
         assert "not a locator problem" in diagnosis.describe(verdict, evidence)[0]

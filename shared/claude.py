@@ -8,7 +8,7 @@ Two entry points:
   call_claude_ex(...)  — returns a ClaudeResult carrying *why* a call produced no
                          output, plus any partial output recovered from a timeout.
 
-Optional kwargs: on_output, system_prompt_file, log_dir, allowed_tools,
+Optional kwargs: on_output, system_prompt_file, log_dir, allowed_tools, add_dir,
 stream_json, partial_on_timeout.
 """
 
@@ -176,6 +176,7 @@ def call_claude_ex(
     system_prompt_file=None,
     log_dir=None,
     allowed_tools: list = None,
+    add_dir: str = None,
     stream_json: bool = False,
     mcp_config=None,
     strict_mcp_config: bool = False,
@@ -201,6 +202,12 @@ def call_claude_ex(
         cmd.extend(["--system-prompt-file", str(system_prompt_file)])
     if allowed_tools:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+    if add_dir:
+        # Adds a working directory. Verified empirically: this is additive, not
+        # restrictive — it does NOT confine a granted tool to that directory, and
+        # Read reaches absolute paths outside it either way. Do not treat passing
+        # this as a sandbox.
+        cmd.extend(["--add-dir", str(add_dir)])
     if mcp_config:
         cmd.extend(["--mcp-config", str(mcp_config)])
     if strict_mcp_config:
@@ -359,6 +366,7 @@ def call_claude(
     system_prompt_file=None,
     log_dir=None,
     allowed_tools: list = None,
+    add_dir: str = None,
     stream_json: bool = False,
     mcp_config=None,
     strict_mcp_config: bool = False,
@@ -393,6 +401,7 @@ def call_claude(
         system_prompt_file=system_prompt_file,
         log_dir=log_dir,
         allowed_tools=allowed_tools,
+        add_dir=add_dir,
         stream_json=stream_json,
         mcp_config=mcp_config,
         strict_mcp_config=strict_mcp_config,

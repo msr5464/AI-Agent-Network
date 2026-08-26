@@ -19,8 +19,14 @@ ROOT = Path(__file__).resolve().parents[2]
 AGENT = ROOT / "agents" / "test-healing-agent"
 sys.path.insert(0, str(ROOT))
 
-from shared import page_identity
+from shared import diagnosis, page_identity
 from tests import fixtures as fx
+
+
+def diagnosis_stop():
+    """Parametrise over the live list, so a new stop verdict is covered by
+    this test the moment it is added rather than whenever someone remembers."""
+    return diagnosis.STOP
 
 
 @pytest.fixture(scope="module")
@@ -171,3 +177,54 @@ class TestAbstentionIsStillGuarded:
         ok, reason = fix.validate_diagnosis_fit(
             ORIGINAL, GENUINE_FIX, "INSUFFICIENT_EVIDENCE")
         assert ok is True, reason
+
+
+class TestPipelineGating:
+    """The asymmetry between the two entry points, stated as a test.
+
+    Probes run on the standalone path only, so a verdict reached in the fix step
+    has never been measured. It gates at HIGH alone; standalone gates at MEDIUM
+    because a probe stands behind it. The invariant both share: nothing blocks
+    work unless it was measured or corroborated.
+    """
+
+    def _v(self, verdict, confidence="HIGH"):
+        return {"verdict": verdict, "confidence": confidence, "reasons": ["r"]}
+
+    def test_high_confidence_stop_gates_the_pipeline(self, fix):
+        gate, note = fix.should_gate(self._v("WRONG_PAGE"), "enforce", False)
+        assert gate is True and note == ""
+
+    def test_medium_confidence_reports_but_does_not_gate(self, fix):
+        # Unmeasured on this path — reporting is honest, blocking would be a guess.
+        gate, note = fix.should_gate(self._v("WRONG_PAGE", "MEDIUM"), "enforce", False)
+        assert gate is False
+        assert "unprobed on this path" in note
+
+    def test_shadow_never_gates_even_at_high(self, fix):
+        gate, note = fix.should_gate(self._v("WRONG_PAGE"), "shadow", False)
+        assert gate is False
+        assert "would have stopped" in note
+
+    def test_force_never_gates(self, fix):
+        gate, note = fix.should_gate(self._v("WRONG_PAGE"), "enforce", True)
+        assert gate is False and "FORCE" in note
+
+    def test_an_actionable_verdict_never_gates(self, fix):
+        gate, note = fix.should_gate(self._v("LOCATOR_STALE"), "enforce", False)
+        assert (gate, note) == (False, "")
+
+    def test_abstention_never_gates(self, fix):
+        gate, _ = fix.should_gate(self._v("INSUFFICIENT_EVIDENCE", "LOW"),
+                                  "enforce", False)
+        assert gate is False
+
+    def test_a_missing_diagnosis_never_gates(self, fix):
+        assert fix.should_gate({}, "enforce", False) == (False, "")
+        assert fix.should_gate(None, "enforce", False) == (False, "")
+
+    @pytest.mark.parametrize("verdict", sorted(diagnosis_stop()))
+    def test_every_stop_verdict_gates_at_high_in_enforce(self, fix, verdict):
+        gate, _ = fix.should_gate(
+            {"verdict": verdict, "confidence": "HIGH"}, "enforce", False)
+        assert gate is True

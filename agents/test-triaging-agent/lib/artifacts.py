@@ -11,6 +11,7 @@ the classifier decided what kind of failure it was while structurally unable to
 see the evidence — and its verdict is what gates the entire downstream pipeline.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -110,9 +111,73 @@ def attach_failure_context(issue: dict, report_dir: Path, method_name: str,
         log(f"  Could not attach failure context for {method_name}: {e}")
 
 
+def attach_screenshot(issue: dict, report_dir: Path, method_name: str,
+                      audit_dir: Path, log=print) -> None:
+    """Preserve the failure screenshot.
+
+    The framework has always taken one, and it has never reached anything that
+    could use it: JsonTestReporter leaves `screenshotPath` empty by design, so it
+    is located by convention here, the same way the DOM snapshot is. For an
+    element that is present but covered, one image settles in a glance what pages
+    of DOM text only imply.
+    """
+    if not report_dir or not method_name:
+        return
+    try:
+        matches = [p for p in Path(report_dir).rglob(f"screenshots/{method_name}_*.png")
+                   if p.is_file()]
+        if not matches:
+            matches = [p for p in Path(report_dir).rglob(f"{method_name}_*.png")
+                       if p.is_file()]
+        if not matches:
+            return
+        newest = max(matches, key=lambda p: p.stat().st_mtime)
+        shots = audit_dir / "screenshots"
+        shots.mkdir(parents=True, exist_ok=True)
+        preserved = shots / f"{method_name}.png"
+        preserved.write_bytes(newest.read_bytes())
+        issue["screenshot"] = str(preserved)
+        log(f"  Screenshot attached for {method_name}")
+    except Exception as e:
+        log(f"  Could not attach screenshot for {method_name}: {e}")
+
+
+def attach_baselines(issues: list, workspace: Path, audit_dir: Path, log=print) -> None:
+    """Preserve the recorded good-run fingerprints for the whole session.
+
+    Baselines live under the framework's results directory, which CI deletes
+    between builds — so without copying them the strongest channel available
+    silently contributes nothing on exactly the runs that matter most.
+
+    Takes every issue at once and copies once, because a baseline describes a
+    page rather than a test: doing it per failure repeated the same copy for each
+    one and said so in the log each time.
+    """
+    if not workspace or not issues:
+        return
+    try:
+        source = Path(os.environ.get("BASELINE_DIR") or (Path(workspace) / "baselines"))
+        if not source.exists():
+            return
+        preserved = audit_dir / "baselines"
+        preserved.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for record in source.glob("*.json"):
+            (preserved / record.name).write_text(
+                record.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+            copied += 1
+        if copied:
+            for issue in issues:
+                issue["baseline_dir"] = str(preserved)
+            log(f"  {copied} baseline(s) preserved for the session")
+    except Exception as e:
+        log(f"  Could not preserve baselines: {e}")
+
+
 def attach_all(issue: dict, report_dir: Path, method_name: str, audit_dir: Path,
                log=print) -> None:
     """Attach every artefact this failure produced."""
     attach_dom_snapshot(issue, report_dir, method_name, audit_dir, log)
     attach_trace(issue, report_dir, method_name, audit_dir, log)
     attach_failure_context(issue, report_dir, method_name, audit_dir, log)
+    attach_screenshot(issue, report_dir, method_name, audit_dir, log)

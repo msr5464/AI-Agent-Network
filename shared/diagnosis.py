@@ -29,19 +29,25 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from shared import (baseline, failure_context, page_identity, preconditions,
-                    step_provenance, trace_network)
+from shared import (baseline, failure_context, history, page_identity,
+                    preconditions, step_provenance, trace_network)
 
 # Verdicts the agent can act on, and what it is allowed to do about them.
+# The only verdict that authorises the agent to edit code.
+#
+# Timing and obstruction used to be here too. They were removed on a constraint
+# that only surfaced during implementation: the framework has no per-element wait
+# budget — WaitHelper.getTimeout reads the global ObjectWaitTime — so "give this
+# element more time" means slowing down every test in the suite. A fix like that
+# also hides the thing most worth knowing, which is that the page got slower. They
+# now report precisely and stop, each naming the change a human would make.
 ACTIONS = {
     "LOCATOR_STALE": "edit the selector",
-    "NOT_READY": "add an explicit readiness wait",
-    "TOO_SLOW": "raise the wait budget",
-    "BLOCKED": "dismiss what is covering the element, then interact",
 }
-# Verdicts that stop the run instead. Nothing here is fixable by editing code.
+# Verdicts that stop the run instead. Nothing here is fixable by editing a locator.
 STOP = ("WRONG_PAGE", "PRIOR_STEP_FAILED", "ERROR_STATE", "ENV_UNREACHABLE",
-        "DATA_PRECONDITION", "FLAKY_TRANSIENT", "ELEMENT_GONE")
+        "DATA_PRECONDITION", "FLAKY_TRANSIENT", "ELEMENT_GONE",
+        "NOT_READY", "TOO_SLOW", "BLOCKED")
 ABSTAIN = "INSUFFICIENT_EVIDENCE"
 
 # Whether a stop verdict should leave a queued handoff in place for the next run.
@@ -68,6 +74,11 @@ _PAGE_OBJECT_IN_TRACE = re.compile(r"\b([A-Z]\w*(?:Page|Screen|Component|View))\
 _MIN_EVALUABLE = 2
 # A rival page object only corroborates when essentially all of it matches.
 _RIVAL_RATIO = 0.99
+
+# Actions whose whole purpose is to move the flow on. If one of these was the last
+# thing that happened and nothing navigated, it did not work.
+_INTERACTIONS = ("click", "submit", "select", "press", "tap", "choose", "login",
+                 "sign in", "continue", "next", "save", "search")
 
 
 def expected_page_object(issue: Dict) -> str:
@@ -132,7 +143,7 @@ def _sibling_page_objects(workspace, expected: str, limit: int = 12) -> List[Dic
 
 
 def collect(issue: Dict, workspace=None, page_objects: Optional[List[Dict]] = None,
-            budget_s: Optional[int] = None) -> Dict:
+            budget_s: Optional[int] = None, audit_dir=None) -> Dict:
     """Gather every channel available for one failure. Never raises."""
     evidence: Dict = {
         "test_name": issue.get("test_name", ""),
@@ -146,6 +157,7 @@ def collect(issue: Dict, workspace=None, page_objects: Optional[List[Dict]] = No
         "preconditions": {"checked": 0, "problems": []},
         "context": {"available": False},
         "baseline": {"available": False}, "baseline_diff": {"available": False},
+        "history": {"available": False},
         "notes": [],
     }
 
@@ -215,7 +227,8 @@ def collect(issue: Dict, workspace=None, page_objects: Optional[List[Dict]] = No
     # What this page looked like the last time a test reached it successfully.
     # Absent for a page never yet seen passing, which only lowers confidence.
     expected_name = evidence["expected_page_object"]
-    evidence["baseline"] = baseline.load(expected_name, workspace)
+    evidence["baseline"] = baseline.load(expected_name, workspace,
+                                        issue.get("baseline_dir"))
     if evidence["baseline"]["available"] and evidence["facts"]:
         facts = dict(evidence["facts"])
         facts["body_class"] = evidence["facts"].get("body_class") or \
@@ -228,6 +241,8 @@ def collect(issue: Dict, workspace=None, page_objects: Optional[List[Dict]] = No
                                                   issue.get("failure_url", ""))
     evidence["steps"] = step_provenance.summarize(issue.get("execution_log", ""),
                                                   budget_s)
+    evidence["history"] = history.load(issue.get("test_name", ""),
+                                       issue.get("flaky_tests"), audit_dir)
     if workspace:
         evidence["preconditions"] = preconditions.check(
             issue.get("execution_log", ""), workspace)
@@ -328,8 +343,9 @@ def _rule_not_ready(ev: Dict):
     if busy:
         reasons.append("the page was marked aria-busy")
     return ("NOT_READY", "HIGH", reasons,
-            "wait for the page to settle before asserting on it, rather than "
-            "changing the selector")
+            "add WaitHelper.waitForNetworkIdle(config), or "
+            "waitForLoadingComplete(config, loadingBar), before this assertion — "
+            "the selector is not the problem")
 
 
 def _rule_too_slow(ev: Dict):
@@ -352,8 +368,9 @@ def _rule_too_slow(ev: Dict):
             [f"the anchor matched {ev['failing_selector_matches']} element(s) but only "
              f"after the {round(budget / 1000)}s budget had run out",
              "the DOM was still changing throughout, so the page was still rendering"],
-            "raise the wait budget for this element — a probe with a larger budget "
-            "confirms it before anything is edited")
+            "the element does appear, just late. ObjectWaitTime is global, so "
+            "raising it slows every test — decide that deliberately, or find out "
+            "why this page got slower")
 
 
 def _rule_present_but_not_visible(ev: Dict):
@@ -373,7 +390,7 @@ def _rule_present_but_not_visible(ev: Dict):
     # selector is not stale — replacing it can only make the test weaker.
     return ("BLOCKED", confidence, reasons,
             "the element is covered, collapsed or off-screen — dismiss what is over "
-            "it rather than changing the selector")
+            "it before interacting, rather than changing the selector")
 
 
 def _rule_wrong_page(ev: Dict):
@@ -409,6 +426,85 @@ def _rule_wrong_page(ev: Dict):
             "not the locator")
 
 
+def _rule_prior_step_failed(ev: Dict):
+    """An earlier action silently did nothing, so the flow never advanced.
+
+    Ranked above WRONG_PAGE, which is the same observation with less to say about
+    it. The distinguishing evidence is the navigation history: a click that was
+    supposed to move the flow, and no new URL after it.
+    """
+    expected = ev.get("expected_coverage")
+    if not expected or expected["evaluable"] < _MIN_EVALUABLE or expected["matched"]:
+        return None
+    context = ev["context"]
+    if not context.get("available"):
+        return None
+
+    steps = ev["steps"]
+    last_action = (steps.get("last_action") or "").lower()
+    if not last_action or not any(word in last_action for word in _INTERACTIONS):
+        return None
+
+    # One entry means the only navigation was the initial load: nothing the test
+    # did afterwards moved the page.
+    navigation = context.get("navigation") or []
+    distinct = list(dict.fromkeys(navigation))
+    if len(distinct) > 1:
+        return None
+
+    return ("PRIOR_STEP_FAILED", "HIGH" if navigation else "MEDIUM",
+            [f"the last action was {steps['last_action'][:80]!r}, and the page never "
+             f"navigated afterwards",
+             f"{expected['name']} has 0 of {expected['evaluable']} of its locators here, "
+             f"so the flow stopped before this page"],
+            "the previous step did not do what it was supposed to — fix that, not "
+            "the locator on the page it never reached")
+
+
+def _rule_element_gone(ev: Dict):
+    """Right page, and this element was never here even when the test passed.
+
+    The mirror of LOCATOR_STALE, and only separable from it with a baseline: from
+    a single run, "the feature was removed" and "the selector was always wrong"
+    look identical. Without one, abstain rather than guess.
+    """
+    expected = ev.get("expected_coverage")
+    if not expected or expected["evaluable"] < _MIN_EVALUABLE or not expected["matched"]:
+        return None
+    if ev.get("failing_selector_matches"):
+        return None
+    comparison = ev.get("baseline_diff") or {}
+    if not comparison.get("available"):
+        return None
+    # Nothing that used to be present has gone missing, yet the element is absent:
+    # it was never part of a passing run.
+    if comparison.get("vanished"):
+        return None
+    return ("ELEMENT_GONE", "MEDIUM",
+            [f"{expected['name']} matches its last good run, so this is the right page",
+             "the failing element was absent on that run too, so it was never here "
+             "to be renamed"],
+            "the element appears to have been removed from the product — confirm "
+            "with the team before changing the test")
+
+
+def _rule_flaky_transient(ev: Dict):
+    """Nothing structural explains it, and this test has recovered before.
+
+    Deliberately last. "It works sometimes" is a conclusion to reach after the
+    deterministic rules have all declined, never before.
+    """
+    record = ev.get("history") or {}
+    if not record.get("available") or not record.get("intermittent"):
+        return None
+    return ("FLAKY_TRANSIENT", "MEDIUM",
+            [history.describe(record),
+             "no structural cause was found, and this test has recovered before "
+             "without a code change"],
+            "re-run to confirm; if it passes, this is flakiness to investigate "
+            "rather than a locator to fix")
+
+
 def _rule_locator_stale(ev: Dict):
     expected = ev.get("expected_coverage")
     if not expected or expected["evaluable"] < _MIN_EVALUABLE:
@@ -439,8 +535,11 @@ _RULES = (
     _rule_not_ready,
     _rule_too_slow,
     _rule_present_but_not_visible,
+    _rule_prior_step_failed,
     _rule_wrong_page,
+    _rule_element_gone,
     _rule_locator_stale,
+    _rule_flaky_transient,
 )
 
 

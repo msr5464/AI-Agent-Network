@@ -77,10 +77,13 @@ class TestHandoffEligibility:
         assert self._eligible("ELEMENT_NOT_FOUND") is True
         assert self._eligible("LOCATOR_STALE") is True
 
-    def test_newly_fixable_causes_are_forwarded(self):
-        # These used to land in TIMEOUT and never reach the healing agent at all.
+    def test_timing_and_obstruction_causes_are_not_forwarded(self):
+        # These are diagnosable but not fixable by editing a test: the framework
+        # has no per-element wait budget, so "give it more time" would slow every
+        # test in the suite and hide the fact that the page got slower. They stop
+        # with a precise remediation instead of being handed to the fixer.
         for verdict in ("NOT_READY", "TOO_SLOW", "BLOCKED"):
-            assert self._eligible(verdict) is True
+            assert self._eligible(verdict) is False
 
     def test_stop_verdicts_are_never_forwarded(self):
         for verdict in diagnosis.STOP:

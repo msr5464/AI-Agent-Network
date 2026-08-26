@@ -222,6 +222,7 @@ def main():
             method = issue.get("method_name") or ""
             if method:
                 artifacts.attach_all(issue, report_dir, method, AUDIT_DIR, log)
+        artifacts.attach_baselines(failure_dicts, report_dir, AUDIT_DIR, log)
         attached = sum(1 for f in failure_dicts if f.get("dom_snapshot"))
         log(f"Artefacts attached for {attached}/{len(failure_dicts)} failure(s)")
 

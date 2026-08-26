@@ -31,8 +31,16 @@ def url_shape(url: str) -> str:
     return _NUMERIC.sub("/{id}", _UUID.sub("/{uuid}", without_query))
 
 
-def directory(workspace=None, results_dirname: str = "test-output") -> Optional[Path]:
-    """Where baselines live: the env override, else beside the run's results."""
+def directory(workspace=None, results_dirname: str = "test-output",
+              preserved: Optional[str] = None) -> Optional[Path]:
+    """Where baselines live.
+
+    A directory preserved into the audit session wins: it was copied at the time
+    of the failure and survives CI deleting the report directory afterwards. The
+    live workspace is the fallback for local runs.
+    """
+    if preserved and Path(preserved).exists():
+        return Path(preserved)
     override = os.environ.get(_DIR_ENV, "").strip()
     if override:
         return Path(override)
@@ -41,13 +49,13 @@ def directory(workspace=None, results_dirname: str = "test-output") -> Optional[
     return Path(workspace) / results_dirname / _DEFAULT_DIRNAME
 
 
-def load(page_object: str, workspace=None) -> Dict:
+def load(page_object: str, workspace=None, preserved: Optional[str] = None) -> Dict:
     """The recorded fingerprint for one page object, if there is one."""
     result: Dict = {"available": False, "page_object": page_object,
                     "url_shape": "", "title": "", "body_class": "", "coverage": {}}
     if not page_object:
         return result
-    folder = directory(workspace)
+    folder = directory(workspace, preserved=preserved)
     if not folder:
         return result
     path = folder / f"{page_object}.json"

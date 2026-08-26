@@ -170,6 +170,10 @@ def write_handoff(build_tag: str, classify_data: dict, collect_data: dict) -> st
         }
         method = failure.get("method_name") or test_name.split(".")[-1]
         attach_artifacts(issue, report_dir, method)
+        # Whether this test is intermittent is decided across runs, and only
+        # triaging can see across runs. Without carrying it the healing agent has
+        # no way to tell a broken test from a flaky one.
+        issue["flaky_tests"] = collect_data.get("flaky_tests", [])
         automation_issues.append(issue)
 
     handoff = {
