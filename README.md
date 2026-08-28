@@ -232,6 +232,54 @@ Outputs:
 
 ---
 
+### Agent 4 — Test Adaptation
+
+Updates tests when the **product** changes — a step is inserted, a wizard's pages merge,
+a `<select>` becomes a combobox, a form gains a required field. Driven by a plain-English
+change note, so it runs **before** the tests go red.
+
+Healing asks "why did this fail?". This asks "the product changed — what should the tests
+do now?". They are different jobs: once an edit may add or remove steps, "the test passes"
+stops being evidence, because a test that asserts nothing passes fastest of all. What
+replaces it is an **intent contract** — the assertions a repair must preserve, measured
+before any edit and compared against that frozen copy afterwards.
+
+```bash
+make run AGENT=test-adaptation-agent MODULE=checkout
+EXPLORE_ONLY=true  make run AGENT=test-adaptation-agent MODULE=checkout   # flow map only
+ADAPT_APPLY=false  make run AGENT=test-adaptation-agent MODULE=checkout   # propose only
+START_FROM_STEP=4 SESSION_ID=<sid> make run AGENT=test-adaptation-agent   # resume
+```
+
+Change note (`agents/test-adaptation-agent/queue/<module>.txt`):
+
+```
+Module: checkout
+Type: web
+Affects: automation.checkout.*
+
+What changed:
+1. After login a "Choose workspace" screen now appears before the dashboard.
+2. The 3-step checkout wizard is now 2 steps.
+
+Expected outcome unchanged: an order is placed and a confirmation number is shown.
+```
+
+Outputs:
+- A blast radius: the named tests, the tests that pass today but share the changed surface,
+  and what was excluded as framework infrastructure — with the cost of verifying them
+- An ordered flow map of what a browser actually observed, with every selector re-counted
+  in Python rather than taken on the model's word
+- A PR that is **always NEEDS-REVIEW**, carrying each edit against the observed step that
+  justified it
+
+It refuses rather than guessing when the change note does not account for what it saw, when
+the expected *outcome* changed (the spec moved, not the test), when there is no valid saved
+login session, or when the flow ends in something that cannot be undone. See
+[agents/test-adaptation-agent/CLAUDE.md](agents/test-adaptation-agent/CLAUDE.md).
+
+---
+
 ## Configuration Reference
 
 ### Shared
@@ -353,7 +401,8 @@ QA-Agent-Network/
 │   │       ├── 04_review.py       # Adversarial review + .verdict gate
 │   │       └── 05_ship.py         # HTML report + handoff JSON + Slack
 │   │
-│   └── test-healing-agent/        # Agent 3 — fix broken locators, raise PR
+│   ├── test-healing-agent/        # Agent 3 — fix broken locators, raise PR
+│   └── test-adaptation-agent/     # Agent 4 — update tests when the product changes
 │       ├── run.sh                 # Orchestrator (queue / direct / file-path mode)
 │       ├── CLAUDE.md              # Full agent spec
 │       ├── CONVENTIONS.md         # Fallback conventions file for Claude

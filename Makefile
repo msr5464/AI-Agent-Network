@@ -19,7 +19,7 @@ AGENTS_DIR = agents
 # ── Run ────────────────────────────────────────────────────────────────────────
 .PHONY: run
 run:
-	@if [ -z "$(AGENT)" ]; then echo "Usage: make run AGENT=test-triaging-agent  OR  make run AGENT=test-healing-agent"; exit 1; fi
+	@if [ -z "$(AGENT)" ]; then echo "Usage: make run AGENT=<test-authoring-agent|test-triaging-agent|test-healing-agent|test-adaptation-agent>"; exit 1; fi
 	@if [ ! -f "$(AGENTS_DIR)/$(AGENT)/run.sh" ]; then echo "Agent not found: $(AGENTS_DIR)/$(AGENT)/run.sh"; exit 1; fi
 	@BUILD_TAG="$(BUILD_TAG)" MODULE="$(MODULE)" TEST="$(TEST)" bash "$(AGENTS_DIR)/$(AGENT)/run.sh" "$(BUILD_TAG)"
 

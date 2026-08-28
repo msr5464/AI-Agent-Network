@@ -46,3 +46,9 @@ agents/test-authoring-agent/audit
 agents/test-authoring-agent/cache
 .playwright-mcp/
 .mcp.json
+# test-adaptation-agent run output
+agents/test-adaptation-agent/audit
+agents/test-adaptation-agent/cache
+
+# Append-only analytics store — runtime data, grows per run, never pruned.
+qa_agents_server/storage/run_analytics.jsonl

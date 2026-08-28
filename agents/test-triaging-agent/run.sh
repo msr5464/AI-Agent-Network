@@ -85,7 +85,7 @@ declare -a STEP_DURATIONS=()
 
 # ── Step 01 — Scout ────────────────────────────────────────────────────────────
 if [[ "$MODE" == "scout" ]]; then
-  run_step "[01/05] Scout" "python3 '$AGENT_DIR/actions/01_scout.py'"
+  run_step "[01/05] Scout" "python3 '$AGENT_DIR/actions/01_scout.py'" scout
 
   BUILD_TAG=$(cat "$AUDIT_DIR/.selected-buildtag" 2>/dev/null || true)
   if [[ -z "$BUILD_TAG" ]]; then
@@ -122,22 +122,22 @@ fi
 stop_check scout
 
 # ── Step 02 — Collect ─────────────────────────────────────────────────────────
-run_step "[02/05] Collect" "python3 '$AGENT_DIR/actions/02_collect.py'"
+run_step "[02/05] Collect" "python3 '$AGENT_DIR/actions/02_collect.py'" collect
 
 stop_check collect
 
 # ── Step 03 — Classify ────────────────────────────────────────────────────────
-run_step "[03/05] Classify" "python3 '$AGENT_DIR/actions/03_classify.py'"
+run_step "[03/05] Classify" "python3 '$AGENT_DIR/actions/03_classify.py'" classify
 
 stop_check classify
 
 # ── Step 04 — Review ──────────────────────────────────────────────────────────
-run_step "[04/05] Review" "python3 '$AGENT_DIR/actions/04_review.py'"
+run_step "[04/05] Review" "python3 '$AGENT_DIR/actions/04_review.py'" review
 
 stop_check review
 
 # ── Step 05 — Ship ────────────────────────────────────────────────────────────
-run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'"
+run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'" ship
 
 # ── Final summary ─────────────────────────────────────────────────────────────
 TOTAL_ELAPSED=$(elapsed_since $SESSION_START)

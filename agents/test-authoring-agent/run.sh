@@ -279,7 +279,7 @@ elif _cache_hit "01-parse.json"; then
   STEP_NAMES+=("[01/05] Parse")
   STEP_DURATIONS+=(0)
 else
-  run_step "[01/05] Parse" "python3 '$AGENT_DIR/actions/01_parse.py'"
+  run_step "[01/05] Parse" "python3 '$AGENT_DIR/actions/01_parse.py'" parse
   _cache_save "01-parse.json"
   _cache_save "01-parse.md"
 fi
@@ -310,7 +310,7 @@ if _cache_hit "02-validate-api.json"; then
   STEP_NAMES+=("[02/05] Validate API")
   STEP_DURATIONS+=(0)
 else
-  run_step "[02/05] Validate API" "python3 '$AGENT_DIR/actions/02_validate_api.py'"
+  run_step "[02/05] Validate API" "python3 '$AGENT_DIR/actions/02_validate_api.py'" validate_web
   # Only cache if it actually ran a real validation (not skipped as non-API/no-endpoints)
   if python3 -c "
 import json, os, sys
@@ -331,7 +331,7 @@ if [[ "$TEST_TYPE" == "web" || "$TEST_TYPE" == "both" ]]; then
     STEP_NAMES+=("[02/05] Validate Web")
     STEP_DURATIONS+=(0)
   else
-    run_step "[02/05] Validate Web" "python3 '$AGENT_DIR/actions/02_validate_web.py'"
+    run_step "[02/05] Validate Web" "python3 '$AGENT_DIR/actions/02_validate_web.py'" validate_web
     # Only cache if Claude actually returned data (selectors or step results present)
     if python3 -c "
 import json, os, sys
@@ -365,7 +365,7 @@ if [[ "$START_FROM_STEP" -gt 3 ]]; then
   STEP_NAMES+=("[03/05] Generate")
   STEP_DURATIONS+=(0)
 else
-  run_step "[03/05] Generate" "python3 '$AGENT_DIR/actions/03_generate.py'"
+  run_step "[03/05] Generate" "python3 '$AGENT_DIR/actions/03_generate.py'" generate
 fi
 
 # ── Step 04 — Run & Fix (with retry loop) ─────────────────────────────────────
@@ -378,15 +378,16 @@ if [[ "$START_FROM_STEP" -gt 4 ]]; then
 else
   # Initial test run — not counted as a fix attempt
   run_step "[04/05] Run & Fix (initial)" \
-    "FIX_ATTEMPT=0 python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
+    "FIX_ATTEMPT=0 python3 '$AGENT_DIR/actions/04_run_and_fix.py'" run_and_fix
 
   FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
 
   if [[ "$FIX_RESULT" != "true" && "$FIX_RESULT" != "skipped" && "$FIX_RESULT" != "stuck" ]]; then
     FIX_ATTEMPT=1
     while true; do
+      export STEP_ATTEMPT="$FIX_ATTEMPT"
       run_step "[04/05] Run & Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
-        "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/04_run_and_fix.py'"
+        "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/04_run_and_fix.py'" run_and_fix
 
       FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
 
@@ -409,7 +410,7 @@ else
 fi
 
 # ── Step 05 — Ship ────────────────────────────────────────────────────────────
-run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'"
+run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'" ship
 
 # ── Mark input as processed ───────────────────────────────────────────────────
 # Guarded (not unconditional) because a resumed run's input file may already
@@ -430,6 +431,12 @@ echo ""
 for i in "${!STEP_NAMES[@]}"; do
   printf "  %-55s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
 done
+
+# Roll up now so the spend is on screen with the timings rather than only in
+# metrics.json. The EXIT trap re-runs this; a rollup is idempotent.
+_METRICS=$(cd "${REPO_ROOT:-.}" && python3 -m shared.metrics 2>/dev/null || true)
+[[ -n "$_METRICS" ]] && log "Spend: $_METRICS"
+
 echo ""
 log "Audit: $AUDIT_DIR"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

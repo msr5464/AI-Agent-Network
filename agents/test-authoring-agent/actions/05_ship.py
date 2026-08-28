@@ -25,6 +25,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
 from shared.log import log as _log
+from shared import properties_file
 from shared.slack import send_slack as _send_slack
 from shared.git import run_git as _run_git
 from shared.github import create_pr
@@ -176,6 +177,25 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
     test_status = ("tests pass" if test_passed
                    else "tests not run" if fix_gate == "skipped"
                    else "tests need review")
+
+    # The URL properties belong in the PR: code that reads {feature}.login.url is
+    # broken for every other checkout if the key never reaches the repo. Credentials
+    # in that same file are the opposite and must NEVER be committed — so the
+    # committed content is built from HEAD's copy plus the URL keys, never from the
+    # working copy, which is where step 03/04 wrote this run's real credentials.
+    url_props = gen_data.get("url_properties") or {}
+    if url_props:
+        props_path = properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR)
+        props_rel  = str(props_path.relative_to(AUTOMATION_FRAMEWORK_DIR))
+        rc, committed, _ = git(["show", f"HEAD:{props_rel}"], AUTOMATION_FRAMEWORK_DIR)
+        updated, filled, appended = properties_file.apply(
+            committed if rc == 0 else "", url_props,
+            f"{gen_data.get('feature', MODULE).capitalize()} URLs "
+            f"(auto-added by test-authoring-agent)")
+        if filled or appended:
+            step3_contents[props_rel] = updated
+            log(f"Committing {len(filled) + len(appended)} URL propert(ies) in "
+                f"{props_rel}: {', '.join(sorted({**filled, **appended}))}")
 
     if step3_contents:
         msg = (

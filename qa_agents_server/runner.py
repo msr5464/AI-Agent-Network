@@ -46,6 +46,7 @@ from qa_agents_server.paths import (
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+from qa_agents_server import metrics_reader
 from qa_agents_server.agents import (
     AgentConfigError,
     AgentSpec,
@@ -109,6 +110,10 @@ class RunState:
     events: Deque[Event] = field(default_factory=lambda: deque(maxlen=MAX_BUFFERED_EVENTS))
     seq_counter: int = 0
     step_progress: Dict[str, str] = field(default_factory=dict)  # key -> 'running'|'done'
+    # Parallel to step_progress rather than folded into it: step_progress is the
+    # state machine (six string comparisons across two threads depend on its
+    # shape), and timing has no business inside that.
+    step_metrics: Dict[str, dict] = field(default_factory=dict)  # key -> {started_at,...}
     proc: Optional[subprocess.Popen] = None
     cond: threading.Condition = field(default_factory=threading.Condition)
     start_from_step: int = 1  # >1 means this run resumed an existing session
@@ -129,7 +134,19 @@ class RunState:
             "exit_code": self.exit_code,
             "pid": self.pid,
             "start_from_step": self.start_from_step,
+            # Totals only — the per-stage detail stays in the session's
+            # metrics.json rather than bloating every registry entry.
+            "metrics": self.metrics_totals,
         }
+
+    @property
+    def metrics_totals(self) -> Dict:
+        try:
+            from qa_agents_server import metrics_reader
+            return metrics_reader.summary_fields(
+                metrics_reader.read_session_metrics(self.audit_dir))
+        except Exception:
+            return {}
 
 
 # ── Module state ──────────────────────────────────────────────────────────────
@@ -446,14 +463,17 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
                 )
             payload["module"] = recovered
         payload["start_from_step"] = start_from_step
-    elif spec.name == DEFAULT_AGENT:
-        # Authoring only: the module file must already exist in the queue.
+    elif spec.queue_kind == "txt":
+        # Any agent fed by a human-authored queue file: it must already exist.
+        # Keyed on queue_kind rather than the agent name so a second .txt-queue
+        # agent gets the same 404 instead of dying inside run.sh with a bare
+        # non-zero exit and no API-level error.
         module = payload.get("module")
         if not module:
             raise RunnerError("module is required")
-        if feature_exists(module) is None:
+        if feature_exists(module, spec.name) is None:
             raise RunnerError(
-                f"module file not found: {module}.txt — create it first via "
+                f"queue file not found: {module}.txt — create it first via "
                 f"POST /agents/{spec.name}/queue",
                 status=404,
             )
@@ -685,6 +705,52 @@ def _step_file_is_fresh(run: RunState, idx: int, file_path: Path) -> bool:
         return False
 
 
+def _mark_step_running(run: RunState, key: str) -> dict:
+    """Stamp a step's start and return the payload extras for its event."""
+    slot = run.step_metrics.setdefault(key, {})
+    slot.setdefault("started_at", time.time())
+    return {"started_at": slot["started_at"]}
+
+
+def _mark_step_done(run: RunState, key: str) -> dict:
+    """Close a step's timing and fold in whatever the agent recorded for it.
+
+    The poller only knows "the moment I noticed the file", which is up to one
+    poll interval late and meaningless for the first step. Where the agent wrote
+    an exact duration into stages.jsonl, that wins.
+    """
+    slot = run.step_metrics.setdefault(key, {})
+    slot["ended_at"] = time.time()
+    if slot.get("started_at"):
+        slot["duration_s"] = round(slot["ended_at"] - slot["started_at"], 3)
+
+    try:
+        session = metrics_reader.read_session_metrics(run.audit_dir)
+        exact = metrics_reader.step_metrics(session, key)
+        if exact:
+            slot.update(exact)          # agent-side duration_s overrides the estimate
+    except Exception:
+        pass
+    return dict(slot)
+
+
+def _run_metrics(run: RunState) -> dict:
+    """Run-level totals plus the stage breakdown, for the terminal event.
+
+    Rebuilds from the JSONL streams when the agent never wrote metrics.json,
+    so a killed run still reports what it spent.
+    """
+    try:
+        session = metrics_reader.read_session_metrics(run.audit_dir)
+        if not session:
+            return {}
+        data = metrics_reader.totals(session)
+        data["stages"] = metrics_reader.stage_list(session)
+        return data
+    except Exception:
+        return {}
+
+
 def _audit_watcher(run: RunState) -> None:
     """Poll the audit dir and emit step events as JSON files appear.
 
@@ -710,6 +776,7 @@ def _audit_watcher(run: RunState) -> None:
             run.step_progress[first_key] = "running"
             _append_event(run, "step", {
                 "key": first_key, "display": first_display, "status": "running",
+                **_mark_step_running(run, first_key),
             })
 
     while True:
@@ -731,6 +798,7 @@ def _audit_watcher(run: RunState) -> None:
                 run.step_progress[key] = step_status
                 _append_event(run, "step", {
                     "key": key, "display": display, "status": step_status,
+                    **_mark_step_done(run, key),
                 })
                 # Mark the next step as running (if any, and regardless of
                 # whether THIS step failed — the pipeline still runs the next
@@ -742,6 +810,7 @@ def _audit_watcher(run: RunState) -> None:
                         run.step_progress[next_key] = "running"
                         _append_event(run, "step", {
                             "key": next_key, "display": next_display, "status": "running",
+                            **_mark_step_running(run, next_key),
                         })
         if run.proc.poll() is not None:
             # Nothing left to do here — _wait_and_reap runs its own
@@ -824,10 +893,27 @@ def _wait_and_reap(run: RunState) -> None:
             run.step_progress[_key] = _step_status
             _append_event(run, "step", {
                 "key": _key, "display": _display, "status": _step_status,
+                **_mark_step_done(run, _key),
+            })
+        elif run.step_progress.get(_key) == "running":
+            # _audit_watcher marks the NEXT step "running" as soon as the previous
+            # one lands, which is right while a run is in flight and wrong once it
+            # has ended: a run that stops early — EXPLORE_ONLY, an escalation, a
+            # skip — leaves that optimistic chip spinning forever in the live UI.
+            # The replayed stream never had this problem because it only reports
+            # steps that actually produced a file, so the two views disagreed about
+            # the same run. The process has already exited here, so a step with no
+            # output did not run.
+            run.step_progress[_key] = "skipped"
+            _append_event(run, "step", {
+                "key": _key, "display": _display, "status": "skipped",
             })
 
-    # Load ship data for the terminal event payload
-    ship_path = run.audit_dir / "05-ship.json"
+    # Load ship data for the terminal event payload. The filename comes from the
+    # agent's own step model: this was hardcoded to authoring's "05-ship.json",
+    # so a healing run (whose ship step is 02-ship.json) never carried pr_url on
+    # the live stream — only the replay path through audit_reader compensated.
+    ship_path = run.audit_dir / get_agent(run.agent).steps[-1][1]
     pr_url = None
     verdict = None
     test_passed = None
@@ -858,7 +944,21 @@ def _wait_and_reap(run: RunState) -> None:
         "ship_detail": ship_detail,
         "ended_at": run.ended_at,
         "duration": run.ended_at - run.started_at,
+        "metrics": _run_metrics(run),
     })
+
+    # The agent writes its own analytics row at the end of run.sh, which is what
+    # covers plain `make run` invocations the server never sees. This second call
+    # is the fallback for a run whose run.sh was SIGKILLed and never got there.
+    # Duplicate session ids are resolved newest-wins at read time.
+    try:
+        from qa_agents_server import analytics
+        analytics.append_from_session(run.audit_dir, agent=run.agent,
+                                      status=final_status, exit_code=exit_code,
+                                      module=run.module, started_at=run.started_at,
+                                      ended_at=run.ended_at, auto_push=run.auto_push)
+    except Exception:
+        pass
 
     # Persist final snapshot
     storage.upsert(run.snapshot())

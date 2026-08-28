@@ -60,6 +60,59 @@ _EFFORT_OPTIONS = [
 ]
 
 SETTINGS_SCHEMA: List[Dict[str, Any]] = [
+    # ── test-adaptation-agent ────────────────────────────────────────────────
+    {"key": "adapt_model", "env_var": "ADAPT_MODEL", "label": "Adaptation model",
+     "description": "Claude model used to classify the change note and write edits.",
+     "type": "text", "category": "adaptation", "default": "claude-opus-5", "sensitive": False},
+    {"key": "adapt_apply", "env_var": "ADAPT_APPLY", "label": "Apply edits",
+     "description": "Off = propose-only: full diffs and guard results are recorded "
+                    "but nothing is written. Turn on once the proposals are being "
+                    "accepted verbatim.",
+     "type": "boolean", "category": "adaptation", "default": False, "sensitive": False},
+    {"key": "adapt_verify_policy", "env_var": "ADAPT_VERIFY_POLICY",
+     "label": "Verification scope",
+     "description": "named_only re-runs the tests the change note named; tiered adds "
+                    "the shared surface. The verify set holds the single global run "
+                    "slot, so 'all' can make the platform single-tasked for an hour.",
+     "type": "select", "category": "adaptation", "default": "named_only",
+     "options": ["named_only", "tiered", "all"], "sensitive": False},
+    {"key": "adapt_explore_timeout_s", "env_var": "ADAPT_EXPLORE_TIMEOUT_S",
+     "label": "Exploration budget (s)",
+     "description": "Wall-clock limit for one browser exploration.",
+     "type": "number", "category": "adaptation", "default": 1800, "min": 60, "max": 7200, "sensitive": False},
+    {"key": "adapt_explore_attempts", "env_var": "ADAPT_EXPLORE_ATTEMPTS",
+     "label": "Extra exploration attempts",
+     "description": "Full re-runs on a recoverable failure. Each one restarts the "
+                    "flow in a fresh browser — there is no mid-flow resume.",
+     "type": "number", "category": "adaptation", "default": 1, "min": 0, "max": 3, "sensitive": False},
+    {"key": "adapt_max_files", "env_var": "ADAPT_MAX_FILES_PER_RUN",
+     "label": "Max files per run",
+     "description": "Exceeding this flips the run to propose-only rather than "
+                    "truncating the work.",
+     "type": "number", "category": "adaptation", "default": 6, "min": 1, "max": 20, "sensitive": False},
+    {"key": "adapt_max_total_diff", "env_var": "ADAPT_MAX_TOTAL_DIFF_LINES",
+     "label": "Max changed lines per run",
+     "description": "Total across all files. A reviewer has to read this.",
+     "type": "number", "category": "adaptation", "default": 200, "min": 20, "max": 1000, "sensitive": False},
+    {"key": "adapt_blast_max_tests", "env_var": "ADAPT_BLAST_MAX_TESTS",
+     "label": "Max tests in scope",
+     "description": "Above this the change is bigger than one agent run and escalates.",
+     "type": "number", "category": "adaptation", "default": 40, "min": 1, "max": 500, "sensitive": False},
+    {"key": "adapt_hub_threshold", "env_var": "ADAPT_HUB_THRESHOLD",
+     "label": "Hub threshold",
+     "description": "A class referenced by more files than this is shared "
+                    "infrastructure and does not propagate the blast radius.",
+     "type": "number", "category": "adaptation", "default": 8, "min": 2, "max": 100, "sensitive": False},
+    {"key": "adapt_branch_prefix", "env_var": "ADAPT_BRANCH_PREFIX",
+     "label": "Branch prefix",
+     "description": "Branch name is <prefix>/<module>-<timestamp>.",
+     "type": "text", "category": "adaptation", "default": "chore/qa-adapt", "sensitive": False},
+    {"key": "adapt_sandbox", "env_var": "ADAPT_SANDBOX", "label": "Sandbox environment",
+     "description": "Assert the target environment is disposable, allowing "
+                    "exploration to walk a destructive final step. Requires "
+                    "ADAPT_SANDBOX_NOTE, which is reproduced in the PR body.",
+     "type": "boolean", "category": "adaptation", "default": False, "sensitive": False},
+
     # ── Common ───────────────────────────────────────────────────────────────
     {
         "key": "workspace_dir",
@@ -537,7 +590,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
 
 _SCHEMA_BY_KEY: Dict[str, Dict[str, Any]] = {s["key"]: s for s in SETTINGS_SCHEMA}
 
-CATEGORIES: List[str] = ["common", "authoring", "healing", "triaging", "server"]
+CATEGORIES: List[str] = ["common", "authoring", "healing", "adaptation",
+                         "triaging", "server"]
 
 
 class SettingsValidationError(Exception):

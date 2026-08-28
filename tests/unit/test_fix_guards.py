@@ -228,3 +228,95 @@ class TestPipelineGating:
         gate, _ = fix.should_gate(
             {"verdict": verdict, "confidence": "HIGH"}, "enforce", False)
         assert gate is True
+
+
+class TestClaudeInvocation:
+    """The agent's call_claude() wrapper, and how it reaches shared.claude.
+
+    Tier 1 and tier 3 both drive a browser, so both pass their own
+    allowed_tools. The wrapper had that argument hardcoded from artifact_dir and
+    swallowed the caller's in **kwargs, so every browser inspection died with
+    "got multiple values for keyword argument 'allowed_tools'" — after the test
+    had already been re-run with the browser parked.
+    """
+
+    @pytest.fixture
+    def recorded(self, fix, monkeypatch):
+        calls = []
+
+        def spy(prompt, model, cwd, **kwargs):
+            calls.append(kwargs)
+            return "ok"
+
+        monkeypatch.setattr(fix, "_call_claude", spy)
+        return calls
+
+    def test_browser_call_keeps_its_own_tools(self, fix, recorded, tmp_path):
+        out = fix.call_claude("p", tmp_path, use_system_prompt=False,
+                              allowed_tools=["mcp__playwright__*"],
+                              mcp_config="x.json", strict_mcp_config=True,
+                              stream_json=True, partial_on_timeout=True)
+        assert out == "ok"
+        assert recorded[0]["allowed_tools"] == ["mcp__playwright__*"]
+        assert recorded[0]["mcp_config"] == "x.json"
+
+    def test_artifact_dir_grants_read_and_adds_the_dir(self, fix, recorded, tmp_path):
+        fix.call_claude("p", tmp_path, artifact_dir="/shots")
+        assert recorded[0]["allowed_tools"] == ["Read"]
+        assert recorded[0]["add_dir"] == "/shots"
+
+    def test_both_together_merge(self, fix, recorded, tmp_path):
+        fix.call_claude("p", tmp_path, artifact_dir="/shots",
+                        allowed_tools=["mcp__playwright__*"])
+        assert recorded[0]["allowed_tools"] == ["mcp__playwright__*", "Read"]
+
+    def test_a_plain_call_grants_nothing(self, fix, recorded, tmp_path):
+        fix.call_claude("p", tmp_path)
+        assert recorded[0]["allowed_tools"] is None
+        assert recorded[0]["add_dir"] is None
+
+
+class TestReapParkedBrowser:
+    """Closing the browser a repair run parked.
+
+    The framework detaches it on purpose, so nothing else ever closes it. The
+    reaper read a browserPid the framework never wrote, killed nothing, and
+    deleted the session file anyway — leaving a Chromium holding the CDP port,
+    which makes every later run skip repair mode.
+    """
+
+    def _session(self, tmp_path, **extra):
+        f = tmp_path / ".repair-session.json"
+        f.write_text("{}")
+        return {"_path": str(f), "cdpEndpoint": "http://localhost:9222", **extra}
+
+    def test_pid_in_the_session_is_killed(self, fix, monkeypatch, tmp_path):
+        monkeypatch.setattr(fix.time, "sleep", lambda s: None)
+        killed = []
+        monkeypatch.setattr(fix.os, "kill",
+                            lambda pid, sig: killed.append((pid, sig)))
+        fix._reap_parked_browser(self._session(tmp_path, browserPid=4242))
+        assert killed[0] == (4242, fix.signal.SIGTERM)
+
+    def test_missing_pid_falls_back_to_the_cdp_port(self, fix, monkeypatch, tmp_path):
+        monkeypatch.setattr(fix, "_pid_listening_on", lambda endpoint: 777)
+        monkeypatch.setattr(fix.time, "sleep", lambda s: None)
+        killed = []
+        monkeypatch.setattr(fix.os, "kill",
+                            lambda pid, sig: killed.append((pid, sig)))
+        fix._reap_parked_browser(self._session(tmp_path))
+        assert killed[0] == (777, fix.signal.SIGTERM)
+
+    def test_the_session_file_is_always_cleared(self, fix, monkeypatch, tmp_path):
+        monkeypatch.setattr(fix, "_pid_listening_on", lambda endpoint: 0)
+        session = self._session(tmp_path)
+        fix._reap_parked_browser(session)
+        assert not Path(session["_path"]).exists()
+
+    def test_a_browser_that_survives_is_reported_not_assumed(self, fix, monkeypatch,
+                                                             tmp_path, capsys):
+        monkeypatch.setattr(fix.os, "kill", lambda pid, sig: None)  # never dies
+        monkeypatch.setattr(fix.time, "sleep", lambda s: None)
+        fix._reap_parked_browser(self._session(tmp_path, browserPid=4242))
+        out = capsys.readouterr().out
+        assert "ignored SIGTERM" in out and "closed" not in out

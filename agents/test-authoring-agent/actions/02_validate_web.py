@@ -39,10 +39,11 @@ VALIDATE_TIMEOUT = int(os.environ.get("VALIDATE_WEB_TIMEOUT_S", "1800"))
 VALIDATE_RETRY_ATTEMPTS = int(os.environ.get("VALIDATE_WEB_RETRY_ATTEMPTS", "1"))
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
-sys.path.insert(0, str(REPO_ROOT / "shared"))
-from claude import call_claude_ex       # noqa: E402  (after sys.path update)
-from mcp_config import write_playwright_mcp_config  # noqa: E402
-from log import log as _log             # noqa: E402  (shared, redacts known secrets)
+sys.path.insert(0, str(REPO_ROOT))   # repo root → shared.*
+from shared.claude import call_claude_ex            # noqa: E402  (after sys.path update)
+from shared.mcp_config import write_playwright_mcp_config  # noqa: E402
+from shared.log import log as _log      # noqa: E402  (shared, redacts known secrets)
+from shared.page_identity import is_dom_selector    # noqa: E402
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -60,17 +61,73 @@ def _fmt_budget(seconds: int) -> str:
 
 # ── Output parsers ─────────────────────────────────────────────────────────────
 
-def parse_selector_output(output: str) -> dict:
-    """Parse SELECTOR_FOUND: lines from Claude output."""
-    selectors = {}
+# The match count Claude is required to report, taken from the END of the value so
+# that a selector legitimately containing "|" (e.g. [data-x="a|b"]) is unaffected.
+_COUNT_SUFFIX = re.compile(r"\|\s*count\s*=\s*(\d+)\s*$", re.I)
+
+
+def parse_selector_output(output: str) -> tuple:
+    """Parse SELECTOR_FOUND: lines. Returns (selectors, counts).
+
+    Enforces two properties a "confirmed" selector must have, because the prompt
+    has asked for both for a long time and a model that skips one leaves no trace:
+
+    1. It must be a real DOM selector. Claude drives the page through Playwright
+       MCP, whose snapshots label every node with an ephemeral ref (`e71`,
+       `generic[ref=f2e585]`); reporting the handle it just clicked instead of a
+       selector is an easy mistake, and the resulting page object polls a locator
+       that can never match until a 30-second timeout in step 04.
+
+    2. It must match EXACTLY ONE element. A selector matching several compiles
+       fine and then dies at runtime with Playwright's "strict mode violation:
+       resolved to N elements" — the failure that cost a whole fix budget.
+
+    Both are hard drops. An unreported count used to be kept-but-flagged, on the
+    theory that a probably-fine selector beats none. It does not: step 03 cannot
+    tell a verified selector from an unverified one at codegen time, so the only
+    thing the flag bought was a line in the log explaining, after the fact, why
+    the generated test died of a strict mode violation. "Confirmed" now means
+    measured, and a selector this step could not measure is not confirmed.
+
+    counts maps name -> the reported match count, which is 1 for every entry that
+    survives. It is retained so downstream code and the audit record can still see
+    that the measurement happened rather than having to assume it.
+    """
+    selectors, counts = {}, {}
     for line in output.splitlines():
         line = line.strip()
-        if line.startswith("SELECTOR_FOUND:"):
-            rest = line[len("SELECTOR_FOUND:"):].strip()
-            if "=" in rest:
-                name, selector = rest.split("=", 1)
-                selectors[name.strip()] = selector.strip()
-    return selectors
+        if not line.startswith("SELECTOR_FOUND:"):
+            continue
+        rest = line[len("SELECTOR_FOUND:"):].strip()
+        if "=" not in rest:
+            continue
+        name, selector = rest.split("=", 1)
+        name, selector = name.strip(), selector.strip()
+
+        count = None
+        match = _COUNT_SUFFIX.search(selector)
+        if match:
+            count = int(match.group(1))
+            selector = selector[:match.start()].strip()
+
+        if not is_dom_selector(selector):
+            log(f"WARNING: dropped {name} — {selector!r} is not a usable DOM "
+                f"selector (Playwright-MCP ref or pseudo-attribute)")
+            continue
+        if count is None:
+            log(f"WARNING: dropped {name} — {selector!r} was reported without a "
+                f"|count=, so its uniqueness was never measured. Re-report it with "
+                f"the count from the batch check (rule 2c).")
+            continue
+        if count != 1:
+            log(f"WARNING: dropped {name} — {selector!r} matched {count} element(s), "
+                f"not 1. Generating from it would fail at runtime with a strict "
+                f"mode violation; narrow the selector and re-report it.")
+            continue
+
+        selectors[name] = selector
+        counts[name] = count
+    return selectors, counts
 
 
 def parse_step_results(output: str) -> tuple:
@@ -197,8 +254,59 @@ def parse_interaction_hints(output: str) -> list:
         if not (isinstance(obj, dict) and required <= obj.keys()):
             log(f"WARNING: INTERACTION_HINT JSON missing required keys {required} — dropped: {rest[:150]}")
             continue
-        hints.append({k: str(obj[k]).strip() for k in ("type", "name", "selector", "text")})
+        hint = {k: str(obj[k]).strip() for k in ("type", "name", "selector", "text")}
+        # Optional here, but required by reconcile_hints() for any hint that is not
+        # backed by a confirmed SELECTOR_FOUND. Parsed leniently so a malformed
+        # count degrades to "unmeasured" rather than throwing the hint away here.
+        raw_count = obj.get("count")
+        hint["count"] = raw_count if isinstance(raw_count, int) else None
+        # Same hygiene as SELECTOR_FOUND above — step 03 treats hints as equally
+        # authoritative, so an MCP ref reaching the codegen prompt through this
+        # path is just as unusable.
+        if not is_dom_selector(hint["selector"]):
+            log(f"WARNING: dropped hint {hint['name']} — {hint['selector']!r} is not a "
+                f"usable DOM selector (Playwright-MCP ref or pseudo-attribute)")
+            continue
+        hints.append(hint)
     return hints
+
+
+def reconcile_hints(hints: list, selectors: dict) -> list:
+    """Hold INTERACTION_HINTs to the same uniqueness bar as SELECTOR_FOUNDs.
+
+    Step 03 generates locators from hints and from selectors alike, so a hint is
+    not a lesser artefact that can be trusted less — but only SELECTOR_FOUND ever
+    had to prove itself. Two things went wrong in practice:
+
+    1. A hint recorded an element the model INTERACTED with, including elements an
+       interaction then failed on. An observed run hinted the profile-summary edit
+       icon as `img[alt='PencilSimple']`, found that clicking it did nothing, moved
+       up to the parent `span` and confirmed THAT — leaving a hint pointing at the
+       element that does not work next to a selector pointing at the one that does.
+       Where a name has a confirmed selector, that selector is authoritative and
+       the hint's copy is replaced. The hint's real value is its type/label
+       metadata, which is unaffected.
+
+    2. A hint for a name with no confirmed selector was never counted at all, so
+       "button" could reach codegen and resolve to twenty elements at runtime.
+       Those now need their own measured count=1, exactly like a SELECTOR_FOUND.
+    """
+    kept = []
+    for hint in hints:
+        name, confirmed = hint.get("name"), selectors.get(hint.get("name"))
+        if confirmed:
+            if hint["selector"] != confirmed:
+                log(f"NOTE: hint {name} pointed at {hint['selector']!r} but the "
+                    f"confirmed selector is {confirmed!r} — using the confirmed one "
+                    f"(the hint likely recorded an interaction that did not work).")
+                hint = {**hint, "selector": confirmed}
+        elif hint.get("count") != 1:
+            log(f"WARNING: dropped hint {name} — {hint['selector']!r} has no "
+                f"confirmed selector and no measured count=1, so its uniqueness is "
+                f"unknown. Report it via SELECTOR_FOUND, or add \"count\": 1.")
+            continue
+        kept.append({k: v for k, v in hint.items() if k != "count"})
+    return kept
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -307,17 +415,57 @@ OUTPUT PROTOCOL — emit these markers on their own lines:
   (e.g. STEP_FAILED: Click submit button|category=selector_not_found|no element matched [name='submit'] after 3 retries [url=https://example.com/checkout])
 
 • Whenever you find a working selector/locator:
-    SELECTOR_FOUND: <camelCaseName>=<actualSelector>
-  (e.g. SELECTOR_FOUND: loginButton=[name='commit'])
+    SELECTOR_FOUND: <camelCaseName>=<actualSelector>|count=<matchCount>
+  (e.g. SELECTOR_FOUND: loginButton=[name='commit']|count=1)
+
+  ⚠ count IS MANDATORY and is the number of elements the selector matched when
+  you evaluated it in the browser (see UNIQUENESS CHECK below). It goes at the
+  very END of the line, so a selector containing a literal | is still safe.
+  A marker reporting count != 1 is DROPPED — a selector matching several elements
+  kills the generated test at runtime with Playwright's "strict mode violation:
+  resolved to N elements". Narrow it and re-report it with count=1 instead.
+  A marker with NO count is ALSO DROPPED. Nothing downstream can tell a selector
+  you measured from one you eyeballed, so an unmeasured selector is not a
+  confirmed one. The batch check in rule 2c gives you every count at once —
+  report the number it returned.
+
+  ⚠ REPORT THE SELECTOR AS CSS, NOT AS A JAVASCRIPT STRING LITERAL.
+  When you paste a selector into browser_evaluate you escape it for JS, so the
+  class `gap-4.5` becomes 'div.gap-4\\\\.5' inside your snippet. The selector
+  itself is `div.gap-4\\.5` — report that. Copying the doubled backslash out of
+  your own JS source produces a selector that matches nothing in the generated
+  test, no matter what count you measured.
+
+  ⚠ REPORT A REAL DOM SELECTOR, NEVER A SNAPSHOT REF.
+  The `ref=` handles in your browser_snapshot output (e71, f2e585, aria-ref=f2e750)
+  are ephemeral labels for YOUR session. They are not selectors: generated Java runs
+  in a different browser where they match nothing, forever. The same applies to the
+  role prefixes snapshots print — `generic[ref=…]`, `img[ref=…]`, `textbox[ref=…]`.
+  Read the element's real attributes and report those instead, in this priority
+  order: [data-cy] > [data-testid] > [id] > [name] > a stable class or
+  attribute selector > :has-text("visible label").
+  There is no `text` attribute in CSS — write button:has-text('Save'), never
+  button[text='Save'].
+  Any marker carrying a ref is DROPPED, and the locator is then guessed at codegen.
 
 • Whenever you interact with an element worth recording for later code generation:
     INTERACTION_HINT: <json object>
-  Valid JSON on a SINGLE LINE with exactly these keys: "type" (one of input |
-  button | link | dropdown | checkbox | other), "name" (camelCase), "selector",
-  "text" (visible label). Using JSON (not a delimiter) means the selector or
-  text may safely contain any character, including a literal | — do not use
-  a | to separate fields.
-  (e.g. INTERACTION_HINT: {{"type":"input","name":"resumeHeadline","selector":"[id='resumeHeadlineTxt']","text":"Resume Headline"}})
+  Valid JSON on a SINGLE LINE with these keys: "type" (one of input | button |
+  link | dropdown | checkbox | other), "name" (camelCase), "selector", "text"
+  (visible label), and "count" (see below). Using JSON (not a delimiter) means
+  the selector or text may safely contain any character, including a literal | —
+  do not use a | to separate fields.
+  (e.g. INTERACTION_HINT: {{"type":"input","name":"resumeHeadline","selector":"[id='resumeHeadlineTxt']","text":"Resume Headline","count":1}})
+
+  ⚠ HINTS ARE HELD TO THE SAME UNIQUENESS BAR AS SELECTOR_FOUND, because step 03
+  generates locators from both. So:
+  • If you have already emitted SELECTOR_FOUND for this name, repeat that EXACT
+    selector here. Do not hint a different element for the same name — if you
+    tried one element, it did not work, and a different one did, the one that
+    worked is the only one worth recording.
+  • If this name has no SELECTOR_FOUND, the hint must carry its own measured
+    "count": 1 from the rule-2c batch check. A hint with no confirmed selector
+    and no count=1 is DROPPED.
 
 • On every STEP_FAILED, also emit a snapshot of the page at the moment of
   failure (see FAILURE PROTOCOL, rule 6):
@@ -337,27 +485,93 @@ EXECUTION RULES — follow exactly:
 ══════════════════════════════════════════════════════════════
 1. Execute every step in order. Do NOT skip or reorder steps.
 
-2. SELECTOR STRATEGY — try each strategy in priority order until one works:
-   a) [data-cy='...'] or [data-testid='...'] or [data-test='...']
-   b) [id='...']
-   c) [name='...']
-   d) [aria-label='...']
-   e) role-based  (e.g. role=button[name='Sign in'])
-   f) text-based  (e.g. text='Sign in')
+1b. REPEATED SUB-FLOWS — a flow often repeats itself on purpose: log out and log
+   back in to prove a change persisted, or revisit a page already seen. EXECUTE
+   those steps for real — the repetition IS what the test is checking, and
+   skipping it would validate nothing. But do NOT re-discover on the way through:
+   reuse the selectors you already confirmed for those elements and skip both the
+   harvest (2a) and the uniqueness check (2c), which have already run for that
+   page and cannot return a different answer the second time. Emit STEP_PASSED as
+   normal; do not re-emit SELECTOR_FOUND for a name you have already reported.
 
-   UNIQUENESS CHECK — mandatory before emitting SELECTOR_FOUND:
-   While the browser is still open on that page, immediately after finding a
-   candidate selector, use the browser tools to count how many elements it matches:
-   • count == 1 → emit SELECTOR_FOUND and proceed.
-   • count > 1  → selector is NOT unique. Do NOT emit it. Narrow it by:
-       - Adding a parent scope:        form >> [name='commit']
-       - Combining attributes:         button[type='submit'][name='commit']
-       - Using a more specific attribute from the DOM snapshot
-     Repeat the count check with the narrowed selector until count == 1,
-     then emit SELECTOR_FOUND.
-   Never emit a selector that matches more than one element.
+2. SELECTOR STRATEGY — three round-trips per page, not fifteen.
 
-2b. OBSTRUCTIONS — before concluding an element is not found or not clickable,
+   ⚠ BUDGET. Every browser tool call is a full round-trip costing this run about
+   ten seconds, and the context it returns is re-read on every turn after it.
+   Hunting one element at a time through a string of browser_evaluate calls is
+   the single thing that makes this step slow, and it finds nothing the batched
+   sequence below does not. Work page by page: HARVEST once, build ALL the
+   candidates for that page, VERIFY them in one batch.
+
+   2a) HARVEST — the first thing you do on a page whose elements you need, and
+       again when a modal, dropdown or panel opens. ONE browser_evaluate:
+
+       () => {{
+         const ATTRS = ['data-cy','data-testid','data-test','id','name',
+                        'aria-label','placeholder','type'];
+         const root = document.querySelector('<section selector>') || document;
+         return [...root.querySelectorAll(
+                   'input,button,a,select,textarea,[role=button],[contenteditable]')]
+           .filter(el => el.offsetParent !== null)
+           .slice(0, 60)
+           .map(el => {{
+             const o = {{ tag: el.tagName.toLowerCase() }};
+             for (const a of ATTRS) {{ const v = el.getAttribute(a); if (v) o[a] = v; }}
+             const t = (el.innerText || el.value || '').trim();
+             if (t) o.text = t.slice(0, 40);
+             return o;
+           }});
+       }}
+
+       Scope `root` to the section you care about as soon as you know which one
+       that is (drop the querySelector and use `document` only for a first look
+       at a small page). An unscoped harvest of a large page returns a lot of
+       site chrome you will never use, and it stays in your context for the rest
+       of the run.
+
+   2b) BUILD CANDIDATES for every locator still needed on this page from the
+       harvest output, in this priority order:
+         a) [data-cy='...'] or [data-testid='...'] or [data-test='...']
+         b) [id='...']
+         c) [name='...']
+         d) [aria-label='...']
+         e) a stable class or attribute combination, parent-scoped if needed
+         f) role-based  (e.g. role=button[name='Sign in'])
+         g) text-based  (e.g. button:has-text('Sign in'))
+
+       PREFER PLAIN CSS (a–e). `role=` and `:has-text()` are Playwright-only
+       syntax that document.querySelectorAll cannot evaluate, so each one costs
+       its own separate verification round-trip in 2c instead of riding along in
+       the batch. Reach for them only when nothing in a–e identifies the element.
+
+   2c) UNIQUENESS CHECK — mandatory before emitting SELECTOR_FOUND, and BATCHED.
+       Verify EVERY candidate for the page in ONE browser_evaluate:
+
+       () => {{
+         const candidates = {{ /* name: "selector", ... every candidate for THIS page */ }};
+         const out = {{}};
+         for (const [name, sel] of Object.entries(candidates)) {{
+           try {{ out[name] = document.querySelectorAll(sel).length; }}
+           catch (e) {{ out[name] = 'INVALID_CSS: ' + e.message; }}
+         }}
+         return out;
+       }}
+
+       • count === 1 → emit SELECTOR_FOUND for that name now.
+       • count !== 1, or INVALID_CSS → do NOT emit it. Narrow ONLY those, by
+           - adding a parent scope:   #profile-section [name='commit']
+           - combining attributes:    button[type='submit'][name='commit']
+           - using a more specific attribute from the harvest
+         then re-run the SAME snippet with just the unresolved names. Two batch
+         rounds should settle a page — do not degrade into one call per selector.
+       • A role= / :has-text() candidate cannot be counted by the snippet above;
+         count that one on its own with the Playwright locator API instead.
+
+       Never emit a selector that matches more than one element. Report the number
+       you measured as |count=<n> on the SELECTOR_FOUND line. This is parsed and
+       enforced, not just guidance: count != 1 is dropped.
+
+2d. OBSTRUCTIONS — before concluding an element is not found or not clickable,
    and before spending any of rule 3's retry budget on it:
    Check whether a cookie-consent banner, promotional/interstitial modal,
    "enable notifications" prompt, or newsletter popup is covering the page.
@@ -409,9 +623,15 @@ EXECUTION RULES — follow exactly:
 
 7. Include the current page URL in every STEP_FAILED message.
 
-8. After major page transitions (navigation, login, form submit), take an
-   accessibility snapshot to understand the current page structure before
-   attempting the next interaction.
+8. SNAPSHOTS — take an accessibility snapshot after a NAVIGATION or a LOGIN, to
+   confirm where you actually landed. Do NOT snapshot after every click or form
+   submit: one snapshot is ~14k characters that stays in your context for the
+   remainder of the run and slows every turn that follows it, and for locating
+   elements the rule-2a harvest tells you more in a tenth of the size. When a
+   modal, dropdown or panel opens, harvest it (2a) instead of re-snapshotting the
+   whole page.
+   The FAILURE PROTOCOL (rule 6) is the exception and overrides this: on a
+   failure, capture the screenshot and PAGE_DUMP it asks for regardless.
 
 9. Complete ALL steps — do not stop early unless the browser itself crashes.
 
@@ -438,6 +658,16 @@ Begin executing the steps now using the browser tools.
             on_output=_on_output,
             log_dir=str(AUDIT_DIR),
             allowed_tools=["mcp__playwright__*"],
+            # Load NO built-in tools. allowed_tools above only gates permission —
+            # every built-in stays *defined*, costing ~10k tokens of system prompt
+            # on every one of the ~50 turns this step takes, and arriving deferred
+            # so the model burns whole round-trips on ToolSearch before it can
+            # navigate, evaluate or press a key. Verified against the CLI: MCP
+            # tools are unaffected by this flag and are then callable directly.
+            tools="",
+            # Skills and slash commands are equally unreachable from a headless
+            # run and equally present in the prompt until asked to leave.
+            disable_slash_commands=True,
             # Load exactly the Playwright server written above and nothing else.
             # By default the subprocess also inherits the user's global MCP
             # servers, so it spends startup connecting to unrelated ones
@@ -452,13 +682,17 @@ Begin executing the steps now using the browser tools.
 
     def _parsed(output: str) -> dict:
         passed, failed = parse_step_results(output)
+        found, counts = parse_selector_output(output)
         return {
             "output":            output,
-            "selectors":         parse_selector_output(output),
+            "selectors":         found,
+            "selector_counts":   counts,
             "steps_passed":      passed,
             "steps_failed":      failed,
             "page_elements":     parse_page_dumps(output),
-            "interaction_hints": parse_interaction_hints(output),
+            # Reconciled against `found`, so the hints written to disk carry the
+            # same uniqueness guarantee the selector map does.
+            "interaction_hints": reconcile_hints(parse_interaction_hints(output), found),
         }
 
     def _score(result, p: dict) -> tuple:
@@ -481,12 +715,30 @@ Begin executing the steps now using the browser tools.
     def _failure_detail(step_failed_line: str) -> str:
         return step_failed_line.split("|", 1)[1] if "|" in step_failed_line else step_failed_line
 
-    def _worth_retrying(result_status: str, steps_failed: list) -> bool:
+    def _every_locator_confirmed(p: dict) -> bool:
+        """True when every locator the plan asked for came back count=1.
+
+        Only meaningful when the plan actually named locators; a plan that named
+        none can never satisfy this and must fall through to the other checks.
+        """
+        if not all_locators:
+            return False
+        counts = p.get("selector_counts") or {}
+        confirmed = {n for n in p.get("selectors", {}) if counts.get(n) == 1}
+        return set(all_locators) <= confirmed
+
+    def _worth_retrying(result_status: str, p: dict) -> bool:
         """Skip the retry when it can't plausibly help.
 
         A pure login/cascade failure won't be fixed by running the identical
         flow again with the identical credentials — that needs a human to fix
         the input file, not another attempt.
+
+        Nor will it help once every locator the plan asked for is already
+        uniqueness-verified: a retry re-runs the whole flow from a fresh browser
+        for another 5-12 minutes, and the selector map — which is this step's
+        actual deliverable for step 03 — is already complete. What it would
+        produce is a second, differently-flaky set of step results at full price.
 
         No STEP_FAILED markers at all means one of two very different things:
         every step genuinely passed (status == "ok" — nothing to retry), or
@@ -494,9 +746,25 @@ Begin executing the steps now using the browser tools.
         markers (status != "ok") — exactly the scenario retries exist to
         recover from, so that case is always worth another try regardless of
         the (empty) failure list.
+
+        A third case exists now that an unmeasured selector is dropped rather than
+        kept: an attempt can walk the whole flow, report every step as passed, and
+        still confirm nothing, because it never ran the rule-2c count check. That
+        looks like total success by every other signal here, and it leaves step 03
+        with an empty map to abort on. It is worth exactly one more attempt, whose
+        notes say what was missing.
         """
+        steps_failed = p["steps_failed"]
+        if all_locators and not p["selectors"]:
+            log("Retrying: the flow reported no confirmed selectors at all — likely "
+                "SELECTOR_FOUND markers emitted without the mandatory |count=.")
+            return True
         if not steps_failed:
             return result_status != "ok"
+        if _every_locator_confirmed(p):
+            log(f"Not retrying: all {len(set(all_locators))} planned locator(s) are "
+                f"uniqueness-verified, so a second pass cannot add a selector.")
+            return False
         categories = [parse_failure_category(_failure_detail(s)) for s in steps_failed]
         if all(c in ("login_failed", "skipped") for c in categories):
             return False
@@ -512,6 +780,7 @@ Begin executing the steps now using the browser tools.
         r, p = max(attempts, key=lambda ra: _score(ra[0], ra[1]))
         _write_result(
             selectors=p["selectors"],
+            selector_counts=p.get("selector_counts"),
             steps_passed=p["steps_passed"],
             steps_failed=p["steps_failed"],
             page_elements=p["page_elements"],
@@ -550,13 +819,19 @@ Begin executing the steps now using the browser tools.
             log("  → FIX: check model availability and that the Playwright MCP server "
                 "connected (look for \"MCP server 'playwright'\" above)")
 
-        if attempt_num < max_attempts and _worth_retrying(result.status, parsed["steps_failed"]):
+        if attempt_num < max_attempts and _worth_retrying(result.status, parsed):
             if parsed["steps_failed"]:
                 notes = ["\nPRIOR ATTEMPT NOTES — a previous run of this exact flow failed "
                          "on the steps below. Apply the noted fix where relevant, but still "
                          "execute every step from the start (this is a fresh browser with no "
                          "session state carried over):"]
                 notes.extend(f"  - {s}" for s in parsed["steps_failed"])
+            elif not parsed["selectors"]:
+                notes = ["\nPRIOR ATTEMPT NOTES — a previous run of this exact flow walked "
+                         "the steps but confirmed ZERO selectors, because SELECTOR_FOUND "
+                         "markers were emitted without the mandatory |count=<n> and were "
+                         "therefore all dropped. Run the rule-2c batch check on every page "
+                         "and put the number it returns on every SELECTOR_FOUND line."]
             else:
                 notes = ["\nPRIOR ATTEMPT NOTES — a previous run of this exact flow did not "
                          f"complete ({result.describe()}) and produced no usable output. "
@@ -622,13 +897,32 @@ def _write_empty(reason: str) -> None:
 def _write_result(selectors, steps_passed, steps_failed,
                   page_elements=None, interaction_hints=None,
                   skipped=False, reason=None, status="ok", raw_output="",
-                  attempts=1) -> None:
+                  attempts=1, selector_counts=None) -> None:
+    # Every selector that survives parse_selector_output() was measured at exactly
+    # one element, and every hint that survives reconcile_hints() is either backed
+    # by one of those or measured itself. Assert it rather than trusting it: this
+    # file is the contract step 03 generates from, and a regression that quietly
+    # re-admitted unmeasured locators would only show up as a strict mode violation
+    # several minutes later in step 04.
+    unverified = [n for n, c in (selector_counts or {}).items() if c != 1]
+    if unverified:
+        log(f"BUG: {len(unverified)} selector(s) reached the result without a "
+            f"measured count of 1 ({', '.join(sorted(unverified))}) — dropping them.")
+        selectors = {n: sel for n, sel in (selectors or {}).items() if n not in unverified}
+        selector_counts = {n: c for n, c in (selector_counts or {}).items() if n not in unverified}
+    if selectors:
+        log(f"All {len(selectors)} selector(s) are uniqueness-verified (count=1).")
+
     data = {
         "skipped":           skipped,
         "reason":            reason,
         "status":            status,
         "attempts":          attempts,
         "selectors":         selectors,
+        # name -> element count the browser reported, or null when the model did
+        # not report one. Keeps "checked, and it was unique" distinguishable from
+        # "never checked", which the selector map alone cannot express.
+        "selector_match_counts": selector_counts or {},
         "steps_passed":      steps_passed,
         "steps_failed":      steps_failed,
         "page_elements":     page_elements or {},

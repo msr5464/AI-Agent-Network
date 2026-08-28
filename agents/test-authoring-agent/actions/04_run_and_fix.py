@@ -49,6 +49,15 @@ HEADLESS     = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
 FIX_ATTEMPT  = int(os.environ.get("FIX_ATTEMPT", "1"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
 MAVEN_TEST_TIMEOUT_S = int(os.environ.get("MAVEN_TEST_TIMEOUT_S", "300"))
+# Wall-clock budget for the fix call. This step used to pass no timeout at all and
+# silently inherit call_claude_ex's 300s default — too tight for a fix that has to
+# emit COMPLETE file contents, so the call was killed mid-response and reported as
+# an empty one.
+FIX_TIMEOUT_S = int(os.environ.get("FIX_TIMEOUT_S", "900"))
+# Diff budget for one fix. edit_guards defaults to 40, which is healing's *locator*
+# budget; authoring legitimately repairs compile errors, imports and helper calls,
+# so it needs more room while still rejecting a whole-file regeneration.
+FIX_MAX_DIFF_LINES = int(os.environ.get("FIX_MAX_DIFF_LINES", "200"))
 
 # Where the Java framework's TestListener/JsonTestReporter write machine-readable
 # results — built specifically "for AI agents to read... without parsing HTML
@@ -62,14 +71,77 @@ TEST_RESULTS_DIR = AUTOMATION_FRAMEWORK_DIR / os.environ.get("TEST_RESULTS_DIR_N
 from shared.log import log as _log
 def log(msg: str) -> None: _log("04-run-and-fix", msg)
 
-from shared.claude import call_claude as _call_claude
+from shared.claude import call_claude_ex as _call_claude_ex
 def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, MODEL, str(REPO_ROOT))
-    if not output:
-        log("ERROR: Claude CLI returned empty response")
-    return output
+    """Run the fix call, reporting *why* it produced nothing when it does.
+
+    The legacy call_claude() collapses timeout / non-zero exit / genuinely-empty
+    into the same empty string, so a fix killed at the timeout was indistinguishable
+    from one the model declined to make — and the step went on to re-run the test
+    unfixed, reporting only "did not return a valid fix map".
+    """
+    # The decoder turns a finished text block into one progress line per line of
+    # text, and this step's text block IS the fix map — echoing it would dump whole
+    # Java files into the run console. Surface only genuine progress signals.
+    _PROGRESS_PREFIXES = ("API retry", "MCP server", "\u2192 ")
+
+    def _on_output(label: str, line: str) -> None:
+        if label == "stdout" and line.startswith(_PROGRESS_PREFIXES):
+            log(f"  {line[:200]}")
+
+    result = _call_claude_ex(
+        prompt=prompt,
+        model=MODEL,
+        cwd=str(REPO_ROOT),
+        timeout=FIX_TIMEOUT_S,
+        on_output=_on_output,
+        log_dir=str(AUDIT_DIR),   # raw transcript survives for post-mortem
+        stream_json=True,
+        # Generating a fix is pure text-in/text-out — no MCP server is needed, and
+        # inheriting the user's global config just pays connection cost per attempt.
+        strict_mcp_config=True,
+    )
+    if not result.ok:
+        log(f"ERROR: Claude fix call {result.describe()}")
+        # A timeout still carries whatever arrived before the kill; handing it back
+        # lets extract_json() salvage a complete object when the model had already
+        # finished and was only idling on the wire.
+        return result.stdout if result.status == "timeout" else ""
+    return result.stdout
 
 from shared.credential_properties import write_credential_property
+from shared.test_catalog import test_methods_in
+from shared import properties_file, url_properties
+# Evidence readers shared with test-healing-agent. The framework already writes a
+# DOM snapshot, a structured failure context and a Playwright trace on every
+# failure; before this, step 04 read none of them and asked Claude to fix a test
+# from a stack trace alone.
+from shared import diagnosis as _diagnosis
+from shared import failure_context as _failure_context
+from shared.dom_snapshot import (find_snapshot, distill as distill_dom,
+                                 format_for_prompt as format_dom)
+from shared.playwright_trace import (read_actions, failing_action,
+                                     format_for_prompt as format_trace)
+# Mechanical guards, shared with test-healing-agent and test-adaptation-agent.
+# Deliberately NOT imported: validate_diagnosis_fit (rejects any edit touching a
+# page-load assertion unless the verdict is LOCATOR_STALE — which would refuse
+# every compile-error fix this step exists to make), matches_negative (needs a
+# negatives list authoring has no source for) and steps_justified (adaptation's
+# flow contract).
+from shared.edit_guards import (apply_edits, compute_diff, log_edits,
+                                logstep_present, no_new_swallowing,
+                                no_selector_broadening, validate_fix,
+                                wrapper_compliance)
+
+
+def _record_build(cmd, elapsed_s: float, verdict: str) -> None:
+    """Maven time for the metrics rollup. This step runs its own Maven rather
+    than shared/test_runner.py, so it needs its own record call."""
+    try:
+        from shared import metrics
+        metrics.record_tool("build", " ".join(cmd), elapsed_s, verdict)
+    except Exception:
+        pass
 
 
 def extract_json(text: str):
@@ -86,6 +158,31 @@ def extract_json(text: str):
         except json.JSONDecodeError:
             pass
     return None
+
+
+_TESTS_RUN = re.compile(r"Tests run:\s*(\d+)", re.I)
+
+
+def _tests_actually_ran(output: str):
+    """Did surefire execute at least one test? True / False / None if unknown.
+
+    None matters: a build that fell over before surefire reported anything at all
+    (a compile error) must stay a plain failure, not be re-labelled "nothing ran".
+    """
+    counts = [int(m.group(1)) for m in _TESTS_RUN.finditer(output or "")]
+    if not counts:
+        return None
+    return max(counts) > 0
+
+
+def build_passed(returncode: int, output: str) -> bool:
+    """Whether the build represents a genuine pass.
+
+    Exit code alone is not enough: surefire reports BUILD SUCCESS when -Dtest
+    matches no method, so a run that executed nothing exits 0. Kept separate from
+    run_maven_test so the rule is testable without shelling out to maven.
+    """
+    return returncode == 0 and _tests_actually_ran(output) is not False
 
 
 def run_maven_test(test_class: str, test_method: str) -> tuple:
@@ -140,15 +237,28 @@ def run_maven_test(test_class: str, test_method: str) -> tuple:
 
     if timed_out:
         log(f"[build:end] timed out in {int(time.time() - _build_started)}s")
+        _record_build(cmd, time.time() - _build_started, "timed out")
         log(f"ERROR: mvn test timed out ({MAVEN_TEST_TIMEOUT_S}s)")
         return False, "\n".join(all_lines) + f"\nERROR: Maven test timed out after {MAVEN_TEST_TIMEOUT_S} seconds."
 
-    passed = proc.returncode == 0
+    output_text = "\n".join(all_lines)
+    passed = build_passed(proc.returncode, output_text)
+    if proc.returncode == 0 and not passed:
+        # Surefire reports BUILD SUCCESS when -Dtest matches no method: the suite
+        # "passed" having executed nothing. Treated as a pass, that ships an
+        # APPROVED PR for a test that never ran — the single worst outcome this
+        # pipeline can produce, and indistinguishable from a real pass by exit
+        # code alone.
+        log("ERROR: the build succeeded but ZERO tests ran — the -Dtest filter "
+            "matched no method. This is NOT a pass.")
+        log(f"  → check that {test_arg} names a real @Test method in the "
+            f"generated class.")
     log(f"[build:end] {'passed' if passed else 'failed'} in "
         f"{int(time.time() - _build_started)}s")
+    _record_build(cmd, time.time() - _build_started, "passed" if passed else "failed")
     log(f"Test exit code: {proc.returncode} ({'PASS' if passed else 'FAIL'})")
     # Return the full captured output (last 6000 chars keeps tail for Claude context)
-    return passed, "\n".join(all_lines)[-6000:]
+    return passed, output_text[-6000:]
 
 
 def read_generated_files(files_written: list) -> dict:
@@ -165,47 +275,132 @@ def read_generated_files(files_written: list) -> dict:
 
 
 def extract_fix_response(fix_map) -> tuple:
-    """Unpack the fix response into (root_cause, confidence, files_map).
+    """Unpack into (root_cause, confidence, files_map, edits_map).
 
-    Accepts the new {"root_cause":..., "confidence":..., "files": {...}} shape
-    the prompt now asks for, but falls back to treating the whole object as a
-    flat {file: content} map if "files" is absent — an LLM doesn't always
-    follow a structure change on the first try, and a fix that still applies
-    correctly shouldn't be discarded just because the diagnosis fields are
-    missing.
+    Understands three shapes, most preferred first:
+      {"root_cause", "confidence", "edits": [{file, old_string, new_string}]}
+      {"root_cause", "confidence", "files": {path: full_content}}
+      {path: full_content}                       (bare, no metadata)
+
+    Exactly one of files_map / edits_map is ever non-empty.
     """
     if not isinstance(fix_map, dict):
         return "", "", {}
-    if "files" in fix_map and isinstance(fix_map["files"], dict):
-        return (
-            str(fix_map.get("root_cause", "")),
-            str(fix_map.get("confidence", "")),
-            fix_map["files"],
-        )
-    return "", "", fix_map
+    root  = str(fix_map.get("root_cause", ""))
+    conf  = str(fix_map.get("confidence", ""))
 
-
-def apply_fix(files_map: dict) -> tuple:
-    """Write Claude's fixed file contents back to Thanos-pw.
-    Returns (patched_paths: list, patched_contents: dict)."""
-    patched = []
-    patched_contents: dict = {}
-    for rel_path, content in files_map.items():
-        if not content or not content.strip():
+    # Preferred shape — targeted search/replace, the same contract the healing
+    # agent uses. Grouped per file so each file is read, patched and guarded once.
+    edits_map: dict = {}
+    for edit in (fix_map.get("edits") or []):
+        if not isinstance(edit, dict):
             continue
+        rel = str(edit.get("file", "")).strip()
+        if rel:
+            edits_map.setdefault(rel, []).append(edit)
+    if edits_map:
+        return root, conf, {}, edits_map
+
+    if "files" in fix_map and isinstance(fix_map["files"], dict):
+        return root, conf, fix_map["files"], {}
+    # Neither shape: treat the whole object as a flat {file: content} map. An LLM
+    # does not always follow a structure change on the first try, and a fix that
+    # still applies correctly should not be discarded over missing metadata.
+    return "", "", fix_map, {}
+
+
+def _run_guards(original: str, updated: str, rel_path: str) -> tuple:
+    """Mechanical checks a re-run cannot do for us. Returns (ok, reason).
+
+    The verification loop cannot catch a fix built on a wrong diagnosis, because
+    the easiest way to make an assertion pass is to weaken it. These run before
+    maven does, so a fix that could only pass by weakening the test never reaches
+    a runner at all.
+    """
+    is_test = Path(rel_path).name.endswith(("Test.java", "Tests.java", "Test.kt"))
+    checks = (
+        ("size/integrity",  lambda: validate_fix(original, updated,
+                                                 Path(rel_path).name, FIX_MAX_DIFF_LINES)),
+        ("no_new_swallowing",     lambda: no_new_swallowing(original, updated)),
+        ("wrapper_compliance",    lambda: wrapper_compliance(original, updated)),
+        ("logstep_present",       lambda: logstep_present(original, updated, is_test)),
+        ("no_selector_broadening", lambda: no_selector_broadening(original, updated)),
+        # A fix is the other way a literal URL gets into the repo: step 03's
+        # guard cannot see what step 04 writes afterwards.
+        ("no_hardcoded_url",      lambda: url_properties.no_hardcoded_url(original, updated)),
+    )
+    for name, run in checks:
+        try:
+            ok, reason = run()
+        except Exception as exc:      # pragma: no cover - a guard must never break a fix
+            log(f"  guard {name} errored, ignoring: {exc}")
+            continue
+        if not ok:
+            return False, f"{name}: {reason}"
+    return True, ""
+
+
+def apply_fix(files_map: dict, edits_map: dict = None) -> tuple:
+    """Apply a fix to the framework repo, guarded.
+
+    Prefers targeted edits (edits_map) over whole-file replacement (files_map):
+    a search/replace that must match exactly once cannot silently drop the rest of
+    a file the model never saw.
+
+    Returns (patched_paths, patched_contents, rejections).
+    """
+    edits_map = edits_map or {}
+    patched, rejections = [], []
+    patched_contents: dict = {}
+
+    targets = list(edits_map.keys()) + [k for k in files_map if k not in edits_map]
+    for rel_path in targets:
         full = AUTOMATION_FRAMEWORK_DIR / rel_path
-        # Safety: only write inside Thanos-pw
+        # Safety: only ever write inside the framework repo.
         try:
             full.resolve().relative_to(AUTOMATION_FRAMEWORK_DIR.resolve())
         except ValueError:
             log(f"  BLOCKED: {rel_path} escapes repo root")
+            rejections.append({"file": rel_path, "reason": "path escapes repo root"})
             continue
+
+        original = full.read_text() if full.exists() else ""
+
+        if rel_path in edits_map:
+            if not original:
+                log(f"  Cannot patch {rel_path}: file does not exist")
+                rejections.append({"file": rel_path, "reason": "file does not exist"})
+                continue
+            updated, edit_err = apply_edits(original, edits_map[rel_path])
+            if not updated:
+                # apply_edits refuses an old_string that is missing or ambiguous —
+                # guessing which occurrence was meant is how an autofix corrupts a file.
+                log(f"  Cannot apply edits to {rel_path}: {edit_err}")
+                rejections.append({"file": rel_path, "reason": edit_err})
+                continue
+        else:
+            updated = files_map.get(rel_path) or ""
+            if not updated.strip():
+                continue
+
+        if original:
+            ok, reason = _run_guards(original, updated, rel_path)
+            if not ok:
+                log(f"  REJECTED {rel_path} — {reason}")
+                rejections.append({"file": rel_path, "reason": reason,
+                                   "diff": compute_diff(original, updated,
+                                                        Path(rel_path).name)})
+                continue
+
         full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content)
+        full.write_text(updated)
         patched.append(rel_path)
-        patched_contents[rel_path] = content
+        patched_contents[rel_path] = updated
         log(f"  Fixed: {rel_path}")
-    return patched, patched_contents
+        if rel_path in edits_map:
+            # The prose root_cause says WHY; without this nobody can see WHAT.
+            log_edits(full, original, edits_map[rel_path], log)
+    return patched, patched_contents, rejections
 
 
 def _extract_failure_summary(output: str) -> list:
@@ -275,7 +470,18 @@ def read_json_test_report(test_class: str, test_method: str) -> dict:
     if not isinstance(entries, list):
         return {}
 
-    candidates = [e for e in entries if isinstance(e, dict) and e.get("className") == test_class]
+    # JsonTestReporter writes the FULLY QUALIFIED class name
+    # ("automation.naukari.NaukriProfileSummaryWebTest") while step 03 hands us the
+    # simple one ("NaukriProfileSummaryWebTest"), so an equality test never matched
+    # and this returned {} on every run — silently costing the fix prompt the
+    # failureMessage, and the diagnosis engine the page object it reasons from.
+    def _same_class(recorded: str) -> bool:
+        return bool(recorded) and (recorded == test_class
+                                   or recorded.endswith("." + test_class)
+                                   or test_class.endswith("." + recorded))
+
+    candidates = [e for e in entries
+                  if isinstance(e, dict) and _same_class(e.get("className", ""))]
     if test_method:
         method_matches = [e for e in candidates if e.get("testName") == test_method]
         if method_matches:
@@ -343,7 +549,218 @@ def build_failure_context(test_class: str, test_method: str, test_output: str,
         "retry_count":       report_entry.get("retryCount"),
         "screenshot_path":   screenshot,
         "summary_lines":     summary_lines,
+        # Lets the next attempt bound its evidence lookup to THIS run's artefacts.
+        "run_started_at":    run_started_at,
     }
+
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s)]+")
+
+
+def _registrable(host: str) -> str:
+    """Last two labels of a host — good enough to tell first- from third-party.
+
+    Not Public-Suffix-List accurate (it treats example.co.uk as co.uk), which only
+    ever makes the check more permissive: the failure mode is keeping one extra
+    line of evidence, never dropping a real one.
+    """
+    labels = (host or "").strip(".").split(".")
+    return ".".join(labels[-2:]) if len(labels) >= 2 else (host or "")
+
+
+def _first_party_errors(errors: list, page_host: str, max_len: int = 140) -> list:
+    """Keep only request failures on the page's own host, condensed.
+
+    Third-party tracker noise (doubleclick, googleads, analytics beacons) aborts
+    routinely on a normal page load and is never the cause of a test failure.
+    """
+    if not page_host:
+        return []
+    kept = []
+    for err in errors:
+        match = _URL_IN_TEXT.search(str(err))
+        if not match:
+            continue
+        host = _extract_host(match.group(0))
+        # Compare the registrable domain, not the exact host: an API on
+        # api.example.com failing for a page on www.example.com is exactly the
+        # evidence worth keeping, and an exact/subdomain match would discard it.
+        # The cost is that a same-company analytics beacon survives too, which the
+        # cap below bounds to a few condensed lines.
+        if _registrable(host) and _registrable(host) == _registrable(page_host):
+            condensed = str(err)
+            if len(condensed) > max_len:
+                condensed = condensed[:max_len] + " …"
+            kept.append(condensed)
+    return kept
+
+
+def advisory_diagnosis(test_class: str, test_method: str, dom_snapshot_path: str,
+                       failed_selector: str, failure_message: str,
+                       failure_location: str) -> str:
+    """Run the shared rule engine and render its verdict as ADVICE, never a gate.
+
+    test-healing-agent lets this verdict decide what it may edit, because it only
+    ever repairs a locator in a test that used to pass. Authoring is a different
+    job: the code is newly generated and may not even compile, so a verdict of
+    "this is not a stale locator" must never stop the fix. The rules are still
+    worth running — they read the same live-page evidence and are good at spotting
+    that a flow never arrived at the page it was asserting against — so the output
+    goes into the prompt as context and nothing more.
+    """
+    try:
+        issue = {
+            "test_name":      f"{test_class}.{test_method}" if test_class else test_method,
+            "dom_snapshot":   dom_snapshot_path,
+            "failed_selector": failed_selector,
+            "error_message":  failure_message,
+            "stack_trace":    failure_location,
+        }
+        evidence = _diagnosis.collect(issue, workspace=AUTOMATION_FRAMEWORK_DIR)
+        verdict = _diagnosis.diagnose(evidence)
+    except Exception as e:                        # pragma: no cover - defensive
+        log(f"Evidence: diagnosis unavailable ({e})")
+        return ""
+
+    name = verdict.get("verdict", "")
+    if not name:
+        return ""
+    log(f"Evidence: diagnosis {name} ({verdict.get('confidence', '')})")
+    lines = [f"Verdict: {name} (confidence {verdict.get('confidence', 'UNKNOWN')})"]
+    lines += [f"  - {r}" for r in (verdict.get("reasons") or [])]
+    if verdict.get("remediation"):
+        lines.append(f"  Suggested: {verdict['remediation']}")
+    return (
+        "\n## DIAGNOSIS (ADVISORY — from the shared rule engine)\n"
+        "This is a hint from evidence, not an instruction. It is tuned for repairing\n"
+        "locators in tests that used to pass; this test is newly generated, so a\n"
+        "compile error, a wrong helper call or a bad assertion is equally likely.\n"
+        "Use it if it fits the evidence above, and ignore it if it does not.\n"
+        + "\n".join(lines) + "\n"
+    )
+
+
+def gather_runtime_evidence(test_method: str, newer_than: float = 0.0) -> dict:
+    """Read the DOM, failure context and trace the framework wrote at failure.
+
+    `newer_than` bounds the lookup to artefacts this run actually produced. A run
+    where the test never executed writes none, and without the bound the newest
+    matching file from a PREVIOUS session is picked up instead — showing the fixer
+    a DOM and a failing selector from an entirely different failure, which is worse
+    than showing it nothing.
+
+    Every lookup is independently best-effort: a missing or unreadable artefact
+    must degrade the fix prompt, never break the fix path.
+    """
+    out = {"dom_section": "", "trace_section": "", "context_section": "",
+           "dom_snapshot_path": "", "trace_path": ""}
+    if not test_method:
+        return out
+
+    def _fresh(path) -> bool:
+        try:
+            return not newer_than or Path(path).stat().st_mtime >= newer_than
+        except OSError:
+            return False
+
+    # ── DOM at the moment of failure ──────────────────────────────────────────
+    try:
+        snap = find_snapshot(TEST_RESULTS_DIR, test_method)
+        if snap and not _fresh(snap):
+            log(f"Evidence: ignoring stale DOM snapshot {Path(snap).name} — it "
+                f"predates this run, so it describes a different failure")
+            snap = None
+        if snap:
+            out["dom_snapshot_path"] = str(snap)
+            distilled = distill_dom(snap.read_text(errors="ignore"))
+            body = format_dom(distilled)
+            if body.strip():
+                out["dom_section"] = (
+                    "\n## DOM AT FAILURE (captured in the real browser, at the "
+                    "failing step)\n"
+                    "This is the page the test was actually on. A locator that "
+                    "matches nothing here is wrong, and one that matches several "
+                    "elements is what raises Playwright's strict-mode violation.\n"
+                    f"{body}\n"
+                )
+            log(f"Evidence: DOM snapshot {snap.name}")
+    except Exception as e:                       # pragma: no cover - defensive
+        log(f"Evidence: DOM snapshot unavailable ({e})")
+
+    # ── Structured failure context written next to the snapshot ───────────────
+    try:
+        ctx_path = (_failure_context.beside_snapshot(out["dom_snapshot_path"])
+                    if out["dom_snapshot_path"]
+                    else _failure_context.find(TEST_RESULTS_DIR, test_method))
+        # The fallback lookup is not time-bounded, so it will happily return the
+        # context file next to a snapshot that was just rejected as stale.
+        if ctx_path and not _fresh(ctx_path):
+            ctx_path = None
+        if ctx_path:
+            ctx = _failure_context.load(ctx_path)
+            # describe() covers readyState / DOM volatility / anchor counts / JS
+            # errors. The fields it leaves out — which page we were on and how much
+            # of the page object matched — are the ones that say whether the flow
+            # even arrived, so compose them here rather than change a formatter
+            # test-healing-agent shares.
+            lines = []
+            if ctx.get("url"):
+                lines.append(f"Page at failure: {ctx['url']}")
+            if ctx.get("title"):
+                lines.append(f"Page title: {ctx['title']}")
+            cov = _failure_context.self_coverage(ctx)
+            if cov:
+                lines.append(
+                    f"{cov['name']}: {cov['matched']} of {cov['evaluable']} locators "
+                    f"matched in the live page")
+                for name, hits in (cov.get("details") or {}).items():
+                    lines.append(f"    {name}: {hits} match(es)")
+                if cov["evaluable"] and not cov["matched"]:
+                    lines.append(
+                        "    → NOT ONE locator matched. The flow almost certainly "
+                        "never reached this page, so the bug is in an EARLIER step "
+                        "(login, navigation) rather than in these selectors.")
+            described = _failure_context.describe(ctx)
+            if described.strip():
+                lines.append(described)
+            # Only first-party failures. A page like this logs a dozen aborted
+            # requests to ad and analytics hosts on every load; they are never why
+            # a test failed, and unfiltered they cost several KB of prompt to say
+            # nothing. A failed call to the app's OWN host is worth every character.
+            page_host = _extract_host(ctx.get("url", ""))
+            for err in _first_party_errors(ctx.get("http_errors") or [], page_host)[:3]:
+                lines.append(f"HTTP error (first-party): {err}")
+            if lines:
+                out["context_section"] = (
+                    "\n## FAILURE CONTEXT (recorded by the framework, in the live page)\n"
+                    + "\n".join(lines) + "\n"
+                )
+            log(f"Evidence: failure context {Path(ctx_path).name}")
+    except Exception as e:                       # pragma: no cover - defensive
+        log(f"Evidence: failure context unavailable ({e})")
+
+    # ── What the test actually did, selector by selector ──────────────────────
+    try:
+        traces = [t for t in sorted((TEST_RESULTS_DIR / "traces").glob(f"{test_method}_*.zip"),
+                                    key=lambda f: f.stat().st_mtime, reverse=True)
+                  if _fresh(t)]
+        if traces:
+            out["trace_path"] = str(traces[0])
+            actions = read_actions(traces[0])
+            body = format_trace(actions)
+            if body.strip():
+                out["trace_section"] = (
+                    "\n## WHAT THE TEST ACTUALLY DID (Playwright trace)\n"
+                    f"{body}\n"
+                )
+            failed = failing_action(actions)
+            if failed:
+                log(f"Evidence: failing action {failed.get('action')} "
+                    f"{failed.get('selector')!r}")
+    except Exception as e:                       # pragma: no cover - defensive
+        log(f"Evidence: trace unavailable ({e})")
+
+    return out
 
 
 # ── Infrastructure helpers ────────────────────────────────────────────────────
@@ -564,13 +981,117 @@ def try_fix_infra_credentials(plan: dict) -> bool:
     return status == "written"
 
 
+def resolve_test_method(test_class: str, test_method: str, files_written: list) -> str:
+    """Confirm the method we are about to run exists; correct it if it does not.
+
+    Step 03 records the method name, but that record can be stale — a resume runs
+    step 04 against an 03-generate.json written before the class was regenerated,
+    and re-running step 04 alone never revisits it at all. Handing a name that no
+    longer exists to `mvn -Dtest=Class#method` runs ZERO tests and reports BUILD
+    SUCCESS, so the mismatch is invisible unless it is checked here.
+
+    Reads the class from disk, because disk is what maven will run.
+    """
+    if not test_class:
+        return test_method
+
+    path = next((AUTOMATION_FRAMEWORK_DIR / f for f in (files_written or [])
+                 if Path(f).stem == test_class and (AUTOMATION_FRAMEWORK_DIR / f).exists()), None)
+    if path is None:
+        matches = list((AUTOMATION_FRAMEWORK_DIR / "src" / "test").rglob(f"{test_class}.java"))
+        path = matches[0] if matches else None
+    if path is None:
+        log(f"Test method precheck: {test_class}.java not found on disk — running "
+            f"{test_method!r} as recorded")
+        return test_method
+
+    try:
+        declared = test_methods_in(path.read_text())
+    except OSError as e:
+        log(f"Test method precheck: cannot read {path.name} ({e}) — running as recorded")
+        return test_method
+
+    if not declared:
+        log(f"WARNING: {path.name} declares no @Test method at all — nothing can run")
+        return test_method
+    if test_method in declared:
+        return test_method
+
+    corrected = declared[0]
+    log(f"Test method precheck: {test_method!r} is not declared in {path.name} "
+        f"(it has {declared}) — running {corrected!r} instead")
+    return corrected
+
+
+def load_run_target(gen_data: dict) -> tuple:
+    """What step 04 will actually run: (test_class, test_method, files_written).
+
+    Reconciles step 03's record against the code on disk in one place, so the
+    reconciliation cannot be skipped by a caller — the reason this is a function
+    and not two lines inside main() is that "we forgot to check" is precisely the
+    failure it exists to prevent.
+    """
+    files_written = gen_data.get("files_written", [])
+    test_class = gen_data.get("test_class", "")
+    test_method = resolve_test_method(test_class, gen_data.get("test_method", ""),
+                                      files_written)
+    return test_class, test_method, files_written
+
+
+def ensure_credentials(plan: dict) -> None:
+    """Make sure the login properties exist BEFORE the first test run.
+
+    run.sh syncs the framework repo with `git checkout -f <branch>`, which discards
+    every uncommitted change — including the credential properties step 03 wrote,
+    which ship deliberately never commits because they are secrets. They are
+    therefore per-run state that the *next* run wipes.
+
+    try_fix_infra_credentials() below already repairs this, but only after a maven
+    cycle has failed AND classify_failure() matched a credential signature. A run
+    that resumes at step 04, or whose step 03 came from TESTING_MODE cache, starts
+    with no properties at all: getRunTimeProperty returns null, the login form is
+    filled with nothing, and the failure looks like a broken locator on whatever
+    page the test lands on. Writing them up front costs nothing and removes a whole
+    class of misdiagnosis.
+    """
+    feature = (plan.get("feature_name") or "").lower()
+    if not feature:
+        log("Credential precheck: no feature_name in plan — skipping")
+        return
+    creds = plan.get("demo_credentials") or {}
+    status = write_credential_property(AUTOMATION_FRAMEWORK_DIR, feature, creds, log=log)
+    key = f"{feature}.username"
+    if status == "no credentials to write":
+        # Not necessarily wrong — an API-only flow or a CSV-backed module has none.
+        log(f"Credential precheck: plan carries no demo_credentials; the test must "
+            f"not depend on {key}")
+    else:
+        log(f"Credential precheck: {key} / {feature}.password — {status}")
+
+
+def ensure_url_properties(plan: dict, gen_data: dict) -> None:
+    """Make sure the URL properties the generated code reads exist BEFORE the run.
+
+    Same reason as ensure_credentials(): run.sh syncs the framework repo with
+    `git checkout -f`, so a run that resumes at step 04 starts with none of what
+    step 03 wrote. A missing URL property is quieter than a missing credential —
+    getRunTimeProperty returns null, navigation goes nowhere, and the failure
+    looks like a page object whose locators stopped matching.
+    """
+    urls = gen_data.get("url_properties") or url_properties.collect_urls(plan)
+    if not urls:
+        return
+    feature = (plan.get("feature_name") or "").lower()
+    status = url_properties.write_url_properties(
+        AUTOMATION_FRAMEWORK_DIR, urls, feature, log=log)
+    log(f"URL property precheck: {len(urls)} key(s) — {status}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     gen_data = json.loads((AUDIT_DIR / "03-generate.json").read_text())
-    files_written = gen_data.get("files_written", [])
-    test_class    = gen_data.get("test_class", "")
-    test_method   = gen_data.get("test_method", "")
+    test_class, test_method, files_written = load_run_target(gen_data)
     plan_data     = json.loads((AUDIT_DIR / "01-parse.json").read_text())
     api_val_path  = AUDIT_DIR / "02-validate-api.json"
     api_validation = json.loads(api_val_path.read_text()) if api_val_path.exists() else {}
@@ -589,6 +1110,8 @@ def main() -> None:
 
     # ── FIX_ATTEMPT == 0 — initial run, no fix ────────────────────────────────
     if FIX_ATTEMPT == 0:
+        ensure_credentials(plan_data)
+        ensure_url_properties(plan_data, gen_data)
         log(f"Initial test run: {test_class}#{test_method}")
         run_started_at = time.time()
         passed, test_output = run_maven_test(test_class, test_method)
@@ -628,6 +1151,7 @@ def main() -> None:
     prev_output = ""
     prev_failure_location = ""
     prev_root_cause = ""
+    prev_run_started_at = 0.0
     prev_fix_path = AUDIT_DIR / "04-run-and-fix.json"
     if prev_fix_path.exists():
         try:
@@ -638,12 +1162,18 @@ def main() -> None:
             prev_screenshot       = prev.get("screenshot_path", "")
             prev_summary_lines    = prev.get("summary_lines", [])
             prev_root_cause       = prev.get("root_cause", "")
+            prev_run_started_at   = float(prev.get("run_started_at") or 0)
             log(f"Fix attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS} — loaded previous failure ({len(prev_output)} chars)"
                 + (f", location={prev_failure_location}" if prev_failure_location else ""))
         except Exception:
             prev_failure_message, prev_screenshot, prev_summary_lines = "", "", []
     else:
         prev_failure_message, prev_screenshot, prev_summary_lines = "", "", []
+
+    # Read the DOM, failure context and trace the previous attempt's run left on
+    # disk. These describe the exact failure this attempt is being asked to fix,
+    # and step 04 ignored all three until now.
+    evidence = gather_runtime_evidence(test_method, newer_than=prev_run_started_at)
 
     failure_class = classify_failure(prev_output, plan_data.get("api_base_url", ""))
     log(f"Failure classified as: {failure_class}")
@@ -827,6 +1357,29 @@ def main() -> None:
             ) + "\n"
         structured_section += "</structured_failure_report>\n"
 
+    # Runtime evidence — what the browser actually saw. Ordered deliberately:
+    # what the test did, then the page it was on, then the framework's own
+    # verdict on that page.
+    structured_section += (evidence["trace_section"]
+                           + evidence["dom_section"]
+                           + evidence["context_section"])
+
+    failed_selector = ""
+    try:
+        if evidence.get("trace_path"):
+            failed = failing_action(read_actions(Path(evidence["trace_path"])))
+            failed_selector = (failed or {}).get("selector", "")
+    except Exception:
+        pass
+    # Pass the maven tail as the stack trace, not failure_location. The engine
+    # derives which page object the test believed it was on by matching
+    # "SomePage.java" in a trace; a one-line "File.java:NN" (or the empty string
+    # this used to be) gives it nothing to reason from, which is why every run
+    # came back INSUFFICIENT_EVIDENCE.
+    structured_section += advisory_diagnosis(
+        test_class, test_method, evidence["dom_snapshot_path"], failed_selector,
+        prev_failure_message, prev_output or prev_failure_location)
+
     if api_auth_code_bug_hint:
         api_auth = plan_data.get("api_auth", {})
         structured_section += (
@@ -865,6 +1418,13 @@ Previous fix did not resolve the test. Previous failure:
 Try a DIFFERENT approach — do NOT repeat what was tried before.
 """
 
+    # Name the real properties file and the keys already in it, so "use a property"
+    # is an instruction the model can follow rather than one it has to invent.
+    props_file_name = properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR).name
+    known_url_keys  = sorted(gen_data.get("url_properties") or {})
+    url_keys_hint   = (f" — already defined: {', '.join(known_url_keys)}"
+                       if known_url_keys else "")
+
     prompt = f"""You are a Java test automation debugging agent for the Jarvis framework.
 
 <framework_conventions>
@@ -896,31 +1456,53 @@ Common failure causes:
 CRITICAL: Preserve ALL existing JavaDoc comments, inline comments, and annotations exactly as written.
 Only change the minimum code required to fix the failure. Do NOT remove, shorten, or reword any comments.
 
+CRITICAL: Never introduce a literal "http://" or "https://" URL — not in a test, a page object,
+a helper, or a `static final` constant. A fix that adds one is REJECTED outright and the attempt
+is wasted. URLs live in parameters/{props_file_name} and are read back with
+config.getRunTimeProperty("<feature>.<page>.url"){url_keys_hint}. If the URL you need has no
+property yet, use a key named that way anyway — the missing value is a clearer failure than a
+URL welded into Java.
+
 Return ONLY a JSON object of this exact shape:
 {{
   "root_cause": "one or two sentences: what actually broke and why, not just what error appeared",
   "confidence": "high | medium | low",
-  "files": {{
-    "src/test/java/automation/{plan_data.get('feature_name', 'feature')}/{{}}.java": "...fixed content...",
-    "src/main/java/automation/modules/...": "...fixed content..."
-  }}
+  "edits": [
+    {{
+      "file": "src/main/java/automation/modules/{plan_data.get('feature_name', 'feature')}/web/SomePage.java",
+      "old_string": "the exact text to replace, with enough surrounding context to be UNIQUE in the file",
+      "new_string": "the replacement text"
+    }}
+  ]
 }}
 
-Include the COMPLETE file content (not just the changed lines) for every file in "files".
-If you believe this is a framework-level issue you cannot fix from the files you can see,
-set "files" to an empty object {{}} and explain that clearly in root_cause instead of
-guessing at a workaround. Output ONLY valid JSON.
+Return TARGETED EDITS, not whole files. Each "old_string" must appear EXACTLY ONCE in
+its file — include a line or two of surrounding context if the snippet alone would be
+ambiguous. An edit whose old_string is missing or matches twice is rejected outright,
+because guessing which occurrence was meant is how an automated fix corrupts a file.
+Keep edits minimal: change the lines that are wrong, nothing else. A diff larger than
+{FIX_MAX_DIFF_LINES} lines is rejected as a whole-file regeneration.
+
+Only if a file is too badly broken to patch (it does not compile at all, or the change
+is structural), fall back to whole-file replacement instead:
+  "files": {{ "<path>": "...COMPLETE file content..." }}
+
+If this is a framework-level issue you cannot fix from the files you can see, return
+"edits": [] and explain that clearly in root_cause rather than guessing at a workaround.
+Output ONLY valid JSON.
 """
 
     fix_response = call_claude(prompt)
     fix_map = extract_json(fix_response)
-    root_cause, confidence, files_map = extract_fix_response(fix_map)
+    root_cause, confidence, files_map, edits_map = extract_fix_response(fix_map)
 
     fixes_applied = []
     fix_contents: dict = {}
-    if files_map:
-        fixes_applied, fix_contents = apply_fix(files_map)
-        log(f"Applied fixes to {len(fixes_applied)} file(s) — running test")
+    fix_rejections: list = []
+    if files_map or edits_map:
+        fixes_applied, fix_contents, fix_rejections = apply_fix(files_map, edits_map)
+        if fixes_applied:
+            log(f"Applied fixes to {len(fixes_applied)} file(s) — running test")
     elif root_cause:
         log(f"Claude diagnosed the failure but proposed no file changes: {root_cause}")
         log("  → Likely a framework-level issue outside the generated files — running "
@@ -929,6 +1511,32 @@ guessing at a workaround. Output ONLY valid JSON.
         log("WARNING: Claude did not return a valid fix map — running test without fix")
     if root_cause:
         log(f"Root cause ({confidence or 'unknown confidence'}): {root_cause}")
+
+    # Nothing changed on disk, so the test would fail exactly as it just did.
+    # Re-running it costs a full maven cycle to learn nothing and consumes the
+    # attempt that could have carried a real fix — the wasted-attempt bug.
+    nothing_applied = bool((files_map or edits_map) and not fixes_applied)
+    if nothing_applied:
+        log(f"No fix was applied — every proposed change was rejected "
+            f"({len(fix_rejections)} file(s)). Skipping the test re-run: the code on "
+            f"disk is unchanged, so the result would be identical.")
+        for entry in fix_rejections:
+            log(f"  - {entry['file']}: {entry['reason']}")
+        _write_gate("false")
+        _write_result({
+            "attempt": FIX_ATTEMPT,
+            "test_class": test_class,
+            "test_method": test_method,
+            "passed": False,
+            "test_output": prev_output,
+            "fixes_applied": [],
+            "fix_rejections": fix_rejections,
+            "fix_response_length": len(fix_response),
+            "root_cause": root_cause,
+            "confidence": confidence,
+            "skipped_rerun": True,
+        }, files_written, FIX_ATTEMPT)
+        return
 
     # Run the test with the fix applied
     run_started_at = time.time()
@@ -966,6 +1574,7 @@ guessing at a workaround. Output ONLY valid JSON.
         "passed": passed,
         "test_output": test_output,
         "fixes_applied": fixes_applied,
+        "fix_rejections": fix_rejections,
         "fix_response_length": len(fix_response),
         "root_cause": root_cause,
         "confidence": confidence,

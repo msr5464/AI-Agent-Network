@@ -30,6 +30,19 @@ The "Rules (MANDATORY)" section below is loaded at runtime; dynamic context (pla
 10. Waits: ONLY `WaitHelper.*` — never `Thread.sleep()`.
 11. For existing modules: only generate new test class + new helper methods.
     Do NOT regenerate existing Data/Builder/Api files.
+12. URLs: never a literal `"http://..."` / `"https://..."` in Java — not in a test, a page
+    object, a helper, or a `private static final String BASE_URL` constant. Step 03 writes
+    every URL the plan and the browser validation saw into
+    `parameters/{environment}-{country}.properties` before generating, and injects the keys
+    into the prompt. Read them back:
+    - ApiHelper base URL: `super(config, config.getRunTimeProperty("{feature}.api.url"))` —
+      inline in the `super()` call; an instance field cannot be referenced there.
+    - Navigation: `BrowserHelper.navigateTo(config, config.getRunTimeProperty("{feature}.login.url"))`
+    - Reused in a class: `private final String profileUrl = config.getRunTimeProperty(...)` —
+      an instance field, since `static` cannot reach `config`.
+    A literal that survives generation triggers one targeted repair pass; whatever is left
+    is recorded in `03-generate.json` under `hardcoded_urls`. Step 04 rejects any fix that
+    adds one.
 
 ---
 

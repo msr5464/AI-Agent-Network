@@ -119,7 +119,7 @@ declare -a STEP_DURATIONS=()
 
 # ── Step 00 — Reproduce (standalone mode only) ────────────────────────────────
 if [[ "$MODE" == "local" ]]; then
-  run_step "[00/02] Reproduce" "python3 '$AGENT_DIR/actions/00_reproduce.py'"
+  run_step "[00/02] Reproduce" "python3 '$AGENT_DIR/actions/00_reproduce.py'" reproduce
 
   if [[ ! -f "$AUDIT_DIR/00-handoff.json" ]]; then
     # A passing test or a non-locator failure. Both are legitimate outcomes, and
@@ -181,8 +181,9 @@ MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-2}"
 FIX_ATTEMPT=1
 
 while true; do
+  export STEP_ATTEMPT="$FIX_ATTEMPT"
   run_step "[01/02] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
-    "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_fix.py'"
+    "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_fix.py'" fix
 
   FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
 
@@ -200,7 +201,7 @@ while true; do
 done
 
 # ── Step 02 — Ship (PR + Slack) ───────────────────────────────────────────────
-run_step "[02/02] Ship" "python3 '$AGENT_DIR/actions/02_ship.py'"
+run_step "[02/02] Ship" "python3 '$AGENT_DIR/actions/02_ship.py'" ship
 
 # ── Mark handoff as processed ─────────────────────────────────────────────────
 # An infra skip (no GitHub token, workspace missing) means nothing was attempted.
@@ -230,6 +231,12 @@ echo ""
 for i in "${!STEP_NAMES[@]}"; do
   printf "  %-50s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
 done
+
+# Roll up now so the spend is on screen with the timings rather than only in
+# metrics.json. The EXIT trap re-runs this; a rollup is idempotent.
+_METRICS=$(cd "${REPO_ROOT:-.}" && python3 -m shared.metrics 2>/dev/null || true)
+[[ -n "$_METRICS" ]] && log "Spend: $_METRICS"
+
 
 # What each attempt actually changed. The step logs interleave this with the
 # build output, so by the end you would have to scroll through several minutes

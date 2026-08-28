@@ -31,9 +31,9 @@ warnings.filterwarnings("ignore", message=".*urllib3.*")
 import logging
 logging.basicConfig(level=logging.WARNING)
 
-from lib.test_runner import run_test, split_test_name
+from shared.test_runner import run_test, split_test_name
 from lib import probes
-from lib.code_analyzer import CodeAnalyzer
+from shared.code_analyzer import CodeAnalyzer
 from shared.dom_snapshot import find_snapshot, parse_header
 from shared.playwright_trace import read_actions, failing_action
 from shared import diagnosis

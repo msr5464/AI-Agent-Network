@@ -1,0 +1,11 @@
+Module: saucedemo
+Type: web
+URL: https://www.saucedemo.com/
+Affects: automation.saucedemo.SauceDemoWebTest*
+
+What changed:
+1. The products page now shows a product sort dropdown beside the "Products"
+   title, offering Name (A to Z), Name (Z to A), Price (low to high) and
+   Price (high to low). ProductsPage has no locator for this control.
+
+Expected outcome unchanged: after signing in, the products page loads and lists at least one product.

@@ -9,12 +9,14 @@ Two entry points:
                          output, plus any partial output recovered from a timeout.
 
 Optional kwargs: on_output, system_prompt_file, log_dir, allowed_tools, add_dir,
-stream_json, partial_on_timeout.
+stream_json, tools, disable_slash_commands, partial_on_timeout.
 """
 
 import json
 import os
 import shlex
+
+from shared.credential_masking import mask_credential_lines
 import signal
 import subprocess
 import threading
@@ -42,6 +44,14 @@ class ClaudeResult(NamedTuple):
     status:     str
     timed_out:  bool
     duration_s: float
+    # Usage reported by the CLI itself. Trailing defaults keep every existing
+    # positional construction and unpacking of this NamedTuple working.
+    cost_usd:       float = 0.0
+    usage:          dict = {}
+    by_model:       dict = {}
+    num_turns:      int = 0
+    duration_api_s: float = 0.0
+    model_resolved: str = ""
 
     @property
     def ok(self) -> bool:
@@ -77,6 +87,76 @@ def _describe_tool_use(block: dict) -> str:
     return name
 
 
+_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+# The CLI spells the same counts two ways: snake_case in the top-level `usage`
+# block, camelCase inside `modelUsage`.
+_MODEL_USAGE_KEYS = {
+    "input_tokens": "inputTokens",
+    "output_tokens": "outputTokens",
+    "cache_read_input_tokens": "cacheReadInputTokens",
+    "cache_creation_input_tokens": "cacheCreationInputTokens",
+}
+
+
+def _absorb_usage(target: dict, ev: dict) -> None:
+    """Pull cost/token/turn fields out of a CLI `result` event into `target`.
+
+    Shared by the stream-json decoder and the single-object --output-format json
+    path, so both report identically. Best-effort — a shape change in the CLI
+    envelope must degrade to zeroes, never raise into the caller's step.
+    """
+    try:
+        cost = ev.get("total_cost_usd")
+        if isinstance(cost, (int, float)):
+            target["cost_usd"] = float(cost)
+
+        usage = ev.get("usage")
+        if isinstance(usage, dict):
+            for field in _TOKEN_FIELDS:
+                value = usage.get(field)
+                if isinstance(value, (int, float)):
+                    target[field] = int(value)
+
+        by_model: dict = {}
+        for name, stats in (ev.get("modelUsage") or {}).items():
+            if not isinstance(stats, dict):
+                continue
+            entry = {"cost_usd": float(stats.get("costUSD") or 0.0)}
+            for field in _TOKEN_FIELDS:
+                # modelUsage is camelCase while the top-level `usage` block is
+                # snake_case — same numbers, different spelling. Accept both so a
+                # future CLI that unifies them keeps working.
+                entry[field] = int(stats.get(_MODEL_USAGE_KEYS[field])
+                                   or stats.get(field) or 0)
+            by_model[name] = entry
+        if by_model:
+            target["by_model"] = by_model
+            # `system.init` reports the model the session opened with; modelUsage
+            # reports every model that actually billed. Prefer the latter when it
+            # names exactly one, since that is what the cost belongs to.
+            if len(by_model) == 1:
+                target["model_resolved"] = next(iter(by_model))
+
+        for src, dst in (("num_turns", "num_turns"),
+                         ("duration_api_ms", "duration_api_s"),
+                         ("session_id", "cli_session_id")):
+            value = ev.get(src)
+            if src.endswith("_ms") and isinstance(value, (int, float)):
+                target[dst] = round(float(value) / 1000.0, 3)
+            elif src == "num_turns" and isinstance(value, (int, float)):
+                target[dst] = int(value)
+            elif isinstance(value, str) and value:
+                target[dst] = value
+    except Exception:
+        pass
+
+
 class _StreamJsonDecoder:
     """Turns `--output-format stream-json` JSONL events back into assistant text.
 
@@ -88,6 +168,9 @@ class _StreamJsonDecoder:
     def __init__(self):
         self.text_parts:  list = []
         self.result_text: str = ""
+        # Usage reported by the CLI in its `result` / `system.init` events. The
+        # CLI computes cost itself, so no rate card is needed on our side.
+        self.usage: dict = {}
 
     def feed(self, raw_line: str) -> list:
         """Consume one JSONL line. Returns progress lines to surface to the caller."""
@@ -125,8 +208,14 @@ class _StreamJsonDecoder:
         elif etype == "result":
             if isinstance(ev.get("result"), str):
                 self.result_text = ev["result"]
+            _absorb_usage(self.usage, ev)
 
         elif etype == "system" and ev.get("subtype") == "init":
+            # The CLI resolves the model itself and may not honour what was
+            # requested — an observed run asked for opus and ran sonnet — so cost
+            # must be attributed to what actually ran, never to the --model flag.
+            if isinstance(ev.get("model"), str) and ev["model"]:
+                self.usage["model_resolved"] = ev["model"]
             # Surfacing MCP connection state here is what makes a genuine
             # "MCP server unavailable" failure distinguishable from a timeout.
             for srv in ev.get("mcp_servers") or []:
@@ -134,6 +223,18 @@ class _StreamJsonDecoder:
                     progress.append(
                         f"MCP server '{srv.get('name')}': {srv.get('status')}"
                     )
+
+        elif etype == "system" and ev.get("subtype") == "api_retry":
+            # The CLI retries an overloaded/rate-limited API up to max_retries,
+            # and each retry regenerates the response FROM THE TOP. On a long
+            # single-message call that is minutes of invisible rework, and an
+            # exhausted chain exits non-zero with nothing — which looks exactly
+            # like a hang unless the retries themselves are reported.
+            progress.append(
+                f"API retry {ev.get('attempt')}/{ev.get('max_retries')} — "
+                f"{ev.get('error_status')} {ev.get('error')} "
+                f"(waiting {round((ev.get('retry_delay_ms') or 0) / 1000, 1)}s)"
+            )
 
         return progress
 
@@ -180,6 +281,8 @@ def call_claude_ex(
     stream_json: bool = False,
     mcp_config=None,
     strict_mcp_config: bool = False,
+    tools=None,
+    disable_slash_commands: bool = False,
 ) -> ClaudeResult:
     """Call `claude -p <prompt> --model <model>` and report the full outcome.
 
@@ -195,6 +298,18 @@ def call_claude_ex(
       strict_mcp_config — ignore user/global MCP configuration and use only the
                           servers in mcp_config. Without mcp_config this loads NO
                           servers at all, so the two are passed together.
+      tools             — which BUILT-IN tools to load, as --tools. "" loads none.
+                          Distinct from allowed_tools, which only gates permission:
+                          a tool excluded by allowed_tools is still *defined*, so it
+                          still costs system-prompt tokens on every turn. Verified
+                          against the CLI: MCP tools are unaffected by this flag and
+                          stay available, and dropping the built-ins also stops them
+                          arriving deferred — which is what removes the ToolSearch
+                          round-trips a browser-driving run would otherwise spend
+                          before its first real tool call.
+      disable_slash_commands — pass --disable-slash-commands, dropping the user's
+                          skills and slash commands from the system prompt. Nothing
+                          run headless can invoke them anyway.
     """
     claude_cli = os.environ.get("CLAUDE_CLI_PATH", "claude")
     cmd = [claude_cli, "-p", prompt, "--model", model]
@@ -202,6 +317,12 @@ def call_claude_ex(
         cmd.extend(["--system-prompt-file", str(system_prompt_file)])
     if allowed_tools:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+    if tools is not None:
+        # `is not None`, not truthiness: "" is the meaningful value that loads no
+        # built-in tools at all, and is the whole point of the flag.
+        cmd.extend(["--tools", tools if isinstance(tools, str) else ",".join(tools)])
+    if disable_slash_commands:
+        cmd.append("--disable-slash-commands")
     if add_dir:
         # Adds a working directory. Verified empirically: this is additive, not
         # restrictive — it does NOT confine a granted tool to that directory, and
@@ -218,6 +339,13 @@ def call_claude_ex(
     if stream_json:
         # --verbose is required by the CLI whenever stream-json is combined with -p.
         cmd.extend(["--output-format", "stream-json", "--verbose"])
+    else:
+        # Plain `-p` prints the answer and nothing else — no usage, no cost. The
+        # json envelope carries the same text in ev["result"] plus the accounting,
+        # so this is what stops ~2/3 of spend reporting as $0. Every downstream
+        # parser still sees byte-identical text; if the envelope fails to parse we
+        # fall back to raw stdout below, so the switch cannot break a call site.
+        cmd.extend(["--output-format", "json"])
 
     # Resolve log path if requested
     log_path = None
@@ -247,7 +375,12 @@ def call_claude_ex(
             start_new_session=True,
         )
         if log_file:
-            log_file.write(f"cwd: {cwd}\ncommand: {shlex.join(cmd)}\n\n")
+            # The command line carries `-p <prompt>`, so a prompt holding a
+            # password put that password on disk. Mask the LOG COPY only — the
+            # prompt actually sent is untouched, because redacting that would
+            # silently break any flow that legitimately needs the value.
+            log_file.write(f"cwd: {cwd}\ncommand: "
+                           f"{mask_credential_lines(shlex.join(cmd))}\n\n")
             log_file.flush()
 
         def _kill_group(sig=signal.SIGKILL):
@@ -334,9 +467,15 @@ def call_claude_ex(
     else:
         returncode = _run(None)
 
-    stdout = decoder.text() if decoder is not None else "".join(stdout_chunks)
     stderr = "".join(stderr_chunks)
     duration = time.monotonic() - started
+
+    if decoder is not None:
+        stdout = decoder.text()
+        usage = dict(decoder.usage)
+    else:
+        raw_stdout = "".join(stdout_chunks)
+        stdout, usage = _unwrap_json_envelope(raw_stdout)
 
     if timed_out["hit"]:
         status = "timeout"
@@ -347,14 +486,52 @@ def call_claude_ex(
     else:
         status = "ok"
 
-    return ClaudeResult(
+    result = ClaudeResult(
         stdout=stdout,
         stderr=stderr,
         returncode=returncode if returncode is not None else -1,
         status=status,
         timed_out=timed_out["hit"],
         duration_s=duration,
+        cost_usd=float(usage.get("cost_usd") or 0.0),
+        usage={f: int(usage.get(f) or 0) for f in _TOKEN_FIELDS},
+        by_model=dict(usage.get("by_model") or {}),
+        num_turns=int(usage.get("num_turns") or 0),
+        duration_api_s=float(usage.get("duration_api_s") or 0.0),
+        model_resolved=str(usage.get("model_resolved") or ""),
     )
+
+    # One choke point instruments every call site. Best-effort by construction —
+    # record_llm_call never raises.
+    try:
+        from shared import metrics
+        metrics.record_llm_call(result, model_requested=model)
+    except Exception:
+        pass
+
+    return result
+
+
+def _unwrap_json_envelope(raw: str):
+    """Split `--output-format json` stdout into (text, usage).
+
+    Returns the raw string untouched when the payload is not the expected
+    envelope — a CLI banner, a plain-text response from an older CLI, or a
+    truncated write after a timeout kill. That fallback is what makes adding
+    --output-format json safe for the call sites that json.loads() the result.
+    """
+    text = raw.strip()
+    if not text.startswith("{"):
+        return raw, {}
+    try:
+        ev = json.loads(text)
+    except (ValueError, TypeError):
+        return raw, {}
+    if not isinstance(ev, dict) or not isinstance(ev.get("result"), str):
+        return raw, {}
+    usage: dict = {}
+    _absorb_usage(usage, ev)
+    return ev["result"], usage
 
 
 def call_claude(
@@ -370,6 +547,8 @@ def call_claude(
     stream_json: bool = False,
     mcp_config=None,
     strict_mcp_config: bool = False,
+    tools=None,
+    disable_slash_commands: bool = False,
     partial_on_timeout: bool = False,
 ) -> str:
     """Call `claude -p <prompt> --model <model>` as a subprocess.
@@ -405,6 +584,8 @@ def call_claude(
         stream_json=stream_json,
         mcp_config=mcp_config,
         strict_mcp_config=strict_mcp_config,
+        tools=tools,
+        disable_slash_commands=disable_slash_commands,
     )
     if result.status == "ok":
         return result.stdout

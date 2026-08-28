@@ -38,18 +38,66 @@ WORKSPACE_DIR    = Path(os.environ.get("WORKSPACE_DIR", REPO_ROOT.parent))
 AUTOMATION_FRAMEWORK_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
 
 MODEL = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
+# Wall-clock budget per codegen call. Batching (below) keeps each call short, so
+# this is a per-batch budget rather than one for the whole step.
+GENERATE_TIMEOUT = int(os.environ.get("GENERATE_TIMEOUT_S", "900"))
+# Max files requested per Claude call. `claude -p` returns ONE assistant message,
+# so asking for every file at once makes the step a single all-or-nothing response
+# that takes as long as all files combined — and anything that interrupts it (the
+# timeout, or an exhausted 529 retry chain, which restarts generation from the top)
+# discards every file. Small batches turn that into short, independently
+# retryable calls. 0 = no batching, request everything in one call.
+GENERATE_BATCH_SIZE = int(os.environ.get("GENERATE_BATCH_SIZE", "2"))
+# Diff budget for the URL repair pass. Swapping a literal for a property lookup is
+# a handful of lines per URL; anything past this is the model rewriting a file it
+# was asked only to de-hardcode.
+URL_REPAIR_MAX_DIFF_LINES = int(os.environ.get("URL_REPAIR_MAX_DIFF_LINES", "60"))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 from shared.log import log as _log
 def log(msg: str) -> None: _log("03-generate", msg)
 
-from shared.claude import call_claude as _call_claude
-def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, MODEL, str(REPO_ROOT), timeout=900)
-    if not output:
-        log("ERROR: Claude CLI returned empty response")
-    return output
+from shared.claude import call_claude_ex as _call_claude_ex
+def call_claude(prompt: str, label: str = "") -> str:
+    """Run one codegen call, reporting *why* it produced nothing when it does.
+
+    The legacy call_claude() collapses timeout / non-zero exit / genuinely-empty
+    into the same empty string, which is how a 900s timeout and a CLI error both
+    surfaced as "returned empty response" with no raw output kept to tell them
+    apart afterwards.
+    """
+    # The decoder turns a finished text block into one progress line per line of
+    # text, and this step's text block IS the files map — echoing it would dump
+    # every generated Java file into the run console. Surface only the events that
+    # say something about progress: retries and tool use.
+    _PROGRESS_PREFIXES = ("API retry", "MCP server", "→ ")
+
+    def _on_output(_label: str, line: str) -> None:
+        if _label == "stdout" and line.startswith(_PROGRESS_PREFIXES):
+            log(f"  {line[:200]}")
+
+    result = _call_claude_ex(
+        prompt=prompt,
+        model=MODEL,
+        cwd=str(REPO_ROOT),
+        timeout=GENERATE_TIMEOUT,
+        on_output=_on_output,
+        log_dir=str(AUDIT_DIR),   # raw transcript survives for post-mortem
+        stream_json=True,
+        # Codegen is pure text-in/text-out — it needs no MCP server at all. Without
+        # this the subprocess inherits the user's global config and pays startup
+        # and tool-registry cost connecting Playwright and Google Drive on every
+        # single batch. Passing strict without an mcp_config loads zero servers.
+        strict_mcp_config=True,
+    )
+    if not result.ok:
+        log(f"ERROR: Claude call{label} {result.describe()}")
+        # A timeout still carries whatever arrived before the kill; handing it back
+        # lets extract_json() salvage a complete object when the model had already
+        # finished and was only idling on the wire.
+        return result.stdout if result.status == "timeout" else ""
+    return result.stdout
 
 
 def extract_json(text: str):
@@ -123,6 +171,65 @@ def read_existing_files_context(files_to_generate: list) -> str:
     )
 
 
+_LOCATOR_ARG = re.compile(r"""locator\s*\(\s*(["'])(?P<sel>(?:\\.|(?!\1).)*)\1""")
+
+
+def unverified_selectors(selectors: dict, match_counts: dict) -> list:
+    """Selectors step 02 never measured a match count for.
+
+    A missing count is not the same as a count of 1: it means nobody checked, so
+    the selector may match several elements and fail at runtime with a strict mode
+    violation. Reported rather than dropped — a validation run predating the count
+    protocol would otherwise empty the selector map and abort codegen entirely.
+    """
+    return sorted(n for n in (selectors or {}) if (match_counts or {}).get(n) is None)
+
+
+_NAV_CALL = re.compile(r"\b(?:navigateTo|page\s*\.\s*navigate)\s*\(")
+_ACTION_CALL = re.compile(r"\b(?:click|clickOn|submit|pressEnter|selectBy\w*)\s*\(")
+_WAIT_CALL = re.compile(r"\bWaitHelper\s*\.\s*\w+\s*\(|\bwaitFor\w*\s*\(")
+_COMMENT = ("//", "*", "/*")
+
+
+def unsettled_navigations(content: str, lookback: int = 5) -> list:
+    """Navigations issued while a previous one is probably still in flight.
+
+    Clicking Login/Submit starts a navigation; navigating again before it settles
+    makes Playwright abort the first one — `net::ERR_ABORTED` — which is the most
+    common runtime failure in freshly generated web code. Codegen rule 6c asks for
+    a wait in between; this reports when the generated code did not include one,
+    because a rule the model can silently skip is not a guarantee.
+
+    Returns (action_line_no, action_text, nav_line_no, nav_text) tuples.
+    """
+    lines = content.splitlines()
+    flagged = []
+    for i, line in enumerate(lines):
+        if not _NAV_CALL.search(line):
+            continue
+        for j in range(i - 1, max(-1, i - 1 - lookback), -1):
+            prev = lines[j].strip()
+            if not prev or prev.startswith(_COMMENT):
+                continue
+            if _WAIT_CALL.search(prev):
+                break                     # settled before navigating — fine
+            if _ACTION_CALL.search(prev):
+                flagged.append((j + 1, prev, i + 1, line.strip()))
+                break
+    return flagged
+
+
+def unusable_locators(content: str) -> list:
+    """Selectors in generated code that cannot match in a real browser run.
+
+    Steps 02 and 03 both filter their inputs, so reaching here means the model
+    invented a ref rather than being handed one — rare, but silent if unchecked,
+    and the resulting page object fails in a way that blames the page.
+    """
+    return [m.group("sel") for m in _LOCATOR_ARG.finditer(content)
+            if not is_dom_selector(m.group("sel"))]
+
+
 def write_file(rel_path: str, content: str) -> None:
     """Write a file into Thanos-pw, creating parent directories as needed."""
     full = AUTOMATION_FRAMEWORK_DIR / rel_path
@@ -136,6 +243,12 @@ def write_file(rel_path: str, content: str) -> None:
 # CODE_ERROR failure, so the logic (and the file-location/key-naming rules it
 # encodes) exists in exactly one place.
 from shared.credential_properties import write_credential_property  # noqa: E402
+from shared.page_identity import is_dom_selector  # noqa: E402
+from shared.test_catalog import test_methods_in  # noqa: E402
+# URLs are the same story as credentials — one place decides the property file and
+# the key names — except that URLs are not secrets, so 05_ship.py commits them.
+from shared import properties_file, url_properties  # noqa: E402
+from shared.edit_guards import validate_fix  # noqa: E402
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -215,6 +328,93 @@ def _warn_page_coverage(web_pages, selectors, interaction_hints) -> list:
     return uncovered
 
 
+def _repair_hardcoded_urls(files_map: dict, url_props: dict, feature: str,
+                           props_file_name: str) -> tuple:
+    """Move literal URLs out of generated code and into property lookups.
+
+    Rule 16 in the prompt tells the model not to write them; this is what happens
+    when it does anyway. One targeted pass over only the offending files, guarded
+    by validate_fix so a "repair" cannot quietly drop half a class, and accepted
+    per-file only if it actually removed violations.
+
+    Returns (files_map, {rel_path: [url, ...]}) — the second value is what is
+    STILL hardcoded afterwards, for the audit and for step 04 to see.
+    """
+    violations = {path: found for path, content in files_map.items()
+                  if content and (found := url_properties.hardcoded_urls(content))}
+    if not violations:
+        return files_map, {}
+
+    log(f"GUARD: {len(violations)} generated file(s) hardcode a URL — repairing:")
+    for path, urls in violations.items():
+        log(f"  {Path(path).name}: {', '.join(urls)}")
+
+    # A URL the model invented has no key yet, and the repair needs one to point
+    # at. Name and write it now so the property exists before the test runs.
+    keys = dict(url_props)
+    by_url = {v: k for k, v in keys.items()}
+    for urls in violations.values():
+        for url in urls:
+            normalized = url_properties.normalize(url)
+            if normalized and normalized not in by_url:
+                key = url_properties.derive_key(feature.lower(), normalized, keys)
+                keys[key] = normalized
+                by_url[normalized] = key
+    if len(keys) > len(url_props):
+        url_properties.write_url_properties(
+            AUTOMATION_FRAMEWORK_DIR, keys, feature.lower(), log=log)
+
+    key_table = "".join(f'  "{k}" = {v}\n' for k, v in keys.items())
+    offending = "".join(
+        f"\n--- {path} ---\n{files_map[path]}\n" for path in violations)
+    prompt = f"""These generated Java files hardcode URLs. Every URL below is already a
+property in parameters/{props_file_name}:
+
+{key_table}
+Rewrite each file so no literal "http://" or "https://" string remains in the code,
+reading the URL from its property instead:
+  - In a super(...) call:  super(config, config.getRunTimeProperty("<key>"))
+    Inline it there — a `static final` constant cannot read config, and an instance
+    field cannot be referenced before the supertype constructor has run.
+  - Anywhere else:         private final String loginUrl = config.getRunTimeProperty("<key>");
+    An INSTANCE field, never `static`.
+  - Delete any constant that becomes unused, and keep a URL that only appears in a
+    comment or JavaDoc exactly as it is.
+
+Change NOTHING else: same methods, same signatures, same locators, same comments.
+
+{offending}
+Return ONLY a JSON object mapping each file path above to its complete corrected
+contents. No prose.
+"""
+    response = call_claude(prompt, label=" [url-repair]")
+    repaired = extract_json(response) or {}
+    if not repaired:
+        log("  url-repair returned nothing — leaving the files as generated")
+        return files_map, violations
+
+    remaining = dict(violations)
+    for path, content in repaired.items():
+        if path not in violations or not (content or "").strip():
+            continue
+        still = url_properties.hardcoded_urls(content)
+        if len(still) >= len(violations[path]):
+            log(f"  url-repair did not fix {Path(path).name} — keeping the original")
+            continue
+        ok, reason = validate_fix(files_map[path], content, Path(path).name,
+                                  URL_REPAIR_MAX_DIFF_LINES)
+        if not ok:
+            log(f"  url-repair REJECTED for {Path(path).name} — {reason}")
+            continue
+        files_map[path] = content
+        log(f"  url-repair applied to {Path(path).name}")
+        if still:
+            remaining[path] = still
+        else:
+            remaining.pop(path, None)
+    return files_map, remaining
+
+
 def _build_api_hint(test_type: str, api_data: dict) -> str:
     """Turn 02-validate-api.json into a codegen hint — confirmed auth status and
     real response shapes for endpoints that were actually called, mirroring what
@@ -257,6 +457,52 @@ def _build_api_hint(test_type: str, api_data: dict) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def _layer_of(rel_path: str) -> int:
+    """Framework layer a file belongs to, lowest dependency first.
+
+    Batches are generated in this order so each call can be shown the real
+    contents of everything it depends on: page objects and data types first,
+    then the Helper that orchestrates them, then the test class that calls both.
+    """
+    name = Path(rel_path).name
+    if rel_path.startswith("src/test/"):
+        return 3          # test classes call helpers, pages, builders
+    if name.endswith("Helper.java"):
+        return 2          # helpers orchestrate page objects
+    if "/web/" in rel_path:
+        return 1          # page objects depend only on the framework's BasePage
+    return 0              # Data / Builder / Api enum — no intra-module deps
+
+
+def _batch_by_layer(files: list, size: int) -> list:
+    """Group files into dependency-ordered batches of at most `size` files."""
+    if size <= 0:
+        return [files]
+    batches = []
+    for layer in sorted({_layer_of(f) for f in files}):
+        in_layer = [f for f in files if _layer_of(f) == layer]
+        batches += [in_layer[i:i + size] for i in range(0, len(in_layer), size)]
+    return batches
+
+
+def _generated_context(files_map: dict) -> str:
+    """Formatted block of files earlier batches already produced, for reuse."""
+    if not files_map:
+        return ""
+    sections = "".join(
+        f"\n--- ALREADY GENERATED: {rel} ---\n{content}\n"
+        for rel, content in files_map.items()
+    )
+    return (
+        "\n\n<already_generated_this_run>\n"
+        "These files were generated earlier IN THIS RUN and are already written. "
+        "Call their methods by the EXACT names shown — do not invent different "
+        "method, field, or locator names, and do not re-emit these files.\n"
+        + sections
+        + "</already_generated_this_run>"
+    )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -286,6 +532,34 @@ def main() -> None:
     selectors         = web_data.get("selectors") or {}
     page_elements     = web_data.get("page_elements") or {}
     interaction_hints = web_data.get("interaction_hints") or []
+
+    # Second line of defence behind step 02's own filter: a cached
+    # 02-validate-web.json written before that filter existed still carries
+    # Playwright-MCP refs, and a TESTING_MODE rerun would feed them straight into
+    # codegen. A locator like [ref='f2e585'] compiles and never matches, so the
+    # cost of letting one through is a 30-second timeout in step 04 with a failure
+    # message that points at the page, not at the selector.
+    dropped = [f"{n}={sel!r}" for n, sel in selectors.items() if not is_dom_selector(sel)]
+    if dropped:
+        log(f"Dropped {len(dropped)} unusable selector(s) — not real DOM selectors:")
+        for entry in dropped:
+            log(f"  - {entry}")
+        selectors = {n: sel for n, sel in selectors.items() if is_dom_selector(sel)}
+    hints_before = len(interaction_hints)
+    interaction_hints = [h for h in interaction_hints if is_dom_selector(h.get("selector", ""))]
+    if len(interaction_hints) != hints_before:
+        log(f"Dropped {hints_before - len(interaction_hints)} unusable interaction hint(s)")
+
+    # Step 02 records, per selector, how many elements it matched in the live page.
+    # A selector it never measured may match several, which compiles fine and then
+    # dies at runtime with a strict mode violation — so name them here, where they
+    # are about to become locators, rather than leaving it to a step 04 timeout.
+    match_counts = web_data.get("selector_match_counts") or {}
+    unverified = unverified_selectors(selectors, match_counts)
+    if unverified:
+        log(f"NOTE: {len(unverified)} of {len(selectors)} selector(s) were never "
+            f"uniqueness-verified by the browser — they may match more than one "
+            f"element: {', '.join(sorted(unverified))}")
 
     log(f"Generating code for {feature_class} | type={test_type} | existing={existing}")
 
@@ -383,13 +657,34 @@ def main() -> None:
             AUTOMATION_FRAMEWORK_DIR, feature.lower(), plan.get("demo_credentials", {}), log=log
         )
 
+    # Every URL this module touches becomes a property BEFORE codegen, so the
+    # prompt below can hand Claude keys that already resolve. Without this the
+    # model has nothing to reference and writes the literal instead — which is how
+    # a shipped module ended up with `private static final String LOGIN_URL =
+    # "https://www.naukri.com/nlogin/login"` and no naukari entry in the file.
+    url_props = url_properties.collect_urls(plan, web_data)
+    url_property_status = "nothing to write"
+    if url_props:
+        url_property_status = url_properties.write_url_properties(
+            AUTOMATION_FRAMEWORK_DIR, url_props, feature.lower(), log=log)
+
+    props_file_name = properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR).name
+    url_property_hint = ""
+    if url_props:
+        url_property_hint = (
+            f"\n\nURL properties (already written to parameters/{props_file_name} — "
+            "reference these keys, never the literal URL):\n"
+            + "".join(f'  config.getRunTimeProperty("{k}")  ->  {v}\n'
+                      for k, v in url_props.items()))
+
     # Determine which files to generate / update
     files_to_generate = _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, feature)
 
     # Read current content of files that already exist so Claude can extend them
     existing_files_context = read_existing_files_context(files_to_generate)
 
-    prompt = f"""You are a Java test automation code generator for the Jarvis framework.
+    def build_prompt(batch_files: list, generated_context: str = "") -> str:
+        return f"""You are a Java test automation code generator for the Jarvis framework.
 
 <framework_conventions>
 {claude_md}
@@ -399,19 +694,19 @@ def main() -> None:
 {ref_section}
 </reference_implementations>
 {csv_roles_hint}
-{existing_files_context}
+{existing_files_context}{generated_context}
 
 <generation_plan>
 {json.dumps(plan, indent=2)}
 </generation_plan>
-{selector_hint}{dom_context}{api_hint}
+{selector_hint}{dom_context}{api_hint}{url_property_hint}
 
 Generate the following Java files and return them as a single JSON object where
 keys are relative file paths (from Thanos-pw repo root) and values are the complete
 file contents as strings.
 
 Files to generate:
-{json.dumps(files_to_generate, indent=2)}
+{json.dumps(batch_files, indent=2)}
 
 Rules (MANDATORY — violations will cause compilation failures):
 1. Every file must compile standalone — include all necessary imports.
@@ -444,6 +739,23 @@ Rules (MANDATORY — violations will cause compilation failures):
    Call waitUntilLoaded() LAST in constructor. waitUntilLoaded() uses WaitHelper.
    All interactions use BasePage methods (click, fillText, getText, isElementDisplayed).
    Navigation methods return the next page object.
+6b. NAVIGATION — never call page.navigate() directly. Use
+   BrowserHelper.navigateTo(config, url), which logs the action and waits for the
+   page to load afterwards.
+6c. NAVIGATING AWAY AFTER AN ACTION THAT ITSELF NAVIGATES — mandatory, this is the
+   single most common runtime failure in generated web code. Clicking Login/Submit
+   starts a navigation. Issuing another navigation while that one is still in
+   flight makes Playwright abort it:
+     com.microsoft.playwright.PlaywrightException: net::ERR_ABORTED at <url>
+   So let the first navigation settle BEFORE starting the second:
+     click(loginButton, "Login button");
+     WaitHelper.waitForPageLoad(config);            // let the post-login redirect finish
+     BrowserHelper.navigateTo(config, PROFILE_URL); // only now navigate onwards
+   Use WaitHelper.waitForNetworkIdle(config) instead when the app is a SPA or the
+   submit produces no visible page transition (CLAUDE.md's own guidance: "after
+   form submissions with no visible feedback").
+   Note BrowserHelper.navigateTo waits AFTER navigating, not before — it does NOT
+   remove the need for the wait on the line above it.
 7. Test classes: extend TestBase. Use @Test(dataProvider="getConfig", groups={{...}}).
    Every @Test method has @TestVariables(automatedBy = QA.Mukesh).
    Use config.logStep() in test methods only.
@@ -492,6 +804,19 @@ Rules (MANDATORY — violations will cause compilation failures):
     methods (rule 5) and web orchestration methods (rule 6) — that is correct here, not a violation
     of rule 5's "web methods only if they orchestrate 2+ page objects" guidance, since the method
     orchestrates real cross-interface state, not just page objects.
+16. URLs — NEVER write a literal "http://..." or "https://..." anywhere in the Java you
+    generate: not in a test, not in a page object, not in a helper, and above all not as a
+    `private static final String BASE_URL = "https://..."` constant. Every URL listed under
+    "URL properties" above is already in parameters/{props_file_name}; read it back instead:
+      • ApiHelper base URL:  super(config, config.getRunTimeProperty("{feature}.api.url"))
+                             — inline in the super() call; an instance field cannot be read there.
+      • Navigation:          BrowserHelper.navigateTo(config, config.getRunTimeProperty("{feature}.login.url"))
+      • A URL a class reuses: private final String profileUrl = config.getRunTimeProperty("{feature}.profile.url");
+                             — an INSTANCE field (static cannot reach `config`), never a literal.
+    If you need a URL that is NOT in the list above, still do not inline it: call
+    config.getRunTimeProperty("{feature}.<page>.url") with a key named the same way and it will be
+    added to the properties file. Pointing this module at another environment must never require
+    editing Java.
 
 Return ONLY a JSON object, no prose:
 {{
@@ -501,21 +826,94 @@ Return ONLY a JSON object, no prose:
 }}
 """
 
-    log("Calling Claude to generate Java files...")
-    response = call_claude(prompt)
-    files_map = extract_json(response)
+    batches = _batch_by_layer(files_to_generate, GENERATE_BATCH_SIZE)
+    log(f"Calling Claude to generate {len(files_to_generate)} Java files "
+        f"in {len(batches)} batch(es), {GENERATE_TIMEOUT}s budget each...")
 
+    files_map: dict = {}
+    failed_batches: list = []
+    for i, batch_files in enumerate(batches, 1):
+        tag = f"[batch {i}/{len(batches)}]"
+        log(f"  {tag} {', '.join(Path(f).name for f in batch_files)}")
+        # Later layers must call the REAL method and locator names the earlier
+        # ones just got, not names re-invented from the plan — batching without
+        # this is how a test class ends up calling a helper method that the
+        # helper batch never generated.
+        response = call_claude(
+            build_prompt(batch_files, _generated_context(files_map)),
+            label=f" {tag}",
+        )
+        batch_map = extract_json(response)
+        if not batch_map:
+            # One bad batch no longer sinks the step: keep going so the audit can
+            # name exactly which files are missing rather than all of them.
+            log(f"  {tag} ERROR: no valid files map in response")
+            failed_batches.append({"batch": i, "files": batch_files,
+                                   "raw_response": response[:3000]})
+            continue
+        # A later batch is told not to re-emit earlier files, but if it does anyway
+        # the earlier version is the one every subsequent batch was shown and wrote
+        # its call sites against — keeping the re-emitted copy would silently break
+        # that agreement. First writer wins.
+        stale = [f for f in batch_map if f in files_map]
+        for f in stale:
+            batch_map.pop(f)
+            log(f"  {tag} ignoring re-emitted {Path(f).name} — keeping the earlier version")
+        files_map.update(batch_map)
+        log(f"  {tag} returned {len(batch_map)} file(s)")
+
+    missing = [f for f in files_to_generate if f not in files_map]
     if not files_map:
         log("ERROR: Claude did not return a valid files map")
         (AUDIT_DIR / "03-generate.json").write_text(json.dumps({
             "error": "generation_failed",
-            "raw_response": response[:3000]
+            "failed_batches": failed_batches,
         }, indent=2))
         sys.exit(1)
+    if missing:
+        # Writing a partial module would hand step 04 a compile error whose real
+        # cause — a batch that never came back — is a whole step upstream.
+        log(f"ERROR: {len(missing)} of {len(files_to_generate)} files were never generated:")
+        for f in missing:
+            log(f"  - {f}")
+        (AUDIT_DIR / "03-generate.json").write_text(json.dumps({
+            "error": "generation_incomplete",
+            "files_returned": sorted(files_map),
+            "files_missing": missing,
+            "failed_batches": failed_batches,
+        }, indent=2))
+        sys.exit(1)
+
+    # Rule 16 says no literal URLs. This is the enforcement behind the rule —
+    # run before anything reaches disk, so what gets written (and committed) is
+    # already property-driven.
+    files_map, hardcoded_by_file = _repair_hardcoded_urls(
+        files_map, url_props, feature, props_file_name)
+    if hardcoded_by_file:
+        log(f"WARNING: {len(hardcoded_by_file)} file(s) still hardcode a URL after "
+            f"repair — recorded in 03-generate.json for review")
+
+    # The mirror-image failure: code that reads a URL property nobody ever wrote.
+    # getRunTimeProperty returns null, navigation goes nowhere, and step 04 sees a
+    # page that never loaded rather than a missing setting. Guessing a value would
+    # be worse than saying so.
+    props_path = properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR)
+    known = properties_file.read_values(
+        props_path.read_text() if props_path.exists() else "")
+    missing_url_props = sorted({
+        key for content in files_map.values()
+        for key in url_properties.referenced_keys(content or "")
+        if key not in known})
+    if missing_url_props:
+        log(f"WARNING: generated code reads {len(missing_url_props)} URL "
+            f"propert(ies) that parameters/{props_file_name} does not define — "
+            f"add a value for: {', '.join(missing_url_props)}")
 
     # Write each file to Thanos-pw, saving content for per-step git commits in ship step
     written = []
     written_contents: dict = {}  # {rel_path: content} — used by 05_ship.py for step-03 commit
+    unusable_by_file: dict = {}  # {rel_path: [selector, ...]} — persisted into the audit
+    unsettled_by_file: dict = {}  # {rel_path: [{action_line, nav_line}, ...]}
     for rel_path, content in files_map.items():
         if not content or not content.strip():
             log(f"  Skipping empty: {rel_path}")
@@ -527,6 +925,26 @@ Return ONLY a JSON object, no prose:
         except ValueError:
             log(f"  BLOCKED: path escapes Thanos-pw root: {rel_path}")
             continue
+        for a_line, a_text, n_line, n_text in unsettled_navigations(content):
+            log(f"  WARNING: {Path(rel_path).name}:{n_line} navigates while the "
+                f"action on line {a_line} may still be navigating — Playwright will "
+                f"abort it (net::ERR_ABORTED). Add WaitHelper.waitForPageLoad(config) "
+                f"between them.")
+            log(f"    {a_line}: {a_text[:90]}")
+            log(f"    {n_line}: {n_text[:90]}")
+            unsettled_by_file.setdefault(rel_path, []).append(
+                {"action_line": a_line, "nav_line": n_line})
+
+        bad = unusable_locators(content)
+        if bad:
+            # Not fatal: step 04 can still repair it, and aborting codegen on a
+            # heuristic would be worse. But it must be visible here rather than
+            # surfacing as a page-load timeout three steps later.
+            unusable_by_file[rel_path] = bad
+            log(f"  WARNING: {Path(rel_path).name} contains {len(bad)} locator(s) that "
+                f"cannot match a real DOM:")
+            for sel in bad:
+                log(f"    - {sel!r}")
         write_file(rel_path, content)
         written.append(rel_path)
         written_contents[rel_path] = content
@@ -542,12 +960,27 @@ Return ONLY a JSON object, no prose:
         "files_content": written_contents,  # full content snapshot for per-step commits
         "automation_framework_dir": str(AUTOMATION_FRAMEWORK_DIR),
         "test_class": _infer_test_class(written, test_type),
-        "test_method": _infer_test_method(plan, test_type),
+        "test_method": _resolve_test_method(plan, test_type, written_contents,
+                                            _infer_test_class(written, test_type)),
         # Persisted so a page that shipped with 100% guessed locators has a
         # durable trace beyond a console line that scrolls away — was silently
         # invisible before this field existed.
         "pages_with_zero_coverage": [name for name, _needed in pages_with_zero_coverage],
+        # Locators generated that cannot match a real DOM. Empty is the normal
+        # case; non-empty tells step 04 exactly where to look first.
+        "unusable_locators": unusable_by_file,
+        # Navigations issued without letting a prior one settle — the net::ERR_ABORTED
+        # shape. Empty is the normal case.
+        "unsettled_navigations": unsettled_by_file,
         "credential_property_status": credential_property_status,
+        # Written before codegen and committed by 05_ship.py — unlike credentials,
+        # a URL key that never reaches the repo breaks the test for everyone else.
+        "url_properties": url_props,
+        "url_property_status": url_property_status,
+        # Literal URLs the repair pass could not move into properties. Empty is the
+        # normal case; non-empty is a review finding, not a runtime failure.
+        "hardcoded_urls": hardcoded_by_file,
+        "missing_url_properties": missing_url_props,
     }
     (AUDIT_DIR / "03-generate.json").write_text(json.dumps(result, indent=2))
 
@@ -558,9 +991,19 @@ Return ONLY a JSON object, no prose:
         f"Test type: {test_type}",
         f"Files:     {len(written)}",
         f"Credentials property: {credential_property_status}",
+        f"URL properties: {url_property_status}"
+        + (f" ({', '.join(url_props)})" if url_props else ""),
         "",
         "## Files Written",
     ] + [f"- `{f}`" for f in written]
+    if hardcoded_by_file:
+        summary_lines += [
+            "",
+            "## ⚠️ Hardcoded URLs Still In Generated Code",
+            f"These belong in `parameters/{props_file_name}`, read back with "
+            "`config.getRunTimeProperty(...)`:",
+        ] + [f"- `{path}`: {', '.join(urls)}"
+             for path, urls in sorted(hardcoded_by_file.items())]
     if pages_with_zero_coverage:
         summary_lines += [
             "",
@@ -682,6 +1125,48 @@ def _infer_test_class(written: list, test_type: str) -> str:
 
     # Fallback: first test class found (handles reused classes like GitHubLoginTest)
     return Path(test_paths[0]).stem if test_paths else ""
+
+
+def _resolve_test_method(plan: dict, test_type: str, written_contents: dict,
+                         test_class_name: str) -> str:
+    """The @Test method to run, read from the code that was actually generated.
+
+    The plan's method_name is only a request. Claude frequently names the method
+    something equivalent but different — plan said toggleDotAndVerifyProfileSummary,
+    generated code declared toggleDotInProfileSummaryAndVerify — and handing the
+    plan's name to `mvn -Dtest=Class#method` then matches nothing. Surefire calls
+    that BUILD SUCCESS with "Tests run: 0", which step 04 read as a pass and
+    shipped as APPROVED: a green PR for a test that never executed.
+
+    Falls back to the plan only when the source cannot be read, so behaviour is
+    unchanged for anything this regex does not understand.
+    """
+    planned = _infer_test_method(plan, test_type)
+
+    # written_contents is keyed by RELATIVE PATH while the caller identifies the
+    # class by its simple name (_infer_test_class returns Path(...).stem), so match
+    # on the stem. Looking it up by name directly always missed, silently fell back
+    # to the planned name, and left the original bug in place.
+    source = ""
+    for rel, content in (written_contents or {}).items():
+        if Path(rel).stem == test_class_name:
+            source = content
+            break
+    if not source:
+        return planned
+
+    names = test_methods_in(source)
+    if not names:
+        log(f"  WARNING: no @Test method found in {test_class_name} — "
+            f"falling back to the planned name {planned!r}")
+        return planned
+    if planned in names:
+        return planned
+    chosen = names[0]
+    if planned:
+        log(f"  Test method: generated code declares {chosen!r}, the plan asked for "
+            f"{planned!r} — using the generated name, which is what mvn can run")
+    return chosen
 
 
 def _infer_test_method(plan: dict, test_type: str) -> str:

@@ -8,6 +8,20 @@ import json
 import os
 from pathlib import Path
 
+# Pinned rather than "@latest": npx re-resolves a floating tag against the npm
+# registry on EVERY launch, which is a network round-trip on the startup path of
+# every browser step (twice, when validation retries). It has been observed to
+# leave the server still "status": "pending" when the model takes its first turn,
+# at which point the run has no browser tools at all and reports the flow as
+# unvalidatable. Pinning also stops the server changing version underneath a run.
+# Override with PLAYWRIGHT_MCP_VERSION to move it; "latest" restores the old
+# floating behaviour.
+PLAYWRIGHT_MCP_VERSION = os.environ.get("PLAYWRIGHT_MCP_VERSION", "0.0.79")
+
+
+def _mcp_package() -> str:
+    return f"@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}"
+
 
 def write_playwright_mcp_config(project_root: Path, headless: bool = True,
                                 storage_state=None, cdp_endpoint=None) -> Path:
@@ -43,13 +57,13 @@ def write_playwright_mcp_config(project_root: Path, headless: bool = True,
     if cdp_endpoint:
         # Attaching to an existing browser: --isolated/--headless/--storage-state
         # all describe how to LAUNCH one, and conflict with connecting to one.
-        args = ["@playwright/mcp@latest", "--cdp-endpoint", str(cdp_endpoint)]
+        args = [_mcp_package(), "--cdp-endpoint", str(cdp_endpoint)]
         config = {"mcpServers": {"playwright": {"command": "npx", "args": args}}}
         mcp_json_path = project_root / ".mcp.json"
         mcp_json_path.write_text(json.dumps(config, indent=2) + "\n")
         return mcp_json_path
 
-    args: list = ["@playwright/mcp@latest", "--isolated", "--viewport-size=1920,1080"]
+    args: list = [_mcp_package(), "--isolated", "--viewport-size=1920,1080"]
     if headless:
         args.append("--headless")
     if storage_state:

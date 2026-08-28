@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Generator
@@ -24,9 +25,11 @@ from flask import (Blueprint, Response, jsonify, request, send_file,
                    stream_with_context)
 
 from qa_agents_server import agent_settings, audit_reader, feature_files, runner
-from shared import test_catalog
+from qa_agents_server import analytics, metrics_reader
+from shared import assertion_graph, intent, test_catalog
 from qa_agents_server.agents import (AgentConfigError, DEFAULT_AGENT,
-                                     auto_push_default, get_agent)
+                                     adapt_apply_default, auto_push_default,
+                                     get_agent)
 from qa_agents_server.runner import TERMINAL_STATUSES, AGENT
 
 qa_bp = Blueprint("qa_agents", __name__)
@@ -48,10 +51,10 @@ def queue_list(agent: str):
     spec, err = _resolve(agent)
     if err:
         return err
-    if spec.name == DEFAULT_AGENT:
-        return jsonify({"items": feature_files.list_features()})
-    # Healing's queue is handoffs written by test-triaging-agent — read-only
-    # here; nothing but that agent should be putting work in it.
+    if spec.queue_kind == "txt":
+        return jsonify({"items": feature_files.list_features(spec.name)})
+    # A json queue holds handoffs written by another agent — read-only here;
+    # nothing but that agent should be putting work in it.
     items = []
     if spec.queue_dir.exists():
         for path in sorted(spec.queue_dir.glob("*.json")):
@@ -66,14 +69,14 @@ def queue_create(agent: str):
     spec, err = _resolve(agent)
     if err:
         return err
-    if spec.name != DEFAULT_AGENT:
+    if spec.queue_kind != "txt":
         return jsonify({"error": f"{spec.name}'s queue is written by "
-                                 f"test-triaging-agent, not through this API"}), 405
+                                 f"another agent, not through this API"}), 405
     body = request.get_json(silent=True) or {}
     name = body.get("name")
     content = body.get("content")
     try:
-        result = feature_files.write_feature(name, content)
+        result = feature_files.write_feature(name, content, spec.name)
     except feature_files.FeatureFileError as e:
         return jsonify({"error": str(e)}), e.status
     return jsonify(result), 201
@@ -84,13 +87,13 @@ def queue_read(agent: str, name: str):
     spec, err = _resolve(agent)
     if err:
         return err
-    if spec.name != DEFAULT_AGENT:
+    if spec.queue_kind != "txt":
         path = spec.queue_dir / f"{name}.json"
         if not path.exists():
             return jsonify({"error": f"handoff not found: {name}"}), 404
         return jsonify({"name": name, "content": path.read_text()})
     try:
-        return jsonify(feature_files.read_feature(name))
+        return jsonify(feature_files.read_feature(name, spec.name))
     except feature_files.FeatureFileError as e:
         return jsonify({"error": str(e)}), e.status
 
@@ -110,6 +113,7 @@ def agent_config(agent: str):
     return jsonify({
         "agent": spec.name,
         "auto_push_default": auto_push_default(),
+        "adapt_apply_default": adapt_apply_default(),
     })
 
 
@@ -120,8 +124,8 @@ def tests_list(agent: str):
     spec, err = _resolve(agent)
     if err:
         return err
-    if spec.name == DEFAULT_AGENT:
-        return jsonify({"error": "the authoring agent has no test catalogue"}), 404
+    if not spec.uses_test_catalog:
+        return jsonify({"error": f"{spec.name} has no test catalogue"}), 404
 
     workspace = _automation_workspace()
     if workspace is None:
@@ -149,6 +153,85 @@ def _automation_workspace():
         return None
     candidate = Path(workspace_dir) / repo_name
     return candidate if candidate.is_dir() else None
+
+
+# `pkg.sub.Class#method`. The method half is required, not optional: `intent.derive`
+# splits on the last dot, so a bare `automation.saucedemo.SauceDemoWebTest` is read
+# as class `saucedemo`, method `SauceDemoWebTest` and returns an empty contract
+# rather than an error — a wrong answer that looks like a real one. It also keeps
+# this parameter from being anything path-shaped, since intent.path_for() builds a
+# filename out of it.
+_TEST_IDENT = re.compile(r"^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*#[A-Za-z_$][\w$]*$")
+
+# member_index() re-reads every source file in the repo (~0.2s here). That is fine
+# once and wrong on every keystroke in a picker, so it is cached against the same
+# mtime signal test_catalog keys its own cache on: an edited test shows up without
+# a server restart. Replaced as one dict so a concurrent request either sees the
+# whole old entry or the whole new one — the server runs threaded.
+_MEMBER_INDEX: dict = {"repo": None, "stamp": None, "index": None}
+
+
+def _member_index(repo_path: str) -> dict:
+    global _MEMBER_INDEX
+    stamp = test_catalog.source_stamp(repo_path)
+    cached = _MEMBER_INDEX
+    if cached["repo"] == repo_path and cached["stamp"] == stamp:
+        return cached["index"]
+    index = assertion_graph.member_index(repo_path)
+    _MEMBER_INDEX = {"repo": repo_path, "stamp": stamp, "index": index}
+    return index
+
+
+# ── What a test proves, for the adaptation panel's reference pane ─────────────
+@qa_bp.route(f"{_BASE}/tests/intent", methods=["GET"])
+def tests_intent(agent: str):
+    """One test's intent contract: the steps it narrates and what it asserts.
+
+    Purely derived from source — no model call, no run. The adaptation UI shows
+    it beside the "what changed" box so a human describes a change against what
+    the test actually does today rather than from memory.
+    """
+    spec, err = _resolve(agent)
+    if err:
+        return err
+    if not spec.uses_test_catalog:
+        return jsonify({"error": f"{spec.name} has no test catalogue"}), 404
+
+    test = (request.args.get("test") or "").strip()
+    if not _TEST_IDENT.match(test):
+        return jsonify({
+            "error": "test must name a single method",
+            "detail": "Expected `pkg.Class#method` (a bare class has no contract "
+                      "of its own — ask for each of its methods).",
+        }), 400
+
+    workspace = _automation_workspace()
+    if workspace is None:
+        return jsonify({
+            "error": "automation repo not found",
+            "detail": f"Looked for {os.environ.get('GITHUB_REPO_AUTOMATION', '<unset>')!r} "
+                      f"under WORKSPACE_DIR={os.environ.get('WORKSPACE_DIR', '<unset>')!r}. "
+                      f"Set both in config/.env.",
+        }), 503
+
+    try:
+        contract = intent.for_test(str(workspace), test,
+                                   _member_index(str(workspace)))
+    except Exception as e:
+        return jsonify({"error": "could not read the test's intent",
+                        "detail": str(e)}), 500
+
+    # `unresolved` is a count here, not the list: the UI uses it to say "this may
+    # be incomplete", and the call sites themselves mean nothing to a reader who
+    # is not holding the source open.
+    return jsonify({
+        "test": test,
+        "source": contract.get("source", "derived"),
+        "proves": contract.get("proves") or [],
+        "verifies": intent.verifies(contract),
+        "identity": contract.get("identity") or [],
+        "unresolved_count": len(contract.get("unresolved") or []),
+    })
 
 
 # ── Run trigger + control ─────────────────────────────────────────────────────
@@ -246,6 +329,10 @@ def run_active(agent: str):
         "status": run.status,
         "started_at": run.started_at,
         "step_progress": run.step_progress,
+        # step_progress keeps its historic string-map shape; timing and cost ride
+        # alongside so no existing consumer has to change.
+        "step_metrics": run.step_metrics,
+        "metrics": run.metrics_totals,
         "start_from_step": run.start_from_step,
     })
 
@@ -275,8 +362,10 @@ def session_retry(agent: str, session_id: str):
     from_step must be >= 2 — resuming "from step 1" isn't a resume at all
     (there's nothing prior to reuse); that's just a fresh run, via POST /run.
 
-    Authoring only. The healing agent re-investigates failures through its own
-    internal retry loop, so there is no partial pipeline to resume.
+    Gated on the spec's supports_resume, which authoring and adaptation both set
+    — the adaptation UI offers it on steps 2-5 of its progress bar. The healing
+    agent re-investigates failures through its own internal retry loop, so it has
+    no partial pipeline to resume and returns 405.
     """
     spec, err = _resolve(agent)
     if err:
@@ -466,6 +555,54 @@ def sessions_get(agent: str, session_id: str):
     if session is None:
         return jsonify({"error": "session not found"}), 404
     return jsonify(session)
+
+
+@qa_bp.route(f"{_BASE}/sessions/<session_id>/metrics", methods=["GET"])
+def session_metrics(agent: str, session_id: str):
+    """Time and cost for one session: run totals plus the per-stage breakdown."""
+    spec, err = _resolve(agent)
+    if err:
+        return err
+    session_dir = spec.audit_dir / session_id
+    data = metrics_reader.read_session_metrics(session_dir)
+    if data is None:
+        # Sessions predating metrics capture are a normal case, not an error —
+        # the UI renders em-dashes for them rather than an error state.
+        return jsonify({"session_id": session_id, "metrics": None,
+                        "stages": [], "totals": {}})
+    return jsonify({
+        "session_id": session_id,
+        "metrics": metrics_reader.totals(data),
+        "totals": metrics_reader.totals(data),
+        "stages": metrics_reader.stage_list(data),
+    })
+
+
+# ── Analytics (spans agents, so deliberately not under /agents/<agent>/) ───────
+@qa_bp.route("/analytics/summary", methods=["GET"])
+def analytics_summary():
+    """Per-agent and overall rollups over a window: 24h | 7d | 30d | all.
+
+    Returns raw counts, cost and duration. Time-saved is applied by the Studio,
+    which owns the human-minutes baselines for every flow it reports on.
+    """
+    window = (request.args.get("window") or "7d").strip()
+    if window not in analytics.WINDOWS:
+        return jsonify({"error": f"window must be one of "
+                                 f"{', '.join(analytics.WINDOWS)}"}), 400
+
+    def _ts(name):
+        raw = (request.args.get(name) or "").strip()
+        try:
+            return float(raw) if raw else None
+        except ValueError:
+            return None
+
+    return jsonify(analytics.query(
+        window=window,
+        agent=(request.args.get("agent") or "").strip() or None,
+        since=_ts("from"), until=_ts("to"),
+    ))
 
 
 # ── Agent settings (server-wide, not per-agent) ───────────────────────────────

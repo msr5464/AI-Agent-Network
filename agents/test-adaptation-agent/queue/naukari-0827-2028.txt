@@ -1,0 +1,9 @@
+Module: naukari
+Type: web
+
+What changed:
+1. Currently testcase is not working properly (ie. it do not reach upto Profile page) as seems we are not able to find unique locator for the Login Button.
+Ensure that you review all the locators to ensure they are unique and clickable before waiting for new element on new page
+2. Dont wait for Session Storage
+
+Expected outcome unchanged: verify profile summary trailing dot toggle persists after save and page refresh

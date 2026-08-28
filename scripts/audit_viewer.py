@@ -63,7 +63,8 @@ def parse_session_ts(name):
 
 # ── Agent discovery ───────────────────────────────────────────────────────────
 
-AGENT_ORDER = ["test-triaging-agent", "test-healing-agent", "test-authoring-agent"]
+AGENT_ORDER = ["test-triaging-agent", "test-healing-agent",
+               "test-adaptation-agent", "test-authoring-agent"]
 
 
 def get_agents():
@@ -92,6 +93,7 @@ def get_sessions(agent_name):
         "test-triaging-agent": _get_triaging_session,
         "test-healing-agent": _get_healing_session,
         "test-authoring-agent": _get_authoring_session,
+        "test-adaptation-agent": _get_adaptation_session,
     }
     parser = parsers.get(agent_name, _get_generic_session)
 
@@ -241,6 +243,64 @@ def _get_authoring_session(sd):
         "status": status,
         "status_cls": status_cls,
         "duration": dur,
+        "pr_url": pr_url,
+    }
+
+
+
+def _get_adaptation_session(sd):
+    """One adaptation session row.
+
+    Reads the same fields as qa_agents_server's summariser on purpose: two
+    dashboards looking at the same run must not disagree about what happened.
+    """
+    parse = load_json(sd / "01-parse-change.json")
+    adapt = load_json(sd / "04-adapt.json")
+    ship = load_json(sd / "05-ship.json")
+    gate = load_text(sd / ".fix-passed").strip()
+    skip = load_text(sd / ".skip-reason").strip()
+    verdict = load_text(sd / ".verdict").strip()
+
+    items = adapt.get("items") or []
+    applied = sum(1 for i in items if i.get("status") in ("applied", "partial"))
+    proposed = sum(1 for i in items if i.get("status") == "proposed")
+    escalated = sum(1 for i in items if i.get("status") in ("escalated", "declined"))
+    pr_url = ship.get("pr_url", "") or ""
+
+    # An escalation is the design working, not a failure. Painting a correct
+    # refusal red trains people to ignore the runs most worth reading.
+    if pr_url:
+        status, status_cls = "PR — needs review", "escalated"
+    elif skip in ("escalate", "unsafe", "no-session", "unreachable"):
+        status, status_cls = "Escalated to a human", "progress"
+    elif skip == "explore-only":
+        status, status_cls = "Explored", "shipped"
+    elif proposed:
+        status, status_cls = f"Proposed ({proposed})", "progress"
+    elif gate == "false":
+        status, status_cls = "Adapt failed", "escalated"
+    elif adapt or parse:
+        status, status_cls = "In Progress", "progress"
+    else:
+        status, status_cls = "Unknown", "progress"
+
+    bits = [f"{len(parse.get('items') or [])} change item(s)"]
+    if applied:
+        bits.append(f"{applied} applied")
+    if proposed:
+        bits.append(f"{proposed} proposed")
+    if escalated:
+        bits.append(f"{escalated} escalated")
+
+    return {
+        "id": sd.name,
+        "title": parse.get("module", "") or sd.name,
+        "subtitle": " · ".join(bits),
+        "ts": parse_session_ts(sd.name),
+        "verdict": verdict or (gate.upper() if gate else "PENDING"),
+        "status": status,
+        "status_cls": status_cls,
+        "duration": "",
         "pr_url": pr_url,
     }
 
@@ -490,6 +550,7 @@ def session_detail(agent_name, session_id):
         "test-triaging-agent": _get_triaging_session,
         "test-healing-agent": _get_healing_session,
         "test-authoring-agent": _get_authoring_session,
+        "test-adaptation-agent": _get_adaptation_session,
     }
     session = parsers.get(agent_name, _get_generic_session)(sd)
 

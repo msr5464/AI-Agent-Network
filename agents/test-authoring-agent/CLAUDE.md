@@ -39,6 +39,29 @@ run.sh (orchestrator)
 | **04 Run & Fix** | Run mvn test, call Claude to fix failures, retry | No git push |
 | **05 Ship** | Branch + commit + push + PR creation | No AI calls |
 
+### What "confirmed" means in step 02
+
+Every locator in `02-validate-web.json` — both the `selectors` map and the
+`interaction_hints` list, since step 03 generates from both — has been measured in
+the live browser at **exactly one matching element**. Anything else is dropped
+before the file is written:
+
+| Case | Outcome |
+|------|---------|
+| `SELECTOR_FOUND` with `count=1` | kept |
+| `SELECTOR_FOUND` with `count != 1` | dropped — would be a runtime strict mode violation |
+| `SELECTOR_FOUND` with no `count` at all | dropped — never measured, so not confirmed |
+| `INTERACTION_HINT` whose name has a confirmed selector | kept, with the hint's selector **replaced by the confirmed one** |
+| `INTERACTION_HINT` with no confirmed selector and no `count: 1` | dropped |
+
+The hint rules exist because a hint records an element the model *interacted with*,
+including ones an interaction then failed on — an observed run hinted a profile edit
+icon as `img[alt='PencilSimple']`, found clicking it did nothing, and confirmed the
+parent `span` instead, leaving a hint pointing at the element that does not work.
+
+A run that confirms nothing is retried once; if it still confirms nothing, step 03
+aborts rather than generating from guesses (override with `ALLOW_MISSING_SELECTORS`).
+
 ---
 
 ## Data Flow
@@ -147,6 +170,7 @@ Web Steps:
 | `VALIDATE_WEB_TIMEOUT_S` | Wall-clock budget (s) for the whole step-02 run | `1800` |
 | `VALIDATE_WEB_RETRY_ATTEMPTS` | Extra full re-runs step 02 attempts on recoverable failures | `1` |
 | `PLAYWRIGHT_HEADLESS` | Set `false` to watch the browser during step 02 | `true` |
+| `PLAYWRIGHT_MCP_VERSION` | `@playwright/mcp` version the browser steps launch (pinned, not `latest`) | `0.0.79` |
 | `VALIDATE_API_REQUEST_TIMEOUT_S` | Timeout (s) for each real HTTP call in Validate API | `15` |
 | `VALIDATE_API_RETRY_ON_ERROR` | Set `false` to disable the one connection-error retry in Validate API | `true` |
 | `ALLOW_MISSING_SELECTORS` | Let step 03 generate when step 02 confirmed nothing | `false` |
@@ -232,6 +256,32 @@ src/test/java/automation/{feature}/
 All patterns (Data POJO, Builder, API Enum, Helper, Page Object, Test classes, DO/DON'T rules)
 are defined in `Jarvis/CLAUDE.md` and injected into every Claude prompt at runtime.
 Refer to [Jarvis/CLAUDE.md](../../../Jarvis/CLAUDE.md) for the authoritative reference.
+
+---
+
+### URLs Are Properties, Never Java Literals
+
+A URL welded into a test, page object or helper pins the module to one environment —
+`Jarvis/CLAUDE.md` has always said so ("Hardcoded URL in test/page → put in properties
+file"), but until this guardrail nothing enforced it, and generated modules shipped with
+`private static final String LOGIN_URL = "https://..."` and no matching property.
+
+The rule is enforced at four points, all reading `shared/url_properties.py`:
+
+| Where | What happens |
+|-------|--------------|
+| **03 Generate**, before codegen | `collect_urls()` harvests every URL from the plan (`web_base_url`, `api_base_url`, validation steps) and from `02-validate-web.json`'s `steps_passed`, names a key for each, and writes them to `parameters/{environment}-{country}.properties`. The key table goes into the codegen prompt. |
+| **03 Generate**, after codegen | Any file still holding a literal URL gets one targeted repair pass, guarded by `validate_fix`. What survives is logged and recorded in `03-generate.json` → `hardcoded_urls`. |
+| **04 Run & Fix** | `ensure_url_properties()` rewrites the keys before the first run (`git checkout -f` in run.sh discards them). `no_hardcoded_url` is a fix guard: a fix that adds a literal URL is rejected before it reaches disk. |
+| **05 Ship** | The URL keys are committed — added to HEAD's copy of the properties file, never the working copy, so the run's real credentials in that same file are not committed with them. |
+
+Key naming: the host alone is `{feature}.url` (matching the existing `saucedemo.url`), the
+API base is `{feature}.api.url`, and anything with a path is named for its last meaningful
+segment — `/nlogin/login` → `{feature}.login.url`. Id-like segments are skipped.
+
+Credentials use the same properties file through `shared/credential_properties.py` but are
+the opposite case: never committed. Both share `shared/properties_file.py` so the file
+location and the "never overwrite a human's value" rule exist in one place.
 
 ---
 

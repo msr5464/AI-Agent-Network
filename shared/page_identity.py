@@ -114,6 +114,40 @@ _STATE_TEXT_MARKERS = (
 _MATCH_LIMIT = 25
 
 
+# Playwright-MCP snapshot handles. `browser_snapshot` labels every node with an
+# ephemeral ref (`e71`, `f2e585`) that means nothing outside that one snapshot.
+# Recorded as a selector it compiles fine and matches nothing, forever — which is
+# how a generated page object ends up polling `[ref='f2e585']` for 30 seconds.
+_ARIA_REF = re.compile(r"(?:^|[\[\s])(?:aria-)?ref\s*=", re.I)
+_BARE_REF = re.compile(r"^(?=.*\d)[a-f][0-9a-f]{2,}$", re.I)
+
+# Playwright has no `text` attribute — whoever writes button[text='Save'] means
+# :has-text('Save'). As CSS it is syntactically valid and matches nothing, so it
+# survives every check that only asks "does this parse?".
+_TEXT_ATTR = re.compile(r"\[\s*text\s*=", re.I)
+
+
+def is_dom_selector(raw: str) -> bool:
+    """Whether a recorded locator can actually match in a real browser run.
+
+    Deliberately distinct from normalize_selector(), which asks whether a selector
+    can be evaluated against a *parsed snapshot*: `button:has-text("Login")` is a
+    perfectly good runtime selector that BeautifulSoup cannot evaluate, and
+    `[ref=e71]` is the reverse — evaluable-looking and runtime-useless. Callers
+    recording selectors for later code generation want this question, not that one.
+    """
+    if not raw or not raw.strip():
+        return False
+    selector = raw.strip()
+    if _ARIA_REF.search(selector):
+        return False
+    if _TEXT_ATTR.search(selector):
+        return False
+    if _BARE_REF.match(selector):
+        return False
+    return True
+
+
 def normalize_selector(raw: str) -> Optional[str]:
     """Reduce a recorded locator to plain CSS, or None if it cannot be evaluated.
 

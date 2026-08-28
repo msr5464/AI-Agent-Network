@@ -19,7 +19,7 @@ Gate file: .fix-passed
   - "skipped" — no eligible candidates or infrastructure not configured
 """
 
-import os, sys, json, subprocess, re, difflib, signal
+import os, sys, json, subprocess, re, signal, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,10 +31,10 @@ def log(msg): _log("fix", msg)
 
 # CodeAnalyzer import — graceful fallback if not available
 try:
-    from lib.code_analyzer import (CodeAnalyzer as _CodeAnalyzer, split_class_members,
+    from shared.code_analyzer import (CodeAnalyzer as _CodeAnalyzer, split_class_members,
                                    invalidate_file, reset_caches)
-    from lib.failure_clusters import build_clusters
-    from lib.test_runner import run_test
+    from shared.failure_clusters import build_clusters
+    from shared.test_runner import run_test
     _HAS_CODE_ANALYZER = True
 except ImportError:
     _HAS_CODE_ANALYZER = False
@@ -42,7 +42,7 @@ except ImportError:
     build_clusters = None
     def invalidate_file(_path): pass
     def reset_caches(): pass
-    from lib.test_runner import run_test  # required: verification cannot be skipped
+    from shared.test_runner import run_test  # required: verification cannot be skipped
     log("Warning: CodeAnalyzer not available — falling back to glob-only file search")
 
 import warnings, urllib3
@@ -139,30 +139,49 @@ except ImportError:
     _HAS_MCP_CONFIG = False
 
 from shared.dom_snapshot import distill as distill_dom, format_for_prompt as format_dom
-from shared.page_identity import normalize_selector as _normalize_selector
-from shared import diagnosis, verdict_feedback
+from shared import (adaptation_handoff, diagnosis, verdict_feedback,
+                    workspace as workspace_helper)
 from shared.playwright_trace import read_actions, format_for_prompt as format_trace
+
+# Edit application and the fix-integrity guards now live in shared/edit_guards.py
+# so test-adaptation-agent runs the same checks. Re-exported at module level:
+# tests/unit/test_fix_guards.py loads THIS file by path and calls them as
+# attributes of it, and the fix step's own call sites are unchanged.
+from shared.edit_guards import (            # noqa: F401
+    _condense, _is_broader, _IDENTITY_CALL, _line_of, _QUOTED, _selectors_in,
+    apply_edits, compute_diff, log_edits, logstep_present, matches_negative,
+    no_new_swallowing, validate_diagnosis_fit, validate_fix, wrapper_compliance,
+)
 
 
 def call_claude(prompt: str, cwd: Path, use_system_prompt: bool = True,
-                artifact_dir: str = "", **kwargs) -> str:
+                artifact_dir: str = "", allowed_tools: list | None = None,
+                add_dir: str = "", **kwargs) -> str:
     """Call the Claude CLI for this agent.
 
     use_system_prompt=False for the browser-inspection call: that task is about
     reading a live DOM, and the Java framework context would only be noise.
+
+    allowed_tools and add_dir are named parameters rather than **kwargs
+    passthrough: artifact_dir implies a tool grant of its own, so a caller
+    supplying its own list — the browser inspections pass ["mcp__playwright__*"]
+    — collided with it inside the call and raised TypeError. The two are merged
+    instead, so a browser call that also has an artifact dir keeps both.
     """
     system_prompt = (SYSTEM_PROMPT_FILE
                      if use_system_prompt and SYSTEM_PROMPT_FILE.exists() else None)
+    tools = list(allowed_tools or [])
+    if artifact_dir and "Read" not in tools:
+        # Reading an image needs a tool, and granting Read grants it broadly:
+        # --add-dir was measured and is additive, not a sandbox. Accepted because
+        # this call is already handed the test and page-object source in the
+        # prompt, so Read is not new reach — but it is not the confinement an
+        # earlier comment here claimed.
+        tools.append("Read")
     output = _call_claude(prompt, AUTOFIX_MODEL, str(cwd),
                           system_prompt_file=system_prompt,
-                          # Reading an image needs a tool, and granting Read
-                          # grants it broadly: --add-dir was measured and is
-                          # additive, not a sandbox. Accepted because this call is
-                          # already handed the test and page-object source in the
-                          # prompt, so Read is not new reach — but it is not the
-                          # confinement an earlier comment here claimed.
-                          allowed_tools=(["Read"] if artifact_dir else None),
-                          add_dir=(artifact_dir or None),
+                          allowed_tools=(tools or None),
+                          add_dir=(add_dir or artifact_dir or None),
                           log_dir=str(AUDIT_DIR),
                           **kwargs)
     if not output:
@@ -186,36 +205,15 @@ def _authenticated_url() -> str:
 
 
 def clone_automation_repo(workspace: Path) -> Path | None:
-    """Clone the automation repo into workspace/ if GITHUB_ORG + GITHUB_REPO_AUTOMATION are set."""
-    if not GITHUB_ORG or not GITHUB_REPO_AUTOMATION:
-        log("Cannot clone: GITHUB_ORG or GITHUB_REPO_AUTOMATION not set")
-        return None
-    if not GITHUB_TOKEN:
-        log("Cannot clone: GITHUB_TOKEN not set")
-        return None
+    """Clone the automation repo. Delegates to shared/workspace.py.
 
-    dest = workspace / GITHUB_REPO_AUTOMATION
-    log(f"Cloning {GITHUB_ORG}/{GITHUB_REPO_AUTOMATION} into {workspace}...")
-    workspace.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["git", "clone", "--depth", "1", "--branch", GITHUB_DEFAULT_BRANCH,
-         _authenticated_url(), str(dest)],
-        capture_output=True, text=True, timeout=300,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-    )
-    if result.returncode != 0:
-        # Redact token from error output before logging
-        err = result.stderr.replace(GITHUB_TOKEN, "***")
-        log(f"Clone failed: {err[:400]}")
-        return None
-
-    # git clone persists the URL it was given into .git/config. Strip the token
-    # back out so it does not sit in plaintext on disk for the life of the
-    # checkout; every later push supplies it per-invocation instead.
-    subprocess.run(["git", "remote", "set-url", "origin", _repo_https_url()],
-                   cwd=str(dest), capture_output=True, text=True, timeout=30)
-    log(f"Cloned successfully → {dest} (token not persisted in .git/config)")
-    return dest
+    Kept as a named function because this file is loaded by path in tests and
+    callers reference it by name; the implementation moved so three agents stop
+    carrying three answers to the same question.
+    """
+    return workspace_helper.clone(
+        workspace, GITHUB_ORG, GITHUB_REPO_AUTOMATION, GITHUB_TOKEN,
+        GITHUB_DEFAULT_BRANCH, log=log)
 
 
 def get_workspace() -> Path | None:
@@ -599,6 +597,29 @@ Report only what you observed. Never invent a selector.
 """
 
 
+def _pid_listening_on(endpoint: str) -> int:
+    """The pid holding the CDP port, when the session file does not name one.
+
+    Older framework builds wrote no browserPid, and the session file is deleted
+    on the way out either way — so without this the stray Chromium becomes
+    unreachable the moment we drop the file, and it holds the port against every
+    later repair run.
+    """
+    try:
+        port = int(endpoint.rsplit(":", 1)[1].split("/")[0])
+    except (IndexError, ValueError):
+        return 0
+    try:
+        out = subprocess.run(["lsof", "-tnP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    for line in out.split():
+        if line.strip().isdigit():
+            return int(line.strip())
+    return 0
+
+
 def _reap_parked_browser(session: dict) -> None:
     """Shut down the browser a repair session left running, and clear the file.
 
@@ -606,15 +627,37 @@ def _reap_parked_browser(session: dict) -> None:
     nothing else will ever close it — leaving it behind means a stray Chromium
     (and a held CDP port) after every repair run.
     """
-    pid = session.get("browserPid") or 0
+    try:
+        pid = int(session.get("browserPid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if not pid:
+        pid = _pid_listening_on(session.get("cdpEndpoint", ""))
+
     if pid:
         try:
-            os.kill(int(pid), signal.SIGTERM)
-            log(f"  Parked browser closed (pid {pid})")
+            os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
-            pass  # already gone
-        except (OSError, ValueError) as e:
+            pid = 0  # already gone
+        except OSError as e:
             log(f"  Could not close the parked browser (pid {pid}): {e}")
+            pid = 0
+
+    if pid:
+        # SIGTERM is asynchronous, and the file is about to be deleted: report
+        # what actually happened rather than assuming the browser took the hint.
+        for _ in range(20):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            time.sleep(0.25)
+        else:
+            log(f"  Parked browser (pid {pid}) ignored SIGTERM — still holding "
+                f"{session.get('cdpEndpoint', 'the CDP port')}; kill it before the next repair run")
+            pid = 0
+        if pid:
+            log(f"  Parked browser closed (pid {pid})")
 
     path = session.get("_path")
     if path:
@@ -1285,21 +1328,7 @@ def extract_fix_json(response: str) -> dict | None:
             pass
     return None
 
-# ── Fix application + safety guard ────────────────────────────────────────────
-
-def _line_of(text: str, needle: str) -> int:
-    """1-based line where needle starts, or 0."""
-    idx = text.find(needle)
-    return text.count("\n", 0, idx) + 1 if idx >= 0 else 0
-
-
-def _condense(value: str, width: int = 100) -> str:
-    """One readable line: collapse whitespace, elide the middle if long."""
-    flat = " ".join((value or "").split())
-    if len(flat) <= width:
-        return flat
-    return flat[: width - 20] + " … " + flat[-17:]
-
+# ── Attempt history ───────────────────────────────────────────────────────────
 
 def _attempt_history(result: dict) -> list:
     """Append this attempt's outcome to whatever earlier attempts recorded.
@@ -1340,91 +1369,6 @@ def _attempt_history(result: dict) -> list:
     return sorted(history, key=lambda h: h.get("attempt", 0))
 
 
-def log_edits(target_file, original: str, edits: list, log_fn) -> None:
-    """Print what actually changed, file and line, before -> after.
-
-    The prose fix_description says WHY; without this nobody could see WHAT.
-    Reading a run meant scrolling maven output hunting for the new selector in
-    the next failure message, and a reverted attempt left no record at all.
-    """
-    total = len(edits or [])
-    for n, edit in enumerate(edits or [], 1):
-        old = edit.get("old_string", "")
-        new = edit.get("new_string", "")
-        line = _line_of(original, old)
-        where = f"{target_file.name}:{line}" if line else target_file.name
-        log_fn(f"    edit {n}/{total} — {where}")
-        log_fn(f"      - {_condense(old)}")
-        log_fn(f"      + {_condense(new)}")
-
-
-def apply_edits(original: str, edits: list) -> tuple:
-    """Apply search/replace edits. Returns (updated_text, error).
-
-    Every old_string must appear exactly once — an ambiguous match means the
-    model did not give enough context, and guessing which occurrence it meant is
-    how an autofix corrupts a file.
-    """
-    if not edits:
-        return None, "no edits supplied"
-
-    updated = original
-    for i, edit in enumerate(edits, 1):
-        if not isinstance(edit, dict):
-            return None, f"edit {i} is not an object"
-        old = edit.get("old_string")
-        new = edit.get("new_string")
-        if old is None or new is None:
-            return None, f"edit {i} missing old_string/new_string"
-        if old == new:
-            return None, f"edit {i} is a no-op"
-        count = updated.count(old)
-        if count == 0:
-            return None, f"edit {i}: old_string not found in file"
-        if count > 1:
-            return None, f"edit {i}: old_string matches {count} times — not unique"
-        updated = updated.replace(old, new, 1)
-
-    return updated, ""
-
-
-def validate_fix(original: str, updated: str, filename: str) -> tuple:
-    """Reject a 'locator fix' that is actually a rewrite. Returns (ok, reason).
-
-    The model only ever sees part of a large file, so a change far bigger than a
-    locator is the signature of it regenerating content it never read.
-    """
-    if not updated.strip():
-        return False, "fix produced an empty file"
-
-    changed = [line for line in difflib.unified_diff(
-        original.splitlines(), updated.splitlines(), lineterm="", n=0)
-        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
-    if not changed:
-        return False, "fix changed nothing"
-    if len(changed) > MAX_FIX_DIFF_LINES:
-        return False, (f"fix touches {len(changed)} lines (limit {MAX_FIX_DIFF_LINES}) — "
-                       f"too large for a locator change")
-
-    # Losing a method is the classic whole-file-rewrite failure: the model
-    # regenerates a file it only saw an excerpt of and silently drops the rest.
-    if split_class_members and filename.endswith((".java", ".kt")):
-        try:
-            before = {m["name"] for m in split_class_members(original)
-                      if m["kind"] in ("method", "constructor") and m["name"]}
-            after = {m["name"] for m in split_class_members(updated)
-                     if m["kind"] in ("method", "constructor") and m["name"]}
-            lost = before - after
-            if lost:
-                return False, f"fix removed method(s): {', '.join(sorted(lost))}"
-        except Exception:
-            pass  # never let the guard itself break a valid fix
-
-    return True, ""
-
-
-
-
 def should_gate(verdict: dict, mode: str, force: bool) -> tuple:
     """Whether this verdict may stop the pipeline path. Returns (gate, note).
 
@@ -1461,121 +1405,49 @@ def _snapshot_soup(issue: dict):
         return None
 
 
-# ── Fix-integrity guards ──────────────────────────────────────────────────────
-#
-# The verification loop cannot catch a fix built on a wrong diagnosis, because
-# the easiest way to make a page assertion pass is to weaken it. A run that had
-# already been told the avatar was missing "fixed" it by moving the page-load
-# anchor onto a link that exists on the logged-out page too — and that would have
-# gone green while the login was still broken. These guards are what the re-run
-# cannot do for us.
-
-# Selectors that assert *which page* we are on. Broadening one of these turns a
-# real failure into a silent pass.
-_IDENTITY_CALL = re.compile(r"assertPageLoaded\s*\(")
-
-# A quoted selector, so a replacement can be compared against what it replaced.
-_QUOTED = re.compile(r"""(["'])((?:\\.|(?!\1).)+)\1""")
-
-
-def _selectors_in(text: str) -> list:
-    return [m.group(2) for m in _QUOTED.finditer(text or "")]
-
-
-def _is_broader(before: str, after: str) -> bool:
-    """Whether `after` is a strictly weaker version of `before`.
-
-    Only the unambiguous cases: adding comma-alternatives, dropping attribute or
-    class constraints, or collapsing to a bare tag. A different-but-equally-tight
-    selector is a normal fix and must pass.
-    """
-    if not before or not after or before == after:
-        return False
-    if "," in after and "," not in before:
-        return True
-    def tightness(selector):
-        return (selector.count("[") + selector.count("#") + selector.count(".")
-                + selector.count(":"))
-    if tightness(after) == 0 and tightness(before) > 0:
-        return True
-    return False
-
-
-def validate_diagnosis_fit(original: str, updated: str, verdict: str,
-                           snapshot_soup=None) -> tuple:
-    """Reject an edit that does not match what the diagnosis actually found.
-
-    Returns (ok, reason). Runs before the test does, so a fix that could only
-    pass by weakening the test never reaches a runner at all.
-    """
-    changed = [line for line in difflib.unified_diff(
-        original.splitlines(), updated.splitlines(), lineterm="", n=0)
-        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
-    removed = [line[1:] for line in changed if line.startswith("-")]
-    added = [line[1:] for line in changed if line.startswith("+")]
-
-    # 1. Never weaken a page-identity assertion unless the locator really is the
-    #    thing that broke.
-    if verdict != "LOCATOR_STALE":
-        touched_identity = any(_IDENTITY_CALL.search(line) for line in removed + added)
-        if touched_identity:
-            return False, (f"fix changes a page-load assertion, but the diagnosis is "
-                           f"{verdict or 'unknown'} rather than a stale locator — "
-                           f"weakening a page check would make the test pass on the "
-                           f"wrong page. Re-run with FORCE=true to override.")
-
-    # 2. Never broaden a selector. That is how a wrong-page failure gets papered
-    #    over into a pass.
-    for before, after in zip(_selectors_in("\n".join(removed)),
-                             _selectors_in("\n".join(added))):
-        if _is_broader(before, after):
-            return False, (f"fix broadens the selector {before!r} to {after!r}, "
-                           f"which would make the assertion weaker rather than correct")
-
-    # 3. A genuinely stale locator has a replacement that exists on the page we
-    #    were actually on. One matching nothing is a guess, and the failure-time
-    #    DOM can say so before maven spends a minute discovering it.
-    if verdict == "LOCATOR_STALE" and snapshot_soup is not None:
-        candidates = _selectors_in("\n".join(added))
-        checked, matched = 0, 0
-        for candidate in candidates:
-            normalized = _normalize_selector(candidate)
-            if not normalized:
-                continue
-            try:
-                checked += 1
-                if snapshot_soup.select(normalized, limit=1):
-                    matched += 1
-            except Exception:
-                checked -= 1
-        if checked and not matched:
-            return False, ("the replacement selector matches nothing in the DOM "
-                           "captured at failure, so it is a guess rather than a fix")
-
-    return True, ""
-
-
 # ── Test runner ───────────────────────────────────────────────────────────────
+
+
+def evaluate_shadow_guards(original: str, updated: str, target_file, ctx: dict) -> list:
+    """Run the adaptation-agent guards without letting them decide anything.
+
+    Returns one row per guard: {guard, would_reject, reason}. Failures inside a
+    guard are recorded as errors rather than raised — a guard that crashes must
+    not take down a fix it was only observing.
+    """
+    is_test = target_file.name.endswith(("Test.java", "Test.kt", "Tests.java"))
+    negatives = []
+    snapshot = ctx.get("dom_snapshot_path") or ""
+    checks = [
+        ("no_new_swallowing", lambda: no_new_swallowing(original, updated)),
+        ("wrapper_compliance", lambda: wrapper_compliance(original, updated)),
+        ("logstep_present", lambda: logstep_present(original, updated, is_test)),
+        ("matches_negative",
+         lambda: matches_negative(_selectors_in(updated), negatives)),
+    ]
+    rows = []
+    for name, run in checks:
+        try:
+            ok, reason = run()
+        except Exception as exc:                      # pragma: no cover - defensive
+            rows.append({"guard": name, "would_reject": False,
+                         "reason": "", "error": str(exc)})
+            continue
+        rows.append({"guard": name, "would_reject": not ok, "reason": reason})
+    if snapshot:
+        rows.append({"guard": "_snapshot", "would_reject": False, "reason": snapshot})
+    return rows
+
 
 def run_single_test(test_name: str, workspace: Path) -> tuple:
     """Verify one test. Returns (status, output) — passed / failed / unverified.
 
-    Delegates to lib.test_runner so the fix step and the reproduce step invoke
+    Delegates to shared.test_runner so the fix step and the reproduce step invoke
     tests identically; a fix "verified" by a different command than the one that
     produced the failure would prove nothing.
     """
     return run_test(test_name, workspace, timeout_s=TEST_TIMEOUT_S, log=log)
 
-
-def compute_diff(original: str, fixed: str, filename: str) -> str:
-    diff_lines = list(difflib.unified_diff(
-        original.splitlines(keepends=True),
-        fixed.splitlines(keepends=True),
-        fromfile=f"a/{filename}",
-        tofile=f"b/{filename}",
-        n=3,
-    ))
-    return "".join(diff_lines[:100])
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -1808,6 +1680,24 @@ def main():
             # independent channels agreed; MEDIUM says what it would have done and
             # lets the existing behaviour proceed. The property that holds in both
             # paths: nothing blocks work unless it was measured or corroborated.
+            # A page rebuilt in place reads as WRONG_PAGE at HIGH confidence, and
+            # the remediation sends a human to investigate navigation that is not
+            # broken. Regenerating a page object is far outside a locator edit, so
+            # this does not attempt it — it drafts a change note for the agent
+            # whose job it is, and says so.
+            if adaptation_handoff.looks_restructured(evidence, verdict):
+                queue = (REPO_ROOT / "agents" / "test-adaptation-agent" / "queue")
+                drafted = adaptation_handoff.write_draft(queue, issue, evidence, verdict)
+                verdict["restructured"] = True
+                if drafted:
+                    log(f"  {ctx.get('diagnosis', {}).get('verdict')} here means the "
+                        f"page was REBUILT, not un-reached: the route still matches "
+                        f"the last good run.")
+                    log(f"  Drafted a change note for test-adaptation-agent: "
+                        f"{drafted.name} — review it before running that agent.")
+                else:
+                    log("  Page looks rebuilt; a draft change note is already queued.")
+
             gate, note = should_gate(verdict, DIAGNOSIS_MODE, FORCE)
             if note:
                 log(f"  ({note})")
@@ -1904,7 +1794,8 @@ def main():
             fail_cluster("edit_failed", reason=edit_err, output=edit_err)
             continue
 
-        valid, invalid_reason = validate_fix(target_original, fixed_content, target_file.name)
+        valid, invalid_reason = validate_fix(target_original, fixed_content,
+                                             target_file.name, MAX_FIX_DIFF_LINES)
         if FORCE and (ctx.get("diagnosis") or {}).get("verdict") in diagnosis.STOP:
             # Remember that this run overrode a stop verdict, so that a fix which
             # then verifies can be recorded as evidence the verdict was wrong.
@@ -1919,6 +1810,18 @@ def main():
             valid, invalid_reason = validate_diagnosis_fit(
                 target_original, fixed_content,
                 (ctx.get("diagnosis") or {}).get("verdict", ""), snapshot_soup)
+        # Guards built for test-adaptation-agent, evaluated here but never acting.
+        # They are about to become load-bearing for edits far larger than a
+        # locator, and the cheapest place to find out that one of them is wrong is
+        # against real locator fixes that are known to be good. If any of these
+        # ever reports would_reject on a fix that then verifies, the guard is
+        # wrong — not the fix.
+        ctx["shadow_guards"] = evaluate_shadow_guards(
+            target_original, fixed_content, target_file, ctx)
+        for entry in ctx["shadow_guards"]:
+            if entry["would_reject"]:
+                log(f"  [shadow] {entry['guard']} would have rejected: {entry['reason']}")
+
         if not valid:
             log(f"  Rejected by safety guard: {invalid_reason}")
             fail_cluster("rejected_unsafe", reason=invalid_reason, output=invalid_reason,
@@ -1956,6 +1859,10 @@ def main():
 
         record = {
             **ctx_slim,
+            # ctx_slim was snapshotted before the model was called, so anything
+            # computed after that has to be named here or it never reaches the
+            # audit file — which for a shadow guard is the entire point of it.
+            "shadow_guards": ctx.get("shadow_guards") or [],
             "target_file": str(target_file),
             "fix_description": fix_description,
             "fix_diff": fix_diff,

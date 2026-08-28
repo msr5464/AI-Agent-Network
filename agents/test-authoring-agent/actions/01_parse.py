@@ -61,6 +61,19 @@ def extract_json(text: str):
     return None
 
 
+def normalize_module_name(raw: str) -> str:
+    """Turn the input's `Module:` value into a legal Java package segment.
+
+    The module name reaches the filesystem as a directory and the source as a
+    package segment, so anything the author writes naturally ("Naukari", "My
+    Feature", "user-profile") has to survive as a lowercase identifier.
+    """
+    name = re.sub(r"[^a-z0-9]+", "_", raw.strip().lower()).strip("_")
+    if name and name[0].isdigit():
+        name = f"m_{name}"      # a package segment cannot start with a digit
+    return name
+
+
 def module_exists(feature_name: str) -> bool:
     """Check if the feature module already exists in Thanos-pw."""
     module_dir = AUTOMATION_FRAMEWORK_DIR / "src/main/java/automation/modules" / feature_name.lower()
@@ -98,18 +111,27 @@ def main() -> None:
     java_block_pos = fw_claude_md_full.find("```java")
     claude_md = fw_claude_md_full[:java_block_pos].strip() if java_block_pos > 0 else fw_claude_md_full
 
-    # Extract feature name hint from first line to check module existence early
-    feature_hint = ""
+    # The input's `Module:` line names the module — it decides the package and the
+    # directory on disk. It is NOT a hint: letting the model pick its own
+    # feature_name is how a "Module: Naukari" input ended up in
+    # modules/naukri_profile_summary, which then made the existence check below
+    # (keyed on the Module: name) miss forever, so every rerun regenerated the
+    # module from scratch instead of appending to it.
+    module_name = ""
     for line in raw_text.splitlines():
         if line.lower().startswith("module:"):
-            feature_hint = line.split(":", 1)[1].strip().lower()
+            module_name = normalize_module_name(line.split(":", 1)[1])
             break
-    if not feature_hint:
-        feature_hint = INPUT_FILE.stem.lower()
+    if module_name:
+        log(f"Module name from input's 'Module:' line: '{module_name}'")
+    else:
+        # No Module: line — fall back to the queue filename, as before.
+        module_name = normalize_module_name(INPUT_FILE.stem)
+        log(f"No 'Module:' line in input — falling back to filename: '{module_name}'")
 
-    existing = module_exists(feature_hint)
-    existing_files = read_existing_module_files(feature_hint) if existing else {}
-    log(f"Module '{feature_hint}' exists: {existing}")
+    existing = module_exists(module_name)
+    existing_files = read_existing_module_files(module_name) if existing else {}
+    log(f"Module '{module_name}' exists: {existing}")
 
     existing_context = ""
     if existing_files:
@@ -224,6 +246,12 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
 
 Rules:
 1. Set "existing_module" to {str(existing).lower()} (already detected from filesystem).
+1b. "feature_name" MUST be exactly "{module_name}" — it comes from the input's `Module:` line and
+   names the package and directory on disk. Do NOT substitute a more descriptive name, correct its
+   spelling, or derive one from the scenario. Set "package_main" to "automation.modules.{module_name}"
+   and "package_test" to "automation.{module_name}" to match.
+   "feature_class" is separate and SHOULD describe the scenario (e.g. a "Module: naukari" input about
+   profile summaries gives feature_name "naukari" with feature_class "NaukriProfileSummary").
 2. "feature_enum" must be one of: CARD, BUDGET, CLAIM, DBS_SG, DBS_HK, CC_SG, CALASTONE_SG.
    Pick the closest match; if unsure use CARD.
 3. "response_only": true for fields set by the server (id, status, createdAt, updatedAt).
@@ -313,6 +341,19 @@ Rules:
     # Override existing_module with filesystem truth (don't trust Claude to infer this)
     plan["existing_module"] = existing
     plan["_input_file"] = str(INPUT_FILE)
+
+    # Same treatment for the module name: rule 1b asks for it, this guarantees it.
+    # These three fields decide where every generated file lands and what package it
+    # declares, so a model that renamed the module would silently create a second
+    # copy alongside the real one — and `existing` above, computed from the Module:
+    # name, would then be answering about a directory nothing writes to.
+    claude_name = plan.get("feature_name")
+    if claude_name != module_name:
+        log(f"Module name: overriding Claude's '{claude_name}' with '{module_name}' "
+            f"from the input's 'Module:' line")
+    plan["feature_name"]  = module_name
+    plan["package_main"]  = f"automation.modules.{module_name}"
+    plan["package_test"]  = f"automation.{module_name}"
 
     # Defensive default so every downstream consumer (step 02 Validate API in
     # particular) can read plan["api_auth"]["type"] unconditionally, rather than

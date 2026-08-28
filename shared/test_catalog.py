@@ -11,20 +11,16 @@ are still runnable, because the agent invokes `-Dtest=Class#method`).
 
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-_AGENT_LIB = Path(__file__).resolve().parents[1] / "agents" / "test-healing-agent"
-if str(_AGENT_LIB) not in sys.path:
-    sys.path.insert(0, str(_AGENT_LIB))
-
-from lib.code_analyzer import (  # noqa: E402
+from shared.code_analyzer import (
     CodeAnalyzer,
     _iter_source_files,
     read_source,
     source_roots,
     split_class_members,
+    without_comments,
 )
 
 # Group constants are compile-time finals (TestBase.java), so a source scan sees
@@ -36,6 +32,11 @@ _GROUP_VALUES = {
     "GROUP_MOBILE": "mobileCases",
 }
 _WEB_MARKERS = {"webcases", "web"}
+# The adaptation agent explores an API half as well as a web one, and picks which
+# from the note's `Type:`. Exposing this alongside is_web lets the UI derive that
+# header from the tests the user picked instead of asking, and keeps the marker
+# vocabulary in one place rather than half here and half in the frontend.
+_API_MARKERS = {"apicases", "api"}
 
 # Only used to present a package segment the way the framework spells it.
 _PROJECT_NAMES = ("GitHub", "SauceDemo", "FullSuite")
@@ -59,46 +60,6 @@ def test_source_roots(repo_path: str) -> List[Path]:
     roots = source_roots(repo_path)
     test_roots = [r for r in roots if "test" in r.parts]
     return test_roots or roots
-
-
-def _without_comments(text: str) -> str:
-    """Drop comments, keeping string literals intact.
-
-    `// auto-wire retry on every @Test` must not read as a test method — but
-    blanking literals as well would empty `description = "..."`, which is the
-    single most useful thing the picker shows. So strings are stepped over
-    rather than removed: a `//` inside one is still not a comment.
-    """
-    out = []
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == '/' and i + 1 < n and text[i + 1] == '/':
-            j = text.find('\n', i)
-            i = n if j == -1 else j
-            continue
-        if ch == '/' and i + 1 < n and text[i + 1] == '*':
-            j = text.find('*/', i + 2)
-            out.append(" ")
-            i = n if j == -1 else j + 2
-            continue
-        if ch in '"\'':
-            quote = ch
-            j = i + 1
-            while j < n:
-                if text[j] == '\\':
-                    j += 2
-                    continue
-                if text[j] == quote:
-                    j += 1
-                    break
-                j += 1
-            out.append(text[i:j])       # literal preserved verbatim
-            i = j
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
 
 
 def _annotation_args(member_text: str) -> str:
@@ -149,11 +110,30 @@ def module_for_package(package: str) -> str:
     return segment
 
 
+def test_methods_in(source: str) -> List[str]:
+    """Names of the @Test methods declared in one Java/Kotlin source, in order.
+
+    Comment-aware, unlike a bare regex: `// auto-wire retry on every @Test` above
+    an ordinary helper must not make it look like a test method. Shared because
+    both the authoring agent's generate step (which must report the method it
+    actually produced) and its run step (which must not hand `mvn -Dtest` a name
+    that does not exist) need exactly this answer — and disagreeing about it means
+    surefire runs nothing and calls it BUILD SUCCESS.
+    """
+    names = []
+    for member in split_class_members(source or ""):
+        if member["kind"] not in ("method", "method_decl") or not member["name"]:
+            continue
+        if _TEST_ANNOTATION.search(without_comments(member["text"])):
+            names.append(member["name"])
+    return names
+
+
 def _class_entry(path: Path, repo: Path) -> Optional[dict]:
     content = read_source(path)
     if not content:
         return None
-    if not _TEST_ANNOTATION.search(_without_comments(content)):
+    if not _TEST_ANNOTATION.search(without_comments(content)):
         return None
 
     analyzer = CodeAnalyzer()
@@ -164,7 +144,7 @@ def _class_entry(path: Path, repo: Path) -> Optional[dict]:
     for member in split_class_members(content):
         if member["kind"] not in ("method", "method_decl") or not member["name"]:
             continue
-        declaration = _without_comments(member["text"])
+        declaration = without_comments(member["text"])
         if not _TEST_ANNOTATION.search(declaration):
             continue
 
@@ -182,6 +162,7 @@ def _class_entry(path: Path, repo: Path) -> Optional[dict]:
             # No groups at all means a plain unit test, not a browser test —
             # absent is not unknown here.
             "is_web": any(g.lower() in _WEB_MARKERS for g in groups),
+            "is_api": any(g.lower() in _API_MARKERS for g in groups),
             "data_provider": provider.group(1) if provider else "",
         })
 
@@ -197,6 +178,7 @@ def _class_entry(path: Path, repo: Path) -> Optional[dict]:
         "path": str(path.relative_to(repo)),
         "methods": methods,
         "web_count": sum(1 for m in methods if m["is_web"]),
+        "api_count": sum(1 for m in methods if m["is_api"]),
     }
 
 
@@ -209,6 +191,16 @@ def _newest_mtime(roots: List[Path]) -> float:
             except OSError:
                 continue
     return newest
+
+
+def source_stamp(repo_path: str) -> float:
+    """The newest mtime across the repo's test sources.
+
+    Public so callers outside this module can key their own caches on the same
+    signal `list_tests` uses, instead of re-walking the tree or inventing a
+    second, differently-wrong notion of "has anything changed".
+    """
+    return _newest_mtime(test_source_roots(repo_path))
 
 
 def list_tests(repo_path: str, use_cache: bool = True) -> dict:
