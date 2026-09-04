@@ -1,0 +1,12 @@
+Module: checkout
+Type: web
+URL: https://app.staging.example.com
+Affects: automation.checkout.CheckoutWebTest*
+
+What changed:
+1. Placing an order above 500 SGD now triggers a one-time passcode challenge
+   before the order is submitted. The order is not created until the passcode
+   is entered, so the flow no longer ends on the confirmation screen.
+
+Expected outcome changed: a high-value checkout now ends on the passcode
+challenge screen, not on an order confirmation with a confirmation number.

@@ -182,7 +182,9 @@ Tests cover Agent 2's library (database queries, HTML parser, report generator, 
 
 ## Adding a New Input File (Agent 1)
 
-Input files live in `agents/test-authoring-agent/queue/`. Claude is flexible about exact formatting — the minimum required fields are:
+Input files live in `agents/test-authoring-agent/queue/`. That directory is the agent's live inbox and is **git-ignored** — items are consumed and moved out by `run.sh`, so nothing there is meant to be committed. Worked examples of each input format are kept in [`docs/examples/queue/`](examples/queue/).
+
+Claude is flexible about exact formatting — the minimum required fields are:
 
 ```
 Module: <name>

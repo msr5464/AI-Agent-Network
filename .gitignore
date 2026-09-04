@@ -42,16 +42,39 @@ dist/
 build/
 *.egg-info/
 node_modules/
-agents/test-authoring-agent/audit
-agents/test-authoring-agent/cache
 .playwright-mcp/
+# Rewritten by shared/mcp_config.py on every run from connectors/mcp/*.json.
 .mcp.json
-# test-adaptation-agent run output
-agents/test-adaptation-agent/audit
-agents/test-adaptation-agent/cache
+
+# ── Agent runtime state ───────────────────────────────────────────────────────
+# Everything below is per-run transaction data, not source. Each agent's run.sh
+# does `mkdir -p` on what it needs and the server recreates its own storage on
+# boot, so a fresh clone works with none of it present.
+
+# Per-session audit trails and LLM caches, for every agent.
+agents/*/audit/
+agents/*/cache/
+
+# The live work inbox. The server writes into it (POST /agents/<agent>/queue)
+# and run.sh moves each item into processed/ once it completes — so a tracked
+# file here turns into a deletion the first time anyone runs the agent.
+# Input format examples for each agent live in docs/examples/queue/.
+agents/*/queue/
+
+# Per-run bookkeeping the agents append to; `make clear-feedback` resets them.
+# feedback/known-issues.json is deliberately NOT ignored: it holds hand-written
+# triage rules that a fresh clone needs.
+agents/*/feedback/skip-buildtags.json
+agents/*/feedback/proposals.json
+
+# Server run registry — rewritten on every run, reloaded or recreated on boot.
+qa_agents_server/storage/agent_runs.json
 
 # Append-only analytics store — runtime data, grows per run, never pruned.
 qa_agents_server/storage/run_analytics.jsonl
+
+# Personal, machine-specific Claude Code permissions.
+.claude/settings.local.json
 
 # Locator-heal test bench: recorded fingerprints, not the framework's baselines
 # (those live in the Playwright repo under src/main/resources/baselines).

@@ -1,0 +1,84 @@
+{
+  "build_tag": "ReleaseCandidate-92",
+  "created_at": "2026-03-17T18:17:50.118427Z",
+  "source_session": "20260317-181745-ReleaseCandidate-92",
+  "source_audit_dir": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-ReleaseCandidate-92",
+  "automation_issues": [
+    {
+      "test_name": "automation.checkout.CheckoutWebTest.placeOrderEndToEnd",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "LOCATOR_STALE",
+      "root_cause": "CheckoutPage: 4 of 5 locators still match, so this is the right page; only #finish-button no longer resolves",
+      "failure_signature": "FAILED: Failed to click on element 'Finish order button' with locator",
+      "cause_group_key": "CheckoutPage:#finish-button",
+      "cause_group_size": 1,
+      "recommended_action": "edit the selector",
+      "error_type": "Failed to click on element 'Finish order button' with locator",
+      "error_message": "Failed to click on element 'Finish order button' with locator: Locator@#finish-button: Timeout 5000ms exceeded.\nCall log:\n-   - waiting for locator(\"#finish-button\")\n",
+      "stack_trace": "CheckoutPage.java:71",
+      "execution_log": "[18:17:48] Checkout overview loaded\n[18:17:53] WARNING: Element not visible after timeout: Finish order button\n\tat automation.modules.checkout.web.CheckoutPage.finishOrder(CheckoutPage.java:71)\n",
+      "class_name": "automation.checkout.CheckoutWebTest",
+      "method_name": "placeOrderEndToEnd",
+      "full_name": "automation.checkout.CheckoutWebTest.placeOrderEndToEnd",
+      "dom_snapshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-ReleaseCandidate-92/artifacts/placeOrderEndToEnd_181753.html",
+      "failure_url": "https://app.staging.example.com/checkout/overview",
+      "trace_path": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-ReleaseCandidate-92/artifacts/placeOrderEndToEnd_181753.zip",
+      "failed_selector": "#finish-button",
+      "flaky_tests": [
+        "automation.checkout.CheckoutWebTest.placeOrderWithPromoCode"
+      ],
+      "screenshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-ReleaseCandidate-92/artifacts/placeOrderEndToEnd_181753.png"
+    },
+    {
+      "test_name": "automation.checkout.CheckoutWebTest.placeOrderWithPromoCode",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "LOCATOR_STALE",
+      "root_cause": "Same CheckoutPage selector as placeOrderEndToEnd, but this test is in flaky_tests \u2014 it has passed on 3 of the last 5 nightlies",
+      "failure_signature": "FAILED: Failed to click on element 'Finish order button' with locator",
+      "cause_group_key": "CheckoutPage:#finish-button",
+      "cause_group_size": 1,
+      "recommended_action": "edit the selector",
+      "error_type": "Failed to click on element 'Finish order button' with locator",
+      "error_message": "Failed to click on element 'Finish order button' with locator: Locator@#finish-button: Timeout 5000ms exceeded.\n",
+      "stack_trace": "CheckoutPage.java:71",
+      "execution_log": "[18:18:02] Checkout overview loaded\n[18:18:07] WARNING: Element not visible after timeout: Finish order button\n\tat automation.modules.checkout.web.CheckoutPage.finishOrder(CheckoutPage.java:71)\n",
+      "class_name": "automation.checkout.CheckoutWebTest",
+      "method_name": "placeOrderWithPromoCode",
+      "full_name": "automation.checkout.CheckoutWebTest.placeOrderWithPromoCode",
+      "dom_snapshot": "",
+      "failure_url": "",
+      "trace_path": "",
+      "failed_selector": "",
+      "flaky_tests": [
+        "automation.checkout.CheckoutWebTest.placeOrderWithPromoCode"
+      ]
+    },
+    {
+      "test_name": "automation.account.ProfileWebTest.updateDisplayName",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "LOCATOR_STALE",
+      "root_cause": "ProfilePage: the Save button moved into a sticky footer and its data-test attribute was dropped",
+      "failure_signature": "FAILED: Failed to click on element 'Save profile button' with locator",
+      "cause_group_key": "ProfilePage:[data-test='save-profile']",
+      "cause_group_size": 1,
+      "recommended_action": "edit the selector",
+      "error_type": "Failed to click on element 'Save profile button' with locator",
+      "error_message": "Failed to click on element 'Save profile button' with locator: Locator@[data-test='save-profile']: Timeout 5000ms exceeded.\n",
+      "stack_trace": "ProfilePage.java:96",
+      "execution_log": "[18:18:20] Profile page loaded\n[18:18:25] WARNING: Element not visible after timeout: Save profile button\n\tat automation.modules.account.web.ProfilePage.save(ProfilePage.java:96)\n",
+      "class_name": "automation.account.ProfileWebTest",
+      "method_name": "updateDisplayName",
+      "full_name": "automation.account.ProfileWebTest.updateDisplayName",
+      "dom_snapshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-ReleaseCandidate-92/artifacts/updateDisplayName_181825.html",
+      "failure_url": "https://app.staging.example.com/account/profile",
+      "trace_path": "",
+      "failed_selector": "[data-test='save-profile']",
+      "flaky_tests": [
+        "automation.checkout.CheckoutWebTest.placeOrderWithPromoCode"
+      ]
+    }
+  ]
+}

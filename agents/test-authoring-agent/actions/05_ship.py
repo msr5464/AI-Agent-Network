@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → pl
 from shared import workspace as workspace_helper
 
 from shared.log import log as _log
+from shared.log import blocked
 from shared import properties_file
 from shared.slack import send_slack as _send_slack
 from shared.git import run_git as _run_git
@@ -113,7 +114,10 @@ def _stage_and_commit(contents: dict, message: str) -> bool:
         return False
     rc, _, err = git(["commit", "-m", message], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
-        log(f"ERROR: Commit failed: {err}")
+        log(blocked(f"commit failed ({err.strip()[:160]})",
+                    "no PR will be raised; the generated files stay in the "
+                    "working tree",
+                    f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
         return False
     return True
 
@@ -128,7 +132,9 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
     individual commits in the PR.  Returns (branch_name, tip_sha) or (None, None).
     """
     if not AUTOMATION_FRAMEWORK_DIR.exists():
-        log(f"ERROR: Automation framework repo not found: {AUTOMATION_FRAMEWORK_DIR}")
+        log(blocked(f"the automation repo was not found at {AUTOMATION_FRAMEWORK_DIR}",
+                    "no PR will be raised",
+                    "set FRAMEWORK_DIR, or WORKSPACE_DIR and GITHUB_REPO_AUTOMATION"))
         return None, None
 
     # Step-03 file contents (saved by 03_generate.py in files_content)
@@ -180,18 +186,27 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
             git(["fetch", "origin"], AUTOMATION_FRAMEWORK_DIR)
             rc, _, err = git(["checkout", "-f", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
             if rc != 0:
-                log(f"ERROR: Could not checkout {GITHUB_DEFAULT_BRANCH}: {err}")
+                log(blocked(
+                    f"could not check out {GITHUB_DEFAULT_BRANCH} ({err.strip()[:160]})",
+                    "no PR will be raised; no branch was created",
+                    f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
                 return None, None
         rc, _, err = git(["pull", "origin", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
         if rc != 0:
-            log(f"ERROR: Pull from origin/{GITHUB_DEFAULT_BRANCH} failed — aborting to avoid stale branch: {err}")
+            log(blocked(
+                f"pull from origin/{GITHUB_DEFAULT_BRANCH} failed ({err.strip()[:160]})",
+                "no PR will be raised; aborting rather than branching from a "
+                "stale base",
+                f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
             return None, None
     else:
         log("GITHUB_DEFAULT_BRANCH not set — branching from current HEAD")
 
     rc, _, err = git(["checkout", "-b", branch_name], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
-        log(f"ERROR: Could not create branch: {err}")
+        log(blocked(f"could not create {branch_name} ({err.strip()[:160]})",
+                    "no PR will be raised",
+                    f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
         return None, None
 
     # ── Commit 1: step-03 generated files ────────────────────────────────────────
@@ -302,7 +317,10 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
 
     rc, _, err = git(["push", "-u", "origin", branch_name], AUTOMATION_FRAMEWORK_DIR, use_token=True)
     if rc != 0:
-        log(f"Push failed: {err}")
+        log(blocked(f"push of {branch_name} was rejected ({err.strip()[:160]})",
+                    "no PR will be raised; the commits are on the local branch",
+                    f"git -C {AUTOMATION_FRAMEWORK_DIR} log --oneline "
+                    f"{GITHUB_DEFAULT_BRANCH}..{branch_name}"))
         return None, "push_failed", err
 
     files_written = gen_data.get("files_written", [])
@@ -415,7 +433,10 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
         reviewers=GITHUB_PR_REVIEWERS,
     )
     if not pr_url:
-        log(f"PR creation failed: {pr_err}")
+        log(blocked(f"PR creation failed ({str(pr_err).strip()[:160]})",
+                    f"no PR will be raised; {branch_name} is pushed and can be "
+                    f"opened by hand",
+                    f"https://github.com/{full_repo}/pull/new/{branch_name}"))
         return None, "pr_failed", pr_err
     log(f"PR created: {pr_url}")
     return pr_url, "shipped", ""

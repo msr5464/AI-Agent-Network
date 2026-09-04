@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → sh
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → lib.*
 
 from shared.log import log as _log
+from shared.log import blocked
 def log(msg): _log("fix", msg)
 
 from shared import browser_mode
@@ -1960,9 +1961,11 @@ def main():
             if on_branch:
                 log(f"Branch: {branch_name} (attempt {FIX_ATTEMPT}, base: {GITHUB_DEFAULT_BRANCH})")
             else:
-                log(f"Warning: could not switch to {branch_name} "
-                    f"({switch_err.strip()[:120]}) — leaving edits uncommitted "
-                    f"on the current branch instead")
+                log(blocked(
+                    f"could not switch to {branch_name} ({switch_err.strip()[:120]})",
+                    "no PR will be raised; edits are left uncommitted on the "
+                    "current branch",
+                    f"git -C {workspace} status"))
         else:
             # Offline, or a bad token. Branch off whatever is checked out rather
             # than committing onto it: "proceeding on current branch" quietly meant
@@ -1973,8 +1976,11 @@ def main():
             if on_branch:
                 log(f"Branch: {branch_name} (created from the current HEAD — no remote base)")
             else:
-                log(f"ERROR: could not create {branch_name} ({local_err}) — refusing to "
-                    f"commit onto the checked-out branch")
+                log(blocked(
+                    f"could not create {branch_name} ({local_err})",
+                    "no PR will be raised; refusing to commit onto the "
+                    "checked-out branch",
+                    f"git -C {workspace} status"))
                 write_skipped("could not create a fix branch; refusing to commit to the "
                               "current branch", infra=True)
                 return
@@ -2436,11 +2442,16 @@ def main():
     applied = [f for f in fixes + unverified_fixes + advanced_fixes
                if f.get("target_file")]
     if applied and not on_branch:
-        # Either a dry run, or the branch switch failed. Both mean the same thing:
-        # do not commit. The edits are on disk and `git diff` shows them, which is
-        # what a reviewer wants.
-        log(f"{len(applied)} edit(s) left uncommitted in the working tree — "
-            f"review with: git -C {workspace} diff")
+        # Both a dry run and a failed branch switch land here, and both mean "do
+        # not commit" — but only one of them is news. AUTO_PUSH tells them apart:
+        # with it off the user asked for exactly this; with it on they asked for a
+        # PR and are not getting one.
+        review = f"{len(applied)} edit(s) left uncommitted in the working tree — " \
+                 f"review with: git -C {workspace} diff"
+        log(review if not AUTO_PUSH else blocked(
+            "the fix branch was never checked out",
+            f"no PR will be raised; {len(applied)} edit(s) left uncommitted",
+            f"git -C {workspace} diff"))
     elif applied:
         for fix in applied:
             ok, _, err = run_git(["add", fix["target_file"]], workspace)
@@ -2463,7 +2474,9 @@ def main():
             log("Nothing new to commit — reusing existing branch")
             pr_branch = branch_name
         else:
-            log(f"Warning: commit failed: {err or out}")
+            log(blocked(f"commit failed ({(err or out).strip()[:120]})",
+                        "no PR will be raised; edits remain in the working tree",
+                        f"git -C {workspace} status"))
 
     # Gate
     _stop_statuses = {v.lower() for v in diagnosis.STOP}

@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shared.log import log as _log
+from shared.log import blocked
 def log(msg): _log("ship", msg)
 
 from shared import flow_map
@@ -258,6 +259,11 @@ def main():
         if not ok:
             result.update({"ship_status": "push_failed",
                            "ship_detail": f"could not create {branch}: {err}"})
+            # Recorded in the result and, until now, nowhere a watcher could see
+            # it: the console simply stopped mentioning the PR.
+            log(blocked(f"could not create {branch} ({err.strip()[:160]})",
+                        "no PR will be raised; the edits stay in the working tree",
+                        f"git -C {workspace} status"))
         else:
             log(f"Branch: {branch}")
             for item in applied:
@@ -281,6 +287,10 @@ def main():
                                       push_url=push_url())
             if not pushed:
                 result.update({"ship_status": "push_failed", "ship_detail": perr})
+                log(blocked(f"push of {branch} was rejected ({perr.strip()[:160]})",
+                            "no PR will be raised; the commits are on the local "
+                            "branch",
+                            f"git -C {workspace} log --oneline {BASE_BRANCH}..{branch}"))
             else:
                 title = f"[NEEDS-REVIEW] Adapt {MODULE} tests to product change"
                 url, gerr = create_pr(workspace, f"{GITHUB_ORG}/{GITHUB_REPO}",
@@ -290,6 +300,11 @@ def main():
                     log(f"PR: {url}")
                 else:
                     result.update({"ship_status": "pr_failed", "ship_detail": gerr})
+                    log(blocked(f"PR creation failed ({str(gerr).strip()[:160]})",
+                                f"no PR will be raised; {branch} is pushed and "
+                                f"can be opened by hand",
+                                f"https://github.com/{GITHUB_ORG}/{GITHUB_REPO}"
+                                f"/pull/new/{branch}"))
 
     # The verdict is asserted, not computed. A flow rewrite always needs a human.
     assert result["verdict"] == "NEEDS-REVIEW"

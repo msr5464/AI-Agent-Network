@@ -18,7 +18,7 @@ from qa_agents_server.paths import REPO_ROOT
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from qa_agents_server import runner, storage  # noqa: E402
+from qa_agents_server import runner, seed_examples, storage  # noqa: E402
 from qa_agents_server.routes import qa_bp  # noqa: E402
 
 
@@ -36,6 +36,14 @@ def create_app() -> Flask:
     # Load any pre-existing run registry and mark stranded runs as interrupted.
     storage.init()
     runner.reconcile_on_boot()
+
+    # Put the documented examples in each agent's queue so a fresh checkout has
+    # something in the UI. Seeds once per checkout and never overwrites; see
+    # seed_examples for the rules. Done here rather than in run-server.sh so it
+    # also covers `python -m qa_agents_server.app` and any other entry point.
+    seeded = seed_examples.seed_all(log=lambda m: print(f"[seed]{m}"))
+    if seeded:
+        print(f"Seeded example queue items for {len(seeded)} agent(s)")
 
     app.register_blueprint(qa_bp)
 

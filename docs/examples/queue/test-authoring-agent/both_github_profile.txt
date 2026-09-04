@@ -1,5 +1,5 @@
 Module: github
-Type: api
+Type: both
 API URL: https://api.github.com
 URL: https://github.com
 

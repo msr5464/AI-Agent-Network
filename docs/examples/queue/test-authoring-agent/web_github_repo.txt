@@ -1,0 +1,12 @@
+Module: github
+Type: web
+URL: https://github.com
+
+Steps:
+1. Navigate to the GitHub website.
+2. Perform login using Username: <GITHUB_TEST_USER>, Password: <GITHUB_TEST_PASSWORD>
+3. Using the left sidebar, navigate to the repo automationdemo/QA-Dashboard.
+   This should open the respective repo page.
+4. Scroll down to the "Test Coverage Data for all the Projects:" header.
+5. Validate that the image related to "Test Coverage Data for all the Projects:"
+   is properly visible.

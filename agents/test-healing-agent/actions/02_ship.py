@@ -21,6 +21,7 @@ import logging
 logging.basicConfig(level=logging.WARNING)
 
 from shared.log import log as _log
+from shared.log import blocked
 from shared.slack import send_slack as _send_slack
 from shared.github import create_pr
 from shared.git import run_git
@@ -90,7 +91,13 @@ def short_name(test_name: str) -> str:
 def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: list) -> Optional[str]:
     pr_branch = fix_data.get("pr_branch")
     if not pr_branch:
-        log("No PR branch from fix step — skipping PR creation")
+        # With AUTO_PUSH off this is the dry run the user asked for. With it on,
+        # the fix step could not get onto a branch and already said why — this is
+        # the second half of that story, at the point the PR fails to appear.
+        log("No PR branch from fix step — skipping PR creation" if not AUTO_PUSH
+            else blocked("the fix step produced no branch to push",
+                         "no PR will be raised; see the BLOCKED line above for the "
+                         "git failure that caused it"))
         return None
 
     if not AUTO_PUSH:
@@ -98,12 +105,16 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
         return None
 
     if not GITHUB_ORG or not GITHUB_REPO_AUTOMATION:
-        log("GitHub config not set — skipping PR")
+        log(blocked("GITHUB_ORG or GITHUB_REPO_AUTOMATION is not set",
+                    "no PR will be raised",
+                    "set both in config/.env, or Agent Settings"))
         return None
 
     workspace = get_workspace()
     if not workspace:
-        log("Automation workspace not found — skipping PR")
+        log(blocked("the automation repo was not found",
+                    "no PR will be raised",
+                    "set FRAMEWORK_DIR, or WORKSPACE_DIR and GITHUB_REPO_AUTOMATION"))
         return None
 
     full_repo = f"{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}"
@@ -120,7 +131,9 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
     )
     if not ok:
         redacted = (err or "").replace(GITHUB_TOKEN, "***") if GITHUB_TOKEN else (err or "")
-        log(f"Push failed: {redacted[:500]}")
+        log(blocked(f"push of {pr_branch} was rejected ({redacted.strip()[:160]})",
+                    "no PR will be raised; the commits are on the local branch",
+                    f"git -C {workspace} log --oneline {GITHUB_DEFAULT_BRANCH}..{pr_branch}"))
         return None
 
     # PR title reflects partial/full fix
@@ -228,7 +241,10 @@ executed**. Review and run them manually before merging.
         reviewers=GITHUB_PR_REVIEWERS,
     )
     if not pr_url:
-        log(f"PR creation failed: {pr_err}")
+        log(blocked(f"PR creation failed ({str(pr_err).strip()[:160]})",
+                    f"no PR will be raised; {pr_branch} is pushed and can be "
+                    f"opened by hand",
+                    f"https://github.com/{full_repo}/pull/new/{pr_branch}"))
         return None
     log(f"PR created: {pr_url}")
     return pr_url

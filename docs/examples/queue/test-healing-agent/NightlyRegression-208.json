@@ -1,0 +1,32 @@
+{
+  "build_tag": "NightlyRegression-208",
+  "created_at": "2026-03-16T02:30:50.118427Z",
+  "source_session": "20260316-023011-NightlyRegression-208",
+  "source_audit_dir": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260316-023011-NightlyRegression-208",
+  "automation_issues": [
+    {
+      "test_name": "automation.checkout.CartWebTest.removeSingleItemFromCart",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "AMBIGUOUS_LOCATOR",
+      "root_cause": "Locator \"button.btn_secondary\" resolved to 3 elements \u2014 a Remove button now sits on every cart row, not just the first",
+      "failure_signature": "FAILED: Error: strict mode violation",
+      "cause_group_key": "CartPage:button.btn_secondary",
+      "cause_group_size": 1,
+      "recommended_action": "narrow the selector so it matches exactly one element",
+      "error_type": "Error: strict mode violation",
+      "error_message": "Error: strict mode violation: locator(\"button.btn_secondary\") resolved to 3 elements:\n  1) <button class=\"btn_secondary\" id=\"remove-sauce-labs-backpack\">\u2026\n  2) <button class=\"btn_secondary\" id=\"remove-sauce-labs-bike-light\">\u2026\n  3) <button class=\"btn_secondary\" id=\"continue-shopping\">\u2026\n",
+      "stack_trace": "CartPage.java:34",
+      "execution_log": "[02:30:14] ACTION: Navigating to: https://www.saucedemo.com/cart.html\n[02:30:15] Cart loaded \u2014 2 line items\n[02:30:15] ACTION: Clicking: Remove item button\n[02:30:15] Error: strict mode violation: locator(\"button.btn_secondary\") resolved to 3 elements\n\tat automation.modules.checkout.web.CartPage.removeFirstItem(CartPage.java:34)\n",
+      "class_name": "automation.checkout.CartWebTest",
+      "method_name": "removeSingleItemFromCart",
+      "full_name": "automation.checkout.CartWebTest.removeSingleItemFromCart",
+      "dom_snapshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260316-023011-NightlyRegression-208/artifacts/removeSingleItemFromCart_023015.html",
+      "failure_url": "https://www.saucedemo.com/cart.html",
+      "trace_path": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260316-023011-NightlyRegression-208/artifacts/removeSingleItemFromCart_023015.zip",
+      "failed_selector": "button.btn_secondary",
+      "flaky_tests": [],
+      "screenshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260316-023011-NightlyRegression-208/artifacts/removeSingleItemFromCart_023015.png"
+    }
+  ]
+}

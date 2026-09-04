@@ -10,6 +10,12 @@ set -euo pipefail
 #   QA_AGENT_SERVER_PORT      (default 8765)
 #   QA_AGENT_SERVER_HOST      (default 0.0.0.0)
 #   AI_TEST_STUDIO_URL        (default http://localhost:5001) — CORS allowlist
+#   QA_SEED_EXAMPLES          (default true) — copy docs/examples/queue/<agent>/
+#                             into each agent's queue on boot, so the UI has
+#                             something in it on a fresh checkout. Seeds once per
+#                             checkout: it never overwrites a queued file, never
+#                             re-creates one already in processed/, and stops
+#                             once each queue has its .examples-seeded marker.
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +33,7 @@ fi
 export QA_AGENT_SERVER_PORT="${QA_AGENT_SERVER_PORT:-8765}"
 export QA_AGENT_SERVER_HOST="${QA_AGENT_SERVER_HOST:-0.0.0.0}"
 export AI_TEST_STUDIO_URL="${AI_TEST_STUDIO_URL:-http://localhost:5001}"
+export QA_SEED_EXAMPLES="${QA_SEED_EXAMPLES:-true}"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "QA Agent Server"
@@ -34,6 +41,7 @@ echo "  host            : $QA_AGENT_SERVER_HOST"
 echo "  port            : $QA_AGENT_SERVER_PORT"
 echo "  cors allowed    : $AI_TEST_STUDIO_URL"
 echo "  repo root       : $REPO_ROOT"
+echo "  seed examples   : $QA_SEED_EXAMPLES"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 exec python3 -m qa_agents_server.app

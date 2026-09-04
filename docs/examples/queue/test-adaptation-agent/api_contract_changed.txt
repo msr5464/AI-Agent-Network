@@ -1,0 +1,15 @@
+Module: payments
+Type: api
+API URL: https://api.staging.example.com
+Affects: automation.payments.PaymentsApiTest*
+
+What changed:
+1. POST /v2/payments now returns the payment identifier as "payment_id"
+   instead of "id". The old key is gone, not deprecated.
+2. The response no longer includes "currency" at the top level — it moved
+   under a new "amount" object as "amount.currency", alongside
+   "amount.value".
+3. GET /v2/payments/{id} now requires an "Idempotency-Key" request header.
+   Requests without it are rejected with 400.
+
+Expected outcome unchanged: a payment is created and can be read back by its identifier.

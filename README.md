@@ -151,7 +151,9 @@ Edit `config/.env` and fill in the required values (see Configuration Reference 
 Generates Java test code from a plain English input file and raises a PR on the Jarvis automation repo.
 
 ```bash
-# Create an input file describing what to test
+# Create an input file describing what to test.
+# queue/ is the agent's local inbox — git-ignored, consumed on each run.
+# See docs/examples/queue/ for worked examples of every input format.
 cat > agents/test-authoring-agent/queue/payments.txt << 'EOF'
 Module: payments
 Type: web
@@ -251,7 +253,7 @@ ADAPT_APPLY=false  make run AGENT=test-adaptation-agent MODULE=checkout   # prop
 START_FROM_STEP=4 SESSION_ID=<sid> make run AGENT=test-adaptation-agent   # resume
 ```
 
-Change note (`agents/test-adaptation-agent/queue/<module>.txt`):
+Change note (`agents/test-adaptation-agent/queue/<module>.txt` — git-ignored inbox; see [`docs/examples/queue/`](docs/examples/queue/)):
 
 ```
 Module: checkout
@@ -454,6 +456,18 @@ bash scripts/run-server.sh
 # Listens on http://0.0.0.0:8765 by default
 ```
 
+On its first boot in a checkout the server copies
+[`docs/examples/queue/<agent>/`](docs/examples/queue/) into each agent's queue,
+so the UI's queue view has something in it rather than being empty. It seeds once
+per checkout and never overwrites: a file already queued is left alone, a name
+already in `processed/` is not re-created, and once an agent has been seeded it
+is skipped — so an example you delete stays deleted. Set `QA_SEED_EXAMPLES=false`
+to turn it off, or clear an agent's queue directory to get the examples back.
+
+Note that seeded items are ordinary queue items: `make run AGENT=<agent>` with no
+`MODULE`/`BUILD_TAG` picks the oldest one and runs it. Pass an explicit target, or
+delete the examples, if that is not what you want.
+
 Key endpoints (scoped to `test-authoring-agent` for v1):
 
 | Method | Path | Purpose |
@@ -477,6 +491,7 @@ Environment overrides:
 | `QA_AGENT_SERVER_HOST` | `0.0.0.0` | Bind host |
 | `QA_AGENT_SERVER_PORT` | `8765` | Bind port |
 | `AI_TEST_STUDIO_URL` | `http://localhost:5001` | CORS allowlist |
+| `QA_SEED_EXAMPLES` | `true` | Seed each agent's queue from `docs/examples/queue/` on first boot |
 | `QA_AGENT_RUN_TIMEOUT_SECONDS` | `7200` | SIGKILL after this many seconds |
 | `QA_AGENT_STALE_AFTER_SECONDS` | `900` | Untouched for this long ⇒ treated as abandoned, not running |
 
