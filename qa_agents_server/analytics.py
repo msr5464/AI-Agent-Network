@@ -107,6 +107,34 @@ def _pr_url(d: Path) -> Optional[str]:
     return None
 
 
+def _read_text(path: Path) -> Optional[str]:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        return value or None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _healing_status(d: Path) -> str:
+    """Healing's own ladder: the fix gate plus whether a PR was raised."""
+    if (d / ".crashed").exists():
+        return "failed"
+    if (d / ".cancelled").exists():
+        return "cancelled"
+    if (d / ".interrupted").exists():
+        return "interrupted"
+    gate = (_read_text(d / ".fix-passed") or "").lower()
+    if gate == "true":
+        return "completed"
+    if gate == "false":
+        return "failed"
+    if gate == "skipped":
+        # The gate stopped it on purpose — not a failure. Reporting a correct
+        # refusal as failed trains people to ignore the runs worth reading.
+        return "diagnosed"
+    return ""
+
+
 def _adaptation_status(d: Path) -> str:
     """Adaptation's own status ladder.
 
@@ -151,6 +179,11 @@ def build_record(audit_dir: Path, agent: str = "", status: str = "",
     # here would score every adaptation run as a failure.
     if agent == "test-adaptation-agent":
         status = _adaptation_status(d) or status
+    elif agent == "test-healing-agent":
+        # Healing writes no .verdict, and exits 0 whether or not anything was
+        # actually fixed — so the shell exit code cannot distinguish a heal from
+        # a gated no-op. Its own gate file does.
+        status = _healing_status(d) or status
 
     outcomes = {key: 0 for key in _OUTCOME_KEYS}
     extractor = _OUTCOME_EXTRACTORS.get(agent)
@@ -169,6 +202,8 @@ def build_record(audit_dir: Path, agent: str = "", status: str = "",
         "ended_at": ended_at or session.get("ended_at"),
         "duration_s": session.get("duration_s"),
         "status": status or "unknown",
+        "verdict": _read_text(d / ".verdict"),
+        "fix_gate": _read_text(d / ".fix-passed"),
         "exit_code": exit_code,
         "auto_push": auto_push,
         "cost_usd": float(totals.get("cost_usd") or 0.0),

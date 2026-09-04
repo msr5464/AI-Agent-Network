@@ -18,37 +18,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from shared import blast_radius
-
-
-def _load_repo_env() -> None:
-    """Read config/.env the way shared/load_env.sh does for the agents.
-
-    Without this the CLI auto-detects "the first directory with a src/", which on
-    a machine with several checkouts is reliably the wrong one.
-    """
-    for candidate in (Path(__file__).resolve().parents[1] / "config" / ".env",
-                      Path(__file__).resolve().parents[1] / ".env"):
-        if not candidate.exists():
-            continue
-        for line in candidate.read_text(errors="ignore").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+from shared import blast_radius, workspace
 
 
 def _default_workspace() -> str:
-    _load_repo_env()
-    parent = os.environ.get("WORKSPACE_DIR") or str(Path(__file__).resolve().parents[2])
-    name = os.environ.get("GITHUB_REPO_AUTOMATION", "")
-    if name and (Path(parent) / name).exists():
-        return str(Path(parent) / name)
-    for candidate in sorted(Path(parent).iterdir()):
-        if candidate.is_dir() and (candidate / "src").exists():
-            return str(candidate)
-    return parent
+    """The automation repo, resolved the way the agents resolve it."""
+    workspace.load_repo_env()
+    return str(workspace.resolve(
+        os.environ.get("WORKSPACE_DIR") or Path(__file__).resolve().parents[2],
+        os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+        exclude=Path(__file__).resolve().parents[1]))
 
 
 def main() -> int:

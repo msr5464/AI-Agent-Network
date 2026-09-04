@@ -731,7 +731,17 @@ def _mark_step_done(run: RunState, key: str) -> dict:
             slot.update(exact)          # agent-side duration_s overrides the estimate
     except Exception:
         pass
-    return dict(slot)
+    # Underscore-prefixed keys are our own bookkeeping, not part of the contract.
+    return {k: v for k, v in slot.items() if not k.startswith("_")}
+
+
+def _recorded_attempts(run: RunState, key: str) -> int:
+    """How many attempts the agent has recorded for this stage so far."""
+    try:
+        session = metrics_reader.read_session_metrics(run.audit_dir)
+        return int((metrics_reader.step_metrics(session, key) or {}).get("attempts") or 1)
+    except Exception:
+        return 1
 
 
 def _run_metrics(run: RunState) -> dict:
@@ -779,12 +789,41 @@ def _audit_watcher(run: RunState) -> None:
                 **_mark_step_running(run, first_key),
             })
 
+    stages_path = run.audit_dir / "metrics" / "stages.jsonl"
+    last_stages_mtime = [0.0]
+
     while True:
         if run.proc is None:
             return
         # Scan for new step files
+        # A retried stage rewrites its own JSON file and appends another line to
+        # stages.jsonl. Watching that file's mtime costs one stat() per poll and
+        # is what lets a retry be noticed at all — without it the live stream
+        # keeps reporting attempt 1's time and cost while the replayed stream
+        # shows the summed total, so the same run reads differently before and
+        # after a page reload.
+        try:
+            stages_mtime = stages_path.stat().st_mtime
+        except OSError:
+            stages_mtime = 0.0
+        stages_changed = stages_mtime > last_stages_mtime[0]
+        if stages_changed:
+            last_stages_mtime[0] = stages_mtime
+
         for idx, (key, fname, display) in enumerate(steps):
-            if run.step_progress.get(key) in ("done", "failed"):
+            prior = run.step_progress.get(key)
+            if prior in ("done", "failed"):
+                if not stages_changed:
+                    continue
+                attempts = _recorded_attempts(run, key)
+                slot = run.step_metrics.setdefault(key, {})
+                if attempts <= int(slot.get("_emitted_attempts") or 1):
+                    continue
+                slot["_emitted_attempts"] = attempts
+                _append_event(run, "step", {
+                    "key": key, "display": display, "status": prior,
+                    **_mark_step_done(run, key),
+                })
                 continue
             file_path = run.audit_dir / fname
             if file_path.exists() and _step_file_is_fresh(run, idx, file_path):
@@ -796,9 +835,12 @@ def _audit_watcher(run: RunState) -> None:
                 # vocabulary to tell the two apart.
                 step_status = "failed" if _step_has_error(_safe_load_json(file_path)) else "done"
                 run.step_progress[key] = step_status
+                payload = _mark_step_done(run, key)
+                run.step_metrics.setdefault(key, {})["_emitted_attempts"] = \
+                    int(payload.get("attempts") or 1)
                 _append_event(run, "step", {
                     "key": key, "display": display, "status": step_status,
-                    **_mark_step_done(run, key),
+                    **payload,
                 })
                 # Mark the next step as running (if any, and regardless of
                 # whether THIS step failed — the pipeline still runs the next

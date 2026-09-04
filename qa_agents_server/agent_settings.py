@@ -126,6 +126,18 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
+        "key": "framework_dir",
+        "env_var": "FRAMEWORK_DIR",
+        "label": "Automation Repo Path",
+        "description": "Absolute path to the automation repo checkout, overriding "
+                       "<workspace>/<automation repo>. Leave blank unless the checkout "
+                       "is named differently or lives elsewhere.",
+        "type": "text",
+        "category": "common",
+        "default": "",
+        "sensitive": False,
+    },
+    {
         "key": "github_org",
         "env_var": "GITHUB_ORG",
         "label": "GitHub Org",
@@ -139,7 +151,7 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "key": "github_repo_automation",
         "env_var": "GITHUB_REPO_AUTOMATION",
         "label": "Automation Repo",
-        "description": "Name of the automation repo directory under the workspace directory",
+        "description": "Name of the automation repo — the directory under the workspace directory, and the repo name on GitHub. Required even when Automation Repo Path is set.",
         "type": "text",
         "category": "common",
         "default": "Jarvis",
@@ -240,6 +252,18 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
+        "key": "playwright_headless",
+        "env_var": "PLAYWRIGHT_HEADLESS",
+        "label": "Headless Browser",
+        "description": "Turn off to watch every browser any agent starts — selector "
+                       "validation, DOM inspection, exploration, session login, and the "
+                       "test runs themselves. Useful for debugging; keep on for CI runs.",
+        "type": "boolean",
+        "category": "common",
+        "default": True,
+        "sensitive": False,
+    },
+    {
         "key": "testing_mode",
         "env_var": "TESTING_MODE",
         "label": "Testing Mode (cache steps)",
@@ -302,17 +326,6 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
         "min": 1000,
         "max": 600000,
-    },
-    {
-        "key": "playwright_headless",
-        "env_var": "PLAYWRIGHT_HEADLESS",
-        "label": "Headless Browser",
-        "description": "Turn off to run the browser in headed (visible) mode during selector "
-                       "validation. Useful for debugging; keep on for CI runs.",
-        "type": "boolean",
-        "category": "authoring",
-        "default": True,
-        "sensitive": False,
     },
     # ── Test Healing ─────────────────────────────────────────────────────────
     {

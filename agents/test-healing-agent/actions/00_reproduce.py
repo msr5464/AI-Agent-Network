@@ -15,7 +15,7 @@ Exits 0 in every non-crash case. "The test passes" and "this is not a locator
 failure" are both legitimate outcomes, not errors.
 """
 
-import os, sys, json, re
+import os, sys, json, re, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +37,9 @@ from shared.code_analyzer import CodeAnalyzer
 from shared.dom_snapshot import find_snapshot, parse_header
 from shared.playwright_trace import read_actions, failing_action
 from shared import diagnosis
+from shared import workspace as workspace_helper
+from shared import failure_context as _failure_context
+from shared import narration, run_artifacts
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -134,16 +137,9 @@ def classify_failure_shape(text: str, trace_selector: str = "",
 # ── Workspace + report parsing ────────────────────────────────────────────────
 
 def get_workspace() -> Path | None:
-    workspace = Path(WORKSPACE_DIR)
-    if GITHUB_REPO_AUTOMATION:
-        candidate = workspace / GITHUB_REPO_AUTOMATION
-        if candidate.exists():
-            return candidate
-    for candidate in workspace.iterdir() if workspace.exists() else []:
-        if candidate.is_dir() and (candidate / "src").exists() \
-                and candidate.resolve() != REPO_ROOT.resolve():
-            return candidate
-    return None
+    """The automation checkout: FRAMEWORK_DIR, else WORKSPACE_DIR/repo, else by shape."""
+    return workspace_helper.find(WORKSPACE_DIR, GITHUB_REPO_AUTOMATION,
+                                 exclude=REPO_ROOT)
 
 
 def read_report_entries(results_dir: Path, class_simple: str, method: str) -> list:
@@ -175,41 +171,29 @@ def read_report_entries(results_dir: Path, class_simple: str, method: str) -> li
     return [e for e in matched if (e.get("status") or "").upper() not in ("PASSED", "PASS")]
 
 
-def attach_artifacts(issue: dict, results_dir: Path, method_name: str) -> str:
-    """Point the issue at the DOM snapshot and trace this run just produced."""
-    trace_selector = ""
+def _from_this_run(paths: list, not_before: float | None) -> list:
+    """Drop artifacts written before the run started."""
+    return run_artifacts.from_this_run(paths, not_before)
 
-    snapshot = find_snapshot(results_dir, method_name)
-    if snapshot:
-        try:
-            text = snapshot.read_text(encoding="utf-8", errors="ignore")
-            issue["dom_snapshot"] = str(snapshot)
-            issue["failure_url"] = parse_header(text).get("url", "")
-            log(f"  DOM snapshot: {snapshot.name} ({len(text) // 1024}KB)")
-        except OSError as e:
-            log(f"  Could not read DOM snapshot: {e}")
 
-    # Located by convention: JsonTestReporter leaves screenshotPath empty by design.
-    shots = [p for p in results_dir.rglob(f"screenshots/{method_name}_*.png") if p.is_file()]
-    if shots:
-        issue["screenshot"] = str(max(shots, key=lambda p: p.stat().st_mtime))
-        log(f"  Screenshot: {Path(issue['screenshot']).name}")
+def _find_class_file(class_simple: str, workspace: Path) -> str:
+    """The source file declaring this test class, for a run with no method name."""
+    for ext in ("java", "kt"):
+        for found in workspace.rglob(f"{class_simple}.{ext}"):
+            return str(found.relative_to(workspace))
+    return ""
 
-    traces = list(results_dir.rglob(f"traces/{method_name}_*.zip"))
-    if traces:
-        trace = max(traces, key=lambda p: p.stat().st_mtime)
-        issue["trace_path"] = str(trace)
-        failed = failing_action(read_actions(trace))
-        if failed and failed.get("selector"):
-            trace_selector = failed["selector"]
-            issue["failed_selector"] = trace_selector
-            issue["failed_selector_inferred"] = bool(failed.get("inferred"))
-            how = " (inferred from repeated polling)" if failed.get("inferred") else ""
-            log(f"  Trace: {trace.name} — failing selector {trace_selector}{how}")
-        else:
-            log(f"  Trace: {trace.name}")
 
-    return trace_selector
+def attach_artifacts(issue: dict, results_dir: Path, method_name: str,
+                     not_before: float | None = None) -> str:
+    """Point the issue at the DOM snapshot and trace this run just produced.
+
+    The body lives in `shared/run_artifacts.py`: the fix step needs the same
+    thing after a verification run, to tell a repaired element apart from the
+    next one that fails.
+    """
+    return run_artifacts.attach(issue, results_dir, method_name,
+                                not_before=not_before, log=log)
 
 
 def wait_budget_seconds(workspace: Path) -> int | None:
@@ -228,6 +212,27 @@ def wait_budget_seconds(workspace: Path) -> int | None:
             return None
     return None
 
+
+
+def relabel(issue: dict, verdict: dict, mode: str) -> None:
+    """Let an enforced verdict rename the failure. Shadow mode changes nothing.
+
+    `root_cause_category` is not a label — the fix step keys off it, and
+    `extract_element_names` used to return nothing for any value outside
+    ELEMENT_NOT_FOUND/TIMEOUT. So a shadow-mode verdict of WRONG_PAGE, which is
+    supposed to be inert, still reached the model as the classification *and*
+    switched off the page-object lookup that would have contradicted it. A
+    verdict that is not allowed to stop the run is not allowed to rewrite the
+    failure either.
+    """
+    if mode != "enforce":
+        return
+    if verdict.get("verdict") == "LOCATOR_STALE":
+        issue["root_cause_category"] = "ELEMENT_NOT_FOUND"
+    elif verdict.get("verdict") and verdict["verdict"] != diagnosis.ABSTAIN:
+        issue["root_cause_category"] = verdict["verdict"]
+        issue["recommended_action"] = (verdict.get("action")
+                                       or verdict.get("remediation", ""))
 
 
 def gate_decision(shape: str, reason: str, verdict: dict, mode: str,
@@ -318,8 +323,13 @@ def main():
     # what CodeAnalyzer needs later to find the test file again.
     if "." not in full_class:
         try:
-            found = CodeAnalyzer().find_test_file(f"{class_simple}.{method or 'x'}",
-                                                  str(workspace))
+            # `find_test_file` needs a class AND a method that a @Test declares.
+            # A whole-class run has no method, and the placeholder "x" that used
+            # to be passed matched nothing — so package resolution silently never
+            # worked for a class-level run, and warned about a test named ".x".
+            found = (CodeAnalyzer().find_test_file(f"{class_simple}.{method}",
+                                                   str(workspace)) if method
+                     else _find_class_file(class_simple, workspace))
             if found:
                 package = CodeAnalyzer()._extract_package(
                     (workspace / found).read_text(encoding="utf-8", errors="ignore"))
@@ -338,6 +348,9 @@ def main():
         log("REPAIR=true — parking the browser on the failing page")
 
     log("Running the test to reproduce the failure...")
+    # Anything older than this belongs to an earlier run, whatever it is named.
+    # A second of slack absorbs filesystem timestamp granularity.
+    run_started = time.time() - 1
     status, output = run_test(TEST_NAME, workspace, extra_properties=properties,
                               timeout_s=REPRODUCE_TIMEOUT_S, log=log)
 
@@ -385,7 +398,10 @@ def main():
             "error_type": (message.split(":")[0][:80] if ":" in message else "TestFailure"),
             "error_message": message[:2000],
             "stack_trace": location,
-            "execution_log": output[-4000:],
+            # The tail alone is the maven stack-trace block, which contains no
+            # STEP:/ACTION: lines at all — so every consumer that reads how far
+            # the flow got was answering from an empty record.
+            "execution_log": narration.for_handoff(output),
             "class_name": entry_class,
             "method_name": entry_method,
             "full_name": f"{entry_class}.{entry_method}",
@@ -393,14 +409,16 @@ def main():
             "screenshot": "",
             "cause_group_key": "", "cause_group_size": 1,
         }
-        trace_selector = attach_artifacts(issue, results_dir, entry_method)
+        trace_selector = attach_artifacts(issue, results_dir, entry_method,
+                                          not_before=run_started)
 
         # Ask why the element was missing before assuming the locator is at fault.
         # Everything this reads was already on disk; it costs no model call.
         verdict = {}
         try:
             evidence = diagnosis.collect(issue, workspace=workspace, budget_s=budget_s,
-                                         audit_dir=AUDIT_DIR.parent)
+                                         audit_dir=AUDIT_DIR.parent,
+                                         not_before=run_started)
             verdict = diagnosis.diagnose(evidence)
             for line in diagnosis.describe(verdict, evidence):
                 log(f"  {line}")
@@ -415,16 +433,21 @@ def main():
                 log(f"  probe result: {outcome} → {verdict['verdict']} "
                     f"({verdict['confidence']})")
 
+            # anchor_state travels with the verdict: it is measured in the live
+            # page and it is the one fact that separates an element that was
+            # renamed from one that was hidden from one that was there all along.
+            # Dropping it here left the fix step to re-infer it from saved markup,
+            # which cannot tell those apart.
             issue["diagnosis"] = {k: verdict[k] for k in
                                   ("verdict", "confidence", "reasons", "remediation",
-                                   "action", "actionable", "rule")}
+                                   "action", "actionable", "rule", "anchor_state")}
             issue["diagnosis"]["probe"] = verdict.get("probe", {})
             diagnoses[issue["test_name"]] = verdict
         except Exception as exc:
             log(f"  Diagnosis failed ({exc}) — falling back to signal matching")
 
         shape, reason = classify_failure_shape(
-            f"{message}\n{output[-4000:]}", trace_selector,
+            f"{message}\n{narration.for_handoff(output)}", trace_selector,
             bool(issue.get("failed_selector_inferred")))
 
         shape, reason, note = gate_decision(shape, reason, verdict,
@@ -432,16 +455,19 @@ def main():
         if note:
             log(f"  ({note})")
 
-        if verdict.get("verdict") == "LOCATOR_STALE":
-            issue["root_cause_category"] = "ELEMENT_NOT_FOUND"
-        elif verdict.get("verdict") and verdict["verdict"] != diagnosis.ABSTAIN:
-            issue["root_cause_category"] = verdict["verdict"]
-            issue["recommended_action"] = verdict.get("action") or verdict.get("remediation", "")
+        relabel(issue, verdict, DIAGNOSIS_MODE)
 
         shapes.append((issue["test_name"], shape, reason))
         if shape == "LOCATOR" or FORCE:
             issues.append(issue)
-        log(f"  {entry_method}: {shape} — {reason}")
+        # The diagnosis above already said what broke, in more detail and with
+        # its evidence. Repeating the shape classifier's one-liner underneath it
+        # reads as a second, competing verdict; keep it only when there was no
+        # diagnosis to print.
+        if verdict.get("verdict") and verdict["verdict"] != diagnosis.ABSTAIN:
+            log(f"  {entry_method}: queued as {shape}")
+        else:
+            log(f"  {entry_method}: {shape} — {reason}")
 
     # ── Gate on failure shape ─────────────────────────────────────────────────
     if not issues:

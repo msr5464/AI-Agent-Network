@@ -14,6 +14,13 @@ files — and wrong here: test-adaptation-agent refuses to start on a dirty tree
 precisely so that nobody's uncommitted work gets swept into its commit, and a
 force-checkout would destroy exactly what that gate protects. So `sync()` fetches,
 and leaves the decision about a dirty tree to the caller that already makes it.
+
+**One env var names the checkout.** `FRAMEWORK_DIR` is an absolute path and wins
+outright; otherwise the path is `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION`, which is
+what every agent computed inline before. The two settings are not
+interchangeable: `GITHUB_REPO_AUTOMATION` is also the repo name on GitHub, used
+to build clone and PR URLs, so `FRAMEWORK_DIR` overrides where the checkout
+lives and nothing else.
 """
 
 from __future__ import annotations
@@ -22,6 +29,77 @@ import os
 import subprocess
 from pathlib import Path
 from typing import Dict, Optional
+
+
+_DIR_ENV = "FRAMEWORK_DIR"
+_UNSET = "«FRAMEWORK_DIR-unset»"
+
+
+def configured() -> Optional[Path]:
+    """The checkout path named by FRAMEWORK_DIR, if it is set."""
+    value = os.environ.get(_DIR_ENV, "").strip()
+    return Path(value).expanduser() if value else None
+
+
+def expected(workspace_dir, repo_name: str = "") -> Optional[Path]:
+    """Where the checkout belongs, whether or not it is there yet.
+
+    Callers that clone into the path, or that report it as missing, need an
+    answer before anything exists on disk — `find` cannot give them one. Returns
+    None when neither FRAMEWORK_DIR nor both halves of the derived path are set,
+    because inventing a default repo name only moves the misconfiguration
+    somewhere harder to read.
+    """
+    override = configured()
+    if override is not None:
+        return override
+    if not (workspace_dir and repo_name):
+        return None
+    return Path(workspace_dir) / repo_name
+
+
+def resolve(workspace_dir, repo_name: str = "", exclude=None) -> Path:
+    """The checkout path, always a Path so module-level constants stay usable.
+
+    FRAMEWORK_DIR, else WORKSPACE_DIR/GITHUB_REPO_AUTOMATION, else an existing
+    sibling checkout matched by shape. With none of those it returns a path that
+    cannot exist, so the caller's own "framework repo not found" check names the
+    misconfiguration — an import-time crash would take the agent's error
+    reporting down with it and say nothing useful.
+    """
+    return (expected(workspace_dir, repo_name)
+            or find(workspace_dir, exclude=exclude)
+            or Path(workspace_dir) / _UNSET)
+
+
+# The only keys this module has any business injecting. Reading config/.env
+# wholesale looks harmless and is not: it also carries PLAYWRIGHT_HEADLESS,
+# model names, DB credentials and Slack tokens, so a caller that wanted to know
+# where the repo lives would silently have its browser mode — and everything
+# else — reconfigured underneath it.
+_LOCATION_KEYS = (_DIR_ENV, "WORKSPACE_DIR", "GITHUB_REPO_AUTOMATION")
+
+
+def load_repo_env(root=None) -> None:
+    """Read the checkout location out of config/.env, and nothing else.
+
+    For entry points that run outside an agent — the CLIs and the locator_heal
+    bench — nothing has sourced the environment yet, so `resolve` would fall
+    through to "the first directory with a src/", which on a machine with
+    several checkouts is reliably the wrong one. Already-exported values win.
+    """
+    root = Path(root) if root else Path(__file__).resolve().parents[1]
+    for candidate in (root / "config" / ".env", root / ".env"):
+        if not candidate.exists():
+            continue
+        for line in candidate.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if key in _LOCATION_KEYS:
+                os.environ.setdefault(key, value.strip().strip('"').strip("'"))
 
 
 def repo_https_url(org: str, repo: str) -> str:
@@ -43,7 +121,15 @@ def _redact(text: str, token: str) -> str:
 
 
 def find(workspace_dir, repo_name: str = "", exclude=None) -> Optional[Path]:
-    """An existing checkout under `workspace_dir`, by name or by shape."""
+    """An existing checkout under `workspace_dir`, by name or by shape.
+
+    FRAMEWORK_DIR is an assertion, not a hint: if it is set and empty on disk the
+    answer is None rather than a repo found by shape-matching somewhere else,
+    which would silently work against a checkout nobody asked for.
+    """
+    override = configured()
+    if override is not None:
+        return override if override.exists() else None
     root = Path(workspace_dir)
     if repo_name and (root / repo_name).exists():
         return root / repo_name
@@ -68,10 +154,9 @@ def clone(workspace_dir, org: str, repo: str, token: str, branch: str = "main",
         log("Cannot clone: GITHUB_TOKEN not set")
         return None
 
-    root = Path(workspace_dir)
-    dest = root / repo
+    dest = expected(workspace_dir, repo) or Path(workspace_dir) / repo
     log(f"Automation repo not found at {dest} — cloning {org}/{repo} …")
-    root.mkdir(parents=True, exist_ok=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         ["git", "clone", "--depth", "1", "--branch", branch,
          authenticated_url(org, repo, token), str(dest)],

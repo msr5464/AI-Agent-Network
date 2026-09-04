@@ -29,6 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → li
 from shared.log import log as _log
 def log(msg): _log("fix", msg)
 
+from shared import browser_mode
+
 # CodeAnalyzer import — graceful fallback if not available
 try:
     from shared.code_analyzer import (CodeAnalyzer as _CodeAnalyzer, split_class_members,
@@ -69,6 +71,20 @@ GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "")
 GITHUB_DEFAULT_BRANCH  = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
 AUTOFIX_BRANCH_PREFIX  = os.environ.get("AUTOFIX_BRANCH_PREFIX", "chore/qa-autofix")
 
+# Step 01 (Locate) resolves locators deterministically. In enforce mode a
+# verified resolution replaces the model call entirely; in shadow it is recorded
+# and ignored, so the fix step behaves exactly as it did before.
+LOCATE_MODE = os.environ.get("LOCATE_MODE", "shadow").strip().lower()
+
+# AUTO_PUSH=false means "let me look at this first". Branching and committing
+# would defeat that: the change disappears from `git status`, and reviewing it
+# means knowing which branch to look on. So a dry run leaves the edits in the
+# working tree, on whatever branch the user is already on.
+# Parsed exactly as 02_ship.py does. An empty value must not mean "commit" here
+# while meaning "do not push" there — the two halves of one agent disagreeing
+# about the same flag is how a fix ends up committed to a branch nobody pushes.
+AUTO_PUSH = os.environ.get("AUTO_PUSH", "true").lower() == "true"
+
 KNOWN_ISSUES_FILE = AGENT_DIR / "feedback" / "known-issues.json"
 REPO_CONTEXT_FILE = os.environ.get("REPO_CONTEXT_FILE", "")
 MAX_FIXES         = int(os.environ.get("AUTO_FIX_MAX_FIXES_PER_RUN", "5"))
@@ -91,7 +107,7 @@ FIX_RULES_FILE      = REPO_ROOT / "config" / "prompts" / "fix.md"
 INSPECT_DOM        = os.environ.get("AUTOFIX_INSPECT_DOM", "true").lower() == "true"
 AUTOFIX_BASE_URL   = os.environ.get("AUTOFIX_BASE_URL", "")
 DOM_TIMEOUT_S      = int(os.environ.get("AUTOFIX_DOM_TIMEOUT_S", "600"))
-PW_HEADLESS        = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
+PW_HEADLESS        = browser_mode.headless()
 REPAIR_SESSION_FILE = os.environ.get("AUTOFIX_REPAIR_SESSION", "")
 LOGIN_USERNAME     = os.environ.get("AUTOFIX_LOGIN_USERNAME", "")
 LOGIN_PASSWORD     = os.environ.get("AUTOFIX_LOGIN_PASSWORD", "")
@@ -138,8 +154,12 @@ try:
 except ImportError:
     _HAS_MCP_CONFIG = False
 
-from shared.dom_snapshot import distill as distill_dom, format_for_prompt as format_dom
-from shared import (adaptation_handoff, diagnosis, verdict_feedback,
+from shared.dom_snapshot import (distill as distill_dom,
+                                format_for_prompt as format_dom,
+                                load_fingerprints,
+                                candidates_from_fingerprints)
+from shared import (adaptation_handoff, baseline, diagnosis, failure_identity,
+                    locator_patch, narration, run_artifacts, verdict_feedback,
                     workspace as workspace_helper)
 from shared.playwright_trace import read_actions, format_for_prompt as format_trace
 
@@ -217,30 +237,32 @@ def clone_automation_repo(workspace: Path) -> Path | None:
 
 
 def get_workspace() -> Path | None:
+    """The automation checkout, cloned if it is genuinely absent.
+
+    FRAMEWORK_DIR names the path outright; otherwise it is
+    WORKSPACE_DIR/GITHUB_REPO_AUTOMATION, and failing both, a sibling checkout
+    matched by shape — which works but is a guess, so it says so.
+    """
+    explicit = workspace_helper.configured()
     workspace_dir = os.environ.get("WORKSPACE_DIR", "")
-    if not workspace_dir:
+    if not workspace_dir and explicit is None:
         # Fallback: parent of QA-Agent-Network repo (automation repo should be a sibling)
         workspace_dir = str(REPO_ROOT.parent)
-        log(f"Warning: WORKSPACE_DIR not set — defaulting to {workspace_dir}")
-    workspace = Path(workspace_dir)
+        log(f"Warning: neither FRAMEWORK_DIR nor WORKSPACE_DIR set — "
+            f"defaulting to {workspace_dir}")
 
-    if GITHUB_REPO_AUTOMATION:
-        p = workspace / GITHUB_REPO_AUTOMATION
-        if p.exists():
-            return p
-        # Repo not present — clone it
-        log(f"{GITHUB_REPO_AUTOMATION} not found in {workspace} — attempting clone")
-        return clone_automation_repo(workspace)
+    found = workspace_helper.find(workspace_dir, GITHUB_REPO_AUTOMATION, exclude=REPO_ROOT)
+    if found is not None:
+        if explicit is None and not GITHUB_REPO_AUTOMATION:
+            log(f"Warning: auto-detected workspace {found} — set FRAMEWORK_DIR to avoid this")
+        return found
 
-    # No repo name set — scan for any sibling repo with a src/ directory
-    for candidate in workspace.iterdir():
-        # Skip QA-Agent-Network itself — the automation repo must be separate
-        if not candidate.is_dir() or candidate.resolve() == REPO_ROOT.resolve():
-            continue
-        if (candidate / "src").exists():
-            log(f"Warning: auto-detected workspace {candidate} — set WORKSPACE_DIR + GITHUB_REPO_AUTOMATION to avoid this")
-            return candidate
-    return None
+    target = workspace_helper.expected(workspace_dir, GITHUB_REPO_AUTOMATION)
+    if target is None:
+        return None
+    # Nothing on disk at the configured path — clone into it.
+    log(f"{target} not found — attempting clone")
+    return clone_automation_repo(Path(workspace_dir or REPO_ROOT.parent))
 
 # ── Likely location extractor ─────────────────────────────────────────────────
 
@@ -387,7 +409,15 @@ def repair_possible(workspace: Path) -> tuple:
     return True, ""
 
 
-def park_browser_for_repair(workspace: Path, test_name: str) -> dict:
+def _same_page(left: str, right: str) -> bool:
+    """Whether two URLs are the same page, ignoring ids and query strings."""
+    if not left or not right:
+        return True          # nothing to contradict; the caller keeps what it has
+    return baseline.url_shape(left) == baseline.url_shape(right)
+
+
+def park_browser_for_repair(workspace: Path, test_name: str,
+                            expected_url: str = "") -> dict:
     """Re-run the failing test with the browser parked, then attach to it.
 
     Only worth the extra test run once the cheap path has already failed: the
@@ -413,10 +443,11 @@ def park_browser_for_repair(workspace: Path, test_name: str) -> dict:
         # It passed this time — flaky, not a broken locator.
         log("  The test passed on the re-run; nothing to inspect")
         return {}
-    return find_repair_session(workspace, test_name)
+    return find_repair_session(workspace, test_name, expected_url)
 
 
-def find_repair_session(workspace: Path, test_name: str) -> dict:
+def find_repair_session(workspace: Path, test_name: str,
+                        expected_url: str = "") -> dict:
     """A browser parked on this test's failing page, if one is live right now.
 
     `repairMode` in the automation framework leaves the browser open at the point
@@ -460,7 +491,21 @@ def find_repair_session(workspace: Path, test_name: str) -> dict:
             except OSError:
                 pass
             continue
-        log(f"  Live repair session: {endpoint} parked on {session.get('url', 'unknown URL')}")
+        # Parked, alive, and for the right test — none of which says it stopped
+        # where the failure was. A re-run that dies at an earlier step parks on a
+        # page the failing locator was never on, and answers questions about that
+        # page instead. Being on the wrong page is not a weaker version of being
+        # on the right one; it is a different page.
+        parked_url = session.get("url", "")
+        if not _same_page(parked_url, expected_url):
+            log(f"  Repair session parked on {parked_url or 'an unknown page'}, but the "
+                f"failure was on {expected_url} — the re-run stopped somewhere else, "
+                f"ignoring it")
+            session["_path"] = str(path)
+            _reap_parked_browser(session)   # frees the CDP port for the next attempt
+            continue
+
+        log(f"  Live repair session: {endpoint} parked on {parked_url or 'unknown URL'}")
         session["_path"] = str(path)
         return session
     return {}
@@ -843,7 +888,7 @@ def inspect_live_dom(ctx: dict, url: str, workspace: Path, props: dict,
     prompt = _DOM_PROMPT.format(url=url, elements=elements, failure=failure,
                                 credentials=credentials)
 
-    log(f"  Inspecting live DOM at {url} ({'headless' if PW_HEADLESS else 'headed'})...")
+    log(f"  Inspecting live DOM at {url} ({browser_mode.label(PW_HEADLESS)})...")
     raw = call_claude(
         prompt, AUDIT_DIR,
         use_system_prompt=False,
@@ -891,6 +936,23 @@ def load_dom_snapshot(issue: dict, element_names: list) -> dict:
     except Exception as e:
         log(f"  Could not read DOM snapshot: {e}")
         return {}
+
+    # Prefer the capture over the markup. Parsing the HTML cannot tell what was
+    # visible, and describes elements only by the attributes it thinks to look
+    # for — on a page whose edit control is an <img> carrying nothing but an
+    # `alt`, it offered three candidates, all wrong, and could not express the
+    # right one at all. The sidecar has every element with computed visibility.
+    prints = load_fingerprints(path)
+    if prints.get("elements"):
+        distilled = candidates_from_fingerprints(
+            prints, element_names, issue.get("failed_selector") or "")
+        if not distilled.get("error"):
+            log(f"  DOM candidates from the failure capture: "
+                f"{distilled['total_elements']} visible element(s), "
+                f"{len(distilled['likely_matches'])} in the failing scope "
+                f"at {distilled.get('url') or 'unknown URL'}")
+            return distilled
+        log(f"  Capture unusable ({distilled['error']}) — parsing the saved HTML")
 
     distilled = distill_dom(text, element_names)
     if distilled.get("error"):
@@ -969,6 +1031,13 @@ def build_candidate_context(issue: dict, workspace: Path, prev_test_output: str,
             )
         except Exception as e:
             log(f"  find_page_objects_for_locators failed: {e}")
+    # Ranked by locator similarity, which a generic selector makes meaningless:
+    # `button[type='submit']` is declared by a login page, an OTP page and a
+    # checkout page alike, and the model was handed all three with nothing saying
+    # which one the test was actually on. The failure names it — put it first.
+    owner = failure_identity.identify(f"{error_message}\n{stack_trace}").get("page_object")
+    if owner and page_objects:
+        page_objects.sort(key=lambda po: Path(po.get("path", "")).stem != owner)
 
     # Related files from imports
     related_files = []
@@ -1097,6 +1166,172 @@ def load_fix_rules() -> str:
     return _DEFAULT_FIX_RULES
 
 
+_LOCATE_CACHE = None
+
+
+def load_locate_resolutions() -> list:
+    """What step 01 concluded, or an empty list if it did not run."""
+    global _LOCATE_CACHE
+    if _LOCATE_CACHE is None:
+        path = AUDIT_DIR / "01-locate.json"
+        try:
+            _LOCATE_CACHE = (json.loads(path.read_text()) or {}).get("resolutions") or []
+        except (OSError, ValueError):
+            _LOCATE_CACHE = []
+    return _LOCATE_CACHE
+
+
+# What Locate concluded, and whether it leaves Fix anything to do. Two of these
+# are deliberate refusals that Fix must honour rather than override: healing a
+# locator an assertion reads turns a caught regression into a green build, and a
+# locator that has already been healed repeatedly needs a stable test id, not a
+# fourth heal. The rest are the cases Locate cannot serve — no recorded
+# fingerprint, a page its replay cannot reach, an element it found but could not
+# express uniquely — which is precisely where Fix earns its place.
+_LOCATE_DEFER = {
+    "ASSERTION_LOCATOR": "the locator is read by an assertion — healing it would "
+                         "turn a caught regression into a green build",
+    "UNSTABLE_LOCATOR": "this locator has been healed repeatedly — it needs a "
+                        "stable test id, not another selector",
+    "MISBOUND": "the selector resolves to the wrong element; rebinding it is a "
+                "review decision, not a search",
+}
+
+
+def locate_outcome(ctx: dict) -> dict:
+    """What Locate concluded for this cluster's selector, in every mode.
+
+    Distinct from locate_resolution(), which only speaks in enforce mode because
+    it *applies* an answer. This only reports one, so shadow mode has no reason to
+    withhold it: knowing that Locate already tried literal repair, identity
+    attributes, role+name and anchoring is what stops Fix spending a model call
+    re-treading the same ground.
+    """
+    failed = ctx.get("failed_selector") or ""
+    if not failed:
+        return {}
+    for resolution in load_locate_resolutions():
+        if resolution.get("failed_selector") == failed:
+            return resolution
+    return {}
+
+
+def locate_route(outcome: dict) -> tuple:
+    """(route, note) for what Fix should do about Locate's verdict.
+
+    route is one of: "consume" (Locate proved an answer), "defer" (Locate refused
+    on purpose and so must Fix), or "own" (Locate could not answer; Fix searches).
+    """
+    if not outcome:
+        return "own", "Locate did not run for this selector"
+    verdict = outcome.get("verdict") or ""
+    classification = outcome.get("classification") or ""
+    if verdict == "HEALED":
+        return "consume", (f"Locate proved {outcome.get('new_locator')!r} "
+                           f"({outcome.get('strategy')}, score {outcome.get('score')}, "
+                           f"verification {outcome.get('verification')})")
+    for name, why in _LOCATE_DEFER.items():
+        if name in (verdict, classification):
+            return "defer", why
+    return "own", (outcome.get("reason")
+                   or f"Locate returned {verdict or classification or 'nothing'}")
+
+
+def locate_resolution(ctx: dict):
+    """A verified resolution for this cluster's failing selector, if there is one.
+
+    Shadow mode returns nothing on purpose: the resolution is still written to
+    01-locate.json for comparison, but the model keeps making the decision until
+    the numbers say it should not.
+    """
+    if LOCATE_MODE != "enforce":
+        return None
+    # Only on the first attempt. Reaching attempt 2 means the located locator was
+    # applied and the test still failed, so re-applying the identical edit would
+    # burn the retry on a known-failing answer. Hand the retry to the model, which
+    # is what the retry loop is for.
+    if FIX_ATTEMPT > 1:
+        log(f"  attempt {FIX_ATTEMPT}: the located fix did not verify — asking the model")
+        return None
+    failed = ctx.get("failed_selector") or ""
+    if not failed:
+        return None
+    for resolution in load_locate_resolutions():
+        if (resolution.get("verdict") == "HEALED"
+                and resolution.get("failed_selector") == failed
+                and resolution.get("new_expression")):
+            return resolution
+    return None
+
+
+def build_located_fix(resolution: dict, ctx: dict, workspace: Path):
+    """Shape a resolution like the model's output. Returns (fix_json, error).
+
+    Deliberately produces the identical structure `extract_fix_json` yields, so
+    the edit guards, the diff cap, the test verification and the audit record all
+    run exactly as they do for a model-written fix. A deterministic fix earns no
+    exemptions.
+    """
+    page_object, field = resolution.get("page_object"), resolution.get("field")
+    if not page_object or not field:
+        return None, "resolution names no page object field"
+
+    target = None
+    for candidate in ctx.get("page_objects") or []:
+        path = Path(candidate["path"])
+        if path.stem == page_object:
+            target = path if path.is_absolute() else workspace / path
+            break
+    if target is None or not target.exists():
+        return None, f"page object {page_object}.java not found in this workspace"
+
+    try:
+        source = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"cannot read {target}: {exc}"
+
+    edit, error = locator_patch.declaration_edit(source, field,
+                                                 resolution["new_expression"])
+    if edit is None:
+        return None, error
+
+    return {
+        "fixable": True,
+        "target_file": str(target),
+        "edits": [edit],
+        "fix_description": (
+            f"Located deterministically: {resolution['failed_selector']} no longer "
+            f"matches. Scored {resolution.get('score')} against the fingerprint "
+            f"recorded on the last good run (margin {resolution.get('margin'):+}, "
+            f"{resolution.get('tier')}), then verified by performing the step "
+            f"({resolution.get('verification')})."),
+    }, ""
+
+
+def _refresh_baseline_after_heal(ctx: dict, workspace: Path) -> None:
+    """Re-record the healed locator's fingerprint, if this was a located fix.
+
+    Advisory: a stale fingerprint costs a later diagnosis some confidence, so
+    failing the run over one would be trading a real fix for a bookkeeping error.
+    """
+    located = ctx.get("located")
+    if not located or not located.get("page_object"):
+        return
+    try:
+        directory = baseline.directory(workspace)
+        if not directory:
+            return
+        path = Path(directory) / f"{located['page_object']}.json"
+        locator_patch.update_baseline(
+            path, located["field"], located.get("new_locator", ""),
+            fingerprint={}, score=located.get("score", 0.0),
+            source_expression=located.get("new_expression", ""))
+        log(f"  Baseline history updated for {located['page_object']}#{located['field']}")
+    except Exception as exc:                       # noqa: BLE001 - advisory only
+        log(f"  Could not update the baseline ({type(exc).__name__}) — "
+            f"the next green run will re-record it")
+
+
 def build_fix_prompt(ctx: dict, fix_rules: str) -> str:
     page_obj_text = ""
     for po in ctx["page_objects"]:
@@ -1151,10 +1386,71 @@ network log and the step timeline — before you were called.
             diagnosis_text += (
                 "\nThe page is confirmed correct and its other locators still match, "
                 "so a replacement for the failing one does exist on the page below.\n")
+        if verdict["verdict"] == "AMBIGUOUS_LOCATOR":
+            diagnosis_text += (
+                "\n**The element is present — the selector just matches more than one "
+                "of them.** Playwright refuses to act on an ambiguous locator, so the "
+                "action never ran. Narrow the existing selector to the one element "
+                "this step means, using something that distinguishes it from its "
+                "siblings below (a distinguishing class, an accessible name, the "
+                "enclosing form or section). Do NOT reach for `.first()` or `.nth()` "
+                "to silence it: position is not identity, and the next sibling added "
+                "to that page moves it. Do NOT widen the selector.\n")
+        # Measured in the live page at the moment of the timeout, so it outranks
+        # anything inferred from the saved markup.
+        if verdict.get("anchor_state") == "hidden":
+            diagnosis_text += (
+                "\n**The failing selector DID match an element — it was simply not "
+                "visible.** So this is not a renamed locator, and swapping in another "
+                "selector for the same hidden element will time out in exactly the "
+                "same way. Either the element must be revealed first (an expand, a "
+                "scroll, a parent click the flow is missing), or the test is "
+                "targeting the wrong element entirely. Only propose a new selector "
+                "if you can point to a *visible* element below that does the job; "
+                "otherwise return `fixable: false` and say the element was present "
+                "but hidden.\n")
+        elif verdict.get("anchor_state") == "absent":
+            diagnosis_text += (
+                "\nThe failing selector matched nothing at all in the live page, so "
+                "the element really was renamed, moved or removed.\n")
         elif not verdict.get("actionable"):
             diagnosis_text += (
                 "\nThis is **not** a stale locator. Do not propose a new selector: "
                 "return `fixable: false` with this cause as the reason.\n")
+
+    # What the deterministic search already established. Without this the model
+    # re-derives — worse — an answer that was computed and, when HEALED, proved by
+    # performing the step in a live browser twelve seconds earlier.
+    locate_text = ""
+    outcome = ctx.get("locate_outcome") or {}
+    if outcome and ctx.get("locate_route") == "consume":
+        locate_text = f"""
+## \u2705 ALREADY LOCATED AND PROVED
+A deterministic search matched the element against the fingerprint recorded on
+the last good run, then **performed the action on it in a live browser**:
+
+- replacement: `{outcome.get('new_locator')}`
+- expression: `{outcome.get('new_expression')}`
+- score {outcome.get('score')} (margin {outcome.get('margin')}, {outcome.get('tier')}),
+  verification {outcome.get('verification')}
+
+Use this unless the source below makes it impossible. It is evidence, not a
+suggestion — it was checked against the running page.
+"""
+    elif outcome:
+        tried = "\n".join(f"- {a.get('loop')}: {a.get('detail')}"
+                           for a in (outcome.get("attempts") or []))
+        locate_text = f"""
+## \u26a0\ufe0f THE DETERMINISTIC SEARCH ALREADY FAILED HERE
+It could not propose a locator: {ctx.get('locate_note') or outcome.get('reason')}
+
+What it already tried, so you do not repeat it:
+{tried or '- (no attempt log recorded)'}
+
+Literal repair of the old selector, identity attributes, role + accessible name
+and anchoring to a surviving ancestor have all been ruled out. A different
+strategy is needed — the evidence below, not another variation on the string.
+"""
 
     # Observed DOM outranks everything else in this prompt: the source below is
     # by definition the version that was already failing.
@@ -1178,19 +1474,28 @@ closest-looking one. Either the element was removed (a product bug) or this is n
 the page the test was supposed to reach — both mean `fixable: false`, with which
 one it is stated as the reason.
 """
-    elif dom.get("selectors"):
+
+    # A selector confirmed in a live browser outranks the snapshot, and used to be
+    # unreachable: the branches were exclusive, a snapshot exists on every real
+    # failure, so the confirmed selector was found, logged, and then never shown
+    # to the model — which answered with a guess of its own instead.
+    if dom.get("selectors"):
         found = "\n".join(f"- `{name}` → `{sel}`" for name, sel in dom["selectors"].items())
-        dom_text = f"""
+        dom_text += f"""
 ## ✅ LIVE DOM — CONFIRMED SELECTORS (observed in a real browser just now)
 These were read from the actual page and each was verified to match exactly one
-element. **Prefer these over anything you infer from the source below.**
+element. **This is the strongest evidence in this prompt — prefer it over the
+snapshot above and over anything you infer from the source below. Use one of
+these unless you can say why it is wrong.**
 
 {found}
 """
         if dom.get("page_dump"):
             dom_text += f"\nVisible interactive elements on the page:\n```json\n{dom['page_dump']}\n```\n"
     elif dom.get("absent"):
-        dom_text = f"""
+        # Appended, not assigned: the snapshot block above may already be here,
+        # and overwriting it would drop the strongest evidence in the prompt.
+        dom_text += f"""
 ## ⚠️ LIVE DOM — ELEMENT GENUINELY ABSENT
 A real browser was opened on the failing page and these elements were not present:
 {chr(10).join('- ' + a for a in dom['absent'])}
@@ -1198,7 +1503,7 @@ A real browser was opened on the failing page and these elements were not presen
 This may be a PRODUCT bug rather than a broken locator. If the element is simply
 gone rather than renamed, set `fixable: false` and say so.
 """
-    elif dom.get("status") and dom["status"] != "skipped":
+    elif dom.get("status") and dom["status"] != "skipped" and not dom_text:
         dom_text = f"""
 ## ⚠️ LIVE DOM — NOT AVAILABLE
 The page could not be inspected ({dom['status']}). Everything below is static
@@ -1288,6 +1593,7 @@ Work independently on this test case only.
 
 ## Extracted Element Names
 {chr(10).join(f"- {e}" for e in ctx['element_names']) if ctx['element_names'] else "- (none extracted)"}
+{locate_text}
 {dom_text}
 ## Execution Log (truncated)
 ```
@@ -1352,6 +1658,12 @@ def _attempt_history(result: dict) -> list:
         for f in result.get(bucket) or []:
             if f.get("fix_attempt") not in (None, FIX_ATTEMPT):
                 continue        # carried forward from an earlier attempt
+            # An "advanced" entry sits in failed_fixes because the test is not
+            # green yet, but its edit repaired what it targeted and is still on
+            # disk. Reporting it as "failed, reverted" describes the opposite of
+            # what happened, and is what the console summary said while the fix
+            # it was describing was sitting in the working tree.
+            kept = f.get("status") == "advanced"
             entries.append({
                 "test_name": f.get("test_name"),
                 "target_file": f.get("target_file"),
@@ -1359,8 +1671,10 @@ def _attempt_history(result: dict) -> list:
                 "unfixable_reason": f.get("unfixable_reason") or "",
                 "fix_diff": (f.get("fix_diff") or "")[:4000],
                 "status": f.get("status"),
-                "outcome": outcome,
-                "reverted": outcome == "failed" and bool(f.get("fix_diff")),
+                "outcome": "kept — the test now stops at a later locator" if kept
+                           else outcome,
+                "reverted": (not kept and outcome == "failed"
+                             and bool(f.get("fix_diff"))),
             })
 
     history = [h for h in history if h.get("attempt") != FIX_ATTEMPT]
@@ -1437,6 +1751,71 @@ def evaluate_shadow_guards(original: str, updated: str, target_file, ctx: dict) 
     if snapshot:
         rows.append({"guard": "_snapshot", "would_reject": False, "reason": snapshot})
     return rows
+
+
+def split_by_progress(still_failing: list) -> tuple:
+    """Split still-failing tests into those that moved on and those that did not.
+
+    A run that still fails is not proof the edit was wrong. If the flow now stops
+    at a *different* element, the repaired one works and the test has simply
+    reached the next broken locator — which is progress, and reverting there
+    throws away a good fix and guarantees the next attempt spends itself
+    re-fixing the same thing.
+
+    Returns (advanced, unchanged). `advanced` entries carry the before/after
+    failure so the caller can name what moved.
+    """
+    advanced, unchanged = [], []
+    for member_name, member_output, member, member_started in still_failing:
+        before = failure_identity.identify(
+            f"{member.get('error_message') or ''}\n{member.get('stack_trace') or ''}")
+        after = failure_identity.identify(member_output)
+        if failure_identity.same_locator(before, after):
+            unchanged.append((member_name, member_output, member))
+        else:
+            advanced.append((member_name, member_output, member,
+                             member_started, before, after))
+    return advanced, unchanged
+
+
+def _refresh_issue(issue: dict, output: str, workspace: Path,
+                   started: float) -> dict:
+    """The same test's issue, rebuilt around the element that fails NOW.
+
+    After an edit lands, the failure on the screen can be a different element
+    entirely. Carrying the original issue into the next attempt hands it a
+    repaired selector, a stale DOM snapshot and a diagnosis about a problem that
+    no longer exists — which is how a retry spends itself re-fixing what it just
+    fixed. Everything here is read from the artifacts the verification run wrote.
+    """
+    refreshed = dict(issue)
+    failure = failure_identity.identify(output)
+    refreshed.update({
+        "error_message": output[-2000:],
+        "root_cause": (output or "")[:400],
+        "execution_log": narration.for_handoff(output),
+        # Cleared before re-attaching: a stale path that survives is worse than
+        # an absent one, because it reads as this failure's evidence.
+        "dom_snapshot": "", "failure_url": "", "trace_path": "",
+        "failed_selector": "", "screenshot": "", "failure_context": "",
+        "diagnosis": {},
+    })
+    if failure.get("selector"):
+        refreshed["failed_selector"] = failure["selector"]
+    if failure.get("page_object"):
+        refreshed["stack_trace"] = f"{failure['page_object']}.java"
+
+    results_dir = workspace / os.environ.get("TEST_RESULTS_DIR_NAME", "test-output")
+    method = (issue.get("test_name") or "").rsplit(".", 1)[-1]
+    try:
+        from_trace = run_artifacts.attach(refreshed, results_dir, method,
+                                          not_before=started)
+        if from_trace:
+            refreshed["failed_selector"] = from_trace
+    except Exception as exc:                        # noqa: BLE001 - advisory only
+        log(f"  could not attach fresh artifacts ({type(exc).__name__}) — the next "
+            f"attempt will work from the failure text alone")
+    return refreshed
 
 
 def run_single_test(test_name: str, workspace: Path) -> tuple:
@@ -1522,16 +1901,27 @@ def main():
         if prev_path.exists():
             prev_data = json.loads(prev_path.read_text())
             failed_names = set()
+            # An attempt that repaired its element and uncovered the next one
+            # wrote the new failure down. Without it this retry re-investigates
+            # the selector it just fixed: a repaired locator, a DOM snapshot from
+            # before the edit, and a diagnosis of a problem that no longer exists.
+            refreshed = {}
             for fix in prev_data.get("failed_fixes", []):
                 prev_test_outputs[fix["test_name"]] = fix.get("test_output", "")
                 failed_names.add(fix["test_name"])
+                if fix.get("next_issue"):
+                    refreshed[fix["test_name"]] = fix["next_issue"]
             carried_fixes = prev_data.get("fixes", [])
             carried_unverified = prev_data.get("unverified_fixes", [])
             if failed_names:
                 before = len(eligible)
-                eligible = [i for i in eligible if i["test_name"] in failed_names]
+                eligible = [refreshed.get(i["test_name"], i) for i in eligible
+                            if i["test_name"] in failed_names]
                 log(f"Retry attempt {FIX_ATTEMPT}: re-attempting {len(eligible)} of "
                     f"{before} issue(s) — {len(carried_fixes)} already fixed and committed")
+                for name, issue in refreshed.items():
+                    log(f"  {name.rsplit('.', 1)[-1]}: the previous fix landed — now "
+                        f"working on {issue.get('failed_selector') or 'the next failure'}")
 
     log(f"{len(eligible)} eligible failing test(s) to analyse")
 
@@ -1540,39 +1930,62 @@ def main():
     # On retry (FIX_ATTEMPT > 1), reuse the same branch so commits stack
     safe_tag    = re.sub(r"[^a-zA-Z0-9_-]", "-", build_tag).lower()
     branch_name = f"{AUTOFIX_BRANCH_PREFIX}/{safe_tag}"
-    ok, _, err  = run_git(["fetch", "origin"], workspace, push_url=_authenticated_url())
-    if ok:
-        # FIX_ATTEMPT 1: reset to origin base so we always start clean
-        # FIX_ATTEMPT > 1: reuse the existing branch (fixes accumulate across retries)
-        if FIX_ATTEMPT <= 1:
-            run_git(["checkout", "-B", branch_name, f"origin/{GITHUB_DEFAULT_BRANCH}"], workspace)
-        else:
-            # Branch should already exist from attempt 1; just check it out
-            ret, _, _ = run_git(["checkout", branch_name], workspace)
-            if not ret:
-                # Branch doesn't exist yet (e.g. first attempt committed nothing) — create it
-                run_git(["checkout", "-B", branch_name, f"origin/{GITHUB_DEFAULT_BRANCH}"], workspace)
-        log(f"Branch: {branch_name} (attempt {FIX_ATTEMPT}, base: {GITHUB_DEFAULT_BRANCH})")
+    on_branch = False
+    if not AUTO_PUSH:
+        # Dry run: no branch, no commit. The whole block below is skipped rather
+        # than routed through the offline fallback — that path creates a local
+        # branch too, and it would drag the user's working tree onto it.
+        _, current, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace)
+        log(f"AUTO_PUSH=false — staying on {current.strip() or 'the current branch'}; "
+            f"edits will be left uncommitted for review")
     else:
-        # Offline, or a bad token. Branch off whatever is checked out rather than
-        # committing onto it: "proceeding on current branch" quietly meant fixes
-        # landed as commits on main, which is not something an autofix should
-        # ever do to someone's working checkout.
-        log(f"Warning: git fetch failed ({err})")
-        ok_local, _, local_err = run_git(["checkout", "-B", branch_name], workspace)
-        if ok_local:
-            log(f"Branch: {branch_name} (created from the current HEAD — no remote base)")
+        ok, _, err = run_git(["fetch", "origin"], workspace, push_url=_authenticated_url())
+        if ok:
+            # FIX_ATTEMPT 1: reset to origin base so we always start clean
+            # FIX_ATTEMPT > 1: reuse the existing branch (fixes accumulate across retries)
+            if FIX_ATTEMPT <= 1:
+                on_branch, _, switch_err = run_git(
+                    ["checkout", "-B", branch_name, f"origin/{GITHUB_DEFAULT_BRANCH}"], workspace)
+            else:
+                # Branch should already exist from attempt 1; just check it out
+                on_branch, _, switch_err = run_git(["checkout", branch_name], workspace)
+                if not on_branch:
+                    # Branch doesn't exist yet (first attempt committed nothing) — create it
+                    on_branch, _, switch_err = run_git(
+                        ["checkout", "-B", branch_name, f"origin/{GITHUB_DEFAULT_BRANCH}"], workspace)
+            # Checked, deliberately. This used to be fire-and-forget: a switch
+            # blocked by local modifications failed silently, the log announced a
+            # branch we were never on, and the commit landed on the user's working
+            # branch — precisely what the comment below says must never happen.
+            if on_branch:
+                log(f"Branch: {branch_name} (attempt {FIX_ATTEMPT}, base: {GITHUB_DEFAULT_BRANCH})")
+            else:
+                log(f"Warning: could not switch to {branch_name} "
+                    f"({switch_err.strip()[:120]}) — leaving edits uncommitted "
+                    f"on the current branch instead")
         else:
-            current, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace)[1:3]
-            log(f"ERROR: could not create {branch_name} ({local_err}) — refusing to "
-                f"commit onto the checked-out branch")
-            write_skipped("could not create a fix branch; refusing to commit to the "
-                          "current branch", infra=True)
-            return
+            # Offline, or a bad token. Branch off whatever is checked out rather
+            # than committing onto it: "proceeding on current branch" quietly meant
+            # fixes landed as commits on main, which is not something an autofix
+            # should ever do to someone's working checkout.
+            log(f"Warning: git fetch failed ({err})")
+            on_branch, _, local_err = run_git(["checkout", "-B", branch_name], workspace)
+            if on_branch:
+                log(f"Branch: {branch_name} (created from the current HEAD — no remote base)")
+            else:
+                log(f"ERROR: could not create {branch_name} ({local_err}) — refusing to "
+                    f"commit onto the checked-out branch")
+                write_skipped("could not create a fix branch; refusing to commit to the "
+                              "current branch", infra=True)
+                return
 
     candidates_json  = []
     fixes            = []
     unverified_fixes = []
+    # Edits that fixed the element they targeted but left the test failing on a
+    # later one. Kept on disk and committed like any other fix — the run is not
+    # green yet, so they are reported separately from the ones that are.
+    advanced_fixes = []
     failed_fixes     = []
 
     # ── Phase A — understand every failure before fixing any of them ──────────
@@ -1663,7 +2076,7 @@ def main():
         # fault. A handoff from triaging never runs step 00, so this is the only
         # place the pipeline path gets asked the question at all.
         ctx["diagnosis"] = {}
-        snapshot_soup = None
+        snapshot_soup, snapshot_prints = None, {}
         try:
             evidence = diagnosis.collect(issue, workspace=workspace,
                                          page_objects=ctx.get("page_objects"),
@@ -1671,6 +2084,10 @@ def main():
             verdict = diagnosis.diagnose(evidence)
             ctx["diagnosis"] = verdict
             snapshot_soup = _snapshot_soup(issue)
+            # Visibility lives in the sidecar, never in the saved markup: a
+            # selector can match a real element that no user could have
+            # clicked, and only the capture knows which.
+            snapshot_prints = load_fingerprints(issue.get("dom_snapshot") or "")
             for line in diagnosis.describe(verdict, evidence):
                 log(f"  {line}")
             # Probes run on the standalone path only, so a verdict reached here has
@@ -1709,6 +2126,20 @@ def main():
         except Exception as exc:
             log(f"  Diagnosis failed ({exc}) — continuing with the locator fix")
 
+        # What Locate already concluded, before anything expensive happens: the
+        # park below is a whole Maven run, and a refusal must not pay for it.
+        # A deliberate refusal there is a refusal here; anything else is Fix's to
+        # own, and either way the model should be told rather than left to
+        # re-derive it.
+        outcome = locate_outcome(ctx)
+        route, note = locate_route(outcome)
+        ctx["locate_route"], ctx["locate_note"] = route, note
+        ctx["locate_outcome"] = outcome
+        log(f"  Locate: {route} — {note}")
+        if route == "defer":
+            fail_cluster("locate_refused", reason=note)
+            continue
+
         # Ground the fix in the real DOM rather than in stale source. Four tiers,
         # best first:
         #   1. a browser still parked on the failing page (repairMode) — live and
@@ -1719,11 +2150,14 @@ def main():
         # A browser someone already parked (a developer ran with -DrepairMode=true)
         # always wins. Otherwise the agent parks one itself, but only from the
         # second attempt on — see park_browser_for_repair for why.
-        repair_session = find_repair_session(workspace, test_name) if INSPECT_DOM else {}
+        failure_url = issue.get("failure_url", "") or ctx.get("page_url", "")
+        repair_session = (find_repair_session(workspace, test_name, failure_url)
+                          if INSPECT_DOM else {})
         if not repair_session and INSPECT_DOM:
             explicit = os.environ.get("REPAIR", "").lower() == "true"
             if explicit or FIX_ATTEMPT > 1:
-                repair_session = park_browser_for_repair(workspace, test_name)
+                repair_session = park_browser_for_repair(workspace, test_name,
+                                                         failure_url)
 
         ctx["dom_snapshot"] = load_dom_snapshot(issue, ctx["element_names"])
 
@@ -1744,27 +2178,40 @@ def main():
 
         ctx_slim = {k: v for k, v in ctx.items() if k != "repo_conventions"}
 
-        prompt = build_fix_prompt(ctx, fix_rules)
-        log("  Calling Claude for fix...")
-        response = call_claude(prompt, workspace,
-                               artifact_dir=(str(Path(ctx["screenshot"]).parent)
-                                             if ctx.get("screenshot") else ""))
-        if not response:
-            log("  Empty Claude response — skipping")
-            fail_cluster("no_response")
-            continue
+        # A locator the Locate step already found and proved needs no model.
+        fix_json = None
+        located = locate_resolution(ctx)
+        if located:
+            fix_json, why = build_located_fix(located, ctx, workspace)
+            if fix_json:
+                ctx["located"] = located
+                log(f"  Located deterministically: {located.get('strategy')} "
+                    f"score {located.get('score')} — no model call")
+            else:
+                log(f"  Located, but not applicable here ({why}) — asking the model")
 
-        fix_json = extract_fix_json(response)
-        if not fix_json:
-            log("  Could not parse fix JSON — skipping")
-            fail_cluster("parse_error", output=response[:500])
-            continue
+        if fix_json is None:
+            prompt = build_fix_prompt(ctx, fix_rules)
+            log("  Calling Claude for fix...")
+            response = call_claude(prompt, workspace,
+                                   artifact_dir=(str(Path(ctx["screenshot"]).parent)
+                                                 if ctx.get("screenshot") else ""))
+            if not response:
+                log("  Empty Claude response — skipping")
+                fail_cluster("no_response")
+                continue
 
-        if not fix_json.get("fixable", False):
-            reason = fix_json.get("unfixable_reason", "Claude declared unfixable")
-            log(f"  Unfixable: {reason}")
-            fail_cluster("unfixable", reason=reason)
-            continue
+            fix_json = extract_fix_json(response)
+            if not fix_json:
+                log("  Could not parse fix JSON — skipping")
+                fail_cluster("parse_error", output=response[:500])
+                continue
+
+            if not fix_json.get("fixable", False):
+                reason = fix_json.get("unfixable_reason", "Claude declared unfixable")
+                log(f"  Unfixable: {reason}")
+                fail_cluster("unfixable", reason=reason)
+                continue
 
         target_file = Path(fix_json.get("target_file") or ctx["test_file"])
         if not target_file.is_absolute():
@@ -1809,7 +2256,8 @@ def main():
             # ships a permanently green broken test. FORCE is the way past it.
             valid, invalid_reason = validate_diagnosis_fit(
                 target_original, fixed_content,
-                (ctx.get("diagnosis") or {}).get("verdict", ""), snapshot_soup)
+                (ctx.get("diagnosis") or {}).get("verdict", ""), snapshot_soup,
+                snapshot_prints)
         # Guards built for test-adaptation-agent, evaluated here but never acting.
         # They are about to become load-bearing for edits far larger than a
         # locator, and the cheapest place to find out that one of them is wrong is
@@ -1849,13 +2297,17 @@ def main():
         for member in cluster.contexts:
             member_name = member["test_name"]
             log(f"  Verifying {member_name}...")
+            member_started = time.time() - 1
             member_status, member_output = run_single_test(member_name, workspace)
             if member_status == "passed":
                 passed.append(member_name)
             elif member_status == "unverified":
                 unverified.append((member_name, member_output))
             else:
-                still_failing.append((member_name, member_output, member))
+                still_failing.append((member_name, member_output, member,
+                                      member_started))
+
+        advanced, unchanged = split_by_progress(still_failing)
 
         record = {
             **ctx_slim,
@@ -1877,9 +2329,41 @@ def main():
                 else "none"),
         }
 
+        if not passed and not unverified and advanced and not unchanged:
+            # Every test that still fails has moved on to a different element, so
+            # the edit did its job. Keep it, and hand the next attempt the NEW
+            # failure — refreshed from the artifacts this run just wrote — rather
+            # than the one that is now repaired.
+            log(f"  ➜  Fix kept — the repaired element no longer fails; "
+                f"{len(advanced)} test(s) now stop at a different locator")
+            for member_name, member_output, member, member_started, before, after in advanced:
+                log(f"     {member_name.rsplit('.', 1)[-1]}: "
+                    f"{failure_identity.describe(before)} → "
+                    f"{failure_identity.describe(after)}")
+                slim = {k: v for k, v in member.items() if k != "repo_conventions"}
+                failed_fixes.append({
+                    **slim, "status": "advanced", "verified": False,
+                    "target_file": str(target_file),
+                    "fix_description": fix_description, "fix_diff": fix_diff,
+                    "test_passed": False, "test_output": member_output[-2000:],
+                    # Kept so `02_ship` and the retry can tell a fix that worked
+                    # and uncovered the next problem from one that did nothing.
+                    "progressed_from": before, "progressed_to": after,
+                    "next_issue": _refresh_issue(
+                        cluster.issues[cluster.contexts.index(member)],
+                        member_output, workspace, member_started),
+                })
+            advanced_fixes.append({**record, "status": "advanced",
+                                   "verified": False, "test_passed": False,
+                                   "test_names": [m[0] for m in advanced]})
+            continue
+
         if not passed and not unverified:
             # The edit helped nobody — put the file back exactly as it was.
             log(f"  ❌ Fix failed every test in the cluster ({cluster.size})")
+            for member_name, member_output, member in unchanged:
+                log(f"     {member_name.rsplit('.', 1)[-1]} still fails on the same "
+                    f"element: {failure_identity.describe(failure_identity.identify(member_output))}")
             try:
                 target_file.write_text(target_original, encoding="utf-8")
                 invalidate_file(target_file)
@@ -1889,7 +2373,7 @@ def main():
                     f"pre-fix state, so attempt {FIX_ATTEMPT + 1} starts clean")
             except Exception as e:
                 log(f"  WARNING: could not revert {target_file.name}: {e}")
-            for member_name, member_output, member in still_failing:
+            for member_name, member_output, member, _started in still_failing:
                 slim = {k: v for k, v in member.items() if k != "repo_conventions"}
                 failed_fixes.append({**slim, "status": "test_failed", "verified": False,
                                      "target_file": str(target_file),
@@ -1911,6 +2395,12 @@ def main():
                     session=os.environ.get("SESSION_ID", ""))
                 log(f"  Recorded a false stop for {overridden} in "
                     f"feedback/known-issues.json")
+            # The locator moved, so the fingerprint describing it is now stale.
+            # The next green run would re-record it anyway, but leaving it behind
+            # means the PR carries a baseline that describes the element the test
+            # no longer uses — and any heal attempted before that next green run
+            # compares against the pre-drift element.
+            _refresh_baseline_after_heal(ctx, workspace)
             fixes.append({**record, "status": "success", "verified": True,
                           "test_name": passed[0], "test_names": passed,
                           "test_passed": True,
@@ -1921,7 +2411,7 @@ def main():
                                      "test_name": unverified[0][0],
                                      "test_names": [n for n, _ in unverified],
                                      "test_passed": False, "test_output": unverified[0][1][-500:]})
-        for member_name, member_output, member in still_failing:
+        for member_name, member_output, member, _started in still_failing:
             # The fix worked for its cluster but not this test — a different
             # root cause hiding behind the same symptom. Keep it separate.
             log(f"  ❌ Still failing after the cluster fix: {member_name}")
@@ -1943,8 +2433,15 @@ def main():
     # Commit everything that was applied this attempt (carried entries are
     # already committed, and git add on an unchanged file is a no-op anyway).
     pr_branch = None
-    applied = [f for f in fixes + unverified_fixes if f.get("target_file")]
-    if applied:
+    applied = [f for f in fixes + unverified_fixes + advanced_fixes
+               if f.get("target_file")]
+    if applied and not on_branch:
+        # Either a dry run, or the branch switch failed. Both mean the same thing:
+        # do not commit. The edits are on disk and `git diff` shows them, which is
+        # what a reviewer wants.
+        log(f"{len(applied)} edit(s) left uncommitted in the working tree — "
+            f"review with: git -C {workspace} diff")
+    elif applied:
         for fix in applied:
             ok, _, err = run_git(["add", fix["target_file"]], workspace)
             if not ok:

@@ -7,6 +7,7 @@ trimmed to fit a character budget, but fields, annotations and constructors —
 where locators actually live — are kept in full and only *methods* are dropped.
 """
 
+import hashlib
 import os
 import re
 import logging
@@ -38,10 +39,21 @@ _DEFAULT_SOURCE_ROOTS = (
 # A build with 30 failures used to walk and re-read the entire source tree 30
 # times over — once per test, for the test-file search and again for the page
 # object search. The tree does not change while contexts are being built, so it
-# is walked once and read once. `invalidate_file` is called after a fix is
-# applied so later work sees the edited file, not the cached original.
+# is walked once and read once.
+#
+# The text cache validates each hit against the file's (mtime, size): a
+# path-keyed cache is only correct in a process that outlives one walk of the
+# tree, and qa_agents_server is not one — it served a deleted test method from a
+# file cached at boot for as long as the process lived. `invalidate_file` is
+# still called after a fix is applied; it is now belt-and-braces rather than the
+# only thing standing between an edit and a stale read.
+#
+# The file-list and test-file caches cannot be validated this way — they are
+# per-tree, not per-file, so nothing about an individual file reveals that a new
+# one appeared. Callers that key on `repo_signature()` drop them with
+# `invalidate_tree()` when it moves.
 
-_FILE_TEXT_CACHE: Dict[str, str] = {}
+_FILE_TEXT_CACHE: Dict[str, Tuple[Tuple[int, int], str]] = {}
 _SOURCE_FILES_CACHE: Dict[str, List[Path]] = {}
 _TEST_FILE_CACHE: Dict[str, Optional[str]] = {}
 _MAX_CACHED_FILE_BYTES = 1_000_000
@@ -99,24 +111,75 @@ def reset_caches() -> None:
     _TEST_FILE_CACHE.clear()
 
 
+def invalidate_tree() -> None:
+    """Drop what is remembered about the *shape* of the tree, not its contents.
+
+    Which files exist, and where a given test class lives: the two things a
+    changed `repo_signature` can invalidate that no per-file check ever will.
+    The text cache is deliberately spared — it validates itself per file, so
+    clearing it here would mean re-reading every unchanged file in the repo on
+    every edit, which is the cost these caches exist to avoid.
+    """
+    _SOURCE_FILES_CACHE.clear()
+    _TEST_FILE_CACHE.clear()
+
+
+def _stat_sig(stat_result) -> Tuple[int, int]:
+    """The cheapest signal that a file's content has changed.
+
+    mtime_ns rather than mtime: a coarse timestamp lets two edits inside the
+    same clock tick look identical. Size is carried alongside so a rewrite that
+    somehow lands on the same nanosecond is still caught by any length change.
+    A same-size edit at the same nanosecond is undetectable without reading the
+    file, which is the cost this cache exists to avoid.
+    """
+    return (stat_result.st_mtime_ns, stat_result.st_size)
+
+
 def read_source(path: Path) -> str:
-    """Read a source file, caching the text for the rest of the run."""
+    """Read a source file, caching the text against its (mtime, size)."""
     key = str(Path(path).resolve())
-    cached = _FILE_TEXT_CACHE.get(key)
-    if cached is not None:
-        return cached
     try:
-        if path.stat().st_size > _MAX_CACHED_FILE_BYTES:
-            return path.read_text(encoding="utf-8", errors="ignore")
+        stat_result = path.stat()
+    except Exception as e:
+        logger.debug(f"Error reading {path}: {e}")
+        return ""
+
+    sig = _stat_sig(stat_result)
+    cached = _FILE_TEXT_CACHE.get(key)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+
+    try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except Exception as e:
         logger.debug(f"Error reading {path}: {e}")
         return ""
-    _FILE_TEXT_CACHE[key] = text
+    if stat_result.st_size > _MAX_CACHED_FILE_BYTES:
+        return text
+    _FILE_TEXT_CACHE[key] = (sig, text)
     return text
 
 
 # ── Source tree helpers ───────────────────────────────────────────────────────
+
+def _walk_source_files(root: Path, suffixes=(".java", ".kt")) -> List[Path]:
+    """Every source file under root, uncached.
+
+    Prunes skipped directories as it descends rather than walking into them and
+    discarding the results afterwards, so a `target/` full of generated sources
+    costs nothing. Callers that need to *notice* an added or deleted file must
+    use this rather than `_iter_source_files`, whose whole purpose is to hand
+    back the list from last time.
+    """
+    found: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for name in filenames:
+            if name.endswith(suffixes):
+                found.append(Path(dirpath) / name)
+    return found
+
 
 def _iter_source_files(root: Path, suffixes=(".java", ".kt")):
     """Yield source files under root, skipping build and vendor directories."""
@@ -126,15 +189,37 @@ def _iter_source_files(root: Path, suffixes=(".java", ".kt")):
         yield from cached
         return
 
-    found: List[Path] = []
-    for suffix in suffixes:
-        for path in root.rglob(f"*{suffix}"):
-            if any(part in _SKIP_DIRS for part in path.parts):
-                continue
-            if path.is_file():
-                found.append(path)
+    found = _walk_source_files(root, suffixes)
     _SOURCE_FILES_CACHE[key] = found
     yield from found
+
+
+def repo_signature(repo_path: str, suffixes=(".java", ".kt")) -> str:
+    """A digest of every source file's identity, mtime and size.
+
+    The one answer to "has anything in this repo changed" — shared by the
+    catalogue, the reference graph and the server's freshness gate so they
+    cannot disagree about it. Stat-only: no file is read, which is what makes it
+    cheap enough to run per request (~1ms over ~100 files) next to a ~26ms
+    parse of the same tree.
+
+    A digest rather than the newest mtime, because `max(mtime)` is blind to a
+    deletion — remove any file but the newest and the maximum does not move, so
+    a picker keyed on it goes on offering a test that no longer exists.
+    """
+    entries = []
+    for root in source_roots(repo_path):
+        for path in _walk_source_files(root, suffixes):
+            try:
+                stat_result = path.stat()
+            except OSError:
+                continue        # vanished mid-walk; the next call will settle it
+            entries.append(f"{path}|{stat_result.st_mtime_ns}|{stat_result.st_size}")
+    digest = hashlib.blake2b(digest_size=16)
+    for entry in sorted(entries):
+        digest.update(entry.encode("utf-8", "surrogatepass"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def source_roots(repo_path: str) -> List[Path]:
@@ -627,20 +712,25 @@ class CodeAnalyzer:
 
     def extract_element_names(self, root_cause: str, execution_log: str = "", category: str = "") -> List[str]:
         """
-        Extract element names/locators from error messages for ELEMENT_NOT_FOUND/TIMEOUT cases.
+        Extract element names/locators from error messages.
+
+        Deliberately not gated on the root-cause category. It used to return
+        nothing unless the failure was already classified ELEMENT_NOT_FOUND or
+        TIMEOUT, which made the evidence conditional on the conclusion it feeds:
+        a diagnosis that decided WRONG_PAGE switched off the very lookup that
+        would have found the page object and shown it was a stale locator. The
+        caller decides what to do with the names; extracting them is free.
 
         Args:
             root_cause: Root cause text from classification
             execution_log: Full execution log
-            category: Root cause category (ELEMENT_NOT_FOUND, TIMEOUT, etc.)
+            category: Root cause category. Accepted for call compatibility and
+                no longer used to suppress extraction.
 
         Returns:
             List of extracted element names/locators
         """
         element_names = []
-        if category not in ['ELEMENT_NOT_FOUND', 'TIMEOUT']:
-            return element_names
-
         combined_text = f"{root_cause}\n{execution_log}"
 
         # Pattern 1: "PageName:ElementName" format (most common)
@@ -699,6 +789,21 @@ class CodeAnalyzer:
                 element_names.append(selector)
             if owner and selector:
                 element_names.append(f"{owner}:{selector.strip()}")
+
+        # Pattern 3c: this framework's own interaction wording, which names the
+        # element and its selector but never the page object that owns them:
+        #   "Failed to click on element 'Edit Profile Summary button' with
+        #    locator: Locator@#profile-section-profile-summary img[alt='mukesh']"
+        #   "Failed to enter data in element 'Summary' with locator: Locator@..."
+        # Every non-page-load failure reads like this, so without it the majority
+        # of failures resolved to no page object at all and the fix step was
+        # handed a prompt with no locator declarations in it.
+        pattern3c = re.compile(
+            r"Failed to [\w ]{2,30}?element\s+'([^']+)'\s+with locator:\s*"
+            r"Locator@(.+?)(?=:\s*Error|\s*$)", re.MULTILINE)
+        for match in pattern3c.finditer(combined_text):
+            element_names.append(match.group(1).strip())
+            element_names.append(match.group(2).strip())
 
         # Pattern 4: Extract from NoSuchElementException or TimeoutException messages
         pattern4 = re.compile(r"(?:NoSuchElementException|TimeoutException).*?['\"]([^'\"]+)['\"]", re.IGNORECASE)

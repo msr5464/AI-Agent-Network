@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import urlparse
 
+from shared import browser_mode
+
 # The one line of SessionMinter's output that is contractual. Framework logging
 # emits plenty of other braces, so the marker is what makes this parseable.
 _MARKER = "MINT_RESULT "
@@ -98,10 +100,17 @@ def _parse(stdout: str) -> Optional[Dict]:
     return None
 
 
-def mint(workspace, module: str, entry: Dict, headless: bool = True,
+def mint(workspace, module: str, entry: Dict, headless: Optional[bool] = None,
          log=lambda m: None) -> Dict:
-    """Run the entry path the test uses. Returns {ok, path, reason}."""
+    """Run the entry path the test uses. Returns {ok, path, reason}.
+
+    `headless` unset means "whatever this run asked for" — PLAYWRIGHT_HEADLESS,
+    then headless. A login is the one browser step worth watching when it goes
+    wrong, so it must not be the step that ignores the switch.
+    """
     workspace = Path(workspace)
+    if headless is None:
+        headless = browser_mode.headless()
     mode = entry.get("mode")
 
     if mode == "stored_session":

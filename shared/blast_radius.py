@@ -38,7 +38,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from shared.code_analyzer import (CodeAnalyzer, _iter_source_files, read_source,
+from shared.code_analyzer import (CodeAnalyzer, _iter_source_files,
+                                  invalidate_tree, read_source, repo_signature,
                                   source_roots)
 from shared.code_analyzer import without_comments
 from shared.test_catalog import list_tests
@@ -127,21 +128,10 @@ def _module_key(package: str) -> str:
     return parts[0].lower() if parts else "root"
 
 
-def _newest_mtime(roots: List[Path]) -> float:
-    newest = 0.0
-    for root in roots:
-        for path in _iter_source_files(root):
-            try:
-                newest = max(newest, path.stat().st_mtime)
-            except OSError:
-                continue
-    return newest
-
-
 def index(repo_path: str, use_cache: bool = True) -> dict:
     """Every class in the repo, what it references, and what references it.
 
-    One walk of the tree. Cached against the newest source mtime — the same rule
+    One walk of the tree. Cached against `repo_signature` — the same rule
     `test_catalog` uses, so an edited file shows up without a restart but the
     picker does not re-walk on every call.
     """
@@ -149,11 +139,13 @@ def index(repo_path: str, use_cache: bool = True) -> dict:
     if not repo.is_dir():
         raise FileNotFoundError(f"automation repo not found: {repo_path}")
 
+    stamp = repo_signature(str(repo))
     roots = source_roots(str(repo))
-    stamp = _newest_mtime(roots)
     cached = _cache.get(str(repo))
     if use_cache and cached and cached["stamp"] == stamp:
         return cached["payload"]
+
+    invalidate_tree()
 
     analyzer = CodeAnalyzer()
     classes: Dict[str, dict] = {}

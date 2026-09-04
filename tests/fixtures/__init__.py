@@ -48,6 +48,16 @@ DASHBOARD_COVERED = snapshot(
     '<header><img class="avatar-user" src="a.png">'
     '<summary aria-label="View profile and more">me</summary></header>')
 
+# The same page with a second element the selector also matches. Modelled on the
+# real capture that prompted the rule: a login form that grew a "Use OTP to Login"
+# button beside "Login", both of them `button[type='submit']`, which is a
+# strict-mode violation rather than an element that failed to appear.
+DASHBOARD_AMBIGUOUS = snapshot(
+    "https://app.example.com/", "Dashboard · Example", "logged-in",
+    '<header><img class="avatar-user" src="a.png">'
+    '<img class="avatar-user" src="b.png">'
+    '<summary aria-label="View profile and more">me</summary></header>')
+
 # The application served an error page in place of the real one.
 ERROR_PAGE = snapshot(
     "https://app.example.com/", "Error · Example", "error",

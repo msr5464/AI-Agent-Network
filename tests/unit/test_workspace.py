@@ -1,11 +1,12 @@
 """Tests for shared/workspace.py.
 
 Three agents had grown three answers to "where is the automation repo, and what
-if it isn't there". The two properties worth pinning down are the ones that
-differed between those answers: the token must not end up on disk, and syncing
-must not throw away someone's uncommitted work.
+if it isn't there". The properties worth pinning down are the ones that differed
+between those answers: one env var settles the path, the token must not end up
+on disk, and syncing must not throw away someone's uncommitted work.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from shared import workspace
+
+
+@pytest.fixture(autouse=True)
+def no_inherited_framework_dir(monkeypatch):
+    """A developer's own FRAMEWORK_DIR must not decide these assertions."""
+    monkeypatch.delenv("FRAMEWORK_DIR", raising=False)
 
 
 def _git(*args, cwd):
@@ -51,6 +58,96 @@ class TestFind:
 
     def test_missing_workspace_is_none_not_an_error(self, tmp_path):
         assert workspace.find(tmp_path / "nope", "Jarvis") is None
+
+
+class TestFrameworkDir:
+    """FRAMEWORK_DIR is the one setting that names the checkout."""
+
+    def test_expected_derives_from_workspace_and_repo_name(self, tmp_path):
+        assert workspace.expected(tmp_path, "Jarvis") == tmp_path / "Jarvis"
+
+    def test_expected_answers_before_anything_exists_on_disk(self, tmp_path):
+        # The callers that clone into the path, and those that report it as
+        # missing, both need an answer find() cannot give.
+        assert not (tmp_path / "Jarvis").exists()
+        assert workspace.expected(tmp_path, "Jarvis") == tmp_path / "Jarvis"
+
+    def test_env_override_wins_over_the_derived_path(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FRAMEWORK_DIR", str(tmp_path / "elsewhere"))
+        assert workspace.expected(tmp_path, "Jarvis") == tmp_path / "elsewhere"
+
+    def test_a_half_configured_derivation_is_none_not_a_guessed_repo_name(self, tmp_path):
+        assert workspace.expected(tmp_path, "") is None
+        assert workspace.expected("", "Jarvis") is None
+
+    def test_find_honours_the_override(self, tmp_path, monkeypatch):
+        (tmp_path / "elsewhere" / "src").mkdir(parents=True)
+        monkeypatch.setenv("FRAMEWORK_DIR", str(tmp_path / "elsewhere"))
+        assert workspace.find(tmp_path, "Jarvis") == tmp_path / "elsewhere"
+
+    def test_an_override_pointing_nowhere_finds_nothing(self, tmp_path, monkeypatch):
+        # Set-but-empty is a misconfiguration to report, not a cue to go
+        # shape-matching some other checkout on the machine.
+        (tmp_path / "Jarvis" / "src").mkdir(parents=True)
+        monkeypatch.setenv("FRAMEWORK_DIR", str(tmp_path / "gone"))
+        assert workspace.find(tmp_path, "Jarvis") is None
+
+    def test_clone_targets_the_override(self, tmp_path, monkeypatch, origin):
+        dest = tmp_path / "custom-checkout"
+        monkeypatch.setenv("FRAMEWORK_DIR", str(dest))
+        monkeypatch.setattr(workspace, "authenticated_url",
+                            lambda org, repo, token: str(origin))
+        assert workspace.clone(tmp_path, "org", "repo", "t") == dest
+        assert (dest / "src" / "App.java").exists()
+
+    def test_resolve_always_returns_a_path_so_imports_never_crash(self, tmp_path):
+        # Module-level constants are built from this; a None here would take the
+        # agent's own error reporting down with it.
+        resolved = workspace.resolve(tmp_path, "")
+        assert isinstance(resolved, Path) and not resolved.exists()
+
+
+class TestLoadRepoEnv:
+    """Reading config/.env must answer one question, not reconfigure the process."""
+
+    @pytest.fixture
+    def env_file(self, tmp_path):
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / ".env").write_text(
+            "# a comment\n"
+            "WORKSPACE_DIR=/somewhere\n"
+            "GITHUB_REPO_AUTOMATION=Repo\n"
+            'FRAMEWORK_DIR="/quoted/path"\n'
+            "PLAYWRIGHT_HEADLESS=false\n"
+            "SLACK_BOT_TOKEN=xoxb-secret\n")
+        return tmp_path
+
+    def test_reads_the_location_keys(self, env_file, monkeypatch):
+        for key in ("WORKSPACE_DIR", "GITHUB_REPO_AUTOMATION", "FRAMEWORK_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        workspace.load_repo_env(env_file)
+        assert os.environ["WORKSPACE_DIR"] == "/somewhere"
+        assert os.environ["GITHUB_REPO_AUTOMATION"] == "Repo"
+        assert os.environ["FRAMEWORK_DIR"] == "/quoted/path"
+
+    def test_leaves_every_other_setting_alone(self, env_file, monkeypatch):
+        # The regression this exists for: PLAYWRIGHT_HEADLESS coming along for
+        # the ride flipped the capture-parity test into a headed browser, whose
+        # scrollbar takes layout width — so the geometry diverged from the Java
+        # side and the failure read as a capture bug.
+        monkeypatch.delenv("PLAYWRIGHT_HEADLESS", raising=False)
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        workspace.load_repo_env(env_file)
+        assert "PLAYWRIGHT_HEADLESS" not in os.environ
+        assert "SLACK_BOT_TOKEN" not in os.environ
+
+    def test_an_exported_value_wins(self, env_file, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_DIR", "/from-the-caller")
+        workspace.load_repo_env(env_file)
+        assert os.environ["WORKSPACE_DIR"] == "/from-the-caller"
+
+    def test_a_missing_env_file_is_not_an_error(self, tmp_path):
+        workspace.load_repo_env(tmp_path / "nothing-here")
 
 
 class TestUrls:

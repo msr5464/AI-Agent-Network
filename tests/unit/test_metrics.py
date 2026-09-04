@@ -94,6 +94,81 @@ def test_multi_attempt_stage_sums_into_one_entry(audit, monkeypatch):
     assert stages[0]["cost_usd"] == 1.0
 
 
+def test_retry_sums_every_attempt_not_just_the_last(audit, monkeypatch):
+    """A stage that ran twice cost twice. Reporting only the successful attempt
+    would hide the cost of the failure that made the retry necessary."""
+    monkeypatch.setenv("STEP_KEY", "fix")
+    for attempt, (dur, cost, turns) in enumerate([(30.0, 0.50, 7), (45.0, 0.75, 9)], 1):
+        monkeypatch.setenv("STEP_ATTEMPT", str(attempt))
+        metrics.record_stage("fix", f"[01/02] Fix (attempt {attempt}/2)", 1,
+                             0.0, dur, attempt=attempt)
+        metrics.record_llm_call(_Result(cost_usd=cost, num_turns=turns,
+                                        usage={"output_tokens": 100}))
+        metrics.record_tool("build", "mvn test", 20.0,
+                            "failed" if attempt == 1 else "passed")
+
+    data = metrics.rollup()
+    stage = next(s for s in data["stages"] if s["key"] == "fix")
+    assert stage["attempts"] == 2
+    assert stage["duration_s"] == 75.0          # 30 + 45, not 45
+    assert stage["cost_usd"] == 1.25            # 0.50 + 0.75, not 0.75
+    assert stage["llm_calls"] == 2
+    assert stage["num_turns"] == 16             # 7 + 9
+    assert stage["tool_duration_s"] == 40.0     # both builds, incl. the failed one
+
+    totals = data["totals"]
+    assert totals["cost_usd"] == 1.25
+    assert totals["tool_duration_s"] == 40.0
+    assert totals["output_tokens"] == 200
+
+
+def test_a_failed_attempt_still_counts(audit, monkeypatch):
+    """Spend on an attempt that produced nothing is still spend."""
+    monkeypatch.setenv("STEP_KEY", "fix")
+    metrics.record_llm_call(_Result(cost_usd=0.9, status="error"))
+    metrics.record_llm_call(_Result(cost_usd=0.1, status="ok"))
+    assert metrics.rollup()["totals"]["cost_usd"] == 1.0
+
+
+def test_stage_totals_reconcile_after_retries(audit, monkeypatch):
+    for key, attempts in (("fix", 3), ("ship", 1)):
+        monkeypatch.setenv("STEP_KEY", key)
+        for a in range(1, attempts + 1):
+            monkeypatch.setenv("STEP_ATTEMPT", str(a))
+            metrics.record_stage(key, key, 1, 0.0, 10.0, attempt=a)
+            metrics.record_llm_call(_Result(cost_usd=0.25))
+    data = metrics.rollup()
+    assert sum(s["cost_usd"] for s in data["stages"]) == data["totals"]["cost_usd"]
+    assert sum(s["llm_calls"] for s in data["stages"]) == data["totals"]["llm_calls"]
+    assert {s["key"]: s["attempts"] for s in data["stages"]} == {"fix": 3, "ship": 1}
+
+
+def test_a_stage_that_ran_then_was_reused_is_not_marked_skipped(audit):
+    """A resumed session appends a skip row for a stage that already ran.
+    Last-row-wins would label a stage carrying real time as skipped."""
+    metrics.record_stage("parse", "[01/05] Parse", 1, 0.0, 12.0)          # really ran
+    metrics.record_stage("parse", "[01/05] Parse", 1, 0.0, 0.0, skipped=True)  # reused
+    stage = next(s for s in metrics.rollup()["stages"] if s["key"] == "parse")
+    assert stage["skipped"] is False
+    assert stage["duration_s"] == 12.0
+    assert stage["attempts"] == 2
+
+
+def test_a_stage_only_ever_skipped_stays_skipped(audit):
+    metrics.record_stage("scope", "[02/05] Scope", 2, 0.0, 0.0, skipped=True)
+    metrics.record_stage("scope", "[02/05] Scope", 2, 0.0, 0.0, skipped=True)
+    stage = next(s for s in metrics.rollup()["stages"] if s["key"] == "scope")
+    assert stage["skipped"] is True
+
+
+def test_rollup_exposes_no_private_keys(audit):
+    metrics.record_stage("fix", "Fix", 1, 0.0, 5.0)
+    metrics.record_llm_call(_Result(cost_usd=0.1))
+    data = metrics.rollup()
+    for stage in data["stages"]:
+        assert not [k for k in stage if k.startswith("_")], stage
+
+
 def test_malformed_jsonl_line_is_skipped_not_fatal(audit):
     metrics.record_llm_call(_Result(cost_usd=1.0))
     path = audit / "metrics" / "llm-calls.jsonl"

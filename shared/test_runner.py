@@ -18,6 +18,8 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from shared import browser_mode, narration
+
 DEFAULT_TIMEOUT_S = int(os.environ.get("AUTOFIX_TEST_TIMEOUT_S", "300"))
 
 # Never treated as a candidate module root when looking one level down.
@@ -57,6 +59,33 @@ def split_test_name(test_name: str) -> Tuple[str, str, str]:
 
 def _as_properties(extra_properties: Optional[Dict[str, str]]) -> List[str]:
     return [f"-D{key}={value}" for key, value in (extra_properties or {}).items()]
+
+
+def _apply_browser_mode(cmd: List[str],
+                        properties: Dict[str, str]) -> Tuple[List[str], Dict[str, str]]:
+    """Make PLAYWRIGHT_HEADLESS reach the browser this runner is about to launch.
+
+    The test run is where most of a session's browser time is actually spent —
+    reproduce, verify, probe — and none of it honoured the switch before, so
+    setting it headed showed you the DOM-inspection browser and hid every run
+    that mattered.
+
+    How it is expressed depends on the runner: a JVM build takes `-Dheadless`,
+    which the framework reads ahead of parameters/config.properties, while
+    `npx playwright test` has no such property and spells it `--headed`. When
+    the switch is unset, nothing is added and each runner keeps the default it
+    had before — for Maven that is the framework's own config file, which is
+    the one place a sensible answer already lives.
+    """
+    decided = browser_mode.configured()
+    if decided is None or "headless" in properties:
+        return cmd, properties          # unset, or the caller was explicit
+    runner = " ".join(cmd[:3]).lower()
+    if any(tool in runner for tool in ("mvn", "maven", "gradle")):
+        properties = {**properties, **browser_mode.maven_properties()}
+    elif "playwright" in runner and not decided and "--headed" not in cmd:
+        cmd = cmd + ["--headed"]
+    return cmd, properties
 
 
 def detect_test_command(workspace: Path, class_simple: str, method: str,
@@ -108,6 +137,9 @@ def run_test(test_name: str, workspace: Path,
     extra_properties become -Dkey=value flags. The framework's
     Config.getRunTimeProperty checks System.getProperty first, so this is how the
     reproduce step turns on tracing and repair mode for the run it triggers.
+
+    `headless` is added from PLAYWRIGHT_HEADLESS unless the caller passed its own
+    — see `_apply_browser_mode`.
     """
     full_class, class_simple, method = split_test_name(test_name)
 
@@ -125,7 +157,8 @@ def run_test(test_name: str, workspace: Path,
     if not cmd:
         return "unverified", NO_RUNNER_MESSAGE
 
-    cmd = cmd + _as_properties(extra_properties)
+    cmd, properties = _apply_browser_mode(cmd, dict(extra_properties or {}))
+    cmd = cmd + _as_properties(properties)
 
     try:
         return _run_streaming(cmd, workspace, timeout_s, log)
@@ -221,7 +254,11 @@ def _run_streaming(cmd: List[str], workspace: Path, timeout_s: int,
     lines: List[str] = []
     try:
         for line in proc.stdout:
-            line = line.rstrip("\n")
+            # The framework decorates some lines with HTML for the Studio UI.
+            # Only that one consumer renders it; a terminal and a model prompt
+            # both get raw markup, so render it here instead — once, for
+            # everyone, before the line is shown or kept.
+            line = narration.plain(line.rstrip("\n"))
             # Everything is shown live; only the signal is retained.
             log(line)
             if _keep_for_capture(line):

@@ -24,6 +24,8 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
+from shared import workspace as workspace_helper
+
 from shared.log import log as _log
 from shared import properties_file
 from shared.slack import send_slack as _send_slack
@@ -37,12 +39,14 @@ AGENT_DIR  = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1
 REPO_ROOT  = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
 
 WORKSPACE_DIR          = Path(os.environ.get("WORKSPACE_DIR", str(REPO_ROOT.parent)))
-AUTOMATION_FRAMEWORK_DIR          = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
+AUTOMATION_FRAMEWORK_DIR          = workspace_helper.resolve(
+    WORKSPACE_DIR, os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+    exclude=REPO_ROOT)
 
 AUTO_PUSH              = os.environ.get("AUTO_PUSH", "true").lower() == "true"
 GITHUB_TOKEN           = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_ORG             = os.environ.get("GITHUB_ORG", "")
-GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
+GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "")
 GITHUB_DEFAULT_BRANCH  = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
 GITHUB_PR_REVIEWERS    = [r.strip() for r in os.environ.get("GITHUB_PR_REVIEWERS", "").split(",") if r.strip()]
 BRANCH_PREFIX          = os.environ.get("AUTOCREATE_BRANCH_PREFIX", "feat/qa-autocreate")
@@ -141,6 +145,26 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
 
     if not step3_contents and not attempts_with_fixes:
         log("No files to commit")
+        return None, None
+
+    if not AUTO_PUSH:
+        # Dry run: put the files on disk and stop there.
+        #
+        # Branching would mean the `checkout -f` below, which discards whatever
+        # the user has in progress — a rough thing to do to someone who asked
+        # only to skip the PR. Committing would hide the diff they wanted to
+        # read. So the generated code lands in the working tree, uncommitted,
+        # on whatever branch they are on.
+        latest = dict(step3_contents)
+        for attempt in attempts_with_fixes:
+            latest.update(attempt.get("fix_file_contents") or {})
+        for rel_path, content in latest.items():
+            full = AUTOMATION_FRAMEWORK_DIR / rel_path
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content)
+        log(f"AUTO_PUSH=false — wrote {len(latest)} file(s) to the working tree, "
+            f"uncommitted (no branch, no commit)")
+        log(f"  review with: git -C {AUTOMATION_FRAMEWORK_DIR} status")
         return None, None
 
     # ── Reset to GITHUB_DEFAULT_BRANCH (or stay on current HEAD if blank) ────────

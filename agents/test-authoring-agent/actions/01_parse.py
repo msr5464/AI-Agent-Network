@@ -19,6 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
+from shared import workspace as workspace_helper
+
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR  = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR  = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
@@ -26,7 +28,9 @@ REPO_ROOT  = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[
 INPUT_FILE = Path(os.environ["INPUT_FILE"])
 
 WORKSPACE_DIR    = Path(os.environ.get("WORKSPACE_DIR", REPO_ROOT.parent))
-AUTOMATION_FRAMEWORK_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
+AUTOMATION_FRAMEWORK_DIR    = workspace_helper.resolve(
+    WORKSPACE_DIR, os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+    exclude=REPO_ROOT)
 
 MODEL = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
 
@@ -107,7 +111,8 @@ def main() -> None:
     fw_claude_md_path = AUTOMATION_FRAMEWORK_DIR / "CLAUDE.md"
     fw_claude_md_full = fw_claude_md_path.read_text() if fw_claude_md_path.exists() else ""
     if not fw_claude_md_full:
-        log("WARNING: Jarvis/CLAUDE.md not found — check WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
+        log(f"WARNING: {fw_claude_md_path} not found — check FRAMEWORK_DIR, or "
+            "WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
     java_block_pos = fw_claude_md_full.find("```java")
     claude_md = fw_claude_md_full[:java_block_pos].strip() if java_block_pos > 0 else fw_claude_md_full
 

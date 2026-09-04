@@ -254,10 +254,15 @@ def build_rollup(base: Optional[Path] = None) -> Optional[Dict[str, Any]]:
         slot = stage_slot(key, row.get("label") or "", int(row.get("index") or 0))
         slot["duration_s"] = round(slot["duration_s"] + float(row.get("duration_s") or 0.0), 3)
         slot["attempts"] += 1
-        if row.get("skipped"):
-            slot["skipped"] = True
-        else:
+        # "skipped" means the stage never actually ran. A resumed session
+        # appends a skip row for a stage that DID run in the earlier attempt,
+        # and last-row-wins would then label a stage carrying real time as
+        # skipped. Only all-skipped counts as skipped.
+        if not row.get("skipped"):
             slot["skipped"] = False
+        elif "skipped" not in slot or slot.get("_all_skipped", True):
+            slot["skipped"] = True
+        slot["_all_skipped"] = slot.get("_all_skipped", True) and bool(row.get("skipped"))
 
     for row in llm_calls:
         cost = float(row.get("cost_usd") or 0.0)
@@ -291,6 +296,8 @@ def build_rollup(base: Optional[Path] = None) -> Optional[Dict[str, Any]]:
 
     stages = sorted(per_stage.values(),
                     key=lambda s: (s.get("index") or 999, s.get("key") or ""))
+    for slot in stages:
+        slot["skipped"] = bool(slot.pop("_all_skipped", slot.get("skipped", False)))
 
     started = min((float(r.get("started_at") or 0) for r in stage_rows
                    if r.get("started_at")), default=0.0)

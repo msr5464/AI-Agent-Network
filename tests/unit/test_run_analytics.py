@@ -176,3 +176,50 @@ def test_cost_per_outcome_is_none_when_nothing_was_produced(tmp_path, store):
     overall = analytics.query("all")["overall"]
     assert overall["cost_usd"] == 5.0
     assert overall["cost_per_outcome_usd"] is None    # not a divide-by-zero
+
+
+# ── status ladders ────────────────────────────────────────────────────────────
+
+def test_healing_gate_decides_status_not_the_exit_code(tmp_path, store):
+    """run.sh exits 0 whether or not anything was fixed, so a shell-derived
+    "completed" would report a gated no-op as a successful heal."""
+    d = _session(tmp_path, "test-healing-agent")
+    (d / ".fix-passed").write_text("false")
+    _write_metrics(d)
+    rec = analytics.build_record(d, agent="test-healing-agent", status="completed")
+    assert rec["status"] == "failed"
+
+
+def test_healing_gate_skipped_is_diagnosed_not_failed(tmp_path, store):
+    """The gate stopping a run on purpose is the design working — painting it
+    red trains people to ignore the runs worth reading."""
+    d = _session(tmp_path, "test-healing-agent")
+    (d / ".fix-passed").write_text("skipped")
+    _write_metrics(d)
+    rec = analytics.build_record(d, agent="test-healing-agent", status="completed")
+    assert rec["status"] == "diagnosed"
+
+
+def test_healing_crash_marker_wins(tmp_path, store):
+    d = _session(tmp_path, "test-healing-agent")
+    (d / ".fix-passed").write_text("true")
+    (d / ".crashed").write_text("boom")
+    _write_metrics(d)
+    assert analytics.build_record(d, agent="test-healing-agent")["status"] == "failed"
+
+
+def test_verdict_and_gate_are_recorded(tmp_path, store):
+    d = _session(tmp_path, "test-authoring-agent")
+    (d / ".verdict").write_text("APPROVED\n")
+    (d / ".fix-passed").write_text("true\n")
+    _write_metrics(d)
+    rec = analytics.build_record(d, agent="test-authoring-agent", status="completed")
+    assert rec["verdict"] == "APPROVED"
+    assert rec["fix_gate"] == "true"
+
+
+def test_missing_markers_record_none_not_empty_string(tmp_path, store):
+    d = _session(tmp_path, "test-authoring-agent")
+    _write_metrics(d)
+    rec = analytics.build_record(d, agent="test-authoring-agent")
+    assert rec["verdict"] is None and rec["fix_gate"] is None

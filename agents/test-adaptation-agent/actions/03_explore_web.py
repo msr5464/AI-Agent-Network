@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shared.log import log as _log
 def log(msg): _log("explore-web", msg)
 
-from shared import entry_path, flow_map, mint_session, session_state
+from shared import browser_mode, entry_path, flow_map, mint_session, session_state
 from shared.code_analyzer import read_source
 from shared.claude import call_claude_ex
 from shared.mcp_config import write_playwright_mcp_config
@@ -49,7 +49,7 @@ REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]
 MODEL = os.environ.get("ADAPT_MODEL", "claude-opus-5")
 TIMEOUT_S = int(os.environ.get("ADAPT_EXPLORE_TIMEOUT_S", "1800"))
 ATTEMPTS = int(os.environ.get("ADAPT_EXPLORE_ATTEMPTS", "1"))
-HEADLESS = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
+HEADLESS = browser_mode.headless()
 SANDBOX = os.environ.get("ADAPT_SANDBOX", "false").lower() == "true"
 # Minting is on by default. The hard stop exists to stop us exploring with a
 # *bad* session — one that lands on a login page and makes the whole flow look
@@ -243,7 +243,7 @@ def main():
     # the server can be running another agent against it at the same time.
     mcp_path = write_playwright_mcp_config(AUDIT_DIR, headless=HEADLESS,
                                            storage_state=session.get("path"))
-    log(f"Playwright MCP: {'headless' if HEADLESS else 'headed'}, "
+    log(f"Playwright MCP: {browser_mode.label(HEADLESS)}, "
         f"config {mcp_path.name}, "
         + ("storage-state reused (no credential in the prompt)"
            if session.get("path") else "no session — this flow does not sign in"))

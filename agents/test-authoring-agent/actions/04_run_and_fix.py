@@ -34,18 +34,23 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
+from shared import workspace as workspace_helper
+
+from shared import browser_mode
+
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR    = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR    = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT    = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
 
 WORKSPACE_DIR    = Path(os.environ.get("WORKSPACE_DIR", REPO_ROOT.parent))
-AUTOMATION_FRAMEWORK_DIR    = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
+AUTOMATION_FRAMEWORK_DIR    = workspace_helper.resolve(
+    WORKSPACE_DIR, os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+    exclude=REPO_ROOT)
 
 MODEL        = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
 ENVIRONMENT  = os.environ.get("AUTOCREATE_ENVIRONMENT", "staging")
 COUNTRY      = os.environ.get("AUTOCREATE_COUNTRY", "SG")
-HEADLESS     = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
 FIX_ATTEMPT  = int(os.environ.get("FIX_ATTEMPT", "1"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
 MAVEN_TEST_TIMEOUT_S = int(os.environ.get("MAVEN_TEST_TIMEOUT_S", "300"))
@@ -194,7 +199,10 @@ def run_maven_test(test_class: str, test_method: str) -> tuple:
         f"-Dtest={test_arg}",
         f"-Denvironment={ENVIRONMENT}",
         f"-Dcountry={COUNTRY}",
-        f"-Dheadless={'true' if HEADLESS else 'false'}",
+        # Only when PLAYWRIGHT_HEADLESS actually says so. Passing nothing lets
+        # the framework's own parameters/config.properties decide, which is the
+        # same rule shared/test_runner applies to every other agent's build.
+        *(f"-D{key}={value}" for key, value in browser_mode.maven_properties().items()),
         "--no-transfer-progress",
     ]
     # Same build markers the healing agent emits, so the dashboard can fold the
@@ -1322,7 +1330,8 @@ def main() -> None:
     fw_claude_md_path = AUTOMATION_FRAMEWORK_DIR / "CLAUDE.md"
     claude_md = fw_claude_md_path.read_text() if fw_claude_md_path.exists() else ""
     if not claude_md:
-        log("WARNING: Jarvis/CLAUDE.md not found — check WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
+        log(f"WARNING: {fw_claude_md_path} not found — check FRAMEWORK_DIR, or "
+            "WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
 
     files_context = "\n".join(
         f"\n--- {path} ---\n{content}\n" for path, content in generated_files.items()

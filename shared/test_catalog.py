@@ -17,7 +17,9 @@ from typing import Dict, List, Optional
 from shared.code_analyzer import (
     CodeAnalyzer,
     _iter_source_files,
+    invalidate_tree,
     read_source,
+    repo_signature,
     source_roots,
     split_class_members,
     without_comments,
@@ -182,42 +184,42 @@ def _class_entry(path: Path, repo: Path) -> Optional[dict]:
     }
 
 
-def _newest_mtime(roots: List[Path]) -> float:
-    newest = 0.0
-    for root in roots:
-        for path in _iter_source_files(root):
-            try:
-                newest = max(newest, path.stat().st_mtime)
-            except OSError:
-                continue
-    return newest
-
-
-def source_stamp(repo_path: str) -> float:
-    """The newest mtime across the repo's test sources.
+def source_stamp(repo_path: str) -> str:
+    """How this module decides the repo has changed.
 
     Public so callers outside this module can key their own caches on the same
     signal `list_tests` uses, instead of re-walking the tree or inventing a
     second, differently-wrong notion of "has anything changed".
+
+    Spans *every* source root, not just the test ones, even though only test
+    sources are parsed here. `qa_agents_server.routes` keys its member index on
+    this stamp, and that index reads page objects under src/main/java: scoped to
+    test roots, editing a page object moved nothing and the intent panel went on
+    describing the old one. The cost of the wider scope is an occasional
+    needless re-parse of the catalogue.
     """
-    return _newest_mtime(test_source_roots(repo_path))
+    return repo_signature(repo_path)
 
 
 def list_tests(repo_path: str, use_cache: bool = True) -> dict:
     """Every test class in the repo, with its methods and their @Test metadata.
 
-    Cached against the newest source mtime, so reopening the picker does not
-    re-walk the tree, but an edited test shows up without a restart.
+    Cached against `source_stamp`, so reopening the picker does not re-walk the
+    tree, but an edited, added or deleted test shows up without a restart.
     """
     repo = Path(repo_path)
     if not repo.is_dir():
         raise FileNotFoundError(f"automation repo not found: {repo_path}")
 
+    stamp = source_stamp(str(repo))
     roots = test_source_roots(str(repo))
-    stamp = _newest_mtime(roots)
     cached = _cache.get(str(repo))
     if use_cache and cached and cached["stamp"] == stamp:
         return cached["payload"]
+
+    # The stamp moved, so the remembered file list may be describing a tree that
+    # no longer exists — a test class added since the last walk is not in it.
+    invalidate_tree()
 
     classes = []
     seen = set()

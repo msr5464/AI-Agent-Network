@@ -1,0 +1,399 @@
+{
+  "baseline": "v1/app.html",
+  "locators": {
+    "LoginPage#usernameField": {
+      "raw": "#user-name",
+      "gt": "username",
+      "action": "fill",
+      "post": {
+        "js": "(() => { const l = [...document.querySelectorAll('label')].find(x => /user|benutzer/i.test(x.textContent)); if (!l) return null; const el = (l.htmlFor && document.getElementById(l.htmlFor)) || l.parentElement.querySelector('input'); return el ? el.value : null; })()",
+        "equals": "healcheck"
+      }
+    },
+    "LoginPage#usernameByName": {
+      "raw": "[name=\"user-name\"]",
+      "gt": "username",
+      "action": "fill",
+      "post": {
+        "js": "(() => { const l = [...document.querySelectorAll('label')].find(x => /user|benutzer/i.test(x.textContent)); if (!l) return null; const el = (l.htmlFor && document.getElementById(l.htmlFor)) || l.parentElement.querySelector('input'); return el ? el.value : null; })()",
+        "equals": "healcheck"
+      }
+    },
+    "LoginPage#usernameNested": {
+      "raw": "#login_button_container .form_group > input[type=\"text\"]",
+      "gt": "username",
+      "action": "fill",
+      "post": {
+        "js": "(() => { const l = [...document.querySelectorAll('label')].find(x => /user|benutzer/i.test(x.textContent)); if (!l) return null; const el = (l.htmlFor && document.getElementById(l.htmlFor)) || l.parentElement.querySelector('input'); return el ? el.value : null; })()",
+        "equals": "healcheck"
+      }
+    },
+    "LoginPage#loginButton": {
+      "raw": "button#login-button",
+      "gt": "login",
+      "action": "click",
+      "post": {
+        "js": "document.getElementById('app-status').textContent",
+        "equals": "Login attempted"
+      }
+    },
+    "LoginPage#loginByText": {
+      "raw": "button:has-text(\"Login\")",
+      "gt": "login",
+      "action": "click",
+      "post": {
+        "js": "document.getElementById('app-status').textContent",
+        "equals": "Login attempted"
+      }
+    },
+    "LoginPage#loginNested": {
+      "raw": "#login_button_container form button",
+      "gt": "login",
+      "action": "click",
+      "post": {
+        "js": "document.getElementById('app-status').textContent",
+        "equals": "Login attempted"
+      }
+    },
+    "ProductsPage#addBackpack": {
+      "raw": "[data-testid=\"add-backpack\"]",
+      "gt": "add_backpack",
+      "action": "click",
+      "post": {
+        "js": "(document.querySelector('[data-cart]')||{dataset:{}}).dataset.lastAdded",
+        "equals": "Sauce Labs Backpack"
+      }
+    },
+    "ProductsPage#sortDropdown": {
+      "raw": ".product_sort_container",
+      "gt": "sort",
+      "action": "select",
+      "post": {
+        "js": "document.getElementById('app-status').textContent",
+        "contains": "Sorted:"
+      }
+    },
+    "HeaderPage#cartLink": {
+      "raw": ".shopping_cart_link",
+      "gt": "cart",
+      "action": "click",
+      "post": {
+        "js": "document.getElementById('app-status').textContent",
+        "equals": "Cart opened"
+      }
+    },
+    "ProfilePage#saveButton": {
+      "raw": "#save-btn",
+      "gt": "save",
+      "action": "click",
+      "post": {
+        "js": "document.getElementById('app-status').textContent",
+        "equals": "Profile saved"
+      }
+    },
+    "ProfilePage#saveByText": {
+      "raw": "button:text-is(\"Save changes\")",
+      "gt": "save",
+      "action": "click",
+      "post": {
+        "js": "document.getElementById('app-status').textContent",
+        "equals": "Profile saved"
+      }
+    },
+    "ProfilePage#saveNested": {
+      "raw": "main > section#profile_section > button",
+      "gt": "save",
+      "action": "click",
+      "post": {
+        "js": "document.getElementById('app-status').textContent",
+        "equals": "Profile saved"
+      }
+    },
+    "HeaderPage#cartCount": {
+      "raw": "[data-cart]",
+      "gt": "cart",
+      "action": "assert",
+      "usage": "assertion"
+    },
+    "SummaryPage#editButton": {
+      "raw": "div.rounded-2xl button[type=\"submit\"]",
+      "gt": "edit_summary",
+      "action": "click",
+      "post": {
+        "js": "document.getElementById('app-status').textContent",
+        "equals": "Summary editor opened"
+      }
+    },
+    "ProductsPage#firstProduct": {
+      "raw": ".grid > .inventory_item:nth-child(1) button",
+      "gt": "add_backpack",
+      "action": "click",
+      "post": {
+        "js": "(document.querySelector('[data-cart]')||{dataset:{}}).dataset.lastAdded",
+        "equals": "Sauce Labs Backpack"
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "id_renamed",
+      "file": "v2/id_renamed.html",
+      "target": "LoginPage#usernameField",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "username",
+      "doc": "",
+      "holdout": false
+    },
+    {
+      "name": "id_hashed",
+      "file": "v2/id_hashed.html",
+      "target": "LoginPage#usernameField",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "username",
+      "doc": "",
+      "holdout": false
+    },
+    {
+      "name": "class_renamed",
+      "file": "v2/class_renamed.html",
+      "target": "ProductsPage#sortDropdown",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "sort",
+      "doc": "",
+      "holdout": false
+    },
+    {
+      "name": "class_hashed",
+      "file": "v2/class_hashed.html",
+      "target": "HeaderPage#cartLink",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "cart",
+      "doc": "Styled-components rebuild: every class becomes a content hash.",
+      "holdout": false
+    },
+    {
+      "name": "tag_swapped",
+      "file": "v2/tag_swapped.html",
+      "target": "LoginPage#loginButton",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "login",
+      "doc": "<button> becomes <a role=button> \u2014 the classic component-library migration.",
+      "holdout": false
+    },
+    {
+      "name": "text_reworded",
+      "file": "v2/text_reworded.html",
+      "target": "LoginPage#loginByText",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "login",
+      "doc": "",
+      "holdout": false
+    },
+    {
+      "name": "text_recased",
+      "file": "v2/text_recased.html",
+      "target": "ProfilePage#saveByText",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "save",
+      "doc": "",
+      "holdout": false
+    },
+    {
+      "name": "dom_moved",
+      "file": "v2/dom_moved.html",
+      "target": "LoginPage#loginNested",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "login",
+      "doc": "Login button leaves the <form> for a new sibling container.",
+      "holdout": false
+    },
+    {
+      "name": "wrapper_inserted",
+      "file": "v2/wrapper_inserted.html",
+      "target": "LoginPage#usernameNested",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "username",
+      "doc": "An extra div per field \u2014 breaks `>` chains and nth-child indexes.",
+      "holdout": false
+    },
+    {
+      "name": "attr_removed",
+      "file": "v2/attr_removed.html",
+      "target": "LoginPage#usernameByName",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "username",
+      "doc": "",
+      "holdout": false
+    },
+    {
+      "name": "testid_removed",
+      "file": "v2/testid_removed.html",
+      "target": "ProductsPage#addBackpack",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "add_backpack",
+      "doc": "",
+      "holdout": false
+    },
+    {
+      "name": "moved_into_modal",
+      "file": "v2/moved_into_modal.html",
+      "target": "ProfilePage#saveNested",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "save",
+      "doc": "Profile moves inside a dialog wrapper \u2014 new ancestry, same element.",
+      "holdout": false
+    },
+    {
+      "name": "element_removed",
+      "file": "v2/element_removed.html",
+      "target": "ProfilePage#saveButton",
+      "expect": "NO_HEAL",
+      "expect_reason": "FEATURE_REMOVED",
+      "expect_gt": null,
+      "doc": "Whole Profile feature deleted. Correct answer: don't heal, report removal.",
+      "holdout": false
+    },
+    {
+      "name": "element_replaced",
+      "file": "v2/element_replaced.html",
+      "target": "ProfilePage#saveButton",
+      "expect": "NO_HEAL",
+      "expect_reason": "LOW_CONFIDENCE",
+      "expect_gt": null,
+      "doc": "THE TRAP. Same slot, same styling, same shape \u2014 opposite meaning.",
+      "holdout": false
+    },
+    {
+      "name": "wrong_page",
+      "file": "v2/wrong_page.html",
+      "target": "ProfilePage#saveButton",
+      "expect": "NO_HEAL",
+      "expect_reason": "WRONG_STATE",
+      "expect_gt": null,
+      "doc": "App bounced us to a session-expired screen. Nothing here is healable.",
+      "holdout": false
+    },
+    {
+      "name": "element_disabled",
+      "file": "v2/element_disabled.html",
+      "target": "ProfilePage#saveButton",
+      "expect": "NO_HEAL",
+      "expect_reason": "NOT_LOCATOR",
+      "expect_gt": null,
+      "doc": "Element is right there, just disabled and covered. Not a locator problem.",
+      "holdout": false
+    },
+    {
+      "name": "element_duplicated",
+      "file": "v2/element_duplicated.html",
+      "target": "ProductsPage#addBackpack",
+      "expect": "NO_HEAL",
+      "expect_reason": "AMBIGUOUS",
+      "expect_gt": null,
+      "doc": "Two identical Add-to-cart buttons for the same product. Ambiguity, not drift.",
+      "holdout": false
+    },
+    {
+      "name": "compound_drift",
+      "file": "v2/compound_drift.html",
+      "target": "LoginPage#usernameField",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "username",
+      "doc": "Three changes at once: id renamed, classes hashed, wrapper inserted.",
+      "holdout": true
+    },
+    {
+      "name": "icon_relabelled",
+      "file": "v2/icon_relabelled.html",
+      "target": "HeaderPage#cartLink",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "cart",
+      "doc": "Icon-only link: aria-label reworded and class hashed. Only href survives.",
+      "holdout": true
+    },
+    {
+      "name": "siblings_reordered",
+      "file": "v2/siblings_reordered.html",
+      "target": "ProductsPage#firstProduct",
+      "expect": "NO_HEAL",
+      "expect_reason": "MISBOUND",
+      "expect_gt": null,
+      "doc": "Products reordered. Position now lies; only content tells the truth.",
+      "holdout": true
+    },
+    {
+      "name": "translated",
+      "file": "v2/translated.html",
+      "target": "LoginPage#loginByText",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "login",
+      "doc": "UI translated to German. Text and accessible name change; id/name hold.",
+      "holdout": true
+    },
+    {
+      "name": "deep_restructure",
+      "file": "v2/deep_restructure.html",
+      "target": "LoginPage#usernameNested",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "username",
+      "doc": "Semantic HTML rewritten as divs. Every ancestor changes; ids/labels hold.",
+      "holdout": true
+    },
+    {
+      "name": "utility_class_churn",
+      "file": "v2/utility_class_churn.html",
+      "target": "SummaryPage#editButton",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "edit_summary",
+      "doc": "A restyle rewrites the utility classes. The element is untouched -- only",
+      "holdout": true
+    },
+    {
+      "name": "decoy_added",
+      "file": "v2/decoy_added.html",
+      "target": "ProfilePage#saveButton",
+      "expect": "HEAL",
+      "expect_reason": null,
+      "expect_gt": "save",
+      "doc": "A pixel-identical twin of the Profile panel appears and the original's id",
+      "holdout": true
+    },
+    {
+      "name": "decoy_no_anchor",
+      "file": "v2/decoy_no_anchor.html",
+      "target": "ProfilePage#saveButton",
+      "expect": "NO_HEAL",
+      "expect_reason": "LOW_CONFIDENCE",
+      "expect_gt": null,
+      "doc": "Same twin, but every enclosing id is renamed too, so no ancestor from the",
+      "holdout": true
+    },
+    {
+      "name": "assertion_target",
+      "file": "v2/assertion_target.html",
+      "target": "HeaderPage#cartCount",
+      "expect": "NO_HEAL",
+      "expect_reason": "ASSERTION_LOCATOR",
+      "expect_gt": null,
+      "doc": "The element an assertion reads is renamed. Healable in principle --",
+      "holdout": true
+    }
+  ]
+}

@@ -23,11 +23,14 @@ AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT  = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
 
+sys.path.insert(0, str(REPO_ROOT))   # repo root → shared.*
+from shared import browser_mode      # noqa: E402  (after sys.path update)
+
 CLAUDE_CLI  = os.environ.get("CLAUDE_CLI_PATH", "claude")
 MODEL       = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
 # Per-action wait budget handed to Claude for individual browser interactions.
 PW_TIMEOUT  = int(os.environ.get("PLAYWRIGHT_TIMEOUT_MS", "30000"))
-PW_HEADLESS = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
+PW_HEADLESS = browser_mode.headless()
 # Wall-clock budget for the whole validation run. A login-gated flow of 10+ steps
 # on a heavy site routinely needs 15-25 minutes, so the default is generous;
 # lower it for simple flows or CI.
@@ -39,7 +42,6 @@ VALIDATE_TIMEOUT = int(os.environ.get("VALIDATE_WEB_TIMEOUT_S", "1800"))
 VALIDATE_RETRY_ATTEMPTS = int(os.environ.get("VALIDATE_WEB_RETRY_ATTEMPTS", "1"))
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
-sys.path.insert(0, str(REPO_ROOT))   # repo root → shared.*
 from shared.claude import call_claude_ex            # noqa: E402  (after sys.path update)
 from shared.mcp_config import write_playwright_mcp_config  # noqa: E402
 from shared.log import log as _log      # noqa: E402  (shared, redacts known secrets)
@@ -377,7 +379,7 @@ CREDENTIALS (use exactly these — do NOT use any other values):
         all_locators.extend(page_def.get("locators_needed", []))
 
     # Write .mcp.json so the `claude -p` subprocess can use the Playwright MCP server
-    mode_label = "headless" if PW_HEADLESS else "headed (browser window visible)"
+    mode_label = browser_mode.label(PW_HEADLESS)
     log(f"Browser mode: {mode_label}")
     mcp_path = write_playwright_mcp_config(REPO_ROOT, headless=PW_HEADLESS)
     log(f"Playwright MCP config written: {mcp_path}")

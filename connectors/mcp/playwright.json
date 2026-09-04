@@ -4,9 +4,9 @@
   "type": "stdio",
   "command": "npx",
   "args": ["@playwright/mcp"],
-  "headless_flag": "--no-headless",
+  "headless_flag": "--headless",
   "headless_env_var": "PLAYWRIGHT_HEADLESS",
-  "used_by": ["test-authoring-agent"],
+  "used_by": ["test-authoring-agent", "test-healing-agent", "test-adaptation-agent"],
   "docs": "https://github.com/microsoft/playwright-mcp",
-  "notes": "Headless mode is toggled dynamically by shared/mcp_config.py based on PLAYWRIGHT_HEADLESS env var"
+  "notes": "The server is headed by default; shared/mcp_config.py adds --headless when shared/browser_mode.py resolves PLAYWRIGHT_HEADLESS to true. That same module governs every other browser in the network — direct Playwright launches, session minting, and the -Dheadless passed to Maven test runs."
 }

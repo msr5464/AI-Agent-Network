@@ -155,3 +155,89 @@ def test_metrics_reader_returns_none_for_a_legacy_session(legacy_session):
     assert metrics_reader.step_metrics(None, "fix") == {}
     assert metrics_reader.totals(None) == {}
     assert metrics_reader.summary_fields(None) == {}
+
+
+# ── retries ───────────────────────────────────────────────────────────────────
+
+def test_live_stream_re_emits_a_retried_stage(tmp_path, monkeypatch):
+    """The watcher marks a step done when its file first appears. A retry
+    rewrites that file — without a re-emit the live stream keeps attempt 1's
+    numbers while the replayed stream shows the sum, so the same run reads
+    differently before and after a reload."""
+    import json as _json
+    import threading
+    import time as _time
+    from qa_agents_server import runner
+
+    root = tmp_path / "agents" / "test-healing-agent" / "audit"
+    session = root / "20260828-090000-fix-Retry"
+    (session / "metrics").mkdir(parents=True)
+    _point_agent_at(monkeypatch, "test-healing-agent", root)
+
+    run = runner.RunState(session_id=session.name, module="X", auto_push=False,
+                          audit_dir=session, started_at=_time.time() - 5,
+                          agent="test-healing-agent")
+
+    class _Proc:
+        done = False
+        def poll(self): return 0 if self.done else None
+    run.proc = _Proc()
+
+    def stage(attempt, dur):
+        return _json.dumps({"index": 1, "key": "fix", "label": "Fix",
+                            "attempt": attempt, "started_at": 0.0, "ended_at": dur,
+                            "duration_s": dur, "exit_code": 0, "skipped": False}) + "\n"
+
+    def call(cost):
+        return _json.dumps({"ts": "2026-08-28T09:00:00Z", "stage": "fix",
+                            "cost_usd": cost, "num_turns": 3, "duration_s": 1.0}) + "\n"
+
+    monkeypatch.setattr(runner, "AUDIT_POLL_INTERVAL", 0.05, raising=False)
+    (session / "01-fix.json").write_text(_json.dumps({"succeeded": 0}))
+    (session / "metrics" / "stages.jsonl").write_text(stage(1, 2.0))
+    (session / "metrics" / "llm-calls.jsonl").write_text(call(0.40))
+
+    thread = threading.Thread(target=runner._audit_watcher, args=(run,), daemon=True)
+    thread.start()
+    _time.sleep(0.3)
+
+    _time.sleep(1.1)                       # a distinct mtime for the append
+    (session / "01-fix.json").write_text(_json.dumps({"succeeded": 2}))
+    with (session / "metrics" / "stages.jsonl").open("a") as handle:
+        handle.write(stage(2, 6.0))
+    with (session / "metrics" / "llm-calls.jsonl").open("a") as handle:
+        handle.write(call(0.60))
+    _time.sleep(0.4)
+    run.proc.done = True
+    thread.join(timeout=3)
+
+    events = [e.data for e in run.events
+              if e.kind == "step" and e.data.get("key") == "fix"]
+    assert len(events) >= 2, "a retried stage must be re-emitted"
+    last = events[-1]
+    assert last["attempts"] == 2
+    assert last["duration_s"] == 8.0        # 2 + 6, not 6
+    assert last["cost_usd"] == 1.0          # 0.40 + 0.60, not 0.60
+    # Internal bookkeeping must not leak into the event contract.
+    assert not [k for k in last if k.startswith("_")]
+
+
+def test_replayed_retry_matches_the_final_live_event(tmp_path, monkeypatch):
+    import json as _json
+    root = tmp_path / "agents" / "test-healing-agent" / "audit"
+    session = root / "20260828-091000-fix-Retry2"
+    (session / "metrics").mkdir(parents=True)
+    (session / "01-fix.json").write_text(_json.dumps({"succeeded": 1}))
+    (session / "metrics" / "stages.jsonl").write_text("".join(
+        _json.dumps({"index": 1, "key": "fix", "label": "Fix", "attempt": a,
+                     "started_at": 0.0, "ended_at": d, "duration_s": d,
+                     "exit_code": 0, "skipped": False}) + "\n"
+        for a, d in ((1, 2.0), (2, 6.0))))
+    _point_agent_at(monkeypatch, "test-healing-agent", root)
+
+    rollup = metrics_reader.read_session_metrics(session)
+    events = audit_reader.replay_events(session.name, agent="test-healing-agent") or []
+    fix = [e for e in events if e["kind"] == "step" and e["data"]["key"] == "fix"]
+    assert fix, "expected a replayed fix step"
+    assert fix[0]["data"]["duration_s"] == 8.0
+    assert metrics_reader.step_metrics(rollup, "fix")["attempts"] == 2

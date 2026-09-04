@@ -111,7 +111,7 @@ Handoff File: $HANDOFF_FILE
 Started: $(date +%Y-%m-%dT%H:%M:%S)
 
 ## Env Snapshot (keys only)
-$(env | grep -E '^(GITHUB_|SLACK_|MAX_|AUTO_|AUTOFIX_|CLAUDE_|WORKSPACE_|REPO_CONTEXT_|TEST_RUNNER_)' | sed 's/=.*/=<set>/' | sort)
+$(env | grep -E '^(GITHUB_|SLACK_|MAX_|AUTO_|AUTOFIX_|CLAUDE_|WORKSPACE_|REPO_CONTEXT_|TEST_RUNNER_|PLAYWRIGHT_|LOCATE_)' | sed 's/=.*/=<set>/' | sort)
 EOF
 
 declare -a STEP_NAMES=()
@@ -119,7 +119,7 @@ declare -a STEP_DURATIONS=()
 
 # ── Step 00 — Reproduce (standalone mode only) ────────────────────────────────
 if [[ "$MODE" == "local" ]]; then
-  run_step "[00/02] Reproduce" "python3 '$AGENT_DIR/actions/00_reproduce.py'" reproduce
+  run_step "[00/03] Reproduce" "python3 '$AGENT_DIR/actions/00_reproduce.py'" reproduce
 
   if [[ ! -f "$AUDIT_DIR/00-handoff.json" ]]; then
     # A passing test or a non-locator failure. Both are legitimate outcomes, and
@@ -176,13 +176,23 @@ PYALERT
 }
 trap 'on_error $LINENO' ERR
 
-# ── Step 01 — Fix (with retry loop) ──────────────────────────────────────────
-MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-2}"
+# ── Step 01 — Locate ─────────────────────────────────────────────────────────
+# Work out which element each broken locator meant, deterministically, before any
+# model call. Never edits a file — 01_fix decides what to do with the result — so
+# the worst case here is a model call the run would have made anyway.
+run_step "[01/03] Locate" "python3 '$AGENT_DIR/actions/01_locate.py'" locate
+
+# ── Step 02 — Fix (with retry loop) ──────────────────────────────────────────
+# Each attempt now either fixes an element or proves it cannot, and an attempt
+# that repairs one locator and uncovers the next keeps its edit — so the loop
+# walks a chain of broken locators instead of re-guessing at one. Two was enough
+# for a single locator; a chain needs room to finish.
+MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-4}"
 FIX_ATTEMPT=1
 
 while true; do
   export STEP_ATTEMPT="$FIX_ATTEMPT"
-  run_step "[01/02] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
+  run_step "[02/03] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
     "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_fix.py'" fix
 
   FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
@@ -201,7 +211,7 @@ while true; do
 done
 
 # ── Step 02 — Ship (PR + Slack) ───────────────────────────────────────────────
-run_step "[02/02] Ship" "python3 '$AGENT_DIR/actions/02_ship.py'" ship
+run_step "[03/03] Ship" "python3 '$AGENT_DIR/actions/02_ship.py'" ship
 
 # ── Mark handoff as processed ─────────────────────────────────────────────────
 # An infra skip (no GitHub token, workspace missing) means nothing was attempted.

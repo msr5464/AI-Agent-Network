@@ -73,7 +73,9 @@ def main() -> int:
                     help="fqcn#method whose entry path to reuse; discovered "
                          "from --module when omitted")
     ap.add_argument("--workspace", default=None)
-    ap.add_argument("--headed", action="store_true", help="watch the login happen")
+    ap.add_argument("--headed", action="store_true",
+                    help="watch the login happen. Without it, PLAYWRIGHT_HEADLESS "
+                         "decides, as it does for every other browser here")
     args = ap.parse_args()
 
     if not (args.module or args.test):
@@ -111,7 +113,7 @@ def main() -> int:
         return 0
 
     result = mint_session.mint(workspace, module, entry,
-                               headless=not args.headed, log=print)
+                               headless=False if args.headed else None, log=print)
     if not result["ok"]:
         print(f"FAILED: {result['reason']}", file=sys.stderr)
         return 1

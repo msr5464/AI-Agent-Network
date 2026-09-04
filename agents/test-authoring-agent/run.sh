@@ -221,12 +221,24 @@ declare -a STEP_DURATIONS=()
 
 # ── Prerequisite — sync GITHUB_DEFAULT_BRANCH before any step runs ───────────────
 WORKSPACE_DIR="${WORKSPACE_DIR:-}"
-GITHUB_REPO_AUTOMATION="${GITHUB_REPO_AUTOMATION:-Jarvis}"
+# Normalised and exported so the Python steps resolve the same checkout
+# this block syncs — `set -u` would abort on the bare reference otherwise.
+export FRAMEWORK_DIR="${FRAMEWORK_DIR:-}"
+GITHUB_REPO_AUTOMATION="${GITHUB_REPO_AUTOMATION:-}"
 GITHUB_DEFAULT_BRANCH="${GITHUB_DEFAULT_BRANCH:-main}"
-AUTOMATION_FRAMEWORK_DIR="${WORKSPACE_DIR}/${GITHUB_REPO_AUTOMATION}"
 
-if [[ -z "$WORKSPACE_DIR" ]]; then
-  log "ERROR: WORKSPACE_DIR is not set — cannot sync automation repo"
+# Same order as shared/workspace.py: FRAMEWORK_DIR names the checkout outright,
+# otherwise it is WORKSPACE_DIR/GITHUB_REPO_AUTOMATION. GITHUB_REPO_AUTOMATION
+# is still required either way — it is the repo name on GitHub, and the clone
+# and push URLs below are built from it.
+AUTOMATION_FRAMEWORK_DIR="${FRAMEWORK_DIR:-${WORKSPACE_DIR}/${GITHUB_REPO_AUTOMATION}}"
+
+if [[ -z "$GITHUB_REPO_AUTOMATION" ]]; then
+  log "ERROR: GITHUB_REPO_AUTOMATION is not set — cannot reach the automation repo"
+  exit 1
+fi
+if [[ -z "$FRAMEWORK_DIR" && -z "$WORKSPACE_DIR" ]]; then
+  log "ERROR: set FRAMEWORK_DIR, or WORKSPACE_DIR — cannot locate the automation repo"
   exit 1
 fi
 # Auth via a URL built fresh for each remote-talking command — never
@@ -244,7 +256,7 @@ _PUSH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/${GIT
 
 if [[ ! -d "$AUTOMATION_FRAMEWORK_DIR/.git" ]]; then
   log "Automation repo not found at $AUTOMATION_FRAMEWORK_DIR — cloning from GitHub ..."
-  mkdir -p "$WORKSPACE_DIR"
+  mkdir -p "$(dirname "$AUTOMATION_FRAMEWORK_DIR")"
   if ! git clone "$_PUSH_URL" "$AUTOMATION_FRAMEWORK_DIR"; then
     log "ERROR: Failed to clone $GITHUB_ORG/$GITHUB_REPO_AUTOMATION into $AUTOMATION_FRAMEWORK_DIR"
     exit 1
@@ -272,12 +284,14 @@ if [[ "$START_FROM_STEP" -gt 1 ]]; then
   log "✓ [01/05] Parse — reused from resumed session"
   STEP_NAMES+=("[01/05] Parse")
   STEP_DURATIONS+=(0)
+  record_stage "parse" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
 elif _cache_hit "01-parse.json"; then
   _cache_restore "01-parse.json"
   [[ -f "$CACHE_DIR/01-parse.md" ]] && cp "$CACHE_DIR/01-parse.md" "$AUDIT_DIR/01-parse.md"
   log "✓ [01/05] Parse — skipped (TESTING_MODE cache hit)"
   STEP_NAMES+=("[01/05] Parse")
   STEP_DURATIONS+=(0)
+  record_stage "parse" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
 else
   run_step "[01/05] Parse" "python3 '$AGENT_DIR/actions/01_parse.py'" parse
   _cache_save "01-parse.json"
@@ -296,9 +310,11 @@ if [[ "$START_FROM_STEP" -gt 2 ]]; then
   log "✓ [02/05] Validate API — reused from resumed session"
   STEP_NAMES+=("[02/05] Validate API")
   STEP_DURATIONS+=(0)
+  record_stage "validate_api" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
   log "✓ [02/05] Validate Web — reused from resumed session"
   STEP_NAMES+=("[02/05] Validate Web")
   STEP_DURATIONS+=(0)
+  record_stage "validate_web" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
 else
 
 # -- Validate API — 02_validate_api.py self-skips (writes a "skipped" stub) when
@@ -309,6 +325,7 @@ if _cache_hit "02-validate-api.json"; then
   log "✓ [02/05] Validate API — skipped (TESTING_MODE cache hit)"
   STEP_NAMES+=("[02/05] Validate API")
   STEP_DURATIONS+=(0)
+  record_stage "validate_api" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
 else
   run_step "[02/05] Validate API" "python3 '$AGENT_DIR/actions/02_validate_api.py'" validate_web
   # Only cache if it actually ran a real validation (not skipped as non-API/no-endpoints)
@@ -330,6 +347,7 @@ if [[ "$TEST_TYPE" == "web" || "$TEST_TYPE" == "both" ]]; then
     log "✓ [02/05] Validate Web — skipped (TESTING_MODE cache hit)"
     STEP_NAMES+=("[02/05] Validate Web")
     STEP_DURATIONS+=(0)
+    record_stage "validate_web" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
   else
     run_step "[02/05] Validate Web" "python3 '$AGENT_DIR/actions/02_validate_web.py'" validate_web
     # Only cache if Claude actually returned data (selectors or step results present)
@@ -364,6 +382,7 @@ if [[ "$START_FROM_STEP" -gt 3 ]]; then
   log "✓ [03/05] Generate — reused from resumed session"
   STEP_NAMES+=("[03/05] Generate")
   STEP_DURATIONS+=(0)
+  record_stage "generate" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
 else
   run_step "[03/05] Generate" "python3 '$AGENT_DIR/actions/03_generate.py'" generate
 fi
@@ -375,6 +394,7 @@ if [[ "$START_FROM_STEP" -gt 4 ]]; then
   log "✓ [04/05] Run & Fix — reused from resumed session"
   STEP_NAMES+=("[04/05] Run & Fix")
   STEP_DURATIONS+=(0)
+  record_stage "run_and_fix" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
 else
   # Initial test run — not counted as a fix attempt
   run_step "[04/05] Run & Fix (initial)" \

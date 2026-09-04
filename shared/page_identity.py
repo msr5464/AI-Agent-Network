@@ -51,9 +51,28 @@ _LOCATOR_PATTERNS = (
     re.compile(r"""@FindBy\s*\(\s*(?:css|id)\s*=\s*"""
                r"""(?P<q>["'])(?P<sel>(?:\\.|(?!(?P=q)).)*)(?P=q)"""),
 )
-# The two @FindBy forms carry no assignment, so their field name is read from
-# the declaration that follows the annotation.
+# The @FindBy form carries no assignment, so its field name is read from the
+# declaration that FOLLOWS the annotation.
 _FINDBY_FIELD = re.compile(r"\b(?:WebElement|MobileElement|Locator|By)\s+(\w+)")
+
+# An accessor declares its name BEFORE the selector:
+#     public Locator loginButton() { return page.locator("#login"); }
+# Searching forward here (as @FindBy must) reads the *next* accessor's name and
+# pairs every selector with the wrong field — which is worse than no name at all,
+# because a caller cannot tell it is wrong.
+_ACCESSOR_NAME = re.compile(
+    r"\b(?:Locator|WebElement|MobileElement|By)\s+(\w+)\s*\([^)]*\)\s*\{"
+    r"(?:[^{}]|\{[^{}]*\})*$")
+
+
+def _unescape(selector: str) -> str:
+    """Java string escapes are not part of the selector.
+
+    `page.locator("[name=\\"user\\"]")` reads out of the source with its
+    backslashes still attached, and that string matches nothing and compiles as
+    nothing.
+    """
+    return selector.replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
 
 # Playwright's semantic builders. This framework uses getByRole heavily, so a
 # page object made of them must not look like a page object with no locators at
@@ -260,19 +279,25 @@ def extract_locators(source: str) -> List[Dict[str, str]]:
     if not source:
         return found
 
-    for pattern in _LOCATOR_PATTERNS:
+    for index, pattern in enumerate(_LOCATOR_PATTERNS):
+        is_findby = index == 2
         for match in pattern.finditer(source):
-            raw = match.group("sel")
+            raw = _unescape(match.group("sel"))
             if not raw or raw in seen:
                 continue
             seen.add(raw)
             name = match.groupdict().get("name") or ""
-            if not name:
+            if not name and is_findby:
                 # @FindBy: the field is declared just after the annotation.
                 tail = source[match.end():match.end() + 200]
                 field = _FINDBY_FIELD.search(tail)
                 if field:
                     name = field.group(1)
+            if not name:
+                # An accessor method: its name is behind us, not ahead.
+                head = _ACCESSOR_NAME.search(source[:match.start()])
+                if head:
+                    name = head.group(1)
             found.append({"name": name, "raw": raw, "kind": "css",
                           "value": "", "approx": False,
                           "selector": normalize_selector(raw) or ""})

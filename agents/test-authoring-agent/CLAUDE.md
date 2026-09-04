@@ -154,6 +154,7 @@ Web Steps:
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary | `claude` |
 | `AUTOCREATE_MODEL` | Claude model for all AI steps | `claude-opus-4-6` |
 | `WORKSPACE_DIR` | Parent directory containing Jarvis | required |
+| `FRAMEWORK_DIR` | Absolute path to the checkout, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION` | optional |
 | `GITHUB_TOKEN` | GitHub auth token for PR creation | required |
 | `GITHUB_ORG` | GitHub org/user owning the repo | required |
 | `GITHUB_REPO_AUTOMATION` | Name of the Jarvis repo dir | `Jarvis` |
@@ -169,7 +170,7 @@ Web Steps:
 | `PLAYWRIGHT_TIMEOUT_MS` | Timeout (ms) for each individual browser action | `30000` |
 | `VALIDATE_WEB_TIMEOUT_S` | Wall-clock budget (s) for the whole step-02 run | `1800` |
 | `VALIDATE_WEB_RETRY_ATTEMPTS` | Extra full re-runs step 02 attempts on recoverable failures | `1` |
-| `PLAYWRIGHT_HEADLESS` | Set `false` to watch the browser during step 02 | `true` |
+| `PLAYWRIGHT_HEADLESS` | Set `false` to watch every browser this agent starts — step 02's validation and step 04's `mvn test` run | `true` |
 | `PLAYWRIGHT_MCP_VERSION` | `@playwright/mcp` version the browser steps launch (pinned, not `latest`) | `0.0.79` |
 | `VALIDATE_API_REQUEST_TIMEOUT_S` | Timeout (s) for each real HTTP call in Validate API | `15` |
 | `VALIDATE_API_RETRY_ON_ERROR` | Set `false` to disable the one connection-error retry in Validate API | `true` |

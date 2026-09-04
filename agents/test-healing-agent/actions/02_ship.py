@@ -24,6 +24,7 @@ from shared.log import log as _log
 from shared.slack import send_slack as _send_slack
 from shared.github import create_pr
 from shared.git import run_git
+from shared import workspace as workspace_helper
 def log(msg): _log("ship", msg)
 def send_slack(channel: str, text: str) -> bool:
     return _send_slack(SLACK_BOT_TOKEN, channel, text)
@@ -64,12 +65,9 @@ def read_gate() -> str:
 
 
 def get_workspace() -> Optional[Path]:
-    workspace = Path(WORKSPACE_DIR)
-    if GITHUB_REPO_AUTOMATION:
-        repo_path = workspace / GITHUB_REPO_AUTOMATION
-        if repo_path.exists():
-            return repo_path
-    return None
+    """The automation checkout: FRAMEWORK_DIR, else WORKSPACE_DIR/repo."""
+    candidate = workspace_helper.expected(WORKSPACE_DIR, GITHUB_REPO_AUTOMATION)
+    return candidate if candidate and candidate.exists() else None
 
 
 def _authenticated_url() -> str:
@@ -243,6 +241,12 @@ def _failed_pr_line(f: dict) -> str:
         return f"- ❌ `{name}` — Claude declared unfixable: {f.get('unfixable_reason', '')}"
     if status == "test_failed":
         return f"- ❌ `{name}` — fix applied but test still failing"
+    if status == "advanced":
+        # Kept, not reverted: the element it targeted works now. Reporting this
+        # as a plain failure hides the only progress the run made.
+        moved = (f.get("progressed_to") or {}).get("element") or "a later element"
+        return (f"- ⏩ `{name}` — the locator it targeted is fixed; the test now "
+                f"stops at {moved}")
     if status == "no_file":
         return f"- ❌ `{name}` — test file not found in workspace"
     if status == "rejected_unsafe":
@@ -324,6 +328,10 @@ def _build_slack_message(build_tag: str, fixes: list, unverified_fixes: list,
                 lines.append(f"  • `{name}` — unfixable: {reason[:80]}")
             elif status == "test_failed":
                 lines.append(f"  • `{name}` — fix applied but test still failing")
+            elif status == "advanced":
+                moved = (f.get("progressed_to") or {}).get("element") or "a later element"
+                lines.append(f"  • `{name}` — locator fixed and kept; now stops at "
+                             f"{moved}")
             elif status == "no_file":
                 lines.append(f"  • `{name}` — test file not found in workspace")
             elif status == "rejected_unsafe":

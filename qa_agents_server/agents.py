@@ -33,8 +33,13 @@ AUTHORING_STEPS: List[Tuple[str, str, str]] = [
 
 # Reproduce only runs in standalone mode; in pipeline mode it stays pending and
 # the UI shows it as skipped rather than stuck.
+# Step order comes from this list, not from the numeric filename prefix. Locate
+# sits between reproduce and fix and keeps its own 01- prefix deliberately:
+# renumbering 01-fix.json would break audit_reader's hardcoded reads and every
+# session already archived, which is a migration bought for nothing.
 HEALING_STEPS: List[Tuple[str, str, str]] = [
     ("reproduce", "00-reproduce.json", "Reproduce"),
+    ("locate", "01-locate.json", "Locate"),
     ("fix", "01-fix.json", "Fix"),
     ("ship", "02-ship.json", "Ship"),
 ]

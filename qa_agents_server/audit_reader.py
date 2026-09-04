@@ -536,6 +536,24 @@ def _diagnosis_outcome(session_dir: Path, fix_gate: Optional[str]) -> Optional[D
             "reasons": reasons[:4]}
 
 
+def _locate_counts(locate_data: Optional[Dict]) -> Dict:
+    """What the Locate step concluded, flat enough for a history row.
+
+    `located_deterministically` is the number that matters: every one of those is
+    a locator fixed without a model call, which is the whole point of the step.
+    """
+    if not locate_data:
+        return {"locate_mode": "", "located_deterministically": 0,
+                "locate_attempted": 0, "locate_refused": 0, "locate_verdicts": {}}
+    return {
+        "locate_mode": locate_data.get("mode", ""),
+        "located_deterministically": locate_data.get("located", 0),
+        "locate_attempted": locate_data.get("attempted", 0),
+        "locate_refused": locate_data.get("refused", 0),
+        "locate_verdicts": locate_data.get("verdicts") or {},
+    }
+
+
 def _healing_counts(fix_data: Dict) -> Dict[str, int]:
     return {
         "distinct_fixes": fix_data.get("distinct_fixes", len(fix_data.get("fixes", []))),
@@ -628,6 +646,7 @@ def _healing_status(session_dir: Path, fix_gate: Optional[str],
 
 def _healing_summary(spec, session_dir: Path) -> Dict:
     reproduce = _safe_load_json(session_dir / "00-reproduce.json")
+    locate = _safe_load_json(session_dir / "01-locate.json")
     fix = _safe_load_json(session_dir / "01-fix.json") or {}
     ship = _safe_load_json(session_dir / "02-ship.json")
     fix_gate = (_read_text(session_dir / ".fix-passed") or "").strip() or None
@@ -668,6 +687,7 @@ def _healing_summary(spec, session_dir: Path) -> Dict:
         "duration_s": _duration_with_fallback(session_dir, session_dir.name,
                                               ship or fix or reproduce),
         **counts,
+        **_locate_counts(locate),
         **metrics_reader.summary_fields(
             metrics_reader.read_session_metrics(session_dir)),
     }
@@ -701,6 +721,7 @@ def _get_healing_session(spec, session_id: str) -> Optional[Dict]:
     # is the largest thing in the session by far.
     summary["reports"] = {
         "reproduce_md": _read_text(session_dir / "00-reproduce.md"),
+        "locate_md": _read_text(session_dir / "01-locate.md"),
         "fix_md": _read_text(session_dir / "01-fix.md"),
         "ship_md": _read_text(session_dir / "02-ship.md"),
     }

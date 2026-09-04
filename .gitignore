@@ -52,3 +52,9 @@ agents/test-adaptation-agent/cache
 
 # Append-only analytics store — runtime data, grows per run, never pruned.
 qa_agents_server/storage/run_analytics.jsonl
+
+# Locator-heal test bench: recorded fingerprints, not the framework's baselines
+# (those live in the Playwright repo under src/main/resources/baselines).
+# Rewritten by eval.py / live_check.py on every run and stamped with absolute
+# fixture paths, a capture timestamp and the current app commit.
+locator_heal/baselines/

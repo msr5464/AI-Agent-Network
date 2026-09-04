@@ -7,6 +7,9 @@ calls launched from that cwd will automatically pick up the MCP server.
 import json
 import os
 from pathlib import Path
+from typing import Optional
+
+from shared import browser_mode
 
 # Pinned rather than "@latest": npx re-resolves a floating tag against the npm
 # registry on EVERY launch, which is a network round-trip on the startup path of
@@ -23,7 +26,7 @@ def _mcp_package() -> str:
     return f"@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}"
 
 
-def write_playwright_mcp_config(project_root: Path, headless: bool = True,
+def write_playwright_mcp_config(project_root: Path, headless: Optional[bool] = None,
                                 storage_state=None, cdp_endpoint=None) -> Path:
     """Write .mcp.json at project_root with the Playwright MCP server config.
 
@@ -33,6 +36,9 @@ def write_playwright_mcp_config(project_root: Path, headless: bool = True,
                       unless the path is passed explicitly via --mcp-config).
         headless:     True  → browser runs headless (CI / no display)
                       False → browser window is visible (debug / local dev)
+                      None  → PLAYWRIGHT_HEADLESS decides, defaulting to headless.
+                      Left to the default so a new caller cannot accidentally
+                      pin a mode the rest of the run is not using.
         cdp_endpoint: Optional CDP URL (e.g. http://localhost:9222) of a browser
                       that is ALREADY running. Used by repair mode, where the
                       automation framework parked the browser on the failing page:
@@ -64,6 +70,8 @@ def write_playwright_mcp_config(project_root: Path, headless: bool = True,
         return mcp_json_path
 
     args: list = [_mcp_package(), "--isolated", "--viewport-size=1920,1080"]
+    if headless is None:
+        headless = browser_mode.headless()
     if headless:
         args.append("--headless")
     if storage_state:

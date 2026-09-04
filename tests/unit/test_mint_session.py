@@ -122,3 +122,59 @@ def test_property_keys_are_passed_not_values(tmp_path, monkeypatch):
     # The staging file was promoted to the name the framework reads.
     assert outcome["path"].name == "NaukariLoginStorage.json"
     assert outcome["path"].exists()
+
+
+def _mint_capturing_command(tmp_path, monkeypatch):
+    """Run a successful mint and hand back the maven command it built."""
+    seen = {}
+
+    class Result:
+        stdout = ('MINT_RESULT {"ok":true,"degraded":false,"cookies":9,'
+                  '"url":"https://app/home","error":""}')
+        stderr = ""
+
+    def capture(command, **kwargs):
+        seen["command"] = command
+        target = Path([c for c in command if c.startswith("-Dmint.out=")][0]
+                      .split("=", 1)[1])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('{"cookies": [{"name": "session"}]}')
+        return Result()
+    monkeypatch.setattr(mint_session.subprocess, "run", capture)
+
+    mint_session.mint(tmp_path, "naukari",
+                      {"mode": "credential", "helper": "H", "method": "doLogin",
+                       "arg_keys": ["naukari.username"]})
+    return " ".join(seen["command"])
+
+
+def test_minting_follows_playwright_headless_when_the_caller_says_nothing(
+        tmp_path, monkeypatch):
+    """A login is the browser step most worth watching when it goes wrong, so
+    it must not be the one that ignores the switch everything else honours."""
+    monkeypatch.setenv("PLAYWRIGHT_HEADLESS", "false")
+    assert "-Dheadless=false" in _mint_capturing_command(tmp_path, monkeypatch)
+
+
+def test_an_explicit_headless_argument_still_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("PLAYWRIGHT_HEADLESS", "false")
+    seen = {}
+
+    class Result:
+        stdout = ('MINT_RESULT {"ok":true,"degraded":false,"cookies":9,'
+                  '"url":"https://app/home","error":""}')
+        stderr = ""
+
+    def capture(command, **kwargs):
+        seen["command"] = command
+        target = Path([c for c in command if c.startswith("-Dmint.out=")][0]
+                      .split("=", 1)[1])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('{"cookies": []}')
+        return Result()
+    monkeypatch.setattr(mint_session.subprocess, "run", capture)
+
+    mint_session.mint(tmp_path, "naukari",
+                      {"mode": "credential", "helper": "H", "method": "doLogin",
+                       "arg_keys": ["naukari.username"]}, headless=True)
+    assert "-Dheadless=true" in " ".join(seen["command"])

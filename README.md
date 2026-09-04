@@ -289,10 +289,11 @@ login session, or when the flow ends in something that cannot be undone. See
 | `CLAUDE_CLI_PATH` | `claude` | Path to Claude CLI binary |
 | `GITHUB_TOKEN` | | GitHub personal access token (repo scope) |
 | `GITHUB_ORG` | | GitHub org or username owning the automation repo |
-| `GITHUB_REPO_AUTOMATION` | `Jarvis` | Name of the automation repo directory under `WORKSPACE_DIR` |
+| `GITHUB_REPO_AUTOMATION` | `Jarvis` | Name of the automation repo — the directory under `WORKSPACE_DIR`, and the repo name on GitHub. Required even when `FRAMEWORK_DIR` is set. |
 | `GITHUB_DEFAULT_BRANCH` | `main` | Base branch for PRs |
 | `GITHUB_PR_REVIEWERS` | | Comma-separated list of PR reviewer handles |
 | `WORKSPACE_DIR` | | Absolute path to the parent directory containing the automation repo. If the repo is absent it is cloned automatically using `GITHUB_TOKEN`. |
+| `FRAMEWORK_DIR` | | Absolute path to the automation repo checkout itself, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION`. Set it when the checkout is named differently or lives elsewhere; every agent and the parity test read this one setting. |
 | `SLACK_BOT_TOKEN` | | Slack Bot OAuth token (`xoxb-...`) |
 | `SLACK_NOTIFY_CHANNEL` | `#qa-reports` | Channel for normal results and successful fixes |
 | `SLACK_ALERT_CHANNEL` | `#qa-critical` | Channel for failures needing human attention |
@@ -309,7 +310,7 @@ login session, or when the flow ends in something that cannot be undone. See
 | `MAX_FIX_ATTEMPTS` | `3` | Max retry cycles if the generated test fails |
 | `TESTING_MODE` | `false` | Set `true` to cache step-01 and step-02 outputs and skip them on reruns |
 | `PLAYWRIGHT_TIMEOUT_MS` | `30000` | Timeout per step in the headless web validation script |
-| `PLAYWRIGHT_HEADLESS` | `true` | Set `false` to run validation browser in headed mode (useful for debugging selectors) |
+| `PLAYWRIGHT_HEADLESS` | `true` | Set `false` to run **every** browser in every agent headed — validation, DOM inspection, exploration, session minting, and the Maven test runs (as `-Dheadless`). Unset, each browser keeps its own default and Maven follows the framework's `config.properties` |
 | `NODE_PATH` | `node` | Path to Node.js binary |
 
 ### Agent 2 — test-triaging-agent

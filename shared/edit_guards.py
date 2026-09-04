@@ -20,6 +20,7 @@ import difflib
 import re
 
 from shared.code_analyzer import split_class_members
+from shared.dom_snapshot import selector_visibility
 from shared.page_identity import normalize_selector as _normalize_selector
 
 # How large a diff may be before it stops looking like a targeted edit. The
@@ -210,11 +211,15 @@ def no_selector_broadening(original: str, updated: str) -> tuple:
 
 
 def validate_diagnosis_fit(original: str, updated: str, verdict: str,
-                           snapshot_soup=None) -> tuple:
+                           snapshot_soup=None, fingerprints=None) -> tuple:
     """Reject an edit that does not match what the diagnosis actually found.
 
     Returns (ok, reason). Runs before the test does, so a fix that could only
     pass by weakening the test never reaches a runner at all.
+
+    `fingerprints` is the sidecar captured beside the DOM snapshot. It is optional
+    because callers without one must keep working unchanged, but supplying it is
+    what makes rule 3 able to see visibility — the saved markup cannot.
     """
     changed = [line for line in difflib.unified_diff(
         original.splitlines(), updated.splitlines(), lineterm="", n=0)
@@ -239,24 +244,54 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
         return False, reason
 
     # 3. A genuinely stale locator has a replacement that exists on the page we
-    #    were actually on. One matching nothing is a guess, and the failure-time
-    #    DOM can say so before maven spends a minute discovering it.
+    #    were actually on, and that a user could actually have interacted with.
+    #    One matching nothing is a guess; one matching only hidden elements is a
+    #    fix that cannot work. The failure-time DOM says so before maven spends a
+    #    minute discovering it.
     if verdict == "LOCATOR_STALE" and snapshot_soup is not None:
-        candidates = _selectors_in("\n".join(added))
-        checked, matched = 0, 0
-        for candidate in candidates:
-            normalized = _normalize_selector(candidate)
-            if not normalized:
-                continue
-            try:
-                checked += 1
-                if snapshot_soup.select(normalized, limit=1):
-                    matched += 1
-            except Exception:
-                checked -= 1
+        prints = fingerprints or {}
+        known_visibility = bool(prints.get("elements"))
+        checked = matched = visible = 0
+        for candidate in _selectors_in("\n".join(added)):
+            result = selector_visibility(candidate, snapshot_soup, prints)
+            if result is None:
+                continue                 # cannot evaluate: not evidence either way
+            hits, seen = result
+            checked += 1
+            matched += 1 if hits else 0
+            visible += seen
         if checked and not matched:
             return False, ("the replacement selector matches nothing in the DOM "
                            "captured at failure, so it is a guess rather than a fix")
+        # Only assert invisibility when the capture actually recorded some, so a
+        # missing sidecar degrades to the match-count rule rather than to "reject".
+        if known_visibility and matched and not visible:
+            return False, ("the replacement selector matches only elements that "
+                           "were not visible when the test failed, so the click "
+                           "would time out exactly as the original did")
+
+    # 4. A fix for an ambiguous locator has to be unambiguous. Playwright refuses
+    #    to act on a selector that resolves to more than one element, so a
+    #    "narrower" selector that still matches two fails identically — as
+    #    `#loginForm button[type='submit']` did, scoping to a form that contained
+    #    both buttons. The captured DOM answers this in a millisecond; discovering
+    #    it by running the test costs half a minute and a revert.
+    if verdict == "AMBIGUOUS_LOCATOR" and snapshot_soup is not None:
+        for candidate in _selectors_in("\n".join(added)):
+            result = selector_visibility(candidate, snapshot_soup, fingerprints or {})
+            if result is None:
+                continue                 # cannot evaluate: not evidence either way
+            hits, _seen = result
+            if hits > 1:
+                return False, (f"the replacement selector still matches {hits} "
+                               f"elements in the DOM captured at failure, and the "
+                               f"diagnosis is that matching more than one IS the "
+                               f"failure — it would throw the same strict mode "
+                               f"violation")
+            if hits == 0:
+                return False, ("the replacement selector matches nothing in the "
+                               "DOM captured at failure, so it is a guess rather "
+                               "than a fix")
 
     return True, ""
 

@@ -45,7 +45,12 @@ def attach_dom_snapshot(issue: dict, report_dir: Path, method_name: str,
         preserved.write_text(text, encoding="utf-8")
 
         issue["dom_snapshot"] = str(preserved)
-        issue["failure_url"] = parse_header(text).get("url", "")
+        header = parse_header(text)
+        issue["failure_url"] = header.get("url", "")
+        # Where it came from and when it was taken, so the failure context can be
+        # matched to *this* snapshot rather than picked independently.
+        issue["_snapshot_source"] = str(snapshot)
+        issue["_snapshot_captured_at"] = header.get("capturedAt", "")
         log(f"  DOM snapshot attached for {method_name} "
             f"({len(text) // 1024}KB) → {preserved.name}")
     except Exception as e:
@@ -97,7 +102,22 @@ def attach_failure_context(issue: dict, report_dir: Path, method_name: str,
     if not report_dir or not method_name:
         return
     try:
-        found = _failure_context.find(report_dir, method_name)
+        # Located beside the snapshot this session preserved, not picked from the
+        # report directory on its own. Both lookups take "the newest file named
+        # for this method", and run independently they can pair a snapshot and a
+        # context from different builds — which then arrive at the healing agent
+        # looking like one coherent account of a single failure.
+        source = issue.get("_snapshot_source") or ""
+        if source:
+            context = _failure_context.for_failure(
+                source, test_name=method_name,
+                captured_at=issue.get("_snapshot_captured_at", ""))
+            found = Path(context["path"]) if context.get("path") else None
+            if not found and context.get("rejected"):
+                log(f"  Failure context for {method_name} ignored — "
+                    f"{context['rejected']}")
+        else:
+            found = _failure_context.find(report_dir, method_name)
         if not found:
             return
         context_dir = audit_dir / "dom"

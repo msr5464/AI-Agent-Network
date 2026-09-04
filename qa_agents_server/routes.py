@@ -15,8 +15,10 @@ bind to localhost).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Generator
@@ -26,11 +28,15 @@ from flask import (Blueprint, Response, jsonify, request, send_file,
 
 from qa_agents_server import agent_settings, audit_reader, feature_files, runner
 from qa_agents_server import analytics, metrics_reader
-from shared import assertion_graph, intent, test_catalog
+from shared import assertion_graph, code_analyzer, intent, test_catalog
+from shared import workspace as workspace_helper
+from shared.git import run_git
 from qa_agents_server.agents import (AgentConfigError, DEFAULT_AGENT,
                                      adapt_apply_default, auto_push_default,
                                      get_agent)
 from qa_agents_server.runner import TERMINAL_STATUSES, AGENT
+
+logger = logging.getLogger(__name__)
 
 qa_bp = Blueprint("qa_agents", __name__)
 
@@ -133,26 +139,94 @@ def tests_list(agent: str):
         # the same — one is a fact about the suite, the other is misconfiguration.
         return jsonify({
             "error": "automation repo not found",
-            "detail": f"Looked for {os.environ.get('GITHUB_REPO_AUTOMATION', '<unset>')!r} "
-                      f"under WORKSPACE_DIR={os.environ.get('WORKSPACE_DIR', '<unset>')!r}. "
-                      f"Set both in config/.env.",
+            "detail": f"Looked in {_automation_workspace_hint()}. "
+                      f"Set FRAMEWORK_DIR, or WORKSPACE_DIR and "
+                      f"GITHUB_REPO_AUTOMATION, in config/.env.",
         }), 503
 
     try:
-        return jsonify(test_catalog.list_tests(str(workspace)))
+        with _REPO_LOCK:
+            _refresh_source_caches(str(workspace))
+            payload = test_catalog.list_tests(str(workspace))
+        # Copied, not mutated: `payload` is test_catalog's cached dict, and the
+        # checkout fields are computed fresh on every request.
+        return jsonify({**payload, **_checkout_state(workspace)})
     except Exception as e:
         return jsonify({"error": "could not read the test catalogue",
                         "detail": str(e)}), 500
 
 
+def _automation_workspace_hint() -> str:
+    """The path the lookup actually used, for an error a reader can act on."""
+    explicit = workspace_helper.configured()
+    if explicit is not None:
+        return f"FRAMEWORK_DIR={str(explicit)!r}"
+    return (f"{os.environ.get('GITHUB_REPO_AUTOMATION', '<unset>')!r} under "
+            f"WORKSPACE_DIR={os.environ.get('WORKSPACE_DIR', '<unset>')!r}")
+
+
 def _automation_workspace():
     """The automation repo, resolved the way the healing agent resolves it."""
-    workspace_dir = os.environ.get("WORKSPACE_DIR", "")
-    repo_name = os.environ.get("GITHUB_REPO_AUTOMATION", "")
-    if not workspace_dir or not repo_name:
-        return None
-    candidate = Path(workspace_dir) / repo_name
-    return candidate if candidate.is_dir() else None
+    candidate = workspace_helper.expected(
+        os.environ.get("WORKSPACE_DIR", ""),
+        os.environ.get("GITHUB_REPO_AUTOMATION", ""))
+    return candidate if candidate and candidate.is_dir() else None
+
+
+# ── Reading the automation repo as it is *now* ────────────────────────────────
+#
+# code_analyzer's caches are scoped to "one run", which is exactly right for an
+# agent subprocess and wrong for this process: nothing here ever ended a run, so
+# a file read at boot was answered from memory for the life of the server. The
+# picker went on offering a test method that had been deleted hours earlier, and
+# only a restart cleared it.
+#
+# So every request that reads the repo passes through here first. The signature
+# is stat-only (~1ms over ~100 files, against ~26ms to re-parse the same tree),
+# so paying it per request buys correctness for almost nothing. Per-file
+# validation in read_source is not enough on its own: the file-list and
+# test-file caches are per-tree, so an added or deleted file is invisible to
+# them until they are dropped wholesale.
+_REPO_STATE: dict = {"repo": None, "signature": None}
+_REPO_LOCK = threading.Lock()
+
+
+def _refresh_source_caches(repo_path: str) -> str:
+    """Drop the shared source caches if anything in the repo has changed.
+
+    Returns the current signature so callers can key their own caches on it.
+    Callers hold _REPO_LOCK: invalidate_tree() clears globals that a concurrent
+    rebuild would otherwise be reading half-way through, and two requests
+    arriving together should not both pay for the same re-parse.
+    """
+    global _REPO_STATE
+    signature = code_analyzer.repo_signature(repo_path)
+    cached = _REPO_STATE
+    if cached["repo"] != repo_path or cached["signature"] != signature:
+        code_analyzer.invalidate_tree()
+        _REPO_STATE = {"repo": repo_path, "signature": signature}
+    return signature
+
+
+def _checkout_state(workspace: Path) -> dict:
+    """Which branch the catalogue was read from, and whether it is dirty.
+
+    Read per request rather than cached with the payload: switching branches can
+    leave the tree byte-identical (and so the signature unchanged) while the
+    answer to "which branch am I looking at" has changed. Never fatal — a
+    workspace that is not a git checkout still has tests worth listing.
+    """
+    try:
+        ok, out, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace, timeout=5)
+        branch = out.strip() if ok else None
+        ok_status, status_out, _ = run_git(["status", "--porcelain"], workspace,
+                                           timeout=5)
+        dirty = bool(status_out.strip()) if ok_status else None
+    except Exception as e:
+        # A hung or missing git must not turn a working catalogue into a 500.
+        logger.debug("could not read the checkout state of %s: %s", workspace, e)
+        return {"branch": None, "dirty": None}
+    return {"branch": branch, "dirty": dirty}
 
 
 # `pkg.sub.Class#method`. The method half is required, not optional: `intent.derive`
@@ -165,21 +239,22 @@ _TEST_IDENT = re.compile(r"^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*#[A-Za-z_$][\w$
 
 # member_index() re-reads every source file in the repo (~0.2s here). That is fine
 # once and wrong on every keystroke in a picker, so it is cached against the same
-# mtime signal test_catalog keys its own cache on: an edited test shows up without
-# a server restart. Replaced as one dict so a concurrent request either sees the
+# signature everything else here keys on: an edited test shows up without a
+# server restart. Replaced as one dict so a concurrent request either sees the
 # whole old entry or the whole new one — the server runs threaded.
 _MEMBER_INDEX: dict = {"repo": None, "stamp": None, "index": None}
 
 
 def _member_index(repo_path: str) -> dict:
     global _MEMBER_INDEX
-    stamp = test_catalog.source_stamp(repo_path)
-    cached = _MEMBER_INDEX
-    if cached["repo"] == repo_path and cached["stamp"] == stamp:
-        return cached["index"]
-    index = assertion_graph.member_index(repo_path)
-    _MEMBER_INDEX = {"repo": repo_path, "stamp": stamp, "index": index}
-    return index
+    with _REPO_LOCK:
+        stamp = _refresh_source_caches(repo_path)
+        cached = _MEMBER_INDEX
+        if cached["repo"] == repo_path and cached["stamp"] == stamp:
+            return cached["index"]
+        index = assertion_graph.member_index(repo_path)
+        _MEMBER_INDEX = {"repo": repo_path, "stamp": stamp, "index": index}
+        return index
 
 
 # ── What a test proves, for the adaptation panel's reference pane ─────────────
@@ -209,9 +284,9 @@ def tests_intent(agent: str):
     if workspace is None:
         return jsonify({
             "error": "automation repo not found",
-            "detail": f"Looked for {os.environ.get('GITHUB_REPO_AUTOMATION', '<unset>')!r} "
-                      f"under WORKSPACE_DIR={os.environ.get('WORKSPACE_DIR', '<unset>')!r}. "
-                      f"Set both in config/.env.",
+            "detail": f"Looked in {_automation_workspace_hint()}. "
+                      f"Set FRAMEWORK_DIR, or WORKSPACE_DIR and "
+                      f"GITHUB_REPO_AUTOMATION, in config/.env.",
         }), 503
 
     try:

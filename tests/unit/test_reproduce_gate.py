@@ -110,6 +110,43 @@ class TestSkipReasonMapping:
         assert diagnosis.skip_reason("LOCATOR_STALE") == "no-work"
 
 
+class TestRelabel:
+    """A verdict that is not allowed to act is not allowed to relabel either.
+
+    `root_cause_category` is what the fix step keys off, so rewriting it in
+    shadow mode let an unenforced verdict reach the model as the classification
+    and suppress the page-object lookup that would have contradicted it.
+    """
+
+    def _issue(self):
+        return {"root_cause_category": "ELEMENT_NOT_FOUND",
+                "recommended_action": "Update the broken locator"}
+
+    def test_shadow_mode_changes_nothing(self, reproduce):
+        issue = self._issue()
+        reproduce.relabel(issue, {"verdict": "WRONG_PAGE",
+                                  "remediation": "fix what happens before it"}, "shadow")
+        assert issue["root_cause_category"] == "ELEMENT_NOT_FOUND"
+        assert issue["recommended_action"] == "Update the broken locator"
+
+    def test_enforce_applies_the_verdict(self, reproduce):
+        issue = self._issue()
+        reproduce.relabel(issue, {"verdict": "WRONG_PAGE",
+                                  "remediation": "fix what happens before it"}, "enforce")
+        assert issue["root_cause_category"] == "WRONG_PAGE"
+        assert issue["recommended_action"] == "fix what happens before it"
+
+    def test_a_stale_locator_maps_to_the_category_the_fixer_knows(self, reproduce):
+        issue = dict(self._issue(), root_cause_category="TIMEOUT")
+        reproduce.relabel(issue, {"verdict": "LOCATOR_STALE"}, "enforce")
+        assert issue["root_cause_category"] == "ELEMENT_NOT_FOUND"
+
+    def test_an_abstention_relabels_nothing(self, reproduce):
+        issue = self._issue()
+        reproduce.relabel(issue, {"verdict": "INSUFFICIENT_EVIDENCE"}, "enforce")
+        assert issue["root_cause_category"] == "ELEMENT_NOT_FOUND"
+
+
 class TestGateDecision:
     """Shadow must be inert; enforce must stop; FORCE must always win."""
 

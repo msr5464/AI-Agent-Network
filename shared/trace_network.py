@@ -173,13 +173,19 @@ def describe(summary: Dict, max_lines: int = 8) -> str:
     lines: List[str] = []
     if summary.get("document_status") is not None:
         lines.append(f"document request -> HTTP {summary['document_status']}")
+    # First party first, and third party last. An ad or analytics beacon fails on
+    # most pages and says nothing about the test; listing those in arrival order
+    # pushed the requests the application actually made past `max_lines` and out
+    # of the report entirely.
     for label, key in (("failed request", "failed"),
                        ("server error", "server_errors"),
                        ("auth rejected", "auth_rejections"),
                        ("client error", "client_errors")):
-        for item in summary.get(key) or []:
+        entries = list(summary.get(key) or [])
+        for item in sorted(entries, key=lambda i: not i.get("first_party")):
+            where = "" if item.get("first_party") else " [third-party]"
             lines.append(f"{label}: {item['method']} {item['url'][:90]} "
-                         f"({item['status']})")
+                         f"({item['status']}){where}")
     for item in summary.get("slow") or []:
         lines.append(f"slow: {round(item['time_ms'])}ms {item['url'][:90]}")
     if not lines:
