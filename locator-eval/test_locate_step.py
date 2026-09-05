@@ -17,7 +17,7 @@ from shared import browser_mode
 from shared import locator_capture as capture
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-HERE = REPO / "locator_heal"
+HERE = REPO / "locator-eval"
 
 # Fingerprints a real page, so it needs the framework's capture script.
 pytestmark = pytest.mark.skipif(

@@ -76,8 +76,8 @@ qa_agents_server/storage/run_analytics.jsonl
 # Personal, machine-specific Claude Code permissions.
 .claude/settings.local.json
 
-# Locator-heal test bench: recorded fingerprints, not the framework's baselines
+# Locator-eval test bench: recorded fingerprints, not the framework's baselines
 # (those live in the Playwright repo under src/main/resources/baselines).
 # Rewritten by eval.py / live_check.py on every run and stamped with absolute
 # fixture paths, a capture timestamp and the current app commit.
-locator_heal/baselines/
+locator-eval/baselines/

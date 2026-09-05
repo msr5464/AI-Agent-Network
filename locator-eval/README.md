@@ -8,18 +8,18 @@ scorer made it better or worse.
 
 ```bash
 V=.venv/bin/python
-$V locator_heal/fixtures/generate.py       # build the v2 corpus + java page objects
-$V locator_heal/eval.py                    # full accuracy/precision table
-$V locator_heal/eval.py --negatives-only   # must report 0 wrong heals
-$V locator_heal/eval.py --locators         # old -> new locator per heal
-$V locator_heal/eval.py --case tag_swapped --explain     # score breakdown
-$V -m pytest locator_heal/test_*.py -q     # phase G + retry-loop tests
-$V locator_heal/live_check.py              # golden case vs real saucedemo.com
+$V locator-eval/fixtures/generate.py       # build the v2 corpus + java page objects
+$V locator-eval/eval.py                    # full accuracy/precision table
+$V locator-eval/eval.py --negatives-only   # must report 0 wrong heals
+$V locator-eval/eval.py --locators         # old -> new locator per heal
+$V locator-eval/eval.py --case tag_swapped --explain     # score breakdown
+$V -m pytest locator-eval/test_*.py -q     # phase G + retry-loop tests
+$V locator-eval/live_check.py              # golden case vs real saucedemo.com
 
 # resolve one locator end to end (dry run, then for real)
 $V -m shared.locator_resolve --locator-id LoginPage#loginButton \
-   --url "file://$PWD/locator_heal/fixtures/v2/tag_swapped.html" \
-   --baseline locator_heal/baselines --pageobjects locator_heal/fixtures/pageobjects \
+   --url "file://$PWD/locator-eval/fixtures/v2/tag_swapped.html" \
+   --baseline locator-eval/baselines --pageobjects locator-eval/fixtures/pageobjects \
    --no-apply --explain
 ```
 

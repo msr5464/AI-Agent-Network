@@ -91,7 +91,7 @@ _LOCATION_KEYS = (_DIR_ENV, "WORKSPACE_DIR", "GITHUB_REPO_AUTOMATION")
 def load_repo_env(root=None) -> None:
     """Read the checkout location out of config/.env, and nothing else.
 
-    For entry points that run outside an agent — the CLIs and the locator_heal
+    For entry points that run outside an agent — the CLIs and the locator-eval
     bench — nothing has sourced the environment yet, so `resolve` would fall
     through to "the first directory with a src/", which on a machine with
     several checkouts is reliably the wrong one. Already-exported values win.
