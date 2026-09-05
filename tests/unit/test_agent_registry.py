@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from qa_agents_server import audit_reader, runner
-from qa_agents_server.agents import AGENTS
+from qa_agents_server.agents import AGENTS, AgentConfigError
 
 
 @pytest.mark.parametrize("name", sorted(AGENTS))
@@ -124,3 +124,54 @@ class TestStepProgressIsAlwaysTerminal:
         assert _step_has_error({"status": "partial"}) is False, (
             "a flow map that recorded most of a journey is a usable result, "
             "not a failed step")
+
+
+# ── The optional per-run base branch ──────────────────────────────────────────
+#
+# One property carries this feature, and it is the one that was got wrong for
+# AUTO_PUSH: a field the caller did not fill in must not be exported. Because
+# shared/load_env.sh lets caller-exported vars beat config/.env, exporting a
+# blank-or-defaulted value silently overrides the admin's setting for every run.
+
+@pytest.mark.parametrize("name", sorted(AGENTS))
+class TestBaseBranchEnv:
+    @staticmethod
+    def _payload(name, **extra):
+        """The minimum each agent's build_env accepts, plus whatever is under test."""
+        base = {"test-healing-agent": {"test": "LoginTest#testLogin"}}.get(
+            name, {"module": "checkout"})
+        return {**base, **extra}
+
+    @pytest.mark.parametrize("absent", [{}, {"base_branch": None},
+                                        {"base_branch": ""}, {"base_branch": "   "}])
+    def test_an_unfilled_field_exports_nothing(self, name, absent):
+        env = AGENTS[name].build_env(self._payload(name, **absent))
+        assert "GITHUB_DEFAULT_BRANCH" not in env, (
+            f"{name} exported a base branch for {absent!r}. A caller-exported var "
+            f"beats config/.env, so this is the AUTO_PUSH bug again: an untouched "
+            f"field would override the branch an admin configured.")
+
+    def test_a_named_branch_overrides_the_configured_default(self, name):
+        env = AGENTS[name].build_env(self._payload(name, base_branch="release/2.3"))
+        assert env["GITHUB_DEFAULT_BRANCH"] == "release/2.3"
+
+    def test_the_name_is_trimmed(self, name):
+        env = AGENTS[name].build_env(self._payload(name, base_branch=" release/2.3 "))
+        assert env["GITHUB_DEFAULT_BRANCH"] == "release/2.3"
+
+    def test_a_flag_shaped_name_is_refused_with_a_400(self, name):
+        """The value reaches git and `gh pr create --base` as an argv element."""
+        with pytest.raises(AgentConfigError) as raised:
+            AGENTS[name].build_env(self._payload(name, base_branch="--upload-pack=x"))
+        assert raised.value.status == 400
+        assert "base_branch" in raised.value.message
+
+    def test_the_override_reuses_the_var_the_pr_base_is_read_from(self, name):
+        """Not a stylistic choice. All three ship steps pass
+        base=GITHUB_DEFAULT_BRANCH to `gh pr create`, so overriding that one
+        variable is what keeps the branch point and the PR base identical. A
+        separate BASE_BRANCH would let them diverge, and a PR opened against the
+        wrong base carries the whole delta between two branches."""
+        env = AGENTS[name].build_env(self._payload(name, base_branch="release/2.3"))
+        assert "BASE_BRANCH" not in env
+        assert env.get("GITHUB_DEFAULT_BRANCH") == "release/2.3"

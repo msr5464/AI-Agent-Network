@@ -33,7 +33,7 @@ from shared import workspace as workspace_helper
 from shared.git import run_git
 from qa_agents_server.agents import (AgentConfigError, DEFAULT_AGENT,
                                      adapt_apply_default, auto_push_default,
-                                     get_agent)
+                                     default_branch, get_agent)
 from qa_agents_server.runner import TERMINAL_STATUSES, AGENT
 
 logger = logging.getLogger(__name__)
@@ -120,7 +120,50 @@ def agent_config(agent: str):
         "agent": spec.name,
         "auto_push_default": auto_push_default(),
         "adapt_apply_default": adapt_apply_default(),
+        # The base a run gets when its branch field is left alone. The UI seeds
+        # the field from this rather than hardcoding "main", so a panel never
+        # shows a default the server would not actually use.
+        "default_branch": default_branch(),
     })
+
+
+# `git ls-remote` is a network round trip, and three panels mounting at once
+# would each pay for it. Cached briefly rather than for the process lifetime:
+# a branch created a minute ago should turn up without a server restart.
+_BRANCH_CACHE: dict = {"key": None, "at": 0.0, "branches": []}
+_BRANCH_CACHE_TTL = 60.0
+_BRANCH_CACHE_LOCK = threading.Lock()
+
+
+@qa_bp.route(f"{_BASE}/branches", methods=["GET"])
+def agent_branches(agent: str):
+    """Branches on the automation repo, for the run panel's picker.
+
+    Never a 500 and never an error body: autocomplete is a convenience, and a
+    picker that cannot reach GitHub must still leave the panel usable — the
+    field is free text, and the run's own pre-flight is the real check.
+    """
+    _spec, err = _resolve(agent)
+    if err:
+        return err
+    org = os.environ.get("GITHUB_ORG", "")
+    repo = os.environ.get("GITHUB_REPO_AUTOMATION", "")
+    key = (org, repo)
+    now = time.time()
+    with _BRANCH_CACHE_LOCK:
+        fresh = (_BRANCH_CACHE["key"] == key
+                 and now - _BRANCH_CACHE["at"] < _BRANCH_CACHE_TTL)
+        branches = list(_BRANCH_CACHE["branches"]) if fresh else None
+    if branches is None:
+        try:
+            branches = workspace_helper.list_remote_branches(
+                org, repo, os.environ.get("GITHUB_TOKEN", ""))
+        except Exception as e:
+            logger.debug("could not list remote branches: %s", e)
+            branches = []
+        with _BRANCH_CACHE_LOCK:
+            _BRANCH_CACHE.update({"key": key, "at": now, "branches": list(branches)})
+    return jsonify({"branches": branches, "default": default_branch()})
 
 
 # ── Test catalogue (healing only) ─────────────────────────────────────────────
@@ -316,6 +359,28 @@ def run_start(agent: str):
     if err:
         return err
     body = request.get_json(silent=True) or {}
+
+    # Reject a bad base branch here rather than only in build_env. build_env
+    # also runs on the reap thread that drains the pending queue, where a raise
+    # is swallowed and the queued run disappears without a word — and this is
+    # the only place that can answer "does that branch exist" before a session
+    # directory is created and the agent starts spending money.
+    requested_base = (body.get("base_branch") or "").strip()
+    if requested_base:
+        org = os.environ.get("GITHUB_ORG", "")
+        repo = os.environ.get("GITHUB_REPO_AUTOMATION", "")
+        try:
+            wanted = workspace_helper.normalise_branch(requested_base)
+        except ValueError as e:
+            return jsonify({"error": f"base_branch: {e}"}), 400
+        # False is a real answer; None means the remote could not be asked, and
+        # a network blip must not block a run that would work from the checkout.
+        if workspace_helper.remote_branch_exists(
+                org, repo, os.environ.get("GITHUB_TOKEN", ""), wanted) is False:
+            return jsonify({
+                "error": f"branch '{wanted}' was not found in {org}/{repo}"
+            }), 400
+
     try:
         run = runner.start_run(body, agent=spec.name)
     except runner._QueuedNotification as q:
@@ -334,6 +399,7 @@ def run_start(agent: str):
         "session_id": run.session_id,
         "module": run.module,
         "auto_push": run.auto_push,
+        "base_branch": run.base_branch,
         "status": run.status,
         "started_at": run.started_at,
     }), 201
@@ -401,6 +467,7 @@ def run_active(agent: str):
         "session_id": run.session_id,
         "module": run.module,
         "auto_push": run.auto_push,
+        "base_branch": run.base_branch,
         "status": run.status,
         "started_at": run.started_at,
         "step_progress": run.step_progress,
@@ -462,8 +529,19 @@ def session_retry(agent: str, session_id: str):
         }), 400
     auto_push = bool(body.get("auto_push", False))
 
+    # The base comes from the session being resumed, not from whatever the run
+    # panel currently shows. auto_push above is deliberately read live because
+    # it is a policy switch; the base branch is a property of the steps this
+    # retry is about to reuse. Shipping step-03 output that was generated
+    # against one branch onto a different one is the failure this avoids.
+    payload = {"auto_push": auto_push}
+    original_base, _sha = workspace_helper.read_base_marker(
+        spec.audit_dir / session_id)
+    if original_base:
+        payload["base_branch"] = original_base
+
     try:
-        run = runner.start_run({"auto_push": auto_push}, agent=spec.name,
+        run = runner.start_run(payload, agent=spec.name,
                                session_id=session_id, start_from_step=from_step)
     except runner._QueuedNotification as q:
         return jsonify({
@@ -479,6 +557,7 @@ def session_retry(agent: str, session_id: str):
         "session_id": run.session_id,
         "module": run.module,
         "auto_push": run.auto_push,
+        "base_branch": run.base_branch,
         "status": run.status,
         "started_at": run.started_at,
         "start_from_step": from_step,

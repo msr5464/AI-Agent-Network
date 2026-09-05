@@ -19,6 +19,18 @@ lxml>=4.9.0
 
 # HTTP requests
 requests>=2.31.0
+# Imported directly by the healing and triaging agents (disable_warnings), not
+# just pulled in behind requests — a direct import belongs in the direct deps.
+urllib3>=2.0.0
+
+# Reads config/locator.yaml (the healing agent and locator_heal) and
+# config/prompts.yaml.
+PyYAML>=6.0
+
+# Browser automation for the locator healing engine. locator_heal/ and the
+# healing agent's 01_locate.py drive it directly. Needs `playwright install
+# chromium` after pip, which pip cannot do for you.
+playwright>=1.40.0
 
 # Core Python libraries
 pydantic>=2.0.0

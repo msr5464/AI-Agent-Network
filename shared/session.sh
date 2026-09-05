@@ -33,8 +33,38 @@ _redact_secrets() {
   printf '%s' "$msg"
 }
 
+# ── Severity colouring ────────────────────────────────────────────────────────
+# The bash half of shared/log.py's severity vocabulary — same prefixes, same
+# colours, same terminal-only gate — so an ERROR line from run.sh and one from a
+# Python action look identical. Under qa_agents_server stdout is a pipe, so
+# nothing is emitted and the Studio console keeps colouring by prefix.
+_log_color_enabled() {
+  case "$(printf '%s' "${QA_LOG_COLOR:-auto}" | tr '[:upper:]' '[:lower:]')" in
+    always|force|1|true|yes) return 0 ;;
+    never|off|0|false|no)    return 1 ;;
+  esac
+  [[ -z "${NO_COLOR:-}" ]] && [[ -t 1 ]]
+}
+
+# _severity_color <message> → the ANSI code for its leading marker, or empty.
+_severity_color() {
+  local head="${1%%$'\n'*}"
+  case "$head" in
+    ERROR*|FATAL*|FAILED*|BLOCKED:*)  printf '\033[1;31m' ;;   # bold red
+    WARNING*|Warning*|WARN*|CAUTION*) printf '\033[0;33m' ;;   # yellow
+  esac
+}
+
 log() {
-  echo "[$(date +%H:%M:%S)] $(_redact_secrets "$*")"
+  local msg
+  msg="$(_redact_secrets "$*")"
+  local color=""
+  _log_color_enabled && color="$(_severity_color "$msg")"
+  if [[ -n "$color" ]]; then
+    printf '%b[%s] %s%b\n' "$color" "$(date +%H:%M:%S)" "$msg" '\033[0m'
+  else
+    echo "[$(date +%H:%M:%S)] $msg"
+  fi
 }
 
 elapsed_since() {

@@ -38,6 +38,7 @@ from shared.dom_snapshot import find_snapshot, parse_header
 from shared.playwright_trace import read_actions, failing_action
 from shared import diagnosis
 from shared import workspace as workspace_helper
+from shared.git import run_git
 from shared import failure_context as _failure_context
 from shared import narration, run_artifacts
 
@@ -48,6 +49,12 @@ REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]
 TEST_NAME = os.environ.get("TEST_NAME", "").strip()
 
 GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "")
+GITHUB_ORG             = os.environ.get("GITHUB_ORG", "")
+GITHUB_TOKEN           = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_DEFAULT_BRANCH  = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
+# Mirrors 01_fix.py: false means "let me look at this first", and nothing may
+# move the user's checkout under them.
+AUTO_PUSH              = os.environ.get("AUTO_PUSH", "true").lower() != "false"
 WORKSPACE_DIR          = os.environ.get("WORKSPACE_DIR", str(REPO_ROOT.parent))
 TEST_RESULTS_DIR_NAME  = os.environ.get("TEST_RESULTS_DIR_NAME", "test-output")
 
@@ -140,6 +147,52 @@ def get_workspace() -> Path | None:
     """The automation checkout: FRAMEWORK_DIR, else WORKSPACE_DIR/repo, else by shape."""
     return workspace_helper.find(WORKSPACE_DIR, GITHUB_REPO_AUTOMATION,
                                  exclude=REPO_ROOT)
+
+
+def align_workspace_to_base(workspace: Path) -> None:
+    """Reproduce against the branch the fix will be based on, not whatever HEAD is.
+
+    These used to be different branches and nobody could see it: this step ran
+    the test against the checkout as found, while 01_fix cut its branch from
+    origin/<base>. With one shared default that was invisible; once a run may
+    name its own base it means diagnosing failures in code the PR will not
+    contain.
+
+    Two things are deliberately not done. On AUTO_PUSH=false nothing moves —
+    that is the documented "let me look at this first" contract, and dragging
+    someone's checkout onto another branch would break it — but the divergence
+    is logged rather than left silent. And a dirty tree is never force-checked-
+    out; uncommitted work outranks the alignment.
+    """
+    _, current, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace)
+    current = current.strip()
+    if not AUTO_PUSH:
+        if current and current != GITHUB_DEFAULT_BRANCH:
+            log(f"AUTO_PUSH=false — reproducing on {current}; a PR would be "
+                f"based on {GITHUB_DEFAULT_BRANCH}")
+        return
+
+    ok, status, _ = run_git(["status", "--porcelain"], workspace)
+    # loginStorage is a session the agent minted moments ago — runtime state
+    # that lives inside the repo, not somebody's work. Same exclusion the
+    # adaptation agent's cleanliness gate uses.
+    dirty = [ln for ln in status.splitlines() if ln.strip() and "loginStorage" not in ln]
+    if not ok or dirty:
+        log(f"Checkout has uncommitted changes — reproducing on {current or 'HEAD'} "
+            f"as it stands rather than moving to {GITHUB_DEFAULT_BRANCH}")
+        return
+
+    prepared = workspace_helper.prepare_base(
+        workspace, GITHUB_ORG, GITHUB_REPO_AUTOMATION, GITHUB_TOKEN,
+        GITHUB_DEFAULT_BRANCH, log=log)
+    if not prepared["ok"]:
+        log(f"Could not prepare {GITHUB_DEFAULT_BRANCH} ({prepared['reason']}) — "
+            f"reproducing on {current or 'HEAD'}")
+        return
+    moved = workspace_helper.checkout_base(
+        workspace, prepared["branch"], prepared["sha"], log=log)
+    if not moved["ok"]:
+        log(f"{moved['reason']} — reproducing on {current or 'HEAD'}")
 
 
 def read_report_entries(results_dir: Path, class_simple: str, method: str) -> list:
@@ -318,6 +371,7 @@ def main():
         finish("INFRA_WORKSPACE", "Automation repo workspace not found — "
                "set WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
     log(f"Workspace: {workspace}")
+    align_workspace_to_base(workspace)
 
     # Resolve the fully-qualified name so the handoff carries a package, which is
     # what CodeAnalyzer needs later to find the test file again.

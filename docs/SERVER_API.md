@@ -142,9 +142,36 @@ admin's setting.
 {
   "agent": "test-adaptation-agent",
   "auto_push_default": true,
-  "adapt_apply_default": false
+  "adapt_apply_default": false,
+  "default_branch": "main"
 }
 ```
+
+`default_branch` is what a run gets when its `base_branch` is left unset. The UI
+seeds its branch field from this rather than hardcoding `main`, so the panel never
+shows a default the server would not actually use.
+
+---
+
+### Branches — Automation Repo
+
+```
+GET /agents/<agent>/branches
+```
+
+Branches on the automation repo, for the run panel's picker. Cached for ~60s.
+
+**Response:**
+```json
+{
+  "branches": ["main", "release/2.3"],
+  "default": "main"
+}
+```
+
+Never returns an error: if GitHub cannot be reached, `branches` is `[]` and the
+panel stays usable — the field is free text and the run's own pre-flight is the
+real check.
 
 ---
 
@@ -224,12 +251,20 @@ Triggers an agent run. Only one run is active at a time; additional requests are
 ```json
 {
   "module": "payments",
-  "auto_push": false
+  "auto_push": false,
+  "base_branch": "release/2.3"
 }
 ```
 
 - `module` — which queue file to process (omit to use queue mode: oldest file)
 - `auto_push` — `false` for dry-run (no GitHub PR created)
+- `base_branch` — *optional.* Branch of the automation repo to base this run on:
+  the checkout is moved onto it before the agent reads or runs anything, the
+  agent's branch is cut from it, and the PR is raised against it. **Omit it** to
+  use `GITHUB_DEFAULT_BRANCH` from `config/.env` — sending a value always
+  overrides that setting for the run, so an untouched UI field must send nothing
+  rather than echoing the default back. Rejected with `400` if the name is
+  malformed or the branch does not exist on the remote.
 
 **Response (201 — run started immediately):**
 ```json
@@ -238,6 +273,7 @@ Triggers an agent run. Only one run is active at a time; additional requests are
   "session_id": "20260507-102341-payments",
   "module": "payments",
   "auto_push": false,
+  "base_branch": "release/2.3",
   "status": "running",
   "started_at": "2026-05-07T10:23:41Z"
 }

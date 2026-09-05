@@ -118,6 +118,12 @@ class RunState:
     cond: threading.Condition = field(default_factory=threading.Condition)
     start_from_step: int = 1  # >1 means this run resumed an existing session
     agent: str = DEFAULT_AGENT
+    # The base this run was asked for, or "" when it took whatever config/.env
+    # says. Empty is meaningful and not a synonym for "main": it is the only
+    # thing that distinguishes a deliberate override from the org default.
+    # Down here rather than beside auto_push because the fields above it have
+    # no defaults, and a dataclass will not take a defaulted field before them.
+    base_branch: str = ""
     payload: Dict = field(default_factory=dict)
 
     def snapshot(self) -> Dict:
@@ -127,6 +133,7 @@ class RunState:
             "agent": self.agent,
             "module": self.module,
             "auto_push": self.auto_push,
+            "base_branch": self.base_branch,
             "audit_dir": str(self.audit_dir),
             "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -191,7 +198,8 @@ def _start_next_from_queue() -> None:
                   session_id=next_item.get("session_id"),
                   start_from_step=next_item.get("start_from_step", 1))
     except Exception as e:
-        print(f"[runner] failed to start queued run for {next_item.get('module')!r}: {e}")
+        print(f"[runner] failed to start queued run for {next_item.get('module')!r} "
+              f"(session {next_item.get('session_id')}): {e}")
 
 
 def _unique_session_id(spec, payload: dict) -> str:
@@ -235,6 +243,7 @@ def get_queue(agent: Optional[str] = None) -> List[Dict]:
     with _queue_lock:
         rows = [{"agent": item.get("agent", DEFAULT_AGENT),
                  "module": item.get("module"), "auto_push": item.get("auto_push"),
+                 "base_branch": item.get("base_branch", ""),
                  "session_id": item.get("session_id"),
                  "start_from_step": item.get("start_from_step", 1),
                  "index": i}
@@ -504,6 +513,7 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
                     _pending_queue.append({
                         "agent": spec.name, "payload": payload,
                         "module": label, "auto_push": bool(payload.get("auto_push")),
+                        "base_branch": (payload.get("base_branch") or "").strip(),
                         "session_id": queued_session_id,
                         "start_from_step": start_from_step,
                     })
@@ -544,6 +554,7 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
             session_id=session_id,
             module=label,
             auto_push=bool(payload.get("auto_push")),
+            base_branch=agent_env.get("GITHUB_DEFAULT_BRANCH", ""),
             agent=spec.name,
             payload=payload,
             audit_dir=audit_dir,
@@ -561,6 +572,7 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
         "agent": run.agent,
         "module": run.module,
         "auto_push": run.auto_push,
+        "base_branch": run.base_branch,
         "status": "running",
         "started_at": run.started_at,
         "start_from_step": start_from_step,

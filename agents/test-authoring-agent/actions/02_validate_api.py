@@ -56,6 +56,7 @@ RETRY_ON_CONNECTION_ERROR = os.environ.get("VALIDATE_API_RETRY_ON_ERROR", "true"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → shared.*
 from shared.log import log as _log
+from shared.credential_extraction import credentials_from_plan
 
 
 def log(msg: str) -> None:
@@ -334,7 +335,7 @@ def main() -> None:
         return
 
     api_auth = plan.get("api_auth") or {"type": "none"}
-    demo_creds = plan.get("demo_credentials", {})
+    demo_creds = credentials_from_plan(plan)
 
     log(f"Authenticating against {base_url} (type={api_auth.get('type')})...")
     auth_result = perform_auth(base_url, api_auth, demo_creds)

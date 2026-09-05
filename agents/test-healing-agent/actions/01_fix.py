@@ -1940,26 +1940,39 @@ def main():
         log(f"AUTO_PUSH=false — staying on {current.strip() or 'the current branch'}; "
             f"edits will be left uncommitted for review")
     else:
-        ok, _, err = run_git(["fetch", "origin"], workspace, push_url=_authenticated_url())
+        # Attempt 1 establishes the base and records it. Later attempts reuse
+        # that recorded SHA and deliberately do NOT re-fetch: origin/<base> may
+        # have advanced in the meantime, and re-cutting the branch from a moved
+        # base would silently drop the commits attempt 1 already made.
+        if FIX_ATTEMPT <= 1:
+            prepared = workspace_helper.prepare_base(
+                workspace, GITHUB_ORG, GITHUB_REPO_AUTOMATION, GITHUB_TOKEN,
+                GITHUB_DEFAULT_BRANCH, log=log)
+            ok, err = prepared["ok"], prepared["reason"]
+            base_sha = prepared["sha"]
+        else:
+            _recorded, base_sha = workspace_helper.read_base_marker(AUDIT_DIR)
+            ok, err = bool(base_sha), "attempt 1 recorded no base"
         if ok:
-            # FIX_ATTEMPT 1: reset to origin base so we always start clean
+            # FIX_ATTEMPT 1: reset to the recorded base so we always start clean
             # FIX_ATTEMPT > 1: reuse the existing branch (fixes accumulate across retries)
             if FIX_ATTEMPT <= 1:
                 on_branch, _, switch_err = run_git(
-                    ["checkout", "-B", branch_name, f"origin/{GITHUB_DEFAULT_BRANCH}"], workspace)
+                    ["checkout", "-B", branch_name, base_sha], workspace)
             else:
                 # Branch should already exist from attempt 1; just check it out
                 on_branch, _, switch_err = run_git(["checkout", branch_name], workspace)
                 if not on_branch:
                     # Branch doesn't exist yet (first attempt committed nothing) — create it
                     on_branch, _, switch_err = run_git(
-                        ["checkout", "-B", branch_name, f"origin/{GITHUB_DEFAULT_BRANCH}"], workspace)
+                        ["checkout", "-B", branch_name, base_sha], workspace)
             # Checked, deliberately. This used to be fire-and-forget: a switch
             # blocked by local modifications failed silently, the log announced a
             # branch we were never on, and the commit landed on the user's working
             # branch — precisely what the comment below says must never happen.
             if on_branch:
-                log(f"Branch: {branch_name} (attempt {FIX_ATTEMPT}, base: {GITHUB_DEFAULT_BRANCH})")
+                log(f"Branch: {branch_name} (attempt {FIX_ATTEMPT}, "
+                    f"base: {GITHUB_DEFAULT_BRANCH} @ {base_sha[:8]})")
             else:
                 log(blocked(
                     f"could not switch to {branch_name} ({switch_err.strip()[:120]})",
@@ -1971,7 +1984,7 @@ def main():
             # than committing onto it: "proceeding on current branch" quietly meant
             # fixes landed as commits on main, which is not something an autofix
             # should ever do to someone's working checkout.
-            log(f"Warning: git fetch failed ({err})")
+            log(f"Warning: could not establish the base branch ({err})")
             on_branch, _, local_err = run_git(["checkout", "-B", branch_name], workspace)
             if on_branch:
                 log(f"Branch: {branch_name} (created from the current HEAD — no remote base)")

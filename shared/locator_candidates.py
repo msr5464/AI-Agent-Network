@@ -247,7 +247,7 @@ def gather(ctx, snap: dict, baseline: dict, cfg: dict, vol: Volatility) -> list[
                 _, fp = capture.find_by_locator(
                     ctx, f'internal:role={role}[name="{acc}"s]', snap=snap)
                 if fp is None:
-                    idx = ctx.evaluate(capture.JS, loc.first.element_handle())
+                    idx = ctx.evaluate(capture.script(), loc.first.element_handle())
                     fp = snap["elements"][idx] if 0 <= idx < len(snap["elements"]) else None
                 mark(fp, "T2_semantic", f'role={role} name="{acc}"')
         except Exception:

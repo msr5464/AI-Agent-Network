@@ -648,7 +648,7 @@ def _main() -> int:
             if res.emitted.get("fragile"):
                 print(f"  FRAGILE: {res.emitted['fragile']}")
         if a.explain:
-            import score as score_mod
+            from shared import locator_score as score_mod
             print("\n  score breakdown:")
             print(score_mod.format_breakdown(res.breakdown_rows, 10))
             print("\n  retry log:")

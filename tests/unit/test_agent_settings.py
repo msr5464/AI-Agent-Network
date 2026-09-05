@@ -219,3 +219,33 @@ class TestShadowDetection:
         agent_dir.mkdir(parents=True)
         (agent_dir / ".env").write_text("# AUTOFIX_MODEL=claude-opus-5\n")
         assert agent_settings._find_shadowed() == {}
+
+
+# ── The per-run base branch must not leak into the admin settings ─────────────
+
+def test_a_per_run_base_branch_never_writes_to_the_environment(monkeypatch):
+    """A run overriding its base must not change what the settings page shows.
+
+    The override works by exporting GITHUB_DEFAULT_BRANCH into the *subprocess*
+    environment runner.py builds from os.environ.copy(). If build_env mutated
+    the server's own os.environ instead, one run against a release branch would
+    silently repoint every later run and the admin page would agree with it.
+    """
+    from qa_agents_server import agents
+
+    monkeypatch.setenv("GITHUB_DEFAULT_BRANCH", "main")
+
+    env = agents.AGENTS["test-authoring-agent"].build_env(
+        {"module": "checkout", "base_branch": "release/2.3"})
+
+    assert env["GITHUB_DEFAULT_BRANCH"] == "release/2.3"
+    assert os.environ["GITHUB_DEFAULT_BRANCH"] == "main"
+    assert agents.default_branch() == "main"
+
+
+def test_the_default_branch_stays_an_admin_setting(monkeypatch):
+    """It is still the org-wide default; only the per-invocation override is new,
+    and per-invocation vars are deliberately absent from SETTINGS_SCHEMA."""
+    keys = {row["env_var"] for row in agent_settings.SETTINGS_SCHEMA}
+    assert "GITHUB_DEFAULT_BRANCH" in keys
+    assert "BASE_BRANCH" not in keys

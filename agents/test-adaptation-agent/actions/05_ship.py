@@ -254,8 +254,28 @@ def main():
         workspace = Path(scope["workspace"])
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
         branch = f"{BRANCH_PREFIX}/{MODULE}-{stamp}"
-        run_git(["fetch", "origin"], workspace, push_url=push_url())
-        ok, _, err = run_git(["checkout", "-B", branch, f"origin/{BASE_BRANCH}"], workspace)
+        # Branch from the SHA step 02 recorded, and do NOT re-fetch first.
+        # Step 04 has already written its edits into the working tree; the
+        # `git fetch origin` that used to be here was a no-op only by accident
+        # (run_git substitutes the literal "origin" for the auth URL, so it ran
+        # `git fetch <url>` with no refspec and never updated origin/<base>).
+        # Make that fetch work and origin/<base> can advance mid-run, at which
+        # point `checkout -B` either moves the tree or refuses with "local
+        # changes would be overwritten". Step 02 already put HEAD at base_sha,
+        # so cutting the branch from it is a pure creation that moves nothing.
+        base_sha = scope.get("base_sha") or ""
+        _, head_sha, _ = run_git(["rev-parse", "HEAD"], workspace)
+        if base_sha and head_sha.strip() == base_sha:
+            ok, _, err = run_git(["checkout", "-B", branch, base_sha], workspace)
+        else:
+            # A resumed run can land on a checkout something else has moved
+            # since step 02. Resetting to the recorded base would destroy the
+            # very edits being shipped, so branch from HEAD and say so.
+            if base_sha:
+                log(f"note: checkout is at {head_sha.strip()[:8]}, not the "
+                    f"{base_sha[:8]} step 02 recorded — branching from HEAD so "
+                    f"the applied edits are not discarded")
+            ok, _, err = run_git(["checkout", "-b", branch], workspace)
         if not ok:
             result.update({"ship_status": "push_failed",
                            "ship_detail": f"could not create {branch}: {err}"})

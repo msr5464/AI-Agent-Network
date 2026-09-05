@@ -13,12 +13,20 @@ import yaml
 from playwright.sync_api import sync_playwright
 
 from shared import browser_mode
+from shared import locator_capture as capture
 from shared import locator_resolve as heal_mod
 
 HERE = pathlib.Path(__file__).resolve().parent
 CONFIG = HERE.parent / "config" / "locator.yaml"
 FIX = HERE / "fixtures"
 BASE = HERE / "baselines"
+
+# These fingerprint a real page, so they need the capture script — which the
+# automation framework owns. Nothing here can stand in for it: a substitute walk
+# is the exact thing keeping a single copy is meant to prevent.
+pytestmark = pytest.mark.skipif(
+    not capture.script_available(),
+    reason=f"capture script not at {capture.script_path()} — set FRAMEWORK_DIR")
 
 
 @pytest.fixture(scope="module")

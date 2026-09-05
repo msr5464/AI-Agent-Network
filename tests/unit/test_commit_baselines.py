@@ -86,3 +86,15 @@ def test_it_never_fails_the_build(tmp_path):
     done = subprocess.run([sys.executable, str(REPO / "scripts/commit_baselines.py"),
                            str(tmp_path)], capture_output=True, text=True)
     assert done.returncode == 0
+
+
+def test_a_pending_fingerprint_is_never_committed(repo):
+    """`pending/` is the Java side's scratch space: record() writes there and
+    promote()/discard() empties it. A file left behind is an interrupted run,
+    not a good-run fingerprint, and its name is a test key rather than a page
+    object — exactly the record a later diagnosis must not compare against."""
+    pending = repo / BASELINE_DIR / "pending"
+    pending.mkdir()
+    (pending / "SomeTest.someMethod__LoginPage.json").write_text(
+        json.dumps({"pageObject": "LoginPage", "recordedAt": "2026-06-01T00:00:00"}))
+    assert commit_baselines.changed_baselines(repo) == []

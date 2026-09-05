@@ -63,6 +63,16 @@ FIX_TIMEOUT_S = int(os.environ.get("FIX_TIMEOUT_S", "900"))
 # budget; authoring legitimately repairs compile errors, imports and helper calls,
 # so it needs more room while still rejecting a whole-file regeneration.
 FIX_MAX_DIFF_LINES = int(os.environ.get("FIX_MAX_DIFF_LINES", "200"))
+# Escape hatch for the assertion-conservation guard, named to match the one
+# test-healing-agent already uses for validate_diagnosis_fit. There is no case
+# where an autofix *should* weaken a test, so this exists for a human who has
+# looked at the diff and decided otherwise — never for the loop to set itself.
+FORCE = os.environ.get("FORCE", "false").lower() == "true"
+# The assertions the generated test had before any fix touched it. Frozen at
+# attempt 0 and compared against on every later attempt, so attempt 3 cannot
+# launder a weakening that attempt 2 introduced — the "freeze before edit" rule
+# shared/intent.py spells out.
+FROZEN_ASSERTIONS = ".assertions-frozen.json"
 
 # Where the Java framework's TestListener/JsonTestReporter write machine-readable
 # results — built specifically "for AI agents to read... without parsing HTML
@@ -115,6 +125,7 @@ def call_claude(prompt: str) -> str:
     return result.stdout
 
 from shared.credential_properties import write_credential_property
+from shared.credential_extraction import credentials_from_plan
 from shared.test_catalog import test_methods_in
 from shared import properties_file, url_properties
 # Evidence readers shared with test-healing-agent. The framework already writes a
@@ -137,6 +148,12 @@ from shared.edit_guards import (apply_edits, compute_diff, log_edits,
                                 logstep_present, no_new_swallowing,
                                 no_selector_broadening, validate_fix,
                                 wrapper_compliance)
+# What the test proves, as opposed to how it proves it. The guards above are all
+# per-file and per-line; none of them notices an assertion being deleted, because
+# that is a one-line diff that loses no method and adds no sleep. An authored test
+# shipped green with `assertTrue(isSuccessToastVisible())` replaced by an `if` and
+# a `logWarning` — every guard above passed it. This is the one that would not.
+from shared import assertion_graph, intent
 
 
 def _record_build(cmd, elapsed_s: float, verdict: str) -> None:
@@ -317,6 +334,68 @@ def extract_fix_response(fix_map) -> tuple:
     return "", "", fix_map, {}
 
 
+def _fingerprint_test(test_class: str, test_method: str):
+    """What `test_class#test_method` currently asserts, or None if unreadable.
+
+    Never raises: this feeds a guard, and a guard that crashes the run is worse
+    than one that abstains. An unreadable fingerprint means conservation is not
+    checked for that attempt, which is logged rather than silently skipped.
+    """
+    try:
+        index = assertion_graph.member_index(str(AUTOMATION_FRAMEWORK_DIR))
+        return assertion_graph.fingerprints(test_class, test_method, index)
+    except Exception as exc:
+        log(f"  could not fingerprint {test_class}#{test_method}: {exc}")
+        return None
+
+
+def freeze_assertions(test_class: str, test_method: str) -> None:
+    """Record what the generated test proves, before any fix can change it.
+
+    Deriving this again after a fix would let an edit that deleted an assertion
+    produce a baseline that no longer expects one — the guard would then approve
+    its own violation.
+    """
+    prints = _fingerprint_test(test_class, test_method)
+    if prints is None:
+        return
+    try:
+        # fingerprints() already returns the shape conserved() consumes, so it is
+        # stored as-is. Tuples land as JSON lists, which conserved() reads the
+        # same way — it only ever takes their length or unpacks them.
+        (AUDIT_DIR / FROZEN_ASSERTIONS).write_text(json.dumps(prints))
+        log(f"Froze {len(prints.get('asserts') or {})} assertion(s) for {test_class}#{test_method}")
+    except Exception as exc:
+        log(f"  could not persist frozen assertions: {exc}")
+
+
+def check_conservation(test_class: str, test_method: str) -> tuple:
+    """Compare what the test proves now against the frozen copy. (ok, reason).
+
+    Abstains — returns ok — when there is nothing to compare against, because a
+    missing freeze must not block a legitimate compile-error fix. It only ever
+    rejects on a measured loss.
+    """
+    path = AUDIT_DIR / FROZEN_ASSERTIONS
+    if not path.exists():
+        return True, ""
+    try:
+        frozen = json.loads(path.read_text())
+    except Exception as exc:
+        log(f"  could not read frozen assertions, skipping conservation: {exc}")
+        return True, ""
+
+    after = _fingerprint_test(test_class, test_method)
+    if after is None:
+        return True, ""
+
+    report = assertion_graph.conserved(frozen, after)
+    if report["ok"]:
+        log(f"  {assertion_graph.describe(report)}")
+        return True, ""
+    return False, assertion_graph.describe(report)
+
+
 def _run_guards(original: str, updated: str, rel_path: str) -> tuple:
     """Mechanical checks a re-run cannot do for us. Returns (ok, reason).
 
@@ -348,18 +427,27 @@ def _run_guards(original: str, updated: str, rel_path: str) -> tuple:
     return True, ""
 
 
-def apply_fix(files_map: dict, edits_map: dict = None) -> tuple:
+def apply_fix(files_map: dict, edits_map: dict = None,
+              test_class: str = "", test_method: str = "") -> tuple:
     """Apply a fix to the framework repo, guarded.
 
     Prefers targeted edits (edits_map) over whole-file replacement (files_map):
     a search/replace that must match exactly once cannot silently drop the rest of
     a file the model never saw.
 
+    The per-file guards run inside the loop; assertion conservation runs once at
+    the end, because what a test proves is a property of its whole call graph and
+    a fix that moves an assertion out of the test and into a page object is not
+    visible in either file alone. A violation rolls every file in the fix back —
+    leaving half of a rejected fix on disk is how the next attempt inherits a
+    weakened test and never notices.
+
     Returns (patched_paths, patched_contents, rejections).
     """
     edits_map = edits_map or {}
     patched, rejections = [], []
     patched_contents: dict = {}
+    originals: dict = {}
 
     targets = list(edits_map.keys()) + [k for k in files_map if k not in edits_map]
     for rel_path in targets:
@@ -401,6 +489,7 @@ def apply_fix(files_map: dict, edits_map: dict = None) -> tuple:
                 continue
 
         full.parent.mkdir(parents=True, exist_ok=True)
+        originals[rel_path] = original
         full.write_text(updated)
         patched.append(rel_path)
         patched_contents[rel_path] = updated
@@ -408,6 +497,29 @@ def apply_fix(files_map: dict, edits_map: dict = None) -> tuple:
         if rel_path in edits_map:
             # The prose root_cause says WHY; without this nobody can see WHAT.
             log_edits(full, original, edits_map[rel_path], log)
+
+    # ── Assertion conservation, across everything the fix just wrote ──────────
+    if patched and test_class and test_method:
+        ok, reason = check_conservation(test_class, test_method)
+        if not ok and FORCE:
+            log(f"  {reason}")
+            log("  FORCE=true — applying it anyway")
+        elif not ok:
+            log(f"  REJECTED whole fix — {reason}")
+            log("  A test that proves less is not a fixed test. If the assertion "
+                "cannot hold, the honest outcome is a failing test and a human "
+                "decision, not a green one.")
+            for rel_path in patched:
+                restore = originals.get(rel_path, "")
+                target = AUTOMATION_FRAMEWORK_DIR / rel_path
+                if restore:
+                    target.write_text(restore)
+                elif target.exists():
+                    target.unlink()
+            rejections.append({"file": ", ".join(patched),
+                               "reason": f"assertion_conservation: {reason}"})
+            return [], {}, rejections
+
     return patched, patched_contents, rejections
 
 
@@ -915,7 +1027,7 @@ def _mysql_escape(value: str) -> str:
 
 def try_fix_infra_user(plan: dict) -> bool:
     """Insert demo user into the user pool table if missing. Returns True if action taken."""
-    creds = plan.get("demo_credentials", {})
+    creds = credentials_from_plan(plan)
     if not creds.get("username") or not creds.get("password"):
         log("User auto-repair: no demo_credentials in plan")
         return False
@@ -982,7 +1094,7 @@ def try_fix_infra_credentials(plan: dict) -> bool:
         log("Credential auto-repair: no feature_name in plan")
         return False
     status = write_credential_property(
-        AUTOMATION_FRAMEWORK_DIR, feature.lower(), plan.get("demo_credentials", {}), log=log
+        AUTOMATION_FRAMEWORK_DIR, feature.lower(), credentials_from_plan(plan), log=log
     )
     if status == "no credentials to write":
         log("Credential auto-repair: no demo_credentials in plan")
@@ -1066,7 +1178,7 @@ def ensure_credentials(plan: dict) -> None:
     if not feature:
         log("Credential precheck: no feature_name in plan — skipping")
         return
-    creds = plan.get("demo_credentials") or {}
+    creds = credentials_from_plan(plan)
     status = write_credential_property(AUTOMATION_FRAMEWORK_DIR, feature, creds, log=log)
     key = f"{feature}.username"
     if status == "no credentials to write":
@@ -1120,6 +1232,9 @@ def main() -> None:
     if FIX_ATTEMPT == 0:
         ensure_credentials(plan_data)
         ensure_url_properties(plan_data, gen_data)
+        # Before the first run, and so before any fix: this is the copy every
+        # later attempt is measured against.
+        freeze_assertions(test_class, test_method)
         log(f"Initial test run: {test_class}#{test_method}")
         run_started_at = time.time()
         passed, test_output = run_maven_test(test_class, test_method)
@@ -1433,6 +1548,10 @@ Try a DIFFERENT approach — do NOT repeat what was tried before.
     known_url_keys  = sorted(gen_data.get("url_properties") or {})
     url_keys_hint   = (f" — already defined: {', '.join(known_url_keys)}"
                        if known_url_keys else "")
+    # The same list the adaptation agent puts in front of its model and into its
+    # PR bodies. Kept in shared/intent.py so the rule reads identically wherever
+    # an agent is allowed to edit a test.
+    never_rules = "\n".join(f"  - {rule}" for rule in intent.NEVER)
 
     prompt = f"""You are a Java test automation debugging agent for the Jarvis framework.
 
@@ -1464,6 +1583,21 @@ Common failure causes:
 
 CRITICAL: Preserve ALL existing JavaDoc comments, inline comments, and annotations exactly as written.
 Only change the minimum code required to fix the failure. Do NOT remove, shorten, or reword any comments.
+
+CRITICAL: Do not change what the test PROVES. You may change how it gets there — locators,
+waits, navigation, intermediate pages are all mechanism and all yours to fix. The assertions are
+not. Specifically, you may never:
+{never_rules}
+A test that passes because it stopped checking is worse than a failing one: the failure was
+visible and this is not. This is enforced mechanically — every assertion reachable from
+{test_class}#{test_method} was fingerprinted before your fix, and one that is removed, moved
+down to a weaker call, or wrapped in a condition gets the WHOLE fix rejected and the attempt
+wasted, however good the rest of it was.
+
+If the only way to make this test pass is to weaken what it checks, then it should not pass.
+Return "edits": [] and say so in root_cause — that the product does not do what the test
+asserts, or that the assertion was never right. That is a useful answer and a human will act
+on it. Turning the assertion into a warning, a log line, or an `if` is not.
 
 CRITICAL: Never introduce a literal "http://" or "https://" URL — not in a test, a page object,
 a helper, or a `static final` constant. A fix that adds one is REJECTED outright and the attempt
@@ -1509,7 +1643,8 @@ Output ONLY valid JSON.
     fix_contents: dict = {}
     fix_rejections: list = []
     if files_map or edits_map:
-        fixes_applied, fix_contents, fix_rejections = apply_fix(files_map, edits_map)
+        fixes_applied, fix_contents, fix_rejections = apply_fix(
+            files_map, edits_map, test_class, test_method)
         if fixes_applied:
             log(f"Applied fixes to {len(fixes_applied)} file(s) — running test")
     elif root_cause:

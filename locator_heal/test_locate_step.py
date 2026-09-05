@@ -18,6 +18,11 @@ from shared import locator_capture as capture
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 HERE = REPO / "locator_heal"
+
+# Fingerprints a real page, so it needs the framework's capture script.
+pytestmark = pytest.mark.skipif(
+    not capture.script_available(),
+    reason=f"capture script not at {capture.script_path()} — set FRAMEWORK_DIR")
 FIX = HERE / "fixtures"
 STEP = REPO / "agents" / "test-healing-agent" / "actions" / "01_locate.py"
 

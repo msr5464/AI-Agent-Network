@@ -48,9 +48,11 @@ before the file is written:
 
 | Case | Outcome |
 |------|---------|
-| `SELECTOR_FOUND` with `count=1` | kept |
+| `SELECTOR_FOUND` with `count=1` and `visible=1` | kept |
 | `SELECTOR_FOUND` with `count != 1` | dropped — would be a runtime strict mode violation |
+| `SELECTOR_FOUND` with `visible != 1` | dropped — a locator nobody can see makes a test fail for an invisible reason |
 | `SELECTOR_FOUND` with no `count` at all | dropped — never measured, so not confirmed |
+| `SELECTOR_FOUND` with no `visible` at all | kept, recorded as visibility-unmeasured (a pre-protocol cached run must not empty the map) |
 | `INTERACTION_HINT` whose name has a confirmed selector | kept, with the hint's selector **replaced by the confirmed one** |
 | `INTERACTION_HINT` with no confirmed selector and no `count: 1` | dropped |
 
@@ -61,6 +63,70 @@ parent `span` instead, leaving a hint pointing at the element that does not work
 
 A run that confirms nothing is retried once; if it still confirms nothing, step 03
 aborts rather than generating from guesses (override with `ALLOW_MISSING_SELECTORS`).
+
+Every dropped selector is recorded in `rejected_selectors` with its reason, so
+"why is there no locator for the toast?" has an answer in the audit trail rather
+than in a console line that has scrolled away.
+
+### What a step outcome means
+
+A step has three outcomes, not two. The third exists because "I did the action but
+could not observe what it claims" used to collapse into a pass — which is how a run
+reported `STEP_PASSED: Verify a success confirmation toast appears` for a toast that
+never rendered, reasoning from the save API returning 200.
+
+| Marker | Meaning |
+|--------|---------|
+| `STEP_PASSED` | the step's claim was observed. For a claim about a UI element that means **seeing the element**; a network response is never proof one rendered |
+| `STEP_UNVERIFIED` | the action completed, the claimed outcome was never observed |
+| `STEP_FAILED` | the step could not be performed |
+
+This is enforced, not requested: a verification step reported as passed with no
+`SELECTOR_FOUND` for the element it claims to have seen is downgraded to unverified
+in Python (`enforce_verification_evidence`). Step outcomes were the last self-report
+in this step that nothing checked.
+
+### Assertions vs mechanisms
+
+The two halves of a test are treated very differently, following the rule
+`shared/intent.py` already states — *the mechanism becomes mutable and the proof
+does not*.
+
+**A verification names the proof, and it is fixed.** What happens to one step 02
+could not observe depends on who asked for it (`shared/check_provenance.py` decides,
+by measuring the check's vocabulary against the author's own words — never by
+trusting the model's claim about itself):
+
+| Check | Outcome |
+|-------|---------|
+| the input asked for it | **kept at full strength.** The test fails on purpose, the PR says why, and the verdict is NEEDS-REVIEW. The product does not do what was asked — that is a finding |
+| the pipeline invented it | **dropped entirely** — locator, accessor and assertion. A failing check nobody asked for is exactly what gets "fixed" by deleting it |
+
+Dropping is the irreversible direction, so it needs the harder test: a check is only
+dropped when *nothing* in it traces back to the input. A partly-traceable check is
+kept and the test goes red, because a wrongly-kept check is visible and a wrongly-
+dropped one is silent.
+
+**An action names an outcome, and the mechanism is ours to find.** "Save the profile"
+does not mean "there is a Save button" — Naukri's profile summary autosaves about a
+second after the last keystroke. When an action's named control is not visible, step
+02 discovers how the outcome actually happens (rule 2e) and reports
+`MECHANISM_FOUND: <action>|<kind>|<trigger>|<settles when>`, which step 03 generates
+from. An action step never becomes an unverified check.
+
+### What step 04 may not do
+
+A fix may change how the test reaches its result; it may not change the result it
+proves. Every assertion reachable from the test method is fingerprinted **before the
+first run** into `.assertions-frozen.json`, and each attempt is compared against that
+frozen copy with `shared/assertion_graph.conserved()` — so attempt 3 cannot launder a
+weakening introduced by attempt 2. An assertion removed, moved down a strength ladder
+(`assertEquals` → `assertNotNull`), or wrapped in a condition rejects the **whole**
+fix and rolls every file back. `FORCE=true` overrides it, matching test-healing-agent.
+
+This exists because none of the six per-file guards could see it: deleting an
+assertion is a one-line diff that loses no method, adds no `Thread.sleep`, and is
+invisible to `no_selector_broadening`, which only inspects `page.locator(...)` calls.
 
 ---
 
@@ -123,8 +189,8 @@ Web Steps:
 - `skipped` — no test could be run (infra issue) → clean exit
 
 **.verdict**
-- `APPROVED`      — test passed, PR created
-- `NEEDS-REVIEW`  — test still failing, PR created with warning
+- `APPROVED`      — test passed, nothing the input asked for went unverified, no fix was rejected for weakening an assertion
+- `NEEDS-REVIEW`  — test failing, OR a requested check could not be observed, OR a fix was rejected for weakening a test, OR no test ran at all
 
 ---
 
@@ -137,10 +203,11 @@ Web Steps:
 | `00-session-init.md` | run.sh | Session metadata, env snapshot |
 | `01-parse.json` + `.md` | Parse | Generation plan |
 | `02-validate-api.json` + `.md` | Validate API | Auth status, confirmed endpoint response shapes |
-| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results |
+| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms` |
 | `claude-*.log` | Validate Web | Raw `claude -p` stream, for diagnosing empty runs |
-| `03-generate.json` + `.md` | Generate | List of files written |
+| `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators` |
 | `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes |
+| `.assertions-frozen.json` | Run & Fix | What the generated test proved before any fix — the conservation baseline |
 | `.fix-passed` | Run & Fix | Gate: true / false / skipped |
 | `05-ship.json` + `.md` | Ship | PR URL, Slack status |
 | `.verdict` | Ship | APPROVED / NEEDS-REVIEW |
@@ -175,6 +242,7 @@ Web Steps:
 | `VALIDATE_API_REQUEST_TIMEOUT_S` | Timeout (s) for each real HTTP call in Validate API | `15` |
 | `VALIDATE_API_RETRY_ON_ERROR` | Set `false` to disable the one connection-error retry in Validate API | `true` |
 | `ALLOW_MISSING_SELECTORS` | Let step 03 generate when step 02 confirmed nothing | `false` |
+| `FORCE` | Let a step 04 fix through even when it weakens an assertion. For a human who has read the diff — never for the loop | `false` |
 | `SLACK_BOT_TOKEN` | Slack bot token | optional |
 | `SLACK_NOTIFY_CHANNEL` | Slack channel for success notifications | optional |
 | `SLACK_ALERT_CHANNEL` | Slack channel for failure alerts | optional |

@@ -80,26 +80,26 @@ class TestStepO2Parsers:
             "SELECTOR_FOUND: profileSummarySection = generic[ref=f2e585]|count=1",
             "SELECTOR_FOUND: loginButton = button.blue-btn|count=1",
         ])
-        selectors, _ = mod.parse_selector_output(raw)
+        selectors, _, _, _ = mod.parse_selector_output(raw)
         assert selectors == {"loginButton": "button.blue-btn"}
 
     def test_a_selector_matching_several_elements_is_dropped(self, tmp_path, monkeypatch):
         """The exact failure: button[type='submit'] matched 2 elements, was recorded
         as confirmed, and killed the generated test with a strict mode violation."""
         mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
-        selectors, counts = mod.parse_selector_output(
+        selectors, counts, _, _ = mod.parse_selector_output(
             "SELECTOR_FOUND: loginButton = button[type='submit']|count=2")
         assert selectors == {} and counts == {}
 
     def test_a_selector_matching_nothing_is_dropped(self, tmp_path, monkeypatch):
         mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
-        selectors, _ = mod.parse_selector_output(
+        selectors, _, _, _ = mod.parse_selector_output(
             "SELECTOR_FOUND: ghost = .no-such-thing|count=0")
         assert selectors == {}
 
     def test_a_unique_selector_is_kept_with_its_count(self, tmp_path, monkeypatch):
         mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
-        selectors, counts = mod.parse_selector_output(
+        selectors, counts, _, _ = mod.parse_selector_output(
             "SELECTOR_FOUND: loginButton = button.blue-btn|count=1")
         assert selectors == {"loginButton": "button.blue-btn"}
         assert counts == {"loginButton": 1}
@@ -111,7 +111,7 @@ class TestStepO2Parsers:
         a log line explaining, after the fact, why the generated test died of a
         strict mode violation. Confirmed now means measured."""
         mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
-        selectors, counts = mod.parse_selector_output(
+        selectors, counts, _, _ = mod.parse_selector_output(
             "SELECTOR_FOUND: loginButton = button.blue-btn")
         assert selectors == {} and counts == {}
 
@@ -119,7 +119,7 @@ class TestStepO2Parsers:
         """The count is read from the END of the line, so a literal | in the
         selector is safe — the same trap that forced INTERACTION_HINT onto JSON."""
         mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
-        selectors, counts = mod.parse_selector_output(
+        selectors, counts, _, _ = mod.parse_selector_output(
             'SELECTOR_FOUND: odd = [data-x="a|b"]|count=1')
         assert selectors == {"odd": '[data-x="a|b"]'} and counts == {"odd": 1}
 
@@ -659,3 +659,433 @@ class TestNavigationSettleScan:
         src = ('        submit(form, "Login form");\n'
                '        page . navigate(PROFILE_URL);\n')
         assert len(self._scan(tmp_path, monkeypatch)(src)) == 1
+
+
+# ── The toast that shipped a green test with its assertion deleted ────────────
+#
+# PR #60 generated `assertTrue(profilePage.isSuccessToastVisible())` against a
+# guessed locator, the toast never existed, and the fix replaced the assertion
+# with `if (!visible) logWarning(...)`. The PR then reported "✅ Passed".
+#
+# Four separate gaps had to line up. One test each.
+
+NAUKRI_INPUT = """Module: Naukari
+Type: web
+
+Steps:
+1. Navigate to https://www.naukri.com/nlogin/login
+2. Do login by using the credentials given below
+3. Then navigate to the profile page and modify the "Profile summary" section by
+   adding a dot (.) at the end
+4. But if a dot (.) is already present at the end, then remove the dot (.)
+5. Save the profile
+6. Wait for 2 seconds
+7. Now, go again to the profile page and validate that the profile is updated and
+   the recent changes are reflected
+"""
+
+TOAST_CHECK = "Verify a success confirmation toast or message appears"
+REAL_CHECK = ("Assert that the displayed Profile Summary text matches the "
+              "modified summary saved in the previous step")
+
+
+class TestCheckProvenance:
+    """Which checks the author actually asked for, measured rather than claimed."""
+
+    def test_a_check_the_input_never_mentions_is_droppable(self):
+        from shared import check_provenance as sp
+        assert sp.droppable(TOAST_CHECK, NAUKRI_INPUT)
+
+    def test_the_authors_own_check_is_never_droppable(self):
+        """The failure mode that matters most. Dropping this would delete an
+        assertion the author asked for — the exact harm the whole change exists
+        to prevent — so it must survive even though it is worded very differently
+        from step 7 of the input."""
+        from shared import check_provenance as sp
+        assert not sp.droppable(REAL_CHECK, NAUKRI_INPUT)
+        assert not sp.droppable("assertEquals refreshedSummary to modifiedSummary "
+                                "— confirms the change persisted", NAUKRI_INPUT)
+
+    def test_a_partly_traceable_check_survives(self):
+        """`clearly_invented` is deliberately stricter than `derive`: one word in
+        common with the author is enough to keep a check, because keeping a
+        doubtful check costs a red test while dropping a real one costs silence."""
+        from shared import check_provenance as sp
+        assert sp.derive("Verify the success toast on the profile page appears",
+                         NAUKRI_INPUT) == sp.INFERRED
+        assert not sp.droppable("Verify the success toast on the profile page appears",
+                                NAUKRI_INPUT)
+
+    def test_an_action_is_never_droppable_however_invented(self):
+        """"Save it" names an outcome, not a button. An action whose control does
+        not exist is a mechanism to discover (rule 2e), never a check to delete."""
+        from shared import check_provenance as sp
+        assert sp.shape("Save the profile") == sp.ACTION
+        assert not sp.droppable("Click the Frobnicate widget", NAUKRI_INPUT)
+
+    def test_a_verification_riding_on_an_action_is_still_a_verification(self):
+        """Step 7 is "go again to the profile page AND validate ..." — the proof
+        is on the tail of an action, not at the front of the sentence."""
+        from shared import check_provenance as sp
+        assert sp.shape("Now, go again to the profile page and validate that the "
+                        "profile is updated") == sp.VERIFICATION
+
+    def test_framework_plumbing_does_not_launder_an_invented_check(self):
+        """`assertTrue isSuccessToastVisible on the returned NaukriProfilePage`
+        drags in naukri/profile from the class name, both of which trace back to
+        the input. The check is still about a toast nobody asked for."""
+        from shared import check_provenance as sp
+        assert sp.droppable("assertTrue isSuccessToastVisible on the returned "
+                            "NaukriProfilePage", NAUKRI_INPUT)
+
+    def test_a_mistagged_check_is_overruled_by_the_text(self):
+        from shared import check_provenance as sp
+        # Model claims the author wanted it; the author's words say otherwise.
+        assert sp.reconcile("user", sp.INFERRED) == sp.USER      # keeps it
+        assert sp.reconcile("inferred", sp.INFERRED) == sp.INFERRED
+        # And the drop decision does not consult the claim at all.
+        assert sp.droppable(TOAST_CHECK, NAUKRI_INPUT)
+
+
+class TestVisibleOnlySelectors:
+    """A locator for something nobody can see is not a confirmed locator."""
+
+    def test_a_hidden_unique_match_is_dropped_with_a_reason(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        selectors, _, _, rejected = mod.parse_selector_output(
+            "SELECTOR_FOUND: successToast = [class*='toast']|count=1|visible=0")
+        assert selectors == {}
+        assert "successToast" in rejected and "visible" in rejected["successToast"]
+
+    def test_a_visible_unique_match_is_kept(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        selectors, counts, visibles, rejected = mod.parse_selector_output(
+            "SELECTOR_FOUND: loginButton = button.blue|count=1|visible=1")
+        assert selectors == {"loginButton": "button.blue"}
+        assert counts == {"loginButton": 1} and visibles == {"loginButton": 1}
+        assert rejected == {}
+
+    def test_an_unmeasured_visibility_is_kept_not_dropped(self, tmp_path, monkeypatch):
+        """A cached run predating the visibility protocol must not empty the
+        selector map and abort codegen — the same reasoning that kept
+        unverified_selectors() reporting rather than dropping."""
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        selectors, _, visibles, _ = mod.parse_selector_output(
+            "SELECTOR_FOUND: legacy = #old|count=1")
+        assert selectors == {"legacy": "#old"}
+        assert visibles == {"legacy": None}
+
+    def test_a_pipe_in_the_selector_still_survives_both_suffixes(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        selectors, _, _, _ = mod.parse_selector_output(
+            'SELECTOR_FOUND: odd = [data-x="a|b"]|count=1|visible=1')
+        assert selectors == {"odd": '[data-x="a|b"]'}
+
+
+class TestStepOutcomeHonesty:
+    """Step outcomes were the one self-report nothing ever checked."""
+
+    def test_a_verification_passed_with_no_selector_is_downgraded(self, tmp_path, monkeypatch):
+        """The single check that would have caught PR #60 on its own. The run
+        reported the toast step passed on the strength of a 200 response."""
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        kept, unverified = mod.enforce_verification_evidence(
+            [TOAST_CHECK], [], {"saveButton": "#save", "profileSummaryText": "#sum"})
+        assert kept == []
+        assert len(unverified) == 1 and TOAST_CHECK in unverified[0]
+
+    def test_a_verification_backed_by_a_selector_is_kept(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        kept, unverified = mod.enforce_verification_evidence(
+            [REAL_CHECK], [], {"profileSummaryDisplayText": "#sum"})
+        assert kept == [REAL_CHECK] and unverified == []
+
+    def test_an_action_step_is_never_downgraded(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        kept, unverified = mod.enforce_verification_evidence(
+            ["Click the Save button", "Wait 2 seconds"], [], {})
+        assert len(kept) == 2 and unverified == []
+
+    def test_the_third_state_is_parsed(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        passed, failed, unverified = mod.parse_step_results(
+            "STEP_PASSED: Click Save\n"
+            "STEP_UNVERIFIED: Verify a toast appears|looked for [role=alert]|never in DOM\n"
+            "STEP_FAILED: Click Next|category=timeout|gave up")
+        assert passed == ["Click Save"] and len(failed) == 1
+        assert unverified and unverified[0].startswith("Verify a toast appears")
+
+    def test_a_discovered_mechanism_is_parsed(self, tmp_path, monkeypatch):
+        """Naukri autosaves ~1s after the last keystroke. "Save it" does not mean
+        "press a Save button", and a missing button is not a dead end."""
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        mechs = mod.parse_mechanisms(
+            "MECHANISM_FOUND: saveProfileSummary|autosave|blur the textarea|"
+            "value persists after reload")
+        assert mechs["saveProfileSummary"]["kind"] == "autosave"
+        assert "blur" in mechs["saveProfileSummary"]["trigger"]
+
+    def test_an_unknown_mechanism_kind_is_ignored(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        assert mod.parse_mechanisms("MECHANISM_FOUND: save|telepathy|think hard") == {}
+
+
+class TestAssertionConservation:
+    """The guard that would have rejected the PR #60 fix outright.
+
+    Java fixtures rather than mocks: `conserved` walks the real call graph, and
+    the bug it missed lived in how an assertion moved between two files.
+    """
+
+    TEST_BEFORE = """package automation.naukari;
+public class NaukriProfileSummaryWebTest extends TestBase {
+    @Test
+    public void toggleDotInProfileSummaryAndVerify(Config config) {
+        NaukriProfilePage profilePage = helper.toggle(config);
+        config.logStep("Save the profile summary and verify the success toast appears");
+        profilePage.saveProfileSummary();
+        AssertHelper.assertTrue(config, profilePage.isSuccessToastVisible(),
+            "Success toast should appear after saving the profile summary");
+        String refreshedSummary = profilePage.refreshAndGetProfileSummaryText();
+        AssertHelper.assertEquals(config, refreshedSummary, modifiedSummary,
+            "Profile summary after page refresh should match the saved modified summary");
+    }
+}
+"""
+
+    def _fingerprints(self, tmp_path, source, name="after"):
+        from shared import assertion_graph
+        root = tmp_path / name / "src" / "test" / "java" / "automation" / "naukari"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "NaukriProfileSummaryWebTest.java").write_text(source)
+        index = assertion_graph.member_index(str(tmp_path / name))
+        return assertion_graph.fingerprints(
+            "NaukriProfileSummaryWebTest", "toggleDotInProfileSummaryAndVerify", index)
+
+    def _verdict(self, tmp_path, after_source):
+        from shared import assertion_graph
+        before = self._fingerprints(tmp_path, self.TEST_BEFORE, "before")
+        after = self._fingerprints(tmp_path, after_source, "after")
+        return assertion_graph.conserved(before, after)
+
+    def test_the_real_pr60_edit_is_rejected(self, tmp_path):
+        """Verbatim shape of what shipped: the assertion replaced by an `if` and a
+        logWarning, and the test then reported as passed."""
+        after = self.TEST_BEFORE.replace(
+            '''        AssertHelper.assertTrue(config, profilePage.isSuccessToastVisible(),
+            "Success toast should appear after saving the profile summary");''',
+            '''        if (!profilePage.isSuccessToastVisible()) {
+            config.logWarning("Success toast not detected — Naukri may suppress it");
+        }''')
+        report = self._verdict(tmp_path, after)
+        assert not report["ok"]
+        assert report["lost"], "the deleted assertTrue must be named"
+        assert "assertTrue" in report["reason"]
+
+    def test_a_ladder_downgrade_is_rejected(self, tmp_path):
+        """assertEquals -> assertNotNull still leaves a call behind, so nothing
+        that counts assertions would notice."""
+        after = self.TEST_BEFORE.replace(
+            "AssertHelper.assertEquals(config, refreshedSummary, modifiedSummary,",
+            "AssertHelper.assertNotNull(config, refreshedSummary,")
+        report = self._verdict(tmp_path, after)
+        assert not report["ok"]
+        assert report["weakened"] or report["lost"]
+
+    def test_wrapping_an_assertion_in_a_condition_is_rejected(self, tmp_path):
+        """An assertion that runs only when it would pass proves nothing."""
+        after = self.TEST_BEFORE.replace(
+            '''        AssertHelper.assertTrue(config, profilePage.isSuccessToastVisible(),
+            "Success toast should appear after saving the profile summary");''',
+            '''        if (profilePage.isSuccessToastVisible()) {
+            AssertHelper.assertTrue(config, profilePage.isSuccessToastVisible(),
+                "Success toast should appear after saving the profile summary");
+        }''')
+        report = self._verdict(tmp_path, after)
+        assert not report["ok"]
+        assert report["conditionalised"] or report["lost"]
+
+    def test_a_legitimate_fix_is_accepted(self, tmp_path):
+        """The other half of the same PR — a real wait fix, changing nothing about
+        what the test proves. A guard that blocked this would be useless."""
+        after = self.TEST_BEFORE.replace(
+            "profilePage.saveProfileSummary();",
+            "profilePage.saveProfileSummary();\n        WaitHelper.waitForNetworkIdle(config);")
+        report = self._verdict(tmp_path, after)
+        assert report["ok"], report["reason"]
+
+    def test_renaming_a_variable_is_accepted(self, tmp_path):
+        after = self.TEST_BEFORE.replace("refreshedSummary", "reloadedSummary")
+        assert self._verdict(tmp_path, after)["ok"]
+
+
+class TestUnverifiedCheckMatrix:
+    """Who asked for the check decides what happens to it.
+
+    Both branches matter and they pull in opposite directions: an invented check
+    is dropped so it cannot fail and tempt a fix, and the author's check is kept
+    so the test fails honestly instead.
+    """
+
+    def _plan(self):
+        return {
+            "web_pages": [{
+                "class_name": "NaukriProfilePage",
+                "locators_needed": ["profileSummaryDisplayText", "saveButton",
+                                    "successToast"],
+                "actions_needed": ["getProfileSummaryText", "saveProfileSummary",
+                                   "isSuccessToastVisible"],
+            }],
+            "web_test_methods": [{
+                "method_name": "toggle",
+                "steps": ["call helper.toggle(...)",
+                          "assertTrue isSuccessToastVisible on the returned NaukriProfilePage",
+                          "assertEquals refreshedSummary to modifiedSummary"],
+            }],
+        }
+
+    def test_an_invented_unverified_check_is_stripped_entirely(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        plan = self._plan()
+        web = {"selectors": {"saveButton": "#save",
+                             "profileSummaryDisplayText": "#sum"},
+               "steps_unverified": [f"{TOAST_CHECK}|no element confirmed|none"]}
+        out = mod.prune_unverified_checks(plan, web, NAUKRI_INPUT)
+
+        assert out["dropped"] == [TOAST_CHECK]
+        page = plan["web_pages"][0]
+        assert "successToast" not in page["locators_needed"]
+        assert "isSuccessToastVisible" not in page["actions_needed"]
+        steps = plan["web_test_methods"][0]["steps"]
+        assert not any("isSuccessToastVisible" in s for s in steps)
+        # ...and the author's own assertion is untouched.
+        assert any("assertEquals refreshedSummary" in s for s in steps)
+        assert "profileSummaryDisplayText" in page["locators_needed"]
+
+    def test_a_requested_unverified_check_is_kept_so_the_test_fails(self, tmp_path, monkeypatch):
+        """The other branch. The product does not do what was asked; the test must
+        say so, not quietly stop asking."""
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        plan = self._plan()
+        web = {"selectors": {"saveButton": "#save"},
+               "steps_unverified": [f"{REAL_CHECK}|read it back|value unchanged"]}
+        out = mod.prune_unverified_checks(plan, web, NAUKRI_INPUT)
+
+        assert out["dropped"] == []
+        assert out["kept_unverified"] == [REAL_CHECK]
+        page = plan["web_pages"][0]
+        assert page["locators_needed"] == ["profileSummaryDisplayText", "saveButton",
+                                           "successToast"]
+        assert len(plan["web_test_methods"][0]["steps"]) == 3
+
+    def test_nothing_is_touched_when_everything_was_observed(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        plan = self._plan()
+        before = json.dumps(plan, sort_keys=True)
+        out = mod.prune_unverified_checks(plan, {"selectors": {}, "steps_unverified": []},
+                                          NAUKRI_INPUT)
+        assert out == {"dropped": [], "kept_unverified": []}
+        assert json.dumps(plan, sort_keys=True) == before
+
+    def test_a_locator_gap_is_named_one_by_one(self, tmp_path, monkeypatch):
+        """The rung between "confirmed nothing" and "this whole page is empty":
+        5-of-6 confirmed used to pass both guards and guess the sixth."""
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        gaps = mod.unconfirmed_locators(
+            self._plan()["web_pages"],
+            {"saveButton": "#save", "profileSummaryDisplayText": "#sum"},
+            [], {})
+        assert gaps == {"NaukriProfilePage": ["successToast"]}
+
+    def test_a_mechanism_covers_a_missing_locator(self, tmp_path, monkeypatch):
+        """An autosave page has no Save button, and that is not a gap."""
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        gaps = mod.unconfirmed_locators(
+            [{"class_name": "P", "locators_needed": ["saveButton"]}],
+            {}, [], {"saveButton": {"kind": "autosave"}})
+        assert gaps == {}
+
+
+class TestFixRollback:
+    """A rejected fix must leave nothing behind.
+
+    Conservation is checked once, after every file in the fix is written, because
+    an assertion can move between a test and a page object and neither file looks
+    wrong alone. That makes rollback part of the guard: half of a rejected fix
+    left on disk is a weakened test the next attempt inherits and never re-checks.
+    """
+
+    TEST_SRC = TestAssertionConservation.TEST_BEFORE
+
+    def _framework(self, tmp_path):
+        fw = tmp_path / "fw"
+        d = fw / "src" / "test" / "java" / "automation" / "naukari"
+        d.mkdir(parents=True)
+        (d / "NaukriProfileSummaryWebTest.java").write_text(self.TEST_SRC)
+        return fw
+
+    REL = "src/test/java/automation/naukari/NaukriProfileSummaryWebTest.java"
+
+    def _mod(self, tmp_path, monkeypatch):
+        fw = self._framework(tmp_path)
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        monkeypatch.setattr(mod, "AUTOMATION_FRAMEWORK_DIR", fw)
+        monkeypatch.setattr(mod, "AUDIT_DIR", tmp_path)
+        return mod, fw
+
+    def test_a_weakening_fix_is_rolled_back(self, tmp_path, monkeypatch):
+        mod, fw = self._mod(tmp_path, monkeypatch)
+        mod.freeze_assertions("NaukriProfileSummaryWebTest",
+                              "toggleDotInProfileSummaryAndVerify")
+        weakened = self.TEST_SRC.replace(
+            '''        AssertHelper.assertTrue(config, profilePage.isSuccessToastVisible(),
+            "Success toast should appear after saving the profile summary");''',
+            '''        if (!profilePage.isSuccessToastVisible()) {
+            config.logWarning("toast missing");
+        }''')
+        patched, contents, rejections = mod.apply_fix(
+            {self.REL: weakened}, {},
+            "NaukriProfileSummaryWebTest", "toggleDotInProfileSummaryAndVerify")
+
+        assert patched == [] and contents == {}
+        assert any("assertion_conservation" in r["reason"] for r in rejections)
+        # The file on disk is the original, not the weakened version.
+        assert (fw / self.REL).read_text() == self.TEST_SRC
+
+    def test_a_legitimate_fix_is_applied(self, tmp_path, monkeypatch):
+        mod, fw = self._mod(tmp_path, monkeypatch)
+        mod.freeze_assertions("NaukriProfileSummaryWebTest",
+                              "toggleDotInProfileSummaryAndVerify")
+        fixed = self.TEST_SRC.replace(
+            "profilePage.saveProfileSummary();",
+            "profilePage.saveProfileSummary();\n        WaitHelper.waitForNetworkIdle(config);")
+        patched, _, rejections = mod.apply_fix(
+            {self.REL: fixed}, {},
+            "NaukriProfileSummaryWebTest", "toggleDotInProfileSummaryAndVerify")
+
+        assert patched == [self.REL] and rejections == []
+        assert "waitForNetworkIdle" in (fw / self.REL).read_text()
+
+    def test_without_a_freeze_the_guard_abstains(self, tmp_path, monkeypatch):
+        """A missing baseline must not block a legitimate compile-error fix — the
+        guard only ever rejects on a measured loss."""
+        mod, fw = self._mod(tmp_path, monkeypatch)
+        ok, reason = mod.check_conservation("NaukriProfileSummaryWebTest",
+                                            "toggleDotInProfileSummaryAndVerify")
+        assert ok and reason == ""
+
+    def test_force_applies_it_anyway(self, tmp_path, monkeypatch):
+        """Matching the escape hatch test-healing-agent already has, for a human
+        who has looked at the diff and decided otherwise."""
+        mod, fw = self._mod(tmp_path, monkeypatch)
+        monkeypatch.setattr(mod, "FORCE", True)
+        mod.freeze_assertions("NaukriProfileSummaryWebTest",
+                              "toggleDotInProfileSummaryAndVerify")
+        weakened = self.TEST_SRC.replace(
+            'AssertHelper.assertTrue(config, profilePage.isSuccessToastVisible(),\n'
+            '            "Success toast should appear after saving the profile summary");',
+            '')
+        patched, _, _ = mod.apply_fix(
+            {self.REL: weakened}, {},
+            "NaukriProfileSummaryWebTest", "toggleDotInProfileSummaryAndVerify")
+        assert patched == [self.REL]

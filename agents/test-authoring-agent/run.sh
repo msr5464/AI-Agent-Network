@@ -225,7 +225,10 @@ WORKSPACE_DIR="${WORKSPACE_DIR:-}"
 # this block syncs — `set -u` would abort on the bare reference otherwise.
 export FRAMEWORK_DIR="${FRAMEWORK_DIR:-}"
 GITHUB_REPO_AUTOMATION="${GITHUB_REPO_AUTOMATION:-}"
-GITHUB_DEFAULT_BRANCH="${GITHUB_DEFAULT_BRANCH:-main}"
+# Deliberately NOT defaulted to main: an explicitly empty value means "branch
+# from current HEAD", which actions/05_ship.py has always honoured. Defaulting
+# it here made the two halves of one run disagree about the same setting.
+export GITHUB_DEFAULT_BRANCH="${GITHUB_DEFAULT_BRANCH-main}"
 
 # Same order as shared/workspace.py: FRAMEWORK_DIR names the checkout outright,
 # otherwise it is WORKSPACE_DIR/GITHUB_REPO_AUTOMATION. GITHUB_REPO_AUTOMATION
@@ -241,43 +244,30 @@ if [[ -z "$FRAMEWORK_DIR" && -z "$WORKSPACE_DIR" ]]; then
   log "ERROR: set FRAMEWORK_DIR, or WORKSPACE_DIR — cannot locate the automation repo"
   exit 1
 fi
-# Auth via a URL built fresh for each remote-talking command — never
-# persisted to .git/config, never left as origin's own stored URL. Confirmed
-# by direct testing against a real GitHub remote: when origin has no
-# embedded credentials, git tries to interactively negotiate a
-# username/password, which fails hard here (no TTY) — and neither a bare
-# token-only URL NOR `-c http.extraHeader` avoids that. Only a URL with a
-# username AND password both already present skips git's own credential
-# negotiation entirely. "x-access-token" is a fixed, non-secret placeholder
-# username (the same convention GitHub Actions itself uses); the token is
-# the real secret, held only in this process's environment.
 export GIT_TERMINAL_PROMPT=0
-_PUSH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/${GITHUB_REPO_AUTOMATION}.git"
 
-if [[ ! -d "$AUTOMATION_FRAMEWORK_DIR/.git" ]]; then
-  log "Automation repo not found at $AUTOMATION_FRAMEWORK_DIR — cloning from GitHub ..."
-  mkdir -p "$(dirname "$AUTOMATION_FRAMEWORK_DIR")"
-  if ! git clone "$_PUSH_URL" "$AUTOMATION_FRAMEWORK_DIR"; then
-    log "ERROR: Failed to clone $GITHUB_ORG/$GITHUB_REPO_AUTOMATION into $AUTOMATION_FRAMEWORK_DIR"
-    exit 1
-  fi
-  log "Cloned $GITHUB_ORG/$GITHUB_REPO_AUTOMATION successfully"
-fi
-
-log "Prerequisite: syncing $AUTOMATION_FRAMEWORK_DIR to origin/$GITHUB_DEFAULT_BRANCH ..."
-if ! git -C "$AUTOMATION_FRAMEWORK_DIR" checkout -f "$GITHUB_DEFAULT_BRANCH" 2>&1; then
-  log "Prerequisite: checkout failed — fetching from origin and retrying ..."
-  git -C "$AUTOMATION_FRAMEWORK_DIR" fetch "$_PUSH_URL" "$GITHUB_DEFAULT_BRANCH"
-  if ! git -C "$AUTOMATION_FRAMEWORK_DIR" checkout -f "$GITHUB_DEFAULT_BRANCH" 2>&1; then
-    log "ERROR: Could not checkout $GITHUB_DEFAULT_BRANCH in $AUTOMATION_FRAMEWORK_DIR — aborting"
-    exit 1
-  fi
-fi
-if ! git -C "$AUTOMATION_FRAMEWORK_DIR" pull "$_PUSH_URL" "$GITHUB_DEFAULT_BRANCH" 2>&1; then
-  log "ERROR: git pull origin/$GITHUB_DEFAULT_BRANCH failed — aborting to avoid stale base"
+# Clone if absent, make origin/$GITHUB_DEFAULT_BRANCH current, and land the
+# checkout on it — all four steps in shared/workspace.py, which is where the
+# other two agents already get them. The bash this replaces had three faults
+# that only a non-default base makes visible:
+#
+#   * `git clone "$_PUSH_URL"` persists the token into .git/config for the life
+#     of the checkout. workspace.clone() strips it back out afterwards.
+#   * `git fetch <url> <branch>` creates neither a local branch nor a
+#     remote-tracking ref, so the retry it fed was guaranteed to fail the same
+#     way and the run dead-ended at `exit 1` for any branch not already checked
+#     out here. An explicit destination refspec is what actually fixes it.
+#   * `pull` needs a merge and can conflict; `checkout -f -B` cannot.
+#
+# An explicitly empty GITHUB_DEFAULT_BRANCH means "branch from current HEAD",
+# which the CLI honours — matching actions/05_ship.py, which has always read a
+# blank value that way while this block was quietly defaulting it to main.
+log "Prerequisite: preparing $AUTOMATION_FRAMEWORK_DIR on ${GITHUB_DEFAULT_BRANCH:-<current HEAD>} ..."
+if ! (cd "$REPO_ROOT" && python3 -m shared.workspace prepare-base --checkout 2>&1); then
+  log "ERROR: could not prepare ${GITHUB_DEFAULT_BRANCH:-the checkout} in $AUTOMATION_FRAMEWORK_DIR — aborting"
   exit 1
 fi
-log "Prerequisite: $GITHUB_DEFAULT_BRANCH is up to date"
+log "Prerequisite: ${GITHUB_DEFAULT_BRANCH:-current HEAD} is ready"
 
 # ── Step 01 — Parse ────────────────────────────────────────────────────────────
 if [[ "$START_FROM_STEP" -gt 1 ]]; then
@@ -355,7 +345,8 @@ if [[ "$TEST_TYPE" == "web" || "$TEST_TYPE" == "both" ]]; then
 import json, os, sys
 from pathlib import Path
 d = json.loads(Path(os.environ['AUDIT_DIR']).joinpath('02-validate-web.json').read_text())
-sys.exit(0 if (d.get('selectors') or d.get('steps_passed') or d.get('steps_failed')) else 1)
+sys.exit(0 if (d.get('selectors') or d.get('steps_passed') or d.get('steps_failed')
+              or d.get('steps_unverified')) else 1)
 " 2>/dev/null; then
       _cache_save "02-validate-web.json"
       _cache_save "02-validate-web.md"
@@ -370,7 +361,7 @@ import json, os
 from pathlib import Path
 Path(os.environ['AUDIT_DIR']).joinpath('02-validate-web.json').write_text(
   json.dumps({'skipped': True, 'reason': 'API-only test', 'selectors': {},
-              'steps_passed': [], 'steps_failed': []})
+              'steps_passed': [], 'steps_failed': [], 'steps_unverified': []})
 )
 "
 fi

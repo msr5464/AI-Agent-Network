@@ -60,8 +60,9 @@ detection, and the per-run caps.
 
 ```
 shared/locator_capture.py   one page.evaluate() -> fingerprint every element
-shared/locator_capture.js   THE capture script — the Java framework loads the same
-                            bytes from src/main/resources/locator-capture.js
+                            reads THE capture script from the framework's
+                            src/main/resources/locator-capture.js — that repo owns
+                            it, because it ships in the jar and runs during tests
 shared/locator_classify.py  the gate: APP_BUG / WRONG_STATE / NOT_LOCATOR / AMBIGUOUS /
                             FEATURE_REMOVED / MISBOUND / ASSERTION_LOCATOR /
                             LOCATOR_DRIFT  <- only the last one heals

@@ -62,12 +62,19 @@ def _committed_version(workspace: Path, relative: str) -> str:
 
 
 def changed_baselines(workspace: Path) -> list[Path]:
-    """Baseline files whose substance differs from what is committed."""
+    """Baseline files whose substance differs from what is committed.
+
+    Deliberately not recursive: `pending/` under this directory is the Java
+    side's scratch space, holding fingerprints recorded by a test that has not
+    finished yet. promote() moves them up here and discard() deletes them, so
+    anything still sitting there is an interrupted run — named by test key
+    rather than by page object, and never a record of the page working.
+    """
     root = workspace / BASELINE_PATH
     if not root.is_dir():
         return []
     changed = []
-    for path in sorted(root.rglob("*.json")):
+    for path in sorted(root.glob("*.json")):
         relative = path.relative_to(workspace).as_posix()
         if _substance(path) != _committed_version(workspace, relative):
             changed.append(path)

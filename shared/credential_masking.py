@@ -9,11 +9,20 @@ agents/test-authoring-agent/queue/processed/naukari_profile_update.txt).
 
 import re
 
-# Common credential-line label shapes, matched case-insensitively. "username"
-# is included (unlike the more generic "user", which would false-positive on
-# phrases like "Admin user") since it's specifically a login-credential term.
+from shared.credential_extraction import LABELS
+
+# Every label credential_extraction can pull a value from, so anything the
+# pipeline treats as a credential is also redacted here — the two vocabularies
+# drifting apart is how `username=foo` came to be masked in one place and
+# reported as "no credentials found" in another. Plus the secret-ish labels that
+# are never extracted but must never be printed either.
+#
+# Bare "user" is in neither list: it would false-positive on "Admin user".
+_EXTRA_SECRET_LABELS = r"token|secret"
 _CREDENTIAL_LINE_RE = re.compile(
-    r"(?im)^(.*\b(?:password|pwd|token|secret|api[_-]?key|otp|username)\b\s*[:=]\s*)(\S+)"
+    r"(?im)^(.*\b(?:"
+    + "|".join(list(LABELS.values()) + [_EXTRA_SECRET_LABELS])
+    + r")\b\s*[:=]\s*)(\S+)"
 )
 
 

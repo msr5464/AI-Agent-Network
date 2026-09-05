@@ -20,6 +20,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
 from shared import workspace as workspace_helper
+from shared.credential_extraction import extract_credentials
+from shared import check_provenance
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR  = Path(os.environ["AUDIT_DIR"])
@@ -63,6 +65,72 @@ def extract_json(text: str):
         except json.JSONDecodeError:
             pass
     return None
+
+
+
+_SOURCE_TAG = re.compile(r"\s*\[\s*source\s*:\s*(user|inferred)\s*\]\s*$", re.I)
+
+
+def resolve_check_provenance(plan: dict, raw_input: str) -> dict:
+    """Strip the [source:] tags, and re-derive what they claim from the input text.
+
+    Rule 4b asks the model to say which checks the author actually wanted. That is
+    the model reporting on itself, and this module already holds the principle
+    that a claim is not evidence — so the claim is cross-checked against the
+    author's own words and the tag is removed from the step text either way
+    (nothing downstream should be parsing prose for metadata).
+
+    A check is only recorded as invented when the tag AND the text scan agree.
+    Disagreement keeps it: a wrongly-kept check makes a test fail visibly, while
+    a wrongly-dropped one makes a test prove less and say nothing.
+
+    Records the verdicts in plan["check_provenance"] so steps 03 and 05 read a
+    decision made once here, rather than re-deriving it three different ways.
+    """
+    verdicts = {}
+
+    def visit(steps):
+        out = []
+        for step in steps or []:
+            match = _SOURCE_TAG.search(step)
+            claimed = match.group(1).lower() if match else ""
+            clean = _SOURCE_TAG.sub("", step).strip()
+            out.append(clean)
+            if check_provenance.shape(clean) != check_provenance.VERIFICATION:
+                continue
+            derived = check_provenance.derive(clean, raw_input)
+            verdicts[clean] = {
+                "source": check_provenance.reconcile(claimed, derived),
+                # The stricter signal, and the one step 03 actually acts on. Kept
+                # separate so the two steps never report different things about
+                # the same check: "source" is the softer judgement for a human,
+                # "droppable" is the decision.
+                "droppable": check_provenance.clearly_invented(clean, raw_input),
+            }
+        return out
+
+    for method in (plan.get("web_test_methods") or []) + (plan.get("api_test_methods") or []):
+        method["steps"] = visit(method.get("steps"))
+    plan["web_steps_for_validation"] = visit(plan.get("web_steps_for_validation"))
+
+    plan["check_provenance"] = verdicts
+    untraceable = sorted(s for s, v in verdicts.items() if v["droppable"])
+    if untraceable:
+        log(f"{len(untraceable)} verification(s) trace to nothing in the input:")
+        for step in untraceable:
+            log(f"  - {step}")
+        log("  Kept for now. If the browser confirms them in step 02 they are "
+            "generated normally; if it cannot, step 03 drops them rather than "
+            "asserting on something nobody asked for.")
+    doubtful = sorted(s for s, v in verdicts.items()
+                      if v["source"] == check_provenance.INFERRED and not v["droppable"])
+    if doubtful:
+        log(f"{len(doubtful)} verification(s) only partly trace to the input — kept, "
+            f"and kept even if unverified, because a wrongly-dropped assertion is "
+            f"silent where a wrongly-kept one is a red test:")
+        for step in doubtful:
+            log(f"  - {step}")
+    return verdicts
 
 
 def normalize_module_name(raw: str) -> str:
@@ -199,8 +267,8 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
         "allocate Admin user",
         "setAuthToken",
         "build PaymentData with amount 100 and currency SGD",
-        "call createPayment and assertNotNull id",
-        "call getPayment by id and assertEquals status PENDING"
+        "call createPayment and assertNotNull id  [source: user]",
+        "call getPayment by id and assertEquals status PENDING  [source: user]"
       ]
     }}
   ],
@@ -225,7 +293,7 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
         "build PaymentData",
         "doLogin -> DashboardPage",
         "createPaymentViaUI(dashboard, payment) -> PaymentFormPage",
-        "assertTrue isSuccessMessageVisible"
+        "assertTrue isSuccessMessageVisible  [source: user]"
       ]
     }}
   ],
@@ -241,7 +309,7 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
     "Login with test credentials",
     "Navigate to the feature page",
     "Perform the main action",
-    "Verify the result"
+    "Verify the result  [source: user]"
   ],
   "flow_style": "parallel",
   "interleaved_steps": [],
@@ -262,6 +330,27 @@ Rules:
 3. "response_only": true for fields set by the server (id, status, createdAt, updatedAt).
 4. Infer "web_steps_for_validation" from the plain English web steps for use in the
    Playwright validation script — list them as simple imperative sentences.
+
+4b. DO NOT INVENT CHECKS. You may freely infer the MECHANICS a flow needs —
+   navigations, waits, intermediate pages, reading a value before changing it.
+   Those are means, and filling them in is your job. You may NOT invent a
+   VERIFICATION the input never asked for. "Save the profile" does not imply a
+   success toast, a confirmation dialog, or a status message; if the input does
+   not mention one, do not add a locator for it, do not add an
+   isSomethingVisible() accessor, and do not add an assertion on it.
+   This has a real cost, not a stylistic one: an invented check becomes a hard
+   assertion on a locator that was guessed, the test fails on something nobody
+   asked about, and the failure then looks like something to be "fixed" by
+   deleting it. An input that says "save, then verify the change persisted" wants
+   exactly one assertion — that the change persisted.
+   Mark every verification you emit, in both "web_steps_for_validation" and the
+   "steps" of "web_test_methods", by appending a source tag:
+     "Verify the profile summary persisted after reload  [source: user]"
+     "Verify a success toast appears                     [source: inferred]"
+   Use "user" ONLY when the input actually asks for that check — quote-able back
+   to a line the author wrote. Use "inferred" for anything you added yourself.
+   Tag verifications only; action steps need no tag. This is cross-checked against
+   the input text afterwards, so a mis-tag is caught rather than trusted.
 5. If "existing_module" is true and the input only adds new test scenarios (not new endpoints):
    still list EVERY endpoint this scenario actually calls in "api_endpoints" — including ones that
    already exist in the module's Api enum — because step [02/05] Validate API needs the full list to
@@ -389,30 +478,29 @@ Rules:
     if plan.get("type_resolution"):
         log(f"NOTE: {plan['type_resolution']}")
 
-    # Extract demo credentials from raw input text (for step 04 infra auto-repair)
-    # Claude may not always put them in demo_credentials, so do it in Python as a fallback.
-    if not plan.get("demo_credentials"):
-        creds = {}
-        # Pass 1: top-level key: value lines
-        for line in raw_text.splitlines():
-            lower = line.lower().strip()
-            if lower.startswith("demo username:") or lower.startswith("username:"):
-                creds["username"] = line.split(":", 1)[1].strip()
-            elif lower.startswith("demo password:") or lower.startswith("password:"):
-                creds["password"] = line.split(":", 1)[1].strip()
-            elif lower.startswith("demo otp:") or lower.startswith("otp:"):
-                creds["otp"] = line.split(":", 1)[1].strip()
-        # Pass 2: inline patterns within step text, e.g. "login using username: foo, password: bar"
-        if not (creds.get("username") and creds.get("password")):
-            u_match = re.search(r'username[:\s]+([^\s,]+)', raw_text, re.IGNORECASE)
-            p_match = re.search(r'password[:\s]+([^\s,]+)', raw_text, re.IGNORECASE)
-            if u_match and not creds.get("username"):
-                creds["username"] = u_match.group(1).strip()
-            if p_match and not creds.get("password"):
-                creds["password"] = p_match.group(1).strip()
-        if creds.get("username") and creds.get("password"):
-            plan["demo_credentials"] = creds
-            log(f"Extracted demo credentials for: {creds['username']}")
+    # Extract demo credentials from raw input text (for step 02's login check and
+    # step 04's infra auto-repair). Claude may not always put them in
+    # demo_credentials — and when it doesn't, this fallback is the only thing that
+    # gets them into the plan — so fill in whatever field it left out, without
+    # overwriting anything it did supply.
+    plan_creds = {k: v for k, v in (plan.get("demo_credentials") or {}).items() if v}
+    from_text  = extract_credentials(raw_text)
+    creds      = {**from_text, **plan_creds}
+    if creds.get("username") and creds.get("password"):
+        recovered = [f for f in from_text if f not in plan_creds]
+        plan["demo_credentials"] = creds
+        if recovered:
+            # Which fields, never their values — the run header masks the same
+            # lines, and a log that prints them undoes that.
+            log(f"Extracted demo credentials from the input text: {', '.join(recovered)}")
+    elif creds:
+        # Half a credential is worse than none downstream — it makes a login look
+        # runnable when it isn't — so say exactly which half is missing.
+        missing = [f for f in ("username", "password") if not creds.get(f)]
+        log(f"WARNING: the input file names {', '.join(sorted(creds))} but no "
+            f"{' or '.join(missing)} — a login step will fail validation in step 02")
+
+    resolve_check_provenance(plan, raw_text)
 
     (AUDIT_DIR / "01-parse.json").write_text(json.dumps(plan, indent=2))
 

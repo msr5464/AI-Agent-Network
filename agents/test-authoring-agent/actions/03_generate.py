@@ -246,13 +246,15 @@ def write_file(rel_path: str, content: str) -> None:
 # reuses the exact same function as a defensive re-check before diagnosing a
 # CODE_ERROR failure, so the logic (and the file-location/key-naming rules it
 # encodes) exists in exactly one place.
-from shared.credential_properties import write_credential_property  # noqa: E402
+from shared.credential_properties import write_credential_property
+from shared.credential_extraction import credentials_from_plan  # noqa: E402
 from shared.page_identity import is_dom_selector  # noqa: E402
 from shared.test_catalog import test_methods_in  # noqa: E402
 # URLs are the same story as credentials — one place decides the property file and
 # the key names — except that URLs are not secrets, so 05_ship.py commits them.
 from shared import properties_file, url_properties  # noqa: E402
 from shared.edit_guards import validate_fix  # noqa: E402
+from shared import check_provenance  # noqa: E402
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -295,6 +297,145 @@ def _guard_web_validation(test_type, web_data, selectors, page_elements,
     log("  → FIX: re-run step 02 (see its warning above for the specific cause).")
     log("  → Or set ALLOW_MISSING_SELECTORS=true to generate against inferred locators.")
     sys.exit(1)
+
+
+def _read_raw_input() -> str:
+    """The user's own words, for tracing which checks came from them.
+
+    Best-effort: INPUT_FILE has usually been moved to queue/processed/ by the
+    time a resumed run reaches step 03, and an unreadable input must not break
+    codegen. An empty string makes check_provenance answer USER for everything,
+    which keeps assertions rather than dropping them — the safe way to be wrong.
+    """
+    raw = os.environ.get("INPUT_FILE", "")
+    for candidate in ([Path(raw)] if raw else []) + [
+            AGENT_DIR / "queue" / "processed" / Path(raw).name if raw else None]:
+        try:
+            if candidate and candidate.exists():
+                return candidate.read_text()
+        except OSError:
+            continue
+    log("NOTE: could not read the original input file — every check will be "
+        "treated as user-requested, so none will be dropped.")
+    return ""
+
+
+def prune_unverified_checks(plan: dict, web_data: dict, raw_input: str) -> dict:
+    """Drop the checks nobody asked for that the browser could not confirm.
+
+    The matrix, for a verification step step 02 came back UNVERIFIED on:
+
+      · the user asked for it  → keep everything. The assertion is generated at
+        full strength and the test fails on purpose. The product does not do what
+        they asked for, and that is a finding, not a codegen problem to smooth over.
+      · the pipeline invented it → drop the locator, the accessor and the
+        assertion. A check nobody asked for, against an element that does not
+        exist, has no business failing a test — and a failing check with no owner
+        is exactly what gets "fixed" by deleting it.
+
+    Only ever drops. An unverified check the user DID ask for is left completely
+    alone, because the point is that the test still proves what they wanted.
+
+    Returns {"dropped": [...], "kept_unverified": [...]} for the audit trail.
+    """
+    unverified = web_data.get("steps_unverified") or []
+    if not unverified:
+        return {"dropped": [], "kept_unverified": []}
+
+    dropped, kept = [], []
+    for entry in unverified:
+        step = entry.split("|", 1)[0].strip()
+        if check_provenance.droppable(step, raw_input):
+            dropped.append(step)
+        else:
+            kept.append(step)
+
+    for step in kept:
+        log(f"UNVERIFIED but asked for — keeping the assertion for {step!r}. The "
+            f"generated test WILL fail here: the product did not do this.")
+
+    if not dropped:
+        return {"dropped": [], "kept_unverified": kept}
+
+    # What to remove: the locator names and accessor names whose subject matches a
+    # dropped check. `successToast` and `isSuccessToastVisible` both share "toast"
+    # with "Verify a success confirmation toast appears".
+    subjects = [check_provenance.subject_words(s) for s in dropped]
+    confirmed = set(web_data.get("selectors") or {})
+
+    def serves_dropped(name: str) -> bool:
+        # A name backed by a confirmed selector is real whatever it is called.
+        if name in confirmed:
+            return False
+        words = check_provenance.subject_words(name)
+        return bool(words) and any(words & subj for subj in subjects)
+
+    removed_locators, removed_actions, removed_steps = [], [], []
+    for page in plan.get("web_pages") or []:
+        for key, sink in (("locators_needed", removed_locators),
+                          ("actions_needed", removed_actions)):
+            names = page.get(key) or []
+            keep = [n for n in names if not serves_dropped(n)]
+            if len(keep) != len(names):
+                sink.extend(n for n in names if n not in keep)
+                page[key] = keep
+
+    for method in plan.get("web_test_methods") or []:
+        steps = method.get("steps") or []
+        keep = []
+        for step in steps:
+            if (check_provenance.shape(step) == check_provenance.VERIFICATION
+                    and any(check_provenance.subject_words(step) & subj
+                            for subj in subjects)):
+                removed_steps.append(step)
+                continue
+            keep.append(step)
+        method["steps"] = keep
+
+    log(f"Dropped {len(dropped)} unverified check(s) the input never asked for:")
+    for step in dropped:
+        log(f"  - {step}")
+    if removed_locators:
+        log(f"  locators removed: {', '.join(removed_locators)}")
+    if removed_actions:
+        log(f"  accessors removed: {', '.join(removed_actions)}")
+    if removed_steps:
+        log(f"  test steps removed: {len(removed_steps)}")
+    log("  Nothing asked for this and the browser never saw it — generating an "
+        "assertion against it would produce a test that fails for a reason no "
+        "one owns.")
+
+    return {"dropped": dropped, "kept_unverified": kept,
+            "removed_locators": removed_locators,
+            "removed_actions": removed_actions,
+            "removed_steps": removed_steps}
+
+
+def unconfirmed_locators(web_pages, selectors, interaction_hints, mechanisms) -> dict:
+    """Locators the plan asks for that nothing confirmed. Named one by one.
+
+    The rung missing between _guard_web_validation (fires only when a run
+    confirmed NOTHING) and _warn_page_coverage (fires only when a whole PAGE has
+    zero coverage). A run that confirms five of six locators passes both, and the
+    sixth is silently guessed at codegen — which is how `successToast` became
+    `page.locator("[class*='toast'], [class*='snackBar'], [class*='msgBlock']")`
+    and cost a fix attempt and an assertion.
+    """
+    confirmed = set(selectors) | {h["name"] for h in interaction_hints if h.get("name")}
+    covered = confirmed | set(mechanisms or {})
+    gaps = {}
+    for page in web_pages:
+        missing = [n for n in (page.get("locators_needed") or []) if n not in covered]
+        if missing:
+            gaps[page.get("class_name", "?")] = missing
+    if gaps:
+        log("WARNING: the plan asks for locators that step 02 never confirmed. "
+            "Step 03 will infer these from naming conventions alone, and an "
+            "inferred locator that turns out not to exist fails in step 04 as a "
+            "timeout, not as a missing element:")
+        for class_name, missing in gaps.items():
+            log(f"  - {class_name}: {', '.join(missing)}")
+    return gaps
 
 
 def _warn_page_coverage(web_pages, selectors, interaction_hints) -> list:
@@ -566,12 +707,20 @@ def main() -> None:
             f"uniqueness-verified by the browser — they may match more than one "
             f"element: {', '.join(sorted(unverified))}")
 
+    # Apply the unverified matrix BEFORE anything reads the plan: pruning after
+    # the prompt is built would leave the dropped locator in the model's context.
+    raw_input = _read_raw_input()
+    pruned = prune_unverified_checks(plan, web_data, raw_input)
+
     log(f"Generating code for {feature_class} | type={test_type} | existing={existing}")
 
     _guard_web_validation(test_type, web_data, selectors, page_elements, interaction_hints)
     pages_with_zero_coverage = []
+    locator_gaps = {}
     if test_type in ("web", "both"):
         pages_with_zero_coverage = _warn_page_coverage(web_pages, selectors, interaction_hints)
+        locator_gaps = unconfirmed_locators(web_pages, selectors, interaction_hints,
+                                            web_data.get("mechanisms") or {})
 
     api_hint = _build_api_hint(test_type, api_data)
 
@@ -591,6 +740,45 @@ def main() -> None:
         selector_hint = "\n\nNo selectors were confirmed by Playwright validation. " \
                         "Infer locators using [data-cy='...'] attribute naming convention " \
                         "based on the locator names in the plan."
+
+    # How an action actually takes effect, when it is not a plain click. Without
+    # this a page whose editor autosaves gets a click on a Save button that step
+    # 02 already established does not exist.
+    mechanisms = web_data.get("mechanisms") or {}
+    mechanism_hint = ""
+    if mechanisms:
+        mechanism_hint = (
+            "\n\nDISCOVERED MECHANISMS — how these actions actually take effect on "
+            "the live page. The browser confirmed each one. Implement the method "
+            "this way; do NOT click a control that is not in the confirmed selector "
+            "list above.\n")
+        for name, m in mechanisms.items():
+            mechanism_hint += f"  {name}: {m['kind']}"
+            if m.get("trigger"):
+                mechanism_hint += f" — trigger: {m['trigger']}"
+            if m.get("settles_when"):
+                mechanism_hint += f"; done when: {m['settles_when']}"
+            mechanism_hint += "\n"
+        mechanism_hint += (
+            "  For `autosave` / `blur`: move focus off the field (click a neutral "
+            "element or press Tab) and then WaitHelper until the settle condition "
+            "holds. For `enter_key`: press Enter in the field. For `form_submit`: "
+            "submit the form. Never Thread.sleep().\n")
+
+    # A check the user asked for that the browser could not observe. It stays in
+    # the test at full strength and the test fails — the model needs to be told
+    # that on purpose, or it will "helpfully" soften it.
+    kept_unverified_hint = ""
+    if pruned.get("kept_unverified"):
+        kept_unverified_hint = (
+            "\n\nCHECKS THAT WILL FAIL, ON PURPOSE — step 02 could not observe "
+            "these on the live page, but the test input explicitly asked for them:\n"
+            + "".join(f"  - {s}\n" for s in pruned["kept_unverified"])
+            + "Generate these assertions at FULL STRENGTH anyway. Do not soften "
+              "them, do not wrap them in a condition, do not turn one into a log "
+              "line or a warning, and do not leave one out. The test failing here "
+              "is the correct and intended outcome: it reports that the product "
+              "does not do what was asked. A human decides what happens next.\n")
 
     # Build rich DOM context from live page inspection. page_elements is keyed
     # by the STEP DESCRIPTION active when the snapshot was taken (usually the
@@ -659,7 +847,7 @@ def main() -> None:
     credential_property_status = "not applicable"
     if not existing and test_type in ("web", "both") and not csv_roles_hint:
         credential_property_status = write_credential_property(
-            AUTOMATION_FRAMEWORK_DIR, feature.lower(), plan.get("demo_credentials", {}), log=log
+            AUTOMATION_FRAMEWORK_DIR, feature.lower(), credentials_from_plan(plan), log=log
         )
 
     # Every URL this module touches becomes a property BEFORE codegen, so the
@@ -704,7 +892,7 @@ def main() -> None:
 <generation_plan>
 {json.dumps(plan, indent=2)}
 </generation_plan>
-{selector_hint}{dom_context}{api_hint}{url_property_hint}
+{selector_hint}{mechanism_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
 
 Generate the following Java files and return them as a single JSON object where
 keys are relative file paths (from Thanos-pw repo root) and values are the complete
@@ -779,6 +967,15 @@ Rules (MANDATORY — violations will cause compilation failures):
       external/3rd-party services (GitHub, SauceDemo, public APIs, etc.).
 8. Locators: prefer [data-cy='...'] > [id='...'] > [name='...'] > CSS > XPath.
 9. Assertions: ONLY AssertHelper.* — never Assert.*.
+   Every verification step in the plan becomes a real assertion. Never express a
+   check as an `if` plus a `logWarning`/`logComment`, never wrap one in a
+   try/catch, and never make one conditional on the thing it is checking. Those
+   all produce a test that passes without proving anything, which is worse than
+   no test — a green run is read as evidence.
+   Only assert on a locator in the confirmed list, or one covered by a discovered
+   mechanism. If the plan names a check with neither, leave the assertion out
+   rather than inventing a locator to hang it on — a guessed locator like
+   `[class*='toast']` fails later and looks like a flake.
 10. Waits: ONLY WaitHelper.* — never Thread.sleep().
 11. For existing modules:
     - Data, Builder, Api enum: do NOT regenerate — omit them from your output entirely.
@@ -956,6 +1153,21 @@ Return ONLY a JSON object, no prose:
 
     log(f"Generated {len(written)} files")
 
+    # A dropped check that reappears in the generated code is the whole pruning
+    # step defeated: the locator would be guessed, the assertion would fail, and
+    # step 04 would be back to choosing between a bad fix and a red test.
+    resurrected = {}
+    for name in (pruned.get("removed_locators") or []) + (pruned.get("removed_actions") or []):
+        hits = [rel for rel, content in written_contents.items()
+                if re.search(rf"\b{re.escape(name)}\b", content)]
+        if hits:
+            resurrected[name] = hits
+    if resurrected:
+        log("WARNING: names dropped as unverified-and-unrequested came back in the "
+            "generated code — they will be built on a guessed locator:")
+        for name, hits in resurrected.items():
+            log(f"  - {name} in {', '.join(Path(h).name for h in hits)}")
+
     result = {
         "feature": feature,
         "feature_class": feature_class,
@@ -971,6 +1183,15 @@ Return ONLY a JSON object, no prose:
         # durable trace beyond a console line that scrolls away — was silently
         # invisible before this field existed.
         "pages_with_zero_coverage": [name for name, _needed in pages_with_zero_coverage],
+        # class -> locator names the plan wanted that nothing confirmed. Named
+        # individually so "why did this locator get guessed?" has an answer.
+        "unconfirmed_locators": locator_gaps,
+        # Checks step 02 could not observe: what was dropped because nobody asked
+        # for it, and what was kept because someone did (those tests fail on
+        # purpose — 05 puts them in the PR body).
+        "dropped_unverified_checks": pruned.get("dropped") or [],
+        "resurrected_dropped_names": resurrected,
+        "kept_unverified_checks": pruned.get("kept_unverified") or [],
         # Locators generated that cannot match a real DOM. Empty is the normal
         # case; non-empty tells step 04 exactly where to look first.
         "unusable_locators": unusable_by_file,

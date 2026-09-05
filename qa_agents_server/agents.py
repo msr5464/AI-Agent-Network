@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from shared import workspace
 from qa_agents_server.paths import AGENTS_DIR
 
 # (key, step output filename, display name). Display names are mirrored in
@@ -142,12 +143,41 @@ def adapt_apply_default() -> bool:
     return os.environ.get("ADAPT_APPLY", "false").strip().lower() == "true"
 
 
+def _base_branch_env(payload: dict) -> Dict[str, str]:
+    """GITHUB_DEFAULT_BRANCH, but only when the caller named a branch.
+
+    Same shape and the same reason as _auto_push_env: blank must stay
+    distinguishable from "main", or a run that expressed no preference would
+    export a value that beats config/.env — see there for what that cost.
+
+    It overrides the existing variable rather than adding a second one so that
+    the branch point and the PR base cannot drift apart. All three ship steps
+    already pass base=GITHUB_DEFAULT_BRANCH to `gh pr create`, so they follow an
+    override with no edit; a separate BASE_BRANCH would need each of them to
+    learn which one wins, and a miss there opens a PR against the wrong base
+    containing the entire delta between two branches.
+    """
+    raw = payload.get("base_branch")
+    if raw is None or not str(raw).strip():
+        return {}
+    try:
+        return {"GITHUB_DEFAULT_BRANCH": workspace.normalise_branch(str(raw))}
+    except ValueError as e:
+        raise AgentConfigError(f"base_branch: {e}")
+
+
+def default_branch() -> str:
+    """What config/.env says, for a UI that seeds its field from the real value."""
+    return os.environ.get("GITHUB_DEFAULT_BRANCH", "main").strip() or "main"
+
+
 def _authoring_env(payload: dict) -> Dict[str, str]:
     module = (payload.get("module") or "").strip()
     if not module:
         raise AgentConfigError("module is required")
     env = {"MODULE": module}
     env.update(_auto_push_env(payload))
+    env.update(_base_branch_env(payload))
     if payload.get("start_from_step", 1) > 1:
         env["START_FROM_STEP"] = str(payload["start_from_step"])
     return env
@@ -167,6 +197,7 @@ def _healing_env(payload: dict) -> Dict[str, str]:
         raise AgentConfigError("pass 'test' or 'build_tag', not both")
 
     env: Dict[str, str] = dict(_auto_push_env(payload))
+    env.update(_base_branch_env(payload))
     if test:
         env["TEST_NAME"] = test
         if payload.get("repair"):
@@ -220,6 +251,7 @@ def _adaptation_env(payload: dict) -> Dict[str, str]:
         raise AgentConfigError("module is required")
     env = {"MODULE": module}
     env.update(_auto_push_env(payload))
+    env.update(_base_branch_env(payload))
     if payload.get("start_from_step", 1) > 1:
         env["START_FROM_STEP"] = str(payload["start_from_step"])
     # Exploration is the expensive half, so "look but do not touch" is a

@@ -161,7 +161,9 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "key": "github_default_branch",
         "env_var": "GITHUB_DEFAULT_BRANCH",
         "label": "Default Branch",
-        "description": "Base branch for all pull requests raised by the agents",
+        "description": ("Default base branch: agents check the automation repo "
+                        "out on it and raise their PRs against it. A run can "
+                        "override it from the run panel's branch field."),
         "type": "text",
         "category": "common",
         "default": "main",

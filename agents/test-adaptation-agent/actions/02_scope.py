@@ -39,6 +39,7 @@ def log(msg): _log("scope", msg)
 
 from shared import blast_radius, entry_path, intent, workspace as workspace_helper
 from shared.assertion_graph import member_index
+from shared.git import run_git
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
@@ -113,23 +114,37 @@ def main():
         return
     log(f"Workspace: {workspace}")
 
-    # Fetch so the base is current, but leave HEAD alone — see get_workspace.
-    synced = workspace_helper.sync(
+    # Establish the base BEFORE the cleanliness gate. prepare_base only fetches
+    # — it never moves HEAD or the tree — so it is safe on the far side of a
+    # gate that exists to protect uncommitted work, and doing it here means a
+    # branch that does not exist fails at step 2 of 5 rather than after the
+    # expensive exploration in step 3.
+    base_branch = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
+    prepared = workspace_helper.prepare_base(
         workspace, os.environ.get("GITHUB_ORG", ""), GITHUB_REPO_AUTOMATION,
-        os.environ.get("GITHUB_TOKEN", ""),
-        os.environ.get("GITHUB_DEFAULT_BRANCH", "main"), log=log)
-    if synced.get("skipped"):
-        log(f"  {synced['reason']}")
-    elif not synced["ok"]:
-        log(f"  {synced['reason']} — working from the checkout as it stands")
-    elif synced["behind"]:
-        log(f"  note: this checkout is {synced['behind']} commit(s) behind "
-            f"{os.environ.get('GITHUB_DEFAULT_BRANCH', 'main')}; the PR will be "
-            f"based on it as-is rather than moving your HEAD")
+        os.environ.get("GITHUB_TOKEN", ""), base_branch, log=log)
+    if not prepared["ok"]:
+        write_skip(f"could not prepare base branch — {prepared['reason']}", infra=True)
+        return
+    behind_out = run_git(["rev-list", "--count", f"HEAD..{prepared['sha']}"], workspace)
+    behind = int(behind_out[1]) if behind_out[0] and behind_out[1].isdigit() else 0
+    if behind:
+        log(f"  note: this checkout is {behind} commit(s) behind {base_branch}")
 
     clean, why = working_tree_is_clean(workspace)
     if not clean:
         write_skip(f"automation repo is not clean — {why}", infra=True)
+        return
+
+    # Now that the gate has proved there is nothing to lose, move onto the base.
+    # sync() refuses to reset precisely because it runs before this check; past
+    # it, resetting honours the same intent instead of violating it — and
+    # without this an "adapt against release/2.3" run would edit whatever HEAD
+    # happened to be and then open a PR against release/2.3.
+    moved = workspace_helper.checkout_base(
+        workspace, prepared["branch"], prepared["sha"], log=log)
+    if not moved["ok"]:
+        write_skip(f"could not check out the base branch — {moved['reason']}", infra=True)
         return
 
     nouns = sorted({n for item in plan["items"] for n in (item.get("nouns") or [])})
@@ -200,6 +215,10 @@ def main():
     scope = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "workspace": str(workspace),
+        # 05_ship cuts its branch from this exact SHA rather than re-resolving
+        # origin/<base>, which by then may have moved under the step-04 edits.
+        "base_branch": prepared["branch"],
+        "base_sha": prepared["sha"],
         "module": plan.get("module", ""),
         "selection": result["selection"],
         "tiers": result["tiers"],

@@ -223,3 +223,24 @@ def test_missing_markers_record_none_not_empty_string(tmp_path, store):
     _write_metrics(d)
     rec = analytics.build_record(d, agent="test-authoring-agent")
     assert rec["verdict"] is None and rec["fix_gate"] is None
+
+
+# ── The base a run was actually built on ──────────────────────────────────────
+
+def test_the_base_branch_comes_from_the_session_marker(tmp_path, store):
+    """Read from the session's own file, never from os.environ. build_record has
+    two callers — shared/session.sh inside the agent, and runner.py in the
+    *server's* environment — so an env read would be right for one and would
+    quietly report the org default for the other."""
+    d = _session(tmp_path, "test-authoring-agent")
+    (d / ".base-branch").write_text("release/2.3\ndeadbeefcafe\n")
+
+    assert analytics.build_record(d)["base_branch"] == "release/2.3"
+
+
+def test_a_run_on_the_default_records_an_empty_base_branch(tmp_path, store):
+    """Absent is a normal run, not a missing field — it must not raise, and it
+    must not be reported as 'main' when nobody asked for main."""
+    d = _session(tmp_path, "test-authoring-agent")
+
+    assert analytics.build_record(d)["base_branch"] == ""

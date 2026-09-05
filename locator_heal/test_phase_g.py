@@ -17,6 +17,11 @@ from shared import locator_capture as capture
 from shared import locator_patch, locator_resolve as heal_mod
 
 HERE = pathlib.Path(__file__).resolve().parent
+
+# Fingerprints a real page, so it needs the framework's capture script.
+pytestmark = pytest.mark.skipif(
+    not capture.script_available(),
+    reason=f"capture script not at {capture.script_path()} — set FRAMEWORK_DIR")
 CONFIG = HERE.parent / "config" / "locator.yaml"
 PO = HERE / "fixtures" / "pageobjects"
 FIX = HERE / "fixtures"

@@ -33,6 +33,7 @@ from shared.slack import send_slack as _send_slack
 from shared.git import run_git as _run_git
 from shared.github import create_pr
 from shared.credential_masking import mask_credentials
+from shared.credential_extraction import credentials_from_plan
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR  = Path(os.environ["AUDIT_DIR"])
@@ -180,23 +181,31 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
     log(f"Creating branch: {branch_name}")
 
     if GITHUB_DEFAULT_BRANCH:
-        rc, _, err = git(["checkout", "-f", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
-        if rc != 0:
-            log(f"WARNING: checkout -f failed ({err.strip()!r}), trying fetch + retry")
-            git(["fetch", "origin"], AUTOMATION_FRAMEWORK_DIR)
-            rc, _, err = git(["checkout", "-f", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
-            if rc != 0:
-                log(blocked(
-                    f"could not check out {GITHUB_DEFAULT_BRANCH} ({err.strip()[:160]})",
-                    "no PR will be raised; no branch was created",
-                    f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
-                return None, None
-        rc, _, err = git(["pull", "origin", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
-        if rc != 0:
+        # prepare_base makes origin/<base> exist and be current — which the old
+        # `checkout -f` / `fetch origin` / `pull` sequence here could not do for
+        # a branch this checkout had never seen, because a bare `git fetch`
+        # against a single-branch clone never creates the missing ref. It also
+        # always authenticates: the `pull` it replaces passed no token, so on a
+        # checkout cloned by another agent (which strips the token from
+        # .git/config) it hit GIT_TERMINAL_PROMPT=0 and failed on a private repo.
+        prepared = workspace_helper.prepare_base(
+            AUTOMATION_FRAMEWORK_DIR, GITHUB_ORG, GITHUB_REPO_AUTOMATION,
+            GITHUB_TOKEN, GITHUB_DEFAULT_BRANCH, log=log)
+        if not prepared["ok"]:
             log(blocked(
-                f"pull from origin/{GITHUB_DEFAULT_BRANCH} failed ({err.strip()[:160]})",
+                f"could not prepare {GITHUB_DEFAULT_BRANCH} ({prepared['reason'][:160]})",
                 "no PR will be raised; aborting rather than branching from a "
                 "stale base",
+                f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
+            return None, None
+        # Safe to force here, unlike in the other agents: every file below is
+        # rewritten from the audit JSON, so there is no working-tree state to lose.
+        moved = workspace_helper.checkout_base(
+            AUTOMATION_FRAMEWORK_DIR, prepared["branch"], prepared["sha"], log=log)
+        if not moved["ok"]:
+            log(blocked(
+                f"{moved['reason'][:160]}",
+                "no PR will be raised; no branch was created",
                 f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
             return None, None
     else:
@@ -381,7 +390,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
             plan = {}
         raw_case = _read_original_test_case(plan)
         if raw_case.strip():
-            masked_case = mask_credentials(raw_case, plan.get("demo_credentials", {}))
+            masked_case = mask_credentials(raw_case, credentials_from_plan(plan))
             test_case_section = f"""### Test Case
 <details open>
 <summary>Original request (credentials masked)</summary>
@@ -393,9 +402,33 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
 
 """
 
+    # What the browser could not confirm. Split by who asked for it, because the
+    # two need opposite things from a reviewer: one is a finding about the product,
+    # the other is a note that the pipeline stopped short of inventing a test.
+    kept_unverified = gen_data.get("kept_unverified_checks") or []
+    dropped_checks  = gen_data.get("dropped_unverified_checks") or []
+    checks_section = ""
+    if kept_unverified:
+        checks_section += (
+            "### ⚠️ Asked for, but never seen on the page\n\n"
+            "The test input asks for these, and step 02 could not observe any of "
+            "them in the live UI. The assertions are generated at full strength, "
+            "so **this test fails on purpose** — it is reporting that the product "
+            "does not do what was asked. Decide whether this is a product bug or a "
+            "test-case correction; do not fix it by weakening the assertion.\n\n"
+            + "".join(f"- {c}\n" for c in kept_unverified) + "\n")
+    if dropped_checks:
+        checks_section += (
+            "### Checks not generated\n\n"
+            "These were added by the pipeline rather than requested, and the browser "
+            "never saw the elements they assert on — so no locator, accessor or "
+            "assertion was generated for them. If one of these is actually wanted, "
+            "say so in the test input and re-run.\n\n"
+            + "".join(f"- {c}\n" for c in dropped_checks) + "\n")
+
     pr_body = f"""## QA Auto-Create — {feature_class}
 
-{test_case_section}### Summary
+{test_case_section}{checks_section}### Summary
 | | Value |
 |---|---|
 | Module | {feature_class} |
@@ -565,7 +598,28 @@ def main() -> None:
     # exists but nobody can see or review it — that's never APPROVED,
     # regardless of whether the test itself passed.
     ship_failed = ship_status in ("push_failed", "pr_failed")
-    verdict = "APPROVED" if ((test_passed or fix_gate == "skipped") and not ship_failed) else "NEEDS-REVIEW"
+    # A run that could not observe something the input asked for is never
+    # APPROVED, even if the suite is green — green here means the pipeline
+    # declined to assert on it, which is precisely the thing a human has to look
+    # at. Same for a fix that was rejected for weakening a test.
+    weakening_rejected = [r for r in (fix_data.get("fix_rejections") or [])
+                          if "assertion_conservation" in str(r.get("reason", ""))]
+    kept_unverified = gen_data.get("kept_unverified_checks") or []
+    honest = not kept_unverified and not weakening_rejected
+    # `fix_gate == "skipped"` means no test ever ran (an infra failure). That was
+    # treated as APPROVED, which reads as "verified" for something never executed.
+    ran_and_passed = test_passed
+    verdict = ("APPROVED" if (ran_and_passed and honest and not ship_failed)
+               else "NEEDS-REVIEW")
+    (AUDIT_DIR / ".verdict").write_text(verdict)
+    if kept_unverified:
+        log(f"NEEDS-REVIEW: {len(kept_unverified)} requested check(s) could not be "
+            f"observed in the UI — the test asserts them and fails on purpose.")
+    if weakening_rejected:
+        log(f"NEEDS-REVIEW: {len(weakening_rejected)} fix attempt(s) were rejected "
+            f"for weakening an assertion.")
+    if fix_gate == "skipped":
+        log("NEEDS-REVIEW: no test ever ran (infrastructure) — nothing was verified.")
     (AUDIT_DIR / ".verdict").write_text(verdict)
     log(f"Verdict: {verdict}")
     if ship_failed:

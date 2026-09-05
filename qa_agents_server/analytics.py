@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from shared import metrics as _metrics
+from shared import workspace as _workspace
 
 SCHEMA_VERSION = 1
 _STORE = Path(__file__).resolve().parent / "storage" / "run_analytics.jsonl"
@@ -206,6 +207,12 @@ def build_record(audit_dir: Path, agent: str = "", status: str = "",
         "fix_gate": _read_text(d / ".fix-passed"),
         "exit_code": exit_code,
         "auto_push": auto_push,
+        # Read from the session's own marker, never from os.environ. This
+        # function has two callers — shared/session.sh, running inside the
+        # agent, and runner.py, running in the *server's* environment — and an
+        # env read would be right for the first and silently report the org
+        # default for the second.
+        "base_branch": _workspace.read_base_marker(d)[0],
         "cost_usd": float(totals.get("cost_usd") or 0.0),
         "input_tokens": int(totals.get("input_tokens") or 0),
         "output_tokens": int(totals.get("output_tokens") or 0),

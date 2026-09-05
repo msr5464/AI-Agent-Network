@@ -5,11 +5,10 @@ on a green run. If the two sides disagree about what the page contains, nothing
 breaks loudly: every similarity score is just quietly computed against a
 different idea of the page, and the failure surfaces as bad heals much later.
 
-Two guards, cheapest first:
-  1. the shared script is byte-identical in both repos  (catches an edit to one)
-  2. both stacks produce the same fingerprints for a live page (catches the
-     subtler thing identical source does NOT prove — the two drive different
-     Playwright versions, and so different Chromium builds)
+Source drift is no longer possible — both stacks read the framework's single copy
+of locator-capture.js. What identical source does NOT prove is identical output:
+the two drive different Playwright versions, and so different Chromium builds.
+That is what this checks.
 """
 from __future__ import annotations
 import json, os, pathlib, shutil, subprocess, sys
@@ -29,7 +28,7 @@ FIXTURE = HERE / "fixtures" / "v1" / "app.html"
 
 # Same resolution order the agents use, so the test looks where the run looked:
 # FRAMEWORK_DIR, else WORKSPACE_DIR/GITHUB_REPO_AUTOMATION, else a sibling
-# checkout matched by shape. Both tests skip when it is not there.
+# checkout matched by shape. Skips when it is not there.
 workspace_helper.load_repo_env()
 FRAMEWORK = workspace_helper.resolve(
     os.environ.get("WORKSPACE_DIR") or REPO_ROOT.parent,
@@ -49,16 +48,16 @@ IDENTITY = [
 GEOMETRY_TOLERANCE = 1e-4      # a fraction of the viewport
 
 
-def test_capture_script_is_identical_in_both_repos():
+def test_python_reads_the_frameworks_capture_script():
+    """The engine must load the framework's copy, not one of its own."""
     if not JAVA_COPY.exists():
         pytest.skip(f"automation framework not present at {FRAMEWORK}")
-    ours = (HERE.parent / "shared" / "locator_capture.js").read_bytes()
-    theirs = JAVA_COPY.read_bytes()
-    assert ours == theirs, (
-        "locator-capture.js has drifted between QA-Agent-Network and the automation "
-        "framework. Copy the canonical file over rather than editing either in place — "
-        "two capture implementations silently corrupt every similarity score."
+    assert not (HERE.parent / "shared" / "locator_capture.js").exists(), (
+        "a second copy of the capture script has reappeared in shared/. The "
+        "framework owns it — two capture implementations are free to drift, and "
+        "two that disagree silently corrupt every similarity score."
     )
+    assert capture.script() == JAVA_COPY.read_text()
 
 
 def _java_capture(tmp_path) -> dict | None:

@@ -13,7 +13,7 @@ import hashlib, json, os, pathlib
 from typing import Any
 
 # Every context the engine opens must match the viewport the framework runs at.
-# bbox_norm and area_norm are normalised by the LIVE viewport (locator_capture.js),
+# bbox_norm and area_norm are normalised by the LIVE viewport (locator-capture.js),
 # so a baseline recorded by a 1920x1080 maven run and a candidate captured at
 # 1280x900 disagree on `location` and `area` for the very same element — an
 # identical 200x50 button differs by about 1.8x on area alone. Responsive layouts
@@ -25,10 +25,50 @@ from typing import Any
 VIEWPORT = {"width": int(os.environ.get("LOCATOR_VIEWPORT_W", "1920")),
             "height": int(os.environ.get("LOCATOR_VIEWPORT_H", "1080"))}
 
-# The capture JS lives in its own file because the Java framework loads the very
-# same bytes from its resources. Inlining it here would make a second copy
-# inevitable, and two capture implementations that disagree corrupt every score.
-JS = (pathlib.Path(__file__).parent / "locator_capture.js").read_text()
+# The capture script lives in the automation framework and is read from there,
+# not copied. It has to ship in the framework's jar — LocatorCapture loads it as
+# a resource during a test run, when this repo is not present — so the framework
+# is the only place it can be canonical. Keeping a second copy here would mean
+# two capture implementations free to drift, and two that disagree corrupt every
+# similarity score without anything failing loudly.
+#
+# Nothing needs it before a heal, and a heal already has the framework checked
+# out, so it is loaded on first use rather than at import.
+_SCRIPT_RELATIVE = pathlib.Path("src") / "main" / "resources" / "locator-capture.js"
+_script_cache: str | None = None
+
+
+def script_path() -> pathlib.Path:
+    """Where the capture script should be, whether or not it is there."""
+    from shared import workspace as workspace_helper
+    workspace_helper.load_repo_env()
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    framework = workspace_helper.resolve(
+        os.environ.get("WORKSPACE_DIR") or repo_root.parent,
+        os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+        exclude=repo_root)
+    return framework / _SCRIPT_RELATIVE
+
+
+def script_available() -> bool:
+    """Whether a checkout carrying the script is reachable — for test guards."""
+    return script_path().is_file()
+
+
+def script() -> str:
+    """The capture script, read from the framework checkout and cached."""
+    global _script_cache
+    if _script_cache is not None:
+        return _script_cache
+
+    path = script_path()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"capture script not found at {path}. It is owned by the automation "
+            "framework; point FRAMEWORK_DIR at a checkout, or set WORKSPACE_DIR "
+            "and GITHUB_REPO_AUTOMATION.")
+    _script_cache = path.read_text()
+    return _script_cache
 
 
 
@@ -57,7 +97,7 @@ def snapshot(page, attempts: int = 3) -> dict[str, Any]:
     last: Exception | None = None
     for attempt in range(attempts):
         try:
-            return page.evaluate(JS)
+            return page.evaluate(script())
         except Exception as exc:                   # noqa: BLE001 - re-raised below
             message = str(exc)
             if ("Execution context was destroyed" not in message
@@ -84,7 +124,7 @@ def find_by_locator(page, raw: str, snap: dict | None = None) -> tuple[int, dict
     """Resolve `raw` and return (match_count, fingerprint_of_first_match).
 
     The fingerprint is looked up by position in the *same* filtered node list
-    capture.JS walks, so the two views can never drift out of alignment.
+    capture.script() walks, so the two views can never drift out of alignment.
     """
     loc = page.locator(raw)
     try:
@@ -97,7 +137,7 @@ def find_by_locator(page, raw: str, snap: dict | None = None) -> tuple[int, dict
         snap = snapshot(page)
     # Same expression, element argument: the index comes from the identical walk
     # that produced `snap`, so the two can never disagree.
-    idx = page.evaluate(JS, loc.first.element_handle())
+    idx = page.evaluate(script(), loc.first.element_handle())
     if idx is None or idx < 0 or idx >= len(snap["elements"]):
         return n, None
     return n, snap["elements"][idx]

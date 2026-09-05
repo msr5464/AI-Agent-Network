@@ -452,6 +452,9 @@ def _summarise_step(key: str, data: Dict) -> Dict:
             "reason": data.get("reason"),
             "steps_passed": len(data.get("steps_passed") or []),
             "steps_failed": len(data.get("steps_failed") or []),
+            # Neither passed nor failed: the step ran, but what it claims was
+            # never observed. A run reading 15/15 passed used to hide one of these.
+            "steps_unverified": len(data.get("steps_unverified") or []),
         }
     if key == "generate":
         return {

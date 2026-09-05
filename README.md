@@ -292,7 +292,7 @@ login session, or when the flow ends in something that cannot be undone. See
 | `GITHUB_TOKEN` | | GitHub personal access token (repo scope) |
 | `GITHUB_ORG` | | GitHub org or username owning the automation repo |
 | `GITHUB_REPO_AUTOMATION` | `Jarvis` | Name of the automation repo — the directory under `WORKSPACE_DIR`, and the repo name on GitHub. Required even when `FRAMEWORK_DIR` is set. |
-| `GITHUB_DEFAULT_BRANCH` | `main` | Base branch for PRs |
+| `GITHUB_DEFAULT_BRANCH` | `main` | Default base branch: checked out before a run and used as the PR base. Overridable per run from the GUI. |
 | `GITHUB_PR_REVIEWERS` | | Comma-separated list of PR reviewer handles |
 | `WORKSPACE_DIR` | | Absolute path to the parent directory containing the automation repo. If the repo is absent it is cloned automatically using `GITHUB_TOKEN`. |
 | `FRAMEWORK_DIR` | | Absolute path to the automation repo checkout itself, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION`. Set it when the checkout is named differently or lives elsewhere; every agent and the parity test read this one setting. |
@@ -300,6 +300,7 @@ login session, or when the flow ends in something that cannot be undone. See
 | `SLACK_NOTIFY_CHANNEL` | `#qa-reports` | Channel for normal results and successful fixes |
 | `SLACK_ALERT_CHANNEL` | `#qa-critical` | Channel for failures needing human attention |
 | `AUTO_PUSH` | `true` | Set `false` to skip PR creation (dry-run mode) |
+| `QA_LOG_COLOR` | `auto` | Log severity colouring: `ERROR`/`FATAL`/`FAILED`/`BLOCKED:` lines print red and `WARNING` lines yellow when the run is attached to a terminal. `always` forces colour (e.g. into a pager that renders it), `never` disables it; `NO_COLOR` is honoured too. Under the server, stdout is a pipe, so nothing is emitted and the Studio console colours by prefix. |
 
 ### Agent 1 — test-authoring-agent
 
