@@ -17,68 +17,29 @@ third is the one that needs care:
   * **Never fails the build.** A missing baseline lowers confidence in a later
     diagnosis. It is not worth failing a green suite over.
 
+Which files those are is `shared/baseline.py`'s answer, not this script's: the
+authoring agent's ship step has to ask the same question when it builds a PR, and
+two implementations of "has this fingerprint really changed" would drift.
+
 Usage: commit_baselines.py <workspace> [--branch <name>] [--push]
 """
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from shared import baseline
 from shared.git import run_git
 
-BASELINE_PATH = "src/main/resources/baselines"
-VOLATILE_KEYS = ("recordedAt",)
-
-
-def _substance(path: Path) -> str:
-    """The file's content with per-run noise removed, for comparison only."""
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return path.read_text(errors="ignore") if path.exists() else ""
-    if isinstance(data, dict):
-        for key in VOLATILE_KEYS:
-            data.pop(key, None)
-    return json.dumps(data, sort_keys=True)
-
-
-def _committed_version(workspace: Path, relative: str) -> str:
-    ok, out, _ = run_git(["show", f"HEAD:{relative}"], workspace)
-    if not ok:
-        return ""
-    try:
-        data = json.loads(out)
-    except ValueError:
-        return out
-    if isinstance(data, dict):
-        for key in VOLATILE_KEYS:
-            data.pop(key, None)
-    return json.dumps(data, sort_keys=True)
+BASELINE_PATH = baseline.REPO_SUBPATH
 
 
 def changed_baselines(workspace: Path) -> list[Path]:
-    """Baseline files whose substance differs from what is committed.
-
-    Deliberately not recursive: `pending/` under this directory is the Java
-    side's scratch space, holding fingerprints recorded by a test that has not
-    finished yet. promote() moves them up here and discard() deletes them, so
-    anything still sitting there is an interrupted run — named by test key
-    rather than by page object, and never a record of the page working.
-    """
-    root = workspace / BASELINE_PATH
-    if not root.is_dir():
-        return []
-    changed = []
-    for path in sorted(root.glob("*.json")):
-        relative = path.relative_to(workspace).as_posix()
-        if _substance(path) != _committed_version(workspace, relative):
-            changed.append(path)
-    return changed
+    """Baseline files whose substance differs from what is committed."""
+    return [workspace / relative for relative in baseline.changed(workspace)]
 
 
 def main() -> int:

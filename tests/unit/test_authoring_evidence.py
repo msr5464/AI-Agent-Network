@@ -1089,3 +1089,65 @@ class TestFixRollback:
             {self.REL: weakened}, {},
             "NaukriProfileSummaryWebTest", "toggleDotInProfileSummaryAndVerify")
         assert patched == [self.REL]
+
+
+class TestEvidenceSurvivesARejectedAttempt:
+    """An attempt whose every fix was rejected must not blind the attempt after it.
+
+    Observed in a real run: attempt 1 was rejected by `no_selector_broadening`, so it
+    wrote a result carrying no failure context — and `04-run-and-fix.json` is overwritten
+    wholesale. Attempt 2 then loaded `failure_location=""` (blanking its structured
+    evidence and making the `stuck` check unreachable) and `run_started_at=0.0`, which
+    disables `gather_runtime_evidence`'s freshness gate: `not newer_than` short-circuits.
+    That attempt duly read a DOM context file timestamped hours earlier, from a previous
+    session, and was asked to fix a failure it was not looking at.
+    """
+
+    REJECTED = {
+        "attempt": 1, "test_class": "T", "test_method": "m", "passed": False,
+        "test_output": "same as before", "fixes_applied": [],
+        "fix_rejections": [{"file": "P.java", "reason": "no_selector_broadening: wider"}],
+        "skipped_rerun": True,
+    }
+
+    def _mod(self, tmp_path, monkeypatch):
+        (tmp_path / "fw").mkdir(exist_ok=True)
+        return _load_action("04_run_and_fix.py", tmp_path, monkeypatch,
+                            workspace=tmp_path), tmp_path
+
+    def test_failure_context_is_carried_forward(self, tmp_path, monkeypatch):
+        mod, audit = self._mod(tmp_path, monkeypatch)
+        (audit / "04-run-and-fix.json").write_text(json.dumps({
+            "attempt": 0, "failure_location": "T.java:45",
+            "failure_message": "toast never appeared",
+            "screenshot_path": "/shots/m_110924.png",
+            "summary_lines": ["[ERROR] Tests run: 1"],
+            "run_started_at": 1757000000.0,
+        }))
+        mod._write_result(dict(self.REJECTED), [], 1)
+        after = json.loads((audit / "04-run-and-fix.json").read_text())
+        assert after["failure_location"] == "T.java:45"
+        assert after["failure_message"] == "toast never appeared"
+        assert after["screenshot_path"] == "/shots/m_110924.png"
+        assert after["summary_lines"] == ["[ERROR] Tests run: 1"]
+        # The one that silently disabled stale-artefact filtering.
+        assert after["run_started_at"] == 1757000000.0
+
+    def test_a_real_new_result_still_wins(self, tmp_path, monkeypatch):
+        """Carrying forward must never overwrite an attempt's own fresh evidence."""
+        mod, audit = self._mod(tmp_path, monkeypatch)
+        (audit / "04-run-and-fix.json").write_text(json.dumps({
+            "failure_location": "T.java:45", "run_started_at": 1757000000.0,
+        }))
+        mod._write_result({"attempt": 2, "passed": False, "fixes_applied": ["P.java"],
+                           "failure_location": "Other.java:9",
+                           "run_started_at": 1757009999.0}, [], 2)
+        after = json.loads((audit / "04-run-and-fix.json").read_text())
+        assert after["failure_location"] == "Other.java:9"
+        assert after["run_started_at"] == 1757009999.0
+
+    def test_nothing_to_carry_forward_is_not_an_error(self, tmp_path, monkeypatch):
+        """The initial run has no previous file at all."""
+        mod, audit = self._mod(tmp_path, monkeypatch)
+        mod._write_result({"attempt": 0, "passed": True, "fixes_applied": []}, [], 0)
+        assert json.loads((audit / "04-run-and-fix.json").read_text())["passed"] is True

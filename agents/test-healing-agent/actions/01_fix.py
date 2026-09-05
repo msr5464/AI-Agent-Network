@@ -1831,6 +1831,41 @@ def run_single_test(test_name: str, workspace: Path) -> tuple:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _commit_baselines(workspace, build_tag: str) -> list:
+    """Commit the locator fingerprints the verification re-run recorded.
+
+    A heal is precisely the moment the repo's baseline goes stale: the locator
+    that broke has just been replaced, so the committed fingerprint describes an
+    element the page no longer has. Leaving it means the NEXT drift in that page
+    is diagnosed against a record of the page before this fix — which is how a
+    healed page keeps looking broken to the comparison that is supposed to
+    explain it.
+
+    Path-scoped like the fix commit above: only the baselines directory is ever
+    staged, never `git add -A`.
+    """
+    changed = baseline.changed(workspace)
+    if not changed:
+        return []
+    paths = sorted(changed)
+    ok, _, err = run_git(["add", "--"] + paths, workspace)
+    if not ok:
+        log(f"Warning: could not stage baselines: {err.strip()[:120]}")
+        return []
+    ok, out, err = run_git(
+        ["commit", "-m",
+         f"fix(automation): refresh {len(paths)} locator baseline(s)\n\n"
+         f"Build tag: {build_tag}\n"
+         f"Element fingerprints recorded while the healed tests were verified,\n"
+         f"so the next drift is diagnosed against the page as it is now."],
+        workspace)
+    if not ok and "nothing to commit" not in f"{out}{err}".lower():
+        log(f"Warning: baseline commit failed: {(err or out).strip()[:120]}")
+        return []
+    log(f"Committed {len(paths)} locator baseline(s)")
+    return paths
+
+
 def main():
     # Load handoff
     if not HANDOFF_FILE.exists():
@@ -2481,6 +2516,7 @@ def main():
         if ok:
             log(f"Committed {len(applied)} fix(es) to {branch_name}")
             pr_branch = branch_name
+            _commit_baselines(workspace, build_tag)
         elif "nothing to commit" in f"{out}{err}".lower():
             # Everything applied this attempt was already committed by an earlier
             # one. git reports this on stdout, not stderr.

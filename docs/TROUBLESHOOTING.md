@@ -115,9 +115,12 @@ Claude wrote tests that don't compile or fail at runtime. Options:
    TESTING_MODE=true make run AGENT=test-authoring-agent MODULE=payments
    ```
 
-2. **Increase `MAX_FIX_ATTEMPTS`** — the agent will retry the fix loop more times:
+2. **Increase `AUTHORING_FIX_RETRY_COUNT`** — the agent will retry the fix loop more times.
+   Note the loop stops early regardless once an attempt can bring nothing new (the model
+   returns no edits, the same guard rejects twice running, or an edit set repeats), so
+   raising this only helps when attempts are genuinely still exploring:
    ```bash
-   MAX_FIX_ATTEMPTS=5 make run AGENT=test-authoring-agent MODULE=payments
+   AUTHORING_FIX_RETRY_COUNT=5 make run AGENT=test-authoring-agent MODULE=payments
    ```
 
 3. **Read the Claude prompt** — open `agents/test-authoring-agent/audit/<session>/04-run-and-fix.md` to see exactly what Claude was asked and what it responded.
@@ -206,7 +209,7 @@ The `.json` file for this build tag doesn't exist in the queue. Either Agent 2 h
 
 ### Fix applied but test still failing
 
-Claude generated a locator fix but the test still fails after applying it. The agent will retry up to `MAX_FIX_ATTEMPTS` times. On each retry, it injects the previous failure output into the prompt so Claude can try a different strategy.
+Claude generated a locator fix but the test still fails after applying it. The agent will retry up to `HEALING_RETRY_COUNT` times. On each retry, it injects the previous failure output into the prompt so Claude can try a different strategy.
 
 To debug manually:
 1. Open `agents/test-healing-agent/audit/<session>/01-fix.md` — read the Claude prompt and response

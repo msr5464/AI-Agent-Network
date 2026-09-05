@@ -37,6 +37,7 @@ from shared.log import log as _log
 from shared.log import blocked
 def log(msg): _log("ship", msg)
 
+from shared import baseline as baseline_store
 from shared import flow_map
 from shared.git import run_git
 from shared.github import create_pr
@@ -239,6 +240,7 @@ def main():
         "escalations": adapt.get("escalations") or [],
         "verified": adapt.get("verified") or [],
         "failed": adapt.get("failed") or [],
+        "baselines_committed": [],
     }
 
     applied = [i for i in (adapt.get("items") or [])
@@ -303,6 +305,29 @@ def main():
                            f"Session: {SESSION_ID}")
                 run_git(["commit", "-m", message], workspace)
                 log(f"  committed item {item['index']}")
+
+            # The fingerprints the verification run recorded belong in the same
+            # PR as the edits. Adaptation is the case where leaving them out
+            # hurts most: the page moved, so the baseline still in the repo
+            # describes locators that no longer exist, and the next diagnosis
+            # compares the new page against a record of the old one. Same
+            # path-scoping rule as above — only the baselines directory, never
+            # `git add -A`.
+            baselines = baseline_store.changed(workspace)
+            if baselines:
+                run_git(["add", "--"] + sorted(baselines), workspace)
+                ok, staged, _ = run_git(["diff", "--cached", "--name-only"], workspace)
+                if staged.strip():
+                    run_git(["commit", "-m",
+                             f"test(adapt): refresh {len(baselines)} locator baseline(s)\n\n"
+                             f"Element fingerprints recorded while the adapted tests were\n"
+                             f"verified. They describe what each locator matched on the\n"
+                             f"changed page, so the next drift is diagnosed against the\n"
+                             f"page as it is now rather than as it used to be.\n"
+                             f"Session: {SESSION_ID}"], workspace)
+                    log(f"  committed {len(baselines)} locator baseline(s)")
+                    result["baselines_committed"] = sorted(baselines)
+
             pushed, _, perr = run_git(["push", "-u", "origin", branch], workspace,
                                       push_url=push_url())
             if not pushed:

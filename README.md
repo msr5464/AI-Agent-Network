@@ -310,7 +310,7 @@ login session, or when the flow ends in something that cannot be undone. See
 | `AUTOCREATE_BRANCH_PREFIX` | `feat/qa-autocreate` | Branch prefix. Full name: `<prefix>/<module>-<timestamp>` |
 | `AUTOCREATE_ENVIRONMENT` | `staging` | Maven `-Denvironment=` value when running generated tests |
 | `AUTOCREATE_COUNTRY` | `SG` | Maven `-Dcountry=` value |
-| `MAX_FIX_ATTEMPTS` | `3` | Max retry cycles if the generated test fails |
+| `AUTHORING_FIX_RETRY_COUNT` | `2` | Max retry cycles if the generated test fails. The loop also stops early on its own |
 | `TESTING_MODE` | `false` | Set `true` to cache step-01 and step-02 outputs and skip them on reruns |
 | `PLAYWRIGHT_TIMEOUT_MS` | `30000` | Timeout per step in the headless web validation script |
 | `PLAYWRIGHT_HEADLESS` | `true` | Set `false` to run **every** browser in every agent headed — validation, DOM inspection, exploration, session minting, and the Maven test runs (as `-Dheadless`). Unset, each browser keeps its own default and Maven follows the framework's `config.properties` |
@@ -345,7 +345,7 @@ login session, or when the flow ends in something that cannot be undone. See
 |----------|---------|---------|
 | `AUTOFIX_MODEL` | `claude-opus-4-6` | Claude model for fix generation |
 | `AUTOFIX_BRANCH_PREFIX` | `chore/qa-autofix` | Branch prefix. Full name: `<prefix>/<build-tag>` |
-| `MAX_FIX_ATTEMPTS` | `2` | Retry cycles if tests still fail after fix |
+| `HEALING_RETRY_COUNT` | `4` | Retry cycles if tests still fail after fix — enough to walk a chain of broken locators |
 | `AUTO_FIX_MAX_FIXES_PER_RUN` | `5` | Max tests to fix per session |
 | `TEST_RUNNER_CMD` | auto-detect | Override test runner. Placeholders: `{class}` `{class_simple}` `{method}` |
 | `REPO_CONTEXT_FILE` | `CONVENTIONS.md` | Path to conventions file (relative to automation repo root, or absolute). Falls back to the bundled `agents/test-healing-agent/CONVENTIONS.md`. |

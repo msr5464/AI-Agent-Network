@@ -262,7 +262,7 @@ agents/test-healing-agent/queue/<build_tag>.json   ← written by test-triaging-
 queue/processed/<build_tag>.json   ← moved after completion
 ```
 
-**Retry loop (in run.sh):** If `.fix-passed=false`, re-runs `01_fix.py` up to `MAX_FIX_ATTEMPTS`
+**Retry loop (in run.sh):** If `.fix-passed=false`, re-runs `01_fix.py` up to `HEALING_RETRY_COUNT`
 (default 4 — each attempt either fixes an element or proves it cannot, so the loop walks a
 chain of broken locators rather than re-guessing at one).
 A retry re-attempts **only the tests that actually failed** — fixes already applied and
@@ -316,6 +316,21 @@ that test (an API test, screenshots disabled, or a framework without the capture
 hook). The healing agent then falls back to tier 2.
 
 ---
+
+## Locator baselines are committed with the fix
+
+`src/main/resources/baselines/<PageObject>.json` is the framework's record of what each
+locator matched while the test worked, and a heal is exactly what makes the committed
+one stale: the locator that broke has just been replaced, so the fingerprint in the repo
+describes an element the page no longer uses. `_refresh_baseline_after_heal()` already
+rewrote the file on disk; what was missing was committing it, because the fix commit
+stages only `fix["target_file"]`.
+
+`_commit_baselines()` now runs straight after a successful fix commit and adds a second,
+path-scoped commit for the fingerprints that actually changed — measured with
+`recordedAt` excluded, through `shared/baseline.py`, so two runs that differ only in
+their timestamp commit nothing. Never `git add -A`: this step holds a write token.
+
 
 ## Fix Gate Values (.fix-passed)
 
@@ -382,7 +397,7 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `REPO_CONTEXT_FILE` | Path to conventions file in the automation repo (relative to repo root or absolute). If unset or not found, falls back to `agents/test-healing-agent/CONVENTIONS.md` bundled in this agent. |
 | `TEST_RUNNER_CMD` | Override test runner — use `{class}`, `{class_simple}`, `{method}` placeholders. Without it, runners are auto-detected at the repo root and one level down; if none is found, fixes are reported `unverified` |
 | `AUTO_FIX_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
-| `MAX_FIX_ATTEMPTS` | Max retry cycles if tests fail (default: 2) |
+| `HEALING_RETRY_COUNT` | Max retry cycles if tests fail (default: 4) |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) |
 | `SLACK_BOT_TOKEN`, `SLACK_NOTIFY_CHANNEL` | Slack notifications on success |
 | `SLACK_ALERT_CHANNEL` | Slack channel for failures/partial fixes |

@@ -85,6 +85,12 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
      "description": "Full re-runs on a recoverable failure. Each one restarts the "
                     "flow in a fresh browser — there is no mid-flow resume.",
      "type": "number", "category": "adaptation", "default": 1, "min": 0, "max": 3, "sensitive": False},
+    {"key": "adaptation_retry_count", "env_var": "ADAPTATION_RETRY_COUNT",
+     "label": "Adapt retry count",
+     "description": "Re-runs of the adapt step when verification fails. Each attempt is "
+                    "handed the previous one's unapplied items, so a second failure on the "
+                    "same item is evidence the approach is wrong.",
+     "type": "number", "category": "adaptation", "default": 2, "min": 1, "max": 10, "sensitive": False},
     {"key": "adapt_max_files", "env_var": "ADAPT_MAX_FILES_PER_RUN",
      "label": "Max files per run",
      "description": "Exceeding this flips the run to propose-only rather than "
@@ -230,19 +236,6 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "max_fix_attempts",
-        "env_var": "MAX_FIX_ATTEMPTS",
-        "label": "Max Fix Attempts",
-        "description": "Maximum fix-and-retry cycles before shipping with a NEEDS-REVIEW "
-                       "verdict. The healing agent defaults to 2 when this is unset.",
-        "type": "number",
-        "category": "common",
-        "default": 3,
-        "sensitive": False,
-        "min": 1,
-        "max": 10,
-    },
-    {
         "key": "auto_push",
         "env_var": "AUTO_PUSH",
         "label": "Auto Push & Create PR",
@@ -318,6 +311,21 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
+        "key": "authoring_fix_retry_count",
+        "env_var": "AUTHORING_FIX_RETRY_COUNT",
+        "label": "Fix Retry Count",
+        "description": "Fix-and-retry cycles for a failing generated test before shipping "
+                       "with a NEEDS-REVIEW verdict. The initial run is not counted. The "
+                       "loop also stops early on its own once an attempt can bring nothing "
+                       "new \u2014 so this is a ceiling, not a target.",
+        "type": "number",
+        "category": "authoring",
+        "default": 2,
+        "sensitive": False,
+        "min": 1,
+        "max": 10,
+    },
+    {
         "key": "playwright_timeout_ms",
         "env_var": "PLAYWRIGHT_TIMEOUT_MS",
         "label": "Playwright Step Timeout (ms)",
@@ -354,6 +362,21 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
         "min": 1,
         "max": 50,
+    },
+    {
+        "key": "healing_retry_count",
+        "env_var": "HEALING_RETRY_COUNT",
+        "label": "Fix Retry Count",
+        "description": "Retry cycles when a locator fix fails verification. An attempt that "
+                       "repairs one locator and uncovers the next keeps its edit, so the loop "
+                       "walks a chain of broken locators rather than re-guessing at one \u2014 "
+                       "which is why this is higher than the authoring agent's.",
+        "type": "number",
+        "category": "healing",
+        "default": 4,
+        "sensitive": False,
+        "min": 1,
+        "max": 10,
     },
     {
         "key": "autofix_branch_prefix",

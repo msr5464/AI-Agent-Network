@@ -128,6 +128,40 @@ This exists because none of the six per-file guards could see it: deleting an
 assertion is a one-line diff that loses no method, adds no `Thread.sleep`, and is
 invisible to `no_selector_broadening`, which only inspects `page.locator(...)` calls.
 
+### When step 04 stops retrying
+
+`AUTHORING_FIX_RETRY_COUNT` is a **ceiling, not a target**. A budget bounds the worst
+case; it cannot tell a real attempt from a repeat of one. So the loop also stops the
+moment it can prove the next attempt would not differ, which is the whole reason the
+budget could come down from 4 to 2.
+
+Three proofs, all in `shared/fix_history.py`:
+
+| Stop | Why another attempt cannot help |
+|------|--------------------------------|
+| the model returned `edits: []` | It reports it cannot fix this from the files it can see. That is an answer. Nothing on disk has changed since the failing run, so re-running maven reproduces a known result |
+| the same guard rejected everything **twice running** | The first rejection earns a retry, because the model had not yet been told why. The second was made *with* that reason in the prompt |
+| the proposed edits repeat an earlier attempt's | Matched on exact content hashes. Identical edits, identical result |
+
+All three write the `stuck` gate, not `false` — the test genuinely ran and genuinely
+failed, which is not an infra `skipped` where it never got a fair shot. The stored
+`reason` is what the PR body and the Slack alert quote.
+
+**Every attempt is recorded in `.fix-history.json`, appended and never overwritten**,
+and rendered into the next prompt. This is what makes attempt N differ from attempt N-1:
+
+- `04-run-and-fix.json` is overwritten each attempt, so on its own it gave attempt 3 no
+  way to know what attempt 1 tried — and attempt 3 was free to re-propose it.
+- Guard rejections used to reach disk and the ship verdict but never a prompt. The model
+  was told "try something different" without being told what it had done wrong, and the
+  run burned its budget re-triggering the same guard.
+
+An attempt whose fixes were all rejected also **carries the previous attempt's failure
+context forward** rather than writing a result without it. Dropping it blanked the next
+prompt's `<structured_failure_report>`, made the `stuck` check unreachable, and — via
+`run_started_at=0.0` — silently disabled `gather_runtime_evidence`'s freshness gate, so
+the next attempt was shown a DOM captured in a different session.
+
 ---
 
 ## Data Flow
@@ -187,6 +221,7 @@ Web Steps:
 - `true`    — generated test ran and passed → proceed to ship
 - `false`   — test failed after all fix attempts → ship with NEEDS-REVIEW verdict
 - `skipped` — no test could be run (infra issue) → clean exit
+- `stuck`   — the test ran and failed, and a further attempt provably could not differ (see "When step 04 stops retrying") → ship with NEEDS-REVIEW
 
 **.verdict**
 - `APPROVED`      — test passed, nothing the input asked for went unverified, no fix was rejected for weakening an assertion
@@ -208,6 +243,7 @@ Web Steps:
 | `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators` |
 | `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes |
 | `.assertions-frozen.json` | Run & Fix | What the generated test proved before any fix — the conservation baseline |
+| `.fix-history.json` | Run & Fix | Every fix attempt, appended: diagnosis, edits proposed, guards that rejected them. Feeds the next prompt and the stop rule |
 | `.fix-passed` | Run & Fix | Gate: true / false / skipped |
 | `05-ship.json` + `.md` | Ship | PR URL, Slack status |
 | `.verdict` | Ship | APPROVED / NEEDS-REVIEW |
@@ -228,7 +264,7 @@ Web Steps:
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs | `main` |
 | `GITHUB_PR_REVIEWERS` | Comma-separated reviewer handles | optional |
 | `AUTOCREATE_BRANCH_PREFIX` | Branch name prefix | `feat/qa-autocreate` |
-| `MAX_FIX_ATTEMPTS` | Max retry cycles for failing tests | `3` |
+| `AUTHORING_FIX_RETRY_COUNT` | Max retry cycles for failing tests. A ceiling — the loop stops early once an attempt can bring nothing new | `2` |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) | `true` |
 | `AUTOCREATE_ENVIRONMENT` | Maven `-Denvironment=` value | `staging` |
 | `AUTOCREATE_COUNTRY` | Maven `-Dcountry=` value | `SG` |
@@ -351,6 +387,64 @@ segment — `/nlogin/login` → `{feature}.login.url`. Id-like segments are skip
 Credentials use the same properties file through `shared/credential_properties.py` but are
 the opposite case: never committed. Both share `shared/properties_file.py` so the file
 location and the "never overwrite a human's value" rule exist in one place.
+
+---
+
+## Locator baselines reach the PR
+
+The framework writes an element fingerprint per page object on every successful page
+load — `src/main/resources/baselines/NaukriLoginPage.json` — and that file is the only
+record of what a locator matched while it worked. A generated page object shipped
+without one leaves the next diagnosis of that page with nothing to compare against.
+
+Until this was fixed the authoring PR never carried them, for a reason that is easy to
+miss: 05_ship's branch creation is a `checkout -f -B`, so the untracked baseline the
+green run had just written was wiped off disk *before* there was a branch to commit it
+onto. So the ship step now reads the baselines **before** it touches the branch, and
+commits them last, once the code and any fixes are in:
+
+| Where | What happens |
+|-------|--------------|
+| **05 Ship**, before branching | `baseline.promoted()` reads every fingerprint the run left in `src/main/resources/baselines/` — never `pending/`, which holds records from a test that did not finish. |
+| **05 Ship**, after the fix commits | `baseline.changed()` keeps only the ones whose substance differs from HEAD, and they land in their own commit, listed in the PR body. |
+
+Comparison ignores `recordedAt`: the framework rewrites it on every load, so comparing
+raw bytes would put an empty baseline diff in every PR. The timestamp itself has to stay
+in the file — `baseline.load()`'s staleness guard uses it to reject a record written by
+the failing run itself.
+
+The same rule now holds in the other two agents that raise PRs — `01_fix.py` in the
+healing agent (where the heal is exactly what makes the old fingerprint stale) and
+`05_ship.py` in the adaptation agent — all through `shared/baseline.py`, which
+`scripts/commit_baselines.py` also uses after a green CI suite.
+
+---
+
+## Step narration — one `logStep` per step
+
+The run report prints one line per `logStep`. A test that opens with a single run-on
+summary — *"Login to Naukri, toggle the trailing dot in Profile Summary, save the change,
+and verify it persists after page reload"* — passes every check that existed before
+(`logStep` present, in a test class, plain English) and still produces a one-line report
+for a four-step scenario: when it fails, the report cannot say which step broke. The
+derived intent contract is built from the same strings, so one sentence collapses four
+checkable claims into one blob.
+
+Presence was already checked (`logstep_present` in `shared/edit_guards.py`); granularity
+is what this adds, in two places:
+
+| Where | What happens |
+|-------|--------------|
+| **03 Generate**, in the prompt | Rule 7b: one `logStep` per plan step, immediately before the call(s) that carry it out; setup lines get none; a helper may encapsulate one step, never the whole scenario. Shown with a wrong/right pair. |
+| **03 Generate**, after codegen | `_repair_step_narration()` audits each generated test class with `shared/logstep_narration.py` and runs one targeted repair pass over the ones that fall short, guarded by `validate_fix` and rejected unless it actually adds narration. What survives is recorded in `03-generate.json` → `under_narrated_tests`. |
+
+The expectation is deliberately the *smaller* of two bounds: the plan's own step count for
+that method (setup steps dropped), and the number of statements in the method that
+actually drive or check the app. A method cannot narrate more groups than it has work to
+narrate, so capping by the second is what keeps the guard from firing on correct code —
+and it is why a test whose whole scenario hides behind one helper call is asked for two
+steps rather than five. The repair is given the helper and page objects generated
+alongside it as read-only context and may only call methods that already exist there.
 
 ---
 

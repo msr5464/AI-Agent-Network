@@ -153,5 +153,6 @@ help:
 	@echo ""
 	@echo "Environment (test-healing-agent):"
 	@echo "  AUTO_PUSH=false                                    Dry-run (no PR)"
-	@echo "  MAX_FIX_ATTEMPTS=2                                 Max retry cycles"
+	@echo "  AUTHORING_FIX_RETRY_COUNT=2                        Max retry cycles (authoring)"
+	@echo "  HEALING_RETRY_COUNT=4                              Max retry cycles (healing)"
 	@echo ""

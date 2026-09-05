@@ -28,6 +28,7 @@ from shared import workspace as workspace_helper
 
 from shared.log import log as _log
 from shared.log import blocked
+from shared import baseline as baseline_store
 from shared import properties_file
 from shared.slack import send_slack as _send_slack
 from shared.git import run_git as _run_git
@@ -150,6 +151,20 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
 
     attempts_with_fixes = [a for a in fix_attempts_data if a.get("fix_file_contents")]
 
+    # Read the locator fingerprints step 04's run recorded, BEFORE the branch
+    # checkout below — it is a `checkout -f`, so anything untracked in the working
+    # tree is gone by the time there is a branch to commit onto. This is exactly
+    # how NaukriLoginPage.json kept ending up untracked: the framework wrote it
+    # during the green run, ship reset the tree, and the PR carried the new page
+    # object with no record of what its locators matched when they worked.
+    baseline_contents: dict = {}
+    for path in baseline_store.promoted(AUTOMATION_FRAMEWORK_DIR):
+        try:
+            rel = path.relative_to(AUTOMATION_FRAMEWORK_DIR).as_posix()
+            baseline_contents[rel] = path.read_text()
+        except OSError as exc:
+            log(f"Could not read baseline {path.name} ({exc}) — skipping it")
+
     if not step3_contents and not attempts_with_fixes:
         log("No files to commit")
         return None, None
@@ -165,6 +180,8 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
         latest = dict(step3_contents)
         for attempt in attempts_with_fixes:
             latest.update(attempt.get("fix_file_contents") or {})
+        # Nothing was reset in this mode, so the baselines are already on disk
+        # where the framework wrote them — no need to rewrite them here.
         for rel_path, content in latest.items():
             full = AUTOMATION_FRAMEWORK_DIR / rel_path
             full.parent.mkdir(parents=True, exist_ok=True)
@@ -270,6 +287,33 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
             rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
             log(f"Committed step-04 attempt-{n} ({len(fix_contents)} file(s)): {sha.strip()}")
 
+    # ── Final commit: the locator fingerprints the run recorded ──────────────────
+    #
+    # Last, because they describe the state the test finally reached. Only the
+    # ones whose substance differs from HEAD: the framework rewrites every
+    # baseline it loads with a fresh `recordedAt`, so committing on raw file
+    # change would put an otherwise-empty diff in every single PR.
+    baseline_changed = baseline_store.changed(AUTOMATION_FRAMEWORK_DIR, baseline_contents)
+    if baseline_changed:
+        log(f"Committing {len(baseline_changed)} locator baseline(s): "
+            f"{', '.join(Path(p).name for p in baseline_changed)}")
+        msg = (
+            f"[Authoring Agent]: Locator baselines for {MODULE}\n\n"
+            f"Element fingerprints recorded while the generated test ran. They\n"
+            f"describe what each page object locator matched when it worked, so a\n"
+            f"later drift can be diagnosed by comparison rather than by guesswork.\n"
+            f"Session: {SESSION_ID}\n\n"
+            f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+        )
+        if _stage_and_commit(baseline_changed, msg):
+            rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
+            log(f"Committed baselines ({len(baseline_changed)} file(s)): {sha.strip()}")
+    elif baseline_contents:
+        log(f"{len(baseline_contents)} baseline(s) on disk, none changed — nothing to commit")
+    else:
+        log("No locator baselines were recorded by this run")
+    gen_data["baselines_committed"] = sorted(baseline_changed)
+
     rc, final_sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
     return branch_name, final_sha.strip()
 
@@ -346,11 +390,17 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
         pr_title = f"Authoring Agent: {feature_class} automation for {MODULE} [needs review]"
 
     # Files section — show generated + fixed separately so reviewers can tell what changed
-    all_committed = list(dict.fromkeys(files_written + files_fixed))
+    baselines     = gen_data.get("baselines_committed") or []
+    all_committed = list(dict.fromkeys(files_written + files_fixed + baselines))
     if all_committed:
         gen_lines   = [f"- `{f}`" for f in files_written] or ["_(none)_"]
         fix_lines   = [f"- `{f}` _(auto-fixed)_" for f in files_fixed if f not in files_written]
-        files_lines = gen_lines + fix_lines
+        # Named in the PR rather than left as a silent extra commit: a reviewer
+        # who sees a fingerprint file should know it was recorded by this run,
+        # not hand-written.
+        base_lines  = [f"- `{f}` _(locator baseline recorded by the run)_"
+                       for f in baselines if f not in files_written]
+        files_lines = gen_lines + fix_lines + base_lines
         files_section = "\n".join(files_lines)
     else:
         files_section = "_(none)_"
@@ -359,15 +409,19 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
     if test_passed:
         test_section = "✅ Generated test was run and passed before this PR was created."
     elif fix_data.get("stuck"):
-        # Distinct from the infra-skip case below: this test WAS run, repeatedly,
-        # and genuinely failed every time — a fix attempt just had zero effect on
-        # the exact failure location, so the loop stopped early rather than burn
-        # the rest of the budget on a diagnosis that wasn't converging.
+        # Distinct from the infra-skip case below: this test genuinely failed rather
+        # than never getting a fair shot. The loop stopped short of its budget because
+        # a further attempt could not have differed from one already made — the exact
+        # reason varies (the same failure location after a fix, the same guard rejecting
+        # twice, or the model reporting it has no fix to offer), so quote the one the
+        # fix step actually recorded rather than assuming which it was.
+        why = (fix_data.get("reason") or "").strip()
         test_section = (
-            f"❌ Test is reproducibly failing at the same location after "
-            f"{fix_attempts} fix attempt(s) — the last fix had no effect on it. "
-            "Stopped early rather than retry further; see root_cause in the audit "
-            "trail for what was already tried. Please review manually."
+            f"❌ Test is reproducibly failing after {fix_attempts} fix attempt(s), and "
+            f"the fix loop stopped early rather than spend the rest of its budget: "
+            f"{why or 'no further fix was available'}. "
+            "See root_cause and .fix-history.json in the audit trail for everything "
+            "already tried. Please review manually."
         )
     elif fix_data.get("skipped"):
         test_section = "⚠️ Test could not be run (Maven not available or infra issue)."
@@ -499,7 +553,9 @@ def build_slack_message(gen_data: dict, fix_data: dict, pr_url: Optional[str], f
         # path, which would hide a known-broken test from whoever watches alerts.
         channel = SLACK_ALERT_CHANNEL or SLACK_NOTIFY_CHANNEL
         icon    = ":warning:"
-        status  = "generated but stuck — test reproducibly failing, fix attempts stopped early, needs review"
+        _why = (fix_data.get("reason") or "").strip()
+        status  = ("generated but stuck — test reproducibly failing, fix attempts stopped "
+                   "early, needs review" + (f" ({_why})" if _why else ""))
     elif fix_gate == "skipped":
         channel = SLACK_NOTIFY_CHANNEL
         icon    = ":large_yellow_circle:"

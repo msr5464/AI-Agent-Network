@@ -268,6 +268,19 @@ Resume matters more here than anywhere else in this repo: exploration is the
 expensive half, and a failed edit must never cost a second thirty-minute browser
 run. `TESTING_MODE=true` caches steps 01–03 under `cache/<module>/`.
 
+## Locator baselines are committed with the edits
+
+The fingerprints under `src/main/resources/baselines/` describe what each locator matched
+on the page as it was. Adaptation is the case where leaving them behind hurts most: the
+product moved, the tests were adapted to follow it, and a PR without the refreshed
+baselines leaves the repo describing the page as it used to be — so the next drift is
+diagnosed against a record that is already wrong.
+
+Ship now adds a final path-scoped commit for the baselines whose substance changed
+(`shared/baseline.py`, `recordedAt` excluded from the comparison). Same rule as the item
+commits above: only the paths that changed, never `git add -A`.
+
+
 ## Gate Values
 
 **`.fix-passed`** — `true` (something applied and verified) / `false` (applied,

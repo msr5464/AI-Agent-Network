@@ -64,7 +64,7 @@ Turns a plain English feature file into production-ready Java test code and rais
 | 01 Parse | Claude reads the `.txt` file and produces a structured generation plan (classes, methods, UI steps) |
 | 02 Validate Web | A headless Playwright script visits each URL and confirms element selectors exist in the real DOM |
 | 03 Generate | Claude writes the Java test class, page object, and data provider to the automation repo |
-| 04 Run + Fix | Maven runs the generated test; if it fails, Claude fixes the code and retries (up to `MAX_FIX_ATTEMPTS`) |
+| 04 Run + Fix | Maven runs the generated test; if it fails, Claude fixes the code and retries (up to `AUTHORING_FIX_RETRY_COUNT`, and stops early once an attempt can bring nothing new) |
 | 05 Ship | Git branch → commit → push → `gh pr create` → Slack notification |
 
 **Input:** `agents/test-authoring-agent/queue/<module>.txt`  

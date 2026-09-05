@@ -165,6 +165,30 @@ public void clickOnLoginButton() {
 - **Page objects and helpers**: `testConfig.logComment("description")`
 - Never use `System.out.println`
 - Never use `logStep` in page objects or helpers
+- **One `logStep` per step, never one summary line.** The report prints one line per
+  `logStep`, so a scenario narrated once fails with a report that cannot say which
+  step broke. Each `logStep` goes immediately before the call(s) it describes:
+
+```java
+// WRONG — one line for a four-step scenario
+logStep(testConfig, "Login, toggle the trailing dot in the summary, save, and verify it persists");
+String[] result = helper.toggleProfileSummaryDot(username, password);
+
+// RIGHT — one line per step, each in front of the calls that carry it out
+logStep(testConfig, "Login to Naukri and open the profile page");
+ProfilePage profile = helper.loginAndOpenProfile(username, password);
+
+logStep(testConfig, "Toggle the trailing dot in Profile Summary and save the change");
+String saved = profile.toggleTrailingDotAndSave();
+
+logStep(testConfig, "Verify the summary shown after reload matches the saved value");
+AssertHelper.assertEquals(testConfig, profile.reload().getProfileSummary(), saved,
+    "Profile Summary after reload should match the saved modified summary");
+```
+
+  Setup lines (reading properties or credentials, constructing a helper) get no
+  `logStep`. A helper may encapsulate one step; it must not swallow the whole
+  scenario, because then there is nothing left for the test to narrate.
 
 ---
 

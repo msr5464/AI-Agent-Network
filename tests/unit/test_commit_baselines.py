@@ -98,3 +98,98 @@ def test_a_pending_fingerprint_is_never_committed(repo):
     (pending / "SomeTest.someMethod__LoginPage.json").write_text(
         json.dumps({"pageObject": "LoginPage", "recordedAt": "2026-06-01T00:00:00"}))
     assert commit_baselines.changed_baselines(repo) == []
+
+
+# ── The same answer, asked by the ship step ───────────────────────────────────
+#
+# The authoring agent's PR used to carry a generated page object and no
+# fingerprint for it: the framework wrote NaukriLoginPage.json during the green
+# run, and 05_ship's `checkout -f -B` wiped the untracked file off disk before
+# there was a branch to commit it onto.
+
+from shared import baseline  # noqa: E402
+
+
+def test_a_baseline_read_before_the_checkout_survives_it(repo):
+    """What ship actually does: read the files first, compare after branching.
+
+    The comparison must work from content the caller kept, because by the time it
+    runs the files are no longer on disk.
+    """
+    new = repo / BASELINE_DIR / "NaukriLoginPage.json"
+    new.write_text(json.dumps({"pageObject": "NaukriLoginPage",
+                               "recordedAt": "2026-09-05T15:23:39",
+                               "coverage": {"usernameField": 1}}))
+    captured = {path.relative_to(repo).as_posix(): path.read_text()
+                for path in baseline.promoted(repo)}
+
+    _git(["checkout", "-f", "-B", "feature/new"], repo)   # what ship does next
+    _git(["clean", "-fd", "--", BASELINE_DIR], repo)
+    assert not new.exists()
+
+    changed = baseline.changed(repo, captured)
+    assert list(changed) == [f"{BASELINE_DIR}/NaukriLoginPage.json"]
+    assert "usernameField" in changed[f"{BASELINE_DIR}/NaukriLoginPage.json"]
+
+
+def test_pending_fingerprints_are_never_committed(repo):
+    """`pending/` holds records from a test that has not finished — an
+    interrupted run, named by test key, never proof a page worked."""
+    pending = repo / BASELINE_DIR / "pending"
+    pending.mkdir()
+    (pending / "SomeTest_120000.json").write_text('{"pageObject": "SomeTest"}')
+    assert baseline.changed(repo) == {}
+
+
+def test_build_output_is_never_a_commit_target(tmp_path):
+    """`directory()` also resolves to test-output/baselines. Staging that would
+    commit build output into the repo."""
+    (tmp_path / "test-output" / "baselines").mkdir(parents=True)
+    (tmp_path / "test-output" / "baselines" / "LoginPage.json").write_text("{}")
+    assert baseline.repo_directory(tmp_path) is None
+    assert baseline.promoted(tmp_path) == []
+
+
+def test_only_the_timestamp_changing_is_not_a_commit(repo):
+    """Same guard as the CI job, reached through the shared helper."""
+    _rewrite(repo, recordedAt="2026-09-05T15:23:39")
+    assert baseline.changed(repo) == {}
+
+
+# ── Every agent that raises a PR commits them ─────────────────────────────────
+#
+# Three separate commit paths, one shared answer. These pin the wiring, because
+# the failure mode is silent: the PR looks complete, and the missing fingerprint
+# is only noticed months later by a diagnosis that has nothing to compare against.
+
+AGENT_COMMIT_PATHS = [
+    "agents/test-authoring-agent/actions/05_ship.py",
+    "agents/test-adaptation-agent/actions/05_ship.py",
+    "agents/test-healing-agent/actions/01_fix.py",
+]
+
+
+@pytest.mark.parametrize("relative", AGENT_COMMIT_PATHS)
+def test_every_pr_raising_agent_commits_baselines(relative):
+    source = (REPO / relative).read_text()
+    assert "baseline" in source and "changed(" in source, (
+        f"{relative} builds a PR without committing the locator baselines the "
+        f"run recorded")
+
+
+@pytest.mark.parametrize("relative", AGENT_COMMIT_PATHS)
+def test_no_agent_stages_everything(relative):
+    """These steps hold a write token. Staging the whole tree would sweep up a
+    minted login session or a developer's scratch file along with the fix."""
+    source = (REPO / relative).read_text()
+    assert '"add", "-A"' not in source and "'add', '-A'" not in source
+
+
+def test_authoring_ship_reads_baselines_before_it_branches():
+    """The ordering IS the fix: 05_ship's branch creation is a `checkout -f`, so
+    reading the untracked baselines afterwards would find nothing there."""
+    source = (REPO / "agents/test-authoring-agent/actions/05_ship.py").read_text()
+    read_at = source.index("baseline_store.promoted(")
+    branch_at = source.index("workspace_helper.checkout_base(")
+    commit_at = source.index("baseline_store.changed(")
+    assert read_at < branch_at < commit_at

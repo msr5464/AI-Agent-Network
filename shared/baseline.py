@@ -259,3 +259,112 @@ def is_different_page(comparison: Dict) -> bool:
         if still_present:
             return False
     return len(comparison.get("mismatches") or []) >= 2
+
+
+# ── Committing baselines ──────────────────────────────────────────────────────
+#
+# A baseline is only worth recording if it reaches the repo. The authoring agent
+# generates a page object, runs it green, and the framework writes
+# `NaukriLoginPage.json` next to the ones already tracked — and then the ship step
+# committed only the Java it had generated, so the fingerprint stayed untracked in
+# somebody's working tree. The next drift in that page is then diagnosed with no
+# record of what the locators matched when they worked, which is the one thing a
+# baseline exists to provide.
+#
+# Two callers need exactly this answer: scripts/commit_baselines.py after a green
+# CI suite, and 05_ship.py when it builds the PR. They used to be one caller and a
+# gap; they are now one implementation.
+
+REPO_SUBPATH = "src/main/resources/baselines"
+
+# Excluded from the comparison, not from the file. Two consecutive green runs
+# produce byte-identical fingerprints and a different timestamp, so comparing raw
+# text commits every baseline on every run. The timestamp itself has to stay:
+# load()'s staleness guard uses it to reject a record written by the failing run.
+VOLATILE_KEYS = ("recordedAt",)
+
+
+def substance(text: str) -> str:
+    """A baseline's content with per-run noise removed, for comparison only."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return text or ""
+    if isinstance(data, dict):
+        for key in VOLATILE_KEYS:
+            data.pop(key, None)
+    return json.dumps(data, sort_keys=True)
+
+
+def _committable(root: Path, folder: Optional[Path]) -> bool:
+    """Whether a resolved baseline directory is one a commit may touch.
+
+    `directory()` also resolves to `test-output/baselines`, which is build output.
+    Staging that would either be ignored by git or, worse, track it — so the
+    build-output and outside-the-checkout cases are ruled out here rather than
+    left for the caller to remember.
+    """
+    if folder is None or not folder.is_dir():
+        return False
+    try:
+        folder.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False                     # configured outside the checkout
+    return not {"test-output", "target", "build"} & set(folder.parts)
+
+
+def repo_directory(workspace) -> Optional[Path]:
+    """Where committable baselines live, or None if this repo has none.
+
+    Asks the framework's own `baselineDir` setting first, so the two halves
+    cannot disagree about the location, and falls back to the conventional
+    in-repo path — which is where the framework puts them, and the only thing a
+    freshly cloned checkout with no properties file can be judged against.
+    """
+    if not workspace:
+        return None
+    root = Path(workspace)
+    for candidate in (directory(root), root / REPO_SUBPATH):
+        if _committable(root, candidate):
+            return candidate
+    return None
+
+
+def promoted(workspace) -> List[Path]:
+    """Baselines a successful page load promoted, newest state on disk.
+
+    Deliberately not recursive: `pending/` under this directory is the Java side's
+    scratch space, holding fingerprints recorded by a test that has not finished.
+    promote() moves them up here and discard() deletes them, so anything still
+    sitting there is an interrupted run — named by test key rather than by page
+    object, and never a record of a page working.
+    """
+    folder = repo_directory(workspace)
+    if folder is None or not folder.is_dir():
+        return []
+    return sorted(folder.glob("*.json"))
+
+
+def _committed(workspace, relative: str) -> str:
+    from shared.git import run_git
+    ok, out, _ = run_git(["show", f"HEAD:{relative}"], Path(workspace))
+    return out if ok else ""
+
+
+def changed(workspace, contents: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """{repo-relative path: content} for baselines that differ from HEAD.
+
+    `contents` lets a caller pass baselines it read earlier — 05_ship.py has to,
+    because the branch checkout it runs first is a `checkout -f` that wipes them
+    off disk before there is anything to compare.
+    """
+    root = Path(workspace)
+    if contents is None:
+        contents = {}
+        for path in promoted(root):
+            try:
+                contents[path.relative_to(root).as_posix()] = path.read_text()
+            except OSError:
+                continue
+    return {relative: text for relative, text in sorted(contents.items())
+            if substance(text) != substance(_committed(root, relative))}

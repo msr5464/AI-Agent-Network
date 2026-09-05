@@ -10,7 +10,7 @@ Two-phase design driven by FIX_ATTEMPT (set by run.sh):
   FIX_ATTEMPT>=1  (fix attempt N)
     Loads the previous failure output, calls Claude for a fix, applies it,
     THEN runs the test. Each fix attempt is an atomic (fix + verify) unit.
-    run.sh counts only these attempts against MAX_FIX_ATTEMPTS.
+    run.sh counts only these attempts against AUTHORING_FIX_RETRY_COUNT.
 
 Reads:  $AUDIT_DIR/03-generate.json
         $AUDIT_DIR/04-run-and-fix.json  (previous attempt's test output)
@@ -52,7 +52,9 @@ MODEL        = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
 ENVIRONMENT  = os.environ.get("AUTOCREATE_ENVIRONMENT", "staging")
 COUNTRY      = os.environ.get("AUTOCREATE_COUNTRY", "SG")
 FIX_ATTEMPT  = int(os.environ.get("FIX_ATTEMPT", "1"))
-MAX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
+# Display only — run.sh owns the loop bound. Kept in sync with its default so the
+# "attempt N/M" lines in the console match what the loop will actually do.
+MAX_ATTEMPTS = int(os.environ.get("AUTHORING_FIX_RETRY_COUNT", "2"))
 MAVEN_TEST_TIMEOUT_S = int(os.environ.get("MAVEN_TEST_TIMEOUT_S", "300"))
 # Wall-clock budget for the fix call. This step used to pass no timeout at all and
 # silently inherit call_claude_ex's 300s default — too tight for a fix that has to
@@ -154,6 +156,10 @@ from shared.edit_guards import (apply_edits, compute_diff, log_edits,
 # shipped green with `assertTrue(isSuccessToastVisible())` replaced by an `if` and
 # a `logWarning` — every guard above passed it. This is the one that would not.
 from shared import assertion_graph, intent
+# Every attempt already made, and whether the next one can differ from them. The
+# retry loop used to see one attempt back and never saw its own guard rejections at
+# all, so it re-proposed rejected shapes until the budget ran out.
+from shared import fix_history
 
 
 def _record_build(cmd, elapsed_s: float, verdict: str) -> None:
@@ -1273,7 +1279,6 @@ def main() -> None:
     # previous attempt — this is the failure THIS attempt is being asked to fix.
     prev_output = ""
     prev_failure_location = ""
-    prev_root_cause = ""
     prev_run_started_at = 0.0
     prev_fix_path = AUDIT_DIR / "04-run-and-fix.json"
     if prev_fix_path.exists():
@@ -1284,7 +1289,6 @@ def main() -> None:
             prev_failure_message  = prev.get("failure_message", "")
             prev_screenshot       = prev.get("screenshot_path", "")
             prev_summary_lines    = prev.get("summary_lines", [])
-            prev_root_cause       = prev.get("root_cause", "")
             prev_run_started_at   = float(prev.get("run_started_at") or 0)
             log(f"Fix attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS} — loaded previous failure ({len(prev_output)} chars)"
                 + (f", location={prev_failure_location}" if prev_failure_location else ""))
@@ -1297,6 +1301,10 @@ def main() -> None:
     # disk. These describe the exact failure this attempt is being asked to fix,
     # and step 04 ignored all three until now.
     evidence = gather_runtime_evidence(test_method, newer_than=prev_run_started_at)
+
+    # Every attempt so far, not just the last one. `04-run-and-fix.json` is overwritten
+    # each attempt, so on its own it gives attempt 3 no way to know what attempt 1 tried.
+    history = fix_history.load(AUDIT_DIR)
 
     failure_class = classify_failure(prev_output, plan_data.get("api_base_url", ""))
     log(f"Failure classified as: {failure_class}")
@@ -1522,24 +1530,33 @@ def main() -> None:
 
     retry_section = ""
     if FIX_ATTEMPT > 1:
-        stuck_note = ""
-        if prev_root_cause:
-            stuck_note = (
-                f"\nThe PREVIOUS fix attempt's stated root cause was:\n  {prev_root_cause}\n"
-                "That attempt's fix did not resolve the test (see the failure above, "
-                "captured AFTER that fix was applied and the test re-run) — so either "
-                "that diagnosis was wrong, or the fix for it was incomplete. Do not "
-                "repeat the same diagnosis unless you have a specific reason the fix "
-                "for it was incomplete rather than misdiagnosed.\n"
-            )
+        # What actually happened last time. The old text asserted the previous fix "was
+        # applied and the test re-run" unconditionally — false whenever a guard rejected
+        # everything, which is exactly when the model most needs to know why.
+        last = history[-1] if history else {}
+        if last.get("outcome") == fix_history.ALL_REJECTED:
+            preamble = ("Your previous fix was REJECTED by a guard and never reached disk. "
+                        "The test was NOT re-run, so the failure below is the same one you "
+                        "were already looking at — unchanged, not a new result.")
+        elif last.get("outcome") == fix_history.NO_EDITS:
+            preamble = ("Your previous response proposed no edits. The failure below is "
+                        "therefore unchanged.")
+        else:
+            preamble = ("The previous fix WAS applied — the files above already contain it — "
+                        "and the test still failed. The failure below was captured after that "
+                        "fix ran.")
         retry_section = f"""
 ## ⚠️ RETRY — Fix attempt {FIX_ATTEMPT}
-Previous fix did not resolve the test. Previous failure:
+{preamble}
+
 ```
 {prev_output}
 ```
-{stuck_note}
-Try a DIFFERENT approach — do NOT repeat what was tried before.
+{fix_history.render(history)}
+Either an earlier diagnosis was wrong, or the fix for it was incomplete. Do not repeat a
+diagnosis above unless you can say specifically why its fix was incomplete rather than
+misdiagnosed. If a guard rejected an edit, the same edit shape will be rejected again —
+find a different one, or return "edits": [] and say what would actually be needed.
 """
 
     # Name the real properties file and the keys already in it, so "use a property"
@@ -1639,6 +1656,8 @@ Output ONLY valid JSON.
     fix_map = extract_json(fix_response)
     root_cause, confidence, files_map, edits_map = extract_fix_response(fix_map)
 
+    proposed = fix_history.fingerprint(files_map, edits_map)
+
     fixes_applied = []
     fix_contents: dict = {}
     fix_rejections: list = []
@@ -1647,25 +1666,60 @@ Output ONLY valid JSON.
             files_map, edits_map, test_class, test_method)
         if fixes_applied:
             log(f"Applied fixes to {len(fixes_applied)} file(s) — running test")
-    elif root_cause:
-        log(f"Claude diagnosed the failure but proposed no file changes: {root_cause}")
-        log("  → Likely a framework-level issue outside the generated files — running "
-            "test anyway in case it was already resolved, but expect this to still fail")
-    else:
-        log("WARNING: Claude did not return a valid fix map — running test without fix")
     if root_cause:
         log(f"Root cause ({confidence or 'unknown confidence'}): {root_cause}")
 
+    # ── The model has no fix to offer ────────────────────────────────────────
+    # This used to run maven anyway "in case it was already resolved". It cannot have
+    # been: nothing has changed on disk since the run that produced the failure we are
+    # holding. So the re-run costs a full maven cycle to reproduce a known result, and
+    # the loop then spent the remaining budget re-asking a question already answered.
+    # An explicit "I cannot fix this from the files I can see" is an answer.
+    if not files_map and not edits_map:
+        if root_cause:
+            log(f"Claude diagnosed the failure but proposed no file changes: {root_cause}")
+            log("  → Nothing on disk has changed since the failing run, so the test would "
+                "fail identically. Stopping the fix loop rather than re-running it.")
+        else:
+            log("WARNING: Claude did not return a valid fix map — no change to make, and "
+                "re-running unchanged code would reproduce the same failure. Stopping.")
+        _stop_no_progress(
+            fix_history.record(FIX_ATTEMPT, root_cause, confidence, proposed,
+                               [], [], fix_history.NO_EDITS, prev_failure_location),
+            history,
+            {"attempt": FIX_ATTEMPT, "test_class": test_class, "test_method": test_method,
+             "passed": False, "test_output": prev_output, "fixes_applied": [],
+             "fix_response_length": len(fix_response), "root_cause": root_cause,
+             "confidence": confidence, "skipped_rerun": True},
+            files_written)
+        return
+
+    # ── Every proposed change was rejected ───────────────────────────────────
     # Nothing changed on disk, so the test would fail exactly as it just did.
     # Re-running it costs a full maven cycle to learn nothing and consumes the
     # attempt that could have carried a real fix — the wasted-attempt bug.
-    nothing_applied = bool((files_map or edits_map) and not fixes_applied)
+    nothing_applied = not fixes_applied
     if nothing_applied:
         log(f"No fix was applied — every proposed change was rejected "
             f"({len(fix_rejections)} file(s)). Skipping the test re-run: the code on "
             f"disk is unchanged, so the result would be identical.")
         for entry in fix_rejections:
             log(f"  - {entry['file']}: {entry['reason']}")
+        current = fix_history.record(FIX_ATTEMPT, root_cause, confidence, proposed,
+                                     [], fix_rejections, fix_history.ALL_REJECTED,
+                                     prev_failure_location)
+        stop, why = fix_history.exhausted(history, current)
+        if stop:
+            _stop_no_progress(current, history, {
+                "attempt": FIX_ATTEMPT, "test_class": test_class,
+                "test_method": test_method, "passed": False,
+                "test_output": prev_output, "fixes_applied": [],
+                "fix_rejections": fix_rejections,
+                "fix_response_length": len(fix_response), "root_cause": root_cause,
+                "confidence": confidence, "skipped_rerun": True,
+            }, files_written, why)
+            return
+        fix_history.append(AUDIT_DIR, current)
         _write_gate("false")
         _write_result({
             "attempt": FIX_ATTEMPT,
@@ -1689,10 +1743,22 @@ Output ONLY valid JSON.
     if not passed:
         failure_ctx = build_failure_context(test_class, test_method, test_output, run_started_at)
 
+    current = fix_history.record(
+        FIX_ATTEMPT, root_cause, confidence, proposed, fixes_applied, fix_rejections,
+        fix_history.PASSED if passed else fix_history.FAILED,
+        failure_ctx.get("failure_location", ""))
+    fix_history.append(AUDIT_DIR, current)
+
     stuck_on_same_failure = bool(
         not passed and fixes_applied and prev_failure_location
         and failure_ctx.get("failure_location") == prev_failure_location
     )
+    # A fix that landed and ran still tells us nothing new when it only re-proposed an
+    # earlier attempt's edits. `stuck` above catches the same failure LOCATION; this
+    # catches the same PROPOSAL, which can fail somewhere else and still be a repeat.
+    no_progress, no_progress_why = (False, "")
+    if not passed and not stuck_on_same_failure:
+        no_progress, no_progress_why = fix_history.exhausted(history, current)
 
     if passed:
         log(f"Test PASSED after fix attempt {FIX_ATTEMPT}")
@@ -1707,10 +1773,16 @@ Output ONLY valid JSON.
         # must NOT be treated as APPROVED/"not run" downstream in 05_ship.py the way
         # "skipped" is. run.sh stops the retry loop on "stuck" exactly like "skipped".
         _write_gate("stuck")
+    elif no_progress:
+        log(f"Test still FAILED after fix attempt {FIX_ATTEMPT} — and this attempt brought "
+            f"nothing new: {no_progress_why}. Stopping the fix loop rather than paying for "
+            f"an attempt that cannot differ from one already made.")
+        _write_gate("stuck")
     else:
         log(f"Test still FAILED after fix attempt {FIX_ATTEMPT}")
         _write_gate("false")
 
+    stopped_early = stuck_on_same_failure or no_progress
     result_data = {
         "attempt": FIX_ATTEMPT,
         "test_class": test_class,
@@ -1722,8 +1794,10 @@ Output ONLY valid JSON.
         "fix_response_length": len(fix_response),
         "root_cause": root_cause,
         "confidence": confidence,
-        **({"stuck": True, "reason": "stuck on identical failure across fix attempts — "
-            "see root_cause history in the per-attempt audit files"} if stuck_on_same_failure else {}),
+        **({"stuck": True,
+            "reason": ("stuck on identical failure across fix attempts — see root_cause "
+                       "history in the per-attempt audit files" if stuck_on_same_failure
+                       else no_progress_why)} if stopped_early else {}),
         **failure_ctx,
     }
 
@@ -1736,11 +1810,53 @@ Output ONLY valid JSON.
     )
 
 
+def _stop_no_progress(current: dict, history: list, result: dict,
+                      files_written: list, why: str = "") -> None:
+    """End the fix loop because the next attempt provably cannot differ from this one.
+
+    Writes the `stuck` gate rather than `false`. The two are not interchangeable: run.sh
+    breaks its loop on `stuck`, and 05_ship.py already renders it distinctly in the PR
+    body, the Slack message and the verdict — the test genuinely ran and genuinely failed,
+    which is not the same as an infra `skipped` where it never got a fair shot.
+    """
+    reason = why or current.get("root_cause") or "no further fix is available"
+    if why:
+        log(f"Stopping the fix loop — {why}")
+    fix_history.append(AUDIT_DIR, current)
+    _write_gate("stuck")
+    _write_result({**result, "stuck": True, "reason": reason},
+                  files_written, current.get("attempt", 0))
+
+
 def _write_gate(value: str) -> None:
     (AUDIT_DIR / ".fix-passed").write_text(value)
 
 
+# What the NEXT attempt needs and cannot re-derive: where the test failed, what it
+# said, the page it left behind, and when the run that produced all three started.
+_CARRIED_FORWARD = ("failure_location", "failure_message", "screenshot_path",
+                    "summary_lines", "run_started_at")
+
+
 def _write_result(data: dict, files_written: list, attempt: int) -> None:
+    # An attempt whose every fix was rejected never runs the test, so it has none of
+    # these to write — and this file is overwritten wholesale, so writing without them
+    # DELETED them. The next attempt then loaded failure_location="" (blanking its
+    # structured-evidence section and making the `stuck` check unreachable) and
+    # run_started_at=0.0, which disables gather_runtime_evidence's freshness gate
+    # entirely: `not newer_than` short-circuits, and the fixer gets shown a DOM from a
+    # previous session. Observed in a real run — the attempt after a rejected one read a
+    # context file timestamped hours earlier. Carry them forward instead.
+    out = dict(data)
+    if any(out.get(k) in (None, "", [], 0, 0.0) for k in _CARRIED_FORWARD):
+        try:
+            prev = json.loads((AUDIT_DIR / "04-run-and-fix.json").read_text())
+        except Exception:
+            prev = {}
+        for key in _CARRIED_FORWARD:
+            if not out.get(key) and prev.get(key):
+                out[key] = prev[key]
+    data = out
     (AUDIT_DIR / "04-run-and-fix.json").write_text(json.dumps(data, indent=2))
 
     passed = data.get("passed", False)

@@ -56,6 +56,11 @@ GENERATE_BATCH_SIZE = int(os.environ.get("GENERATE_BATCH_SIZE", "2"))
 # a handful of lines per URL; anything past this is the model rewriting a file it
 # was asked only to de-hardcode.
 URL_REPAIR_MAX_DIFF_LINES = int(os.environ.get("URL_REPAIR_MAX_DIFF_LINES", "60"))
+# Diff budget for the step-narration repair pass. Splitting one summary logStep
+# into a line per step, and unpacking the single helper call that hid them, is a
+# few lines per step — larger than the URL swap, still nowhere near a rewrite.
+NARRATION_REPAIR_MAX_DIFF_LINES = int(
+    os.environ.get("NARRATION_REPAIR_MAX_DIFF_LINES", "120"))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -255,6 +260,7 @@ from shared.test_catalog import test_methods_in  # noqa: E402
 from shared import properties_file, url_properties  # noqa: E402
 from shared.edit_guards import validate_fix  # noqa: E402
 from shared import check_provenance  # noqa: E402
+from shared import logstep_narration  # noqa: E402
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -553,6 +559,133 @@ contents. No prose.
             continue
         files_map[path] = content
         log(f"  url-repair applied to {Path(path).name}")
+        if still:
+            remaining[path] = still
+        else:
+            remaining.pop(path, None)
+    return files_map, remaining
+
+
+def _repair_step_narration(files_map: dict, plan: dict) -> tuple:
+    """Split a one-line summary logStep back into a line per step.
+
+    Rule 7b tells the model to narrate each step where it happens; this is what
+    happens when it writes one run-on logStep at the top of the method instead.
+    It matters beyond tidiness: the run report shows one line per logStep, so a
+    four-step test narrated once fails with a report that cannot say which step
+    broke — and the derived intent contract, built from these same strings, ends
+    up with one blob where it needs four checkable claims.
+
+    Returns (files_map, {rel_path: {method: finding}}) — the second value is what
+    is STILL under-narrated afterwards, for the audit.
+    """
+    expected = logstep_narration.expected_from_plan(plan)
+    findings = {}
+    for path, content in files_map.items():
+        if not content or "src/test/" not in path.replace("\\", "/"):
+            continue
+        under = logstep_narration.audit(content, expected)
+        # Extending an existing class returns the whole file, old methods
+        # included. Those are somebody's shipped tests: re-narrating them is not
+        # this run's business, and a repair pass that rewrites them would be a
+        # codegen step quietly editing code it was not asked to touch.
+        prior = set(test_methods_in(read_existing_file(path)))
+        under = {name: f for name, f in under.items() if name not in prior}
+        if under:
+            findings[path] = under
+    if not findings:
+        return files_map, {}
+
+    log(f"GUARD: {len(findings)} generated test class(es) narrate a multi-step "
+        f"scenario in one logStep — repairing:")
+    for path, methods in findings.items():
+        for name, f in methods.items():
+            log(f"  {Path(path).name}#{name}: {f['log_steps']} logStep(s) for "
+                f"{f['expected']}+ steps")
+
+    # The methods the test calls decide how finely it CAN be narrated: a test
+    # whose whole scenario sits behind one helper call has nothing to put a
+    # second logStep in front of until that call is unpacked. So the helper and
+    # page objects generated alongside it go in as read-only context, and the
+    # repair may only call methods that already exist there.
+    support = "".join(
+        f"\n--- {path} (read-only: call these, do not change this file) ---\n{content}\n"
+        for path, content in files_map.items()
+        if content and "src/main/" in path.replace("\\", "/"))
+
+    wanted = ""
+    for path, methods in findings.items():
+        for name, f in methods.items():
+            wanted += f"\n{Path(path).name}#{name} — currently {f['log_steps']} logStep(s):\n"
+            for text in f["narration"]:
+                wanted += f'    existing: "{text}"\n'
+            for step in f["steps"]:
+                wanted += f"    plan step: {step}\n"
+            if not f["steps"]:
+                wanted += (f"    (no plan steps recorded — narrate the "
+                           f"{f['acting']} acting statements this method already has)\n")
+
+    offending = "".join(
+        f"\n--- {path} ---\n{files_map[path]}\n" for path in findings)
+
+    prompt = f"""These generated Java test classes narrate a multi-step scenario with a single
+summary logStep. The run report prints one line per logStep, so as written the
+report shows one line for the whole test and a failure cannot be located.
+
+Methods to fix, with the steps each one is supposed to show:
+{wanted}
+Rewrite each test method so that:
+  - Every step above gets its OWN config.logStep("...") stating the action AND the
+    expected outcome, placed immediately BEFORE the call(s) that carry it out,
+    with a blank line separating each step group.
+  - No logStep narrates more than one step. Split the existing run-on sentence;
+    do not keep it as an extra summary line.
+  - If one helper call currently hides several steps, replace it with the
+    finer-grained methods that ALREADY EXIST on the helper or page objects below,
+    so each step has its own call to sit in front of. If no such method exists,
+    keep the call as it is and narrate at the granularity the existing calls allow
+    — never invent a method that is not defined in the files below.
+  - Setup lines (reading properties or credentials, constructing the helper) get
+    no logStep.
+
+Change NOTHING else: same assertions with the same strength, same locators, same
+method signatures, same annotations, same comments and JavaDoc.
+
+<support_files>{support}
+</support_files>
+{offending}
+Return ONLY a JSON object mapping each test class path above to its complete
+corrected contents. No prose.
+"""
+    response = call_claude(prompt, label=" [narration-repair]")
+    repaired = extract_json(response) or {}
+    if not repaired:
+        log("  narration-repair returned nothing — leaving the files as generated")
+        return files_map, findings
+
+    remaining = dict(findings)
+    for path, content in repaired.items():
+        if path not in findings or not (content or "").strip():
+            continue
+        still = {name: f for name, f in logstep_narration.audit(content, expected).items()
+                 if name in findings[path]}
+        # A repair that narrates no more finely than what it replaced is not a
+        # repair; keeping the original avoids paying a rewrite's risk for nothing.
+        before_total = sum(f["log_steps"] for f in findings[path].values())
+        after_total = sum(len(logstep_narration.log_steps(body))
+                          for name, body in logstep_narration.test_bodies(content).items()
+                          if name in findings[path])
+        if after_total <= before_total:
+            log(f"  narration-repair added no steps to {Path(path).name} — keeping the original")
+            continue
+        ok, reason = validate_fix(files_map[path], content, Path(path).name,
+                                  NARRATION_REPAIR_MAX_DIFF_LINES)
+        if not ok:
+            log(f"  narration-repair REJECTED for {Path(path).name} — {reason}")
+            continue
+        files_map[path] = content
+        log(f"  narration-repair applied to {Path(path).name} "
+            f"({before_total} -> {after_total} logStep calls)")
         if still:
             remaining[path] = still
         else:
@@ -952,6 +1085,36 @@ Rules (MANDATORY — violations will cause compilation failures):
 7. Test classes: extend TestBase. Use @Test(dataProvider="getConfig", groups={{...}}).
    Every @Test method has @TestVariables(automatedBy = QA.Mukesh).
    Use config.logStep() in test methods only.
+7b. STEP NARRATION — one logStep per step, never one summary line. The run report
+   prints ONE LINE PER logStep: a test narrated once produces a one-line report for
+   the whole scenario, and when it fails the report cannot say which step broke.
+   The intent contract is derived from these same strings, so a run-on sentence
+   collapses several checkable claims into one blob.
+   - Every step in this method's "steps" list in <generation_plan> gets its OWN
+     config.logStep("<action AND its expected outcome>"), placed immediately BEFORE
+     the call(s) that carry it out, with a blank line between step groups.
+   - Setup lines — reading properties or credentials, constructing the helper —
+     get no logStep.
+   - A helper method may encapsulate ONE step. It must NOT swallow the whole
+     scenario: if a single call would cover several plan steps, split it into the
+     per-step methods so the test method itself shows the flow.
+   WRONG — four steps, one logStep, and a helper that hides all of them:
+     config.logStep("Login, toggle the trailing dot in Profile Summary, save, and verify it persists");
+     String[] result = helper.toggleProfileSummaryDot(username, password);
+     AssertHelper.assertEquals(config, result[1], result[0], "Summary should persist");
+   RIGHT — each step narrated where it happens:
+     config.logStep("Login to Naukri and open the profile page");
+     ProfilePage profile = helper.loginAndOpenProfile(username, password);
+
+     config.logStep("Toggle the trailing dot in Profile Summary and save the change");
+     String saved = profile.toggleTrailingDotAndSave();
+
+     config.logStep("Reload the profile page and read the Profile Summary shown");
+     String displayed = profile.reload().getProfileSummary();
+
+     config.logStep("Verify the reloaded Profile Summary matches the saved value");
+     AssertHelper.assertEquals(config, displayed, saved,
+         "Profile Summary after reload should match the saved modified summary");
    WEB LOGIN CREDENTIALS (not API auth — see rule 5b for that) — follow this priority order:
    a) For EXISTING modules: scan every @Test method in the existing test class shown in
       <existing_file_contents> and find how they load credentials. Copy that pattern exactly.
@@ -1095,6 +1258,15 @@ Return ONLY a JSON object, no prose:
         log(f"WARNING: {len(hardcoded_by_file)} file(s) still hardcode a URL after "
             f"repair — recorded in 03-generate.json for review")
 
+    # Rule 7b says one logStep per step. Same shape as the URL guard: enforced
+    # here, before anything reaches disk, because a test that ships with one
+    # summary logStep is only noticed when someone reads a failure report and
+    # finds it says nothing.
+    files_map, under_narrated = _repair_step_narration(files_map, plan)
+    if under_narrated:
+        log(f"WARNING: {len(under_narrated)} test class(es) still narrate several "
+            f"steps in one logStep after repair — recorded in 03-generate.json")
+
     # The mirror-image failure: code that reads a URL property nobody ever wrote.
     # getRunTimeProperty returns null, navigation goes nowhere, and step 04 sees a
     # page that never loaded rather than a missing setting. Guessing a value would
@@ -1207,6 +1379,13 @@ Return ONLY a JSON object, no prose:
         # normal case; non-empty is a review finding, not a runtime failure.
         "hardcoded_urls": hardcoded_by_file,
         "missing_url_properties": missing_url_props,
+        # Test methods whose steps are still narrated more coarsely than the plan
+        # they came from. Empty is the normal case; non-empty means the run report
+        # for those tests cannot say which step failed.
+        "under_narrated_tests": {
+            path: {name: {k: v for k, v in f.items() if k != "narration"}
+                   for name, f in methods.items()}
+            for path, methods in under_narrated.items()},
     }
     (AUDIT_DIR / "03-generate.json").write_text(json.dumps(result, indent=2))
 
@@ -1230,6 +1409,16 @@ Return ONLY a JSON object, no prose:
             "`config.getRunTimeProperty(...)`:",
         ] + [f"- `{path}`: {', '.join(urls)}"
              for path, urls in sorted(hardcoded_by_file.items())]
+    if under_narrated:
+        summary_lines += [
+            "",
+            "## ⚠️ Tests Narrated In One logStep",
+            "The run report prints one line per `logStep`, so a failure in these "
+            "methods cannot be traced to a step:",
+        ] + [f"- `{Path(path).name}#{name}` — {f['log_steps']} logStep(s) for "
+             f"{f['expected']}+ steps"
+             for path, methods in sorted(under_narrated.items())
+             for name, f in sorted(methods.items())]
     if pages_with_zero_coverage:
         summary_lines += [
             "",

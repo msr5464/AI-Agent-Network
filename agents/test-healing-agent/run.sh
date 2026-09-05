@@ -11,7 +11,7 @@ set -Eeuo pipefail
 #   make run AGENT=test-healing-agent BUILD_TAG=ProdSanity-541  # direct: specific handoff
 #   AUTO_PUSH=false make run AGENT=test-healing-agent           # dry-run: no PR
 #
-# Retry loop: if tests fail after fix, re-runs 01_fix.py up to MAX_FIX_ATTEMPTS.
+# Retry loop: if tests fail after fix, re-runs 01_fix.py up to HEALING_RETRY_COUNT.
 # ─────────────────────────────────────────────────────────────────────────────
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -187,12 +187,15 @@ run_step "[01/03] Locate" "python3 '$AGENT_DIR/actions/01_locate.py'" locate
 # that repairs one locator and uncovers the next keeps its edit — so the loop
 # walks a chain of broken locators instead of re-guessing at one. Two was enough
 # for a single locator; a chain needs room to finish.
-MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-4}"
+HEALING_RETRY_COUNT="${HEALING_RETRY_COUNT:-4}"
+if [[ -n "${MAX_FIX_ATTEMPTS:-}" ]]; then
+  log "NOTE: MAX_FIX_ATTEMPTS is set but no longer read — use HEALING_RETRY_COUNT (currently $HEALING_RETRY_COUNT)"
+fi
 FIX_ATTEMPT=1
 
 while true; do
   export STEP_ATTEMPT="$FIX_ATTEMPT"
-  run_step "[02/03] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
+  run_step "[02/03] Fix (attempt $FIX_ATTEMPT/$HEALING_RETRY_COUNT)" \
     "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_fix.py'" fix
 
   FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
@@ -201,7 +204,7 @@ while true; do
     break
   fi
 
-  if [[ "$FIX_ATTEMPT" -ge "$MAX_FIX_ATTEMPTS" ]]; then
+  if [[ "$FIX_ATTEMPT" -ge "$HEALING_RETRY_COUNT" ]]; then
     log "Fixes still failing after $FIX_ATTEMPT attempt(s) — proceeding to ship (will escalate)"
     break
   fi

@@ -25,6 +25,20 @@ The "Rules (MANDATORY)" section below is loaded at runtime; dynamic context (pla
    Every `@Test` method has `@TestVariables(automatedBy = QA.Mukesh, country = Country.{country})`.
    Use `allocateUser(config, UserType.{user_type}, Feature.{feature_enum}, Country.{country})`.
    Use `config.logStep()` in test methods only.
+7b. Step narration — one `logStep` per step, never one summary line. The run report
+   prints one line per `logStep`, so a test narrated once produces a one-line report
+   for the whole scenario and a failure cannot be traced to a step; the intent
+   contract is derived from the same strings, so a run-on sentence collapses several
+   checkable claims into one blob.
+   - Every step in the method's `steps` list in the plan gets its own
+     `config.logStep("<action AND expected outcome>")`, immediately before the
+     call(s) that carry it out, with a blank line between step groups.
+   - Setup lines (reading properties/credentials, constructing the helper) get none.
+   - A helper may encapsulate ONE step, never the whole scenario: if one call would
+     cover several plan steps, split it so the test method shows the flow.
+   Enforced after generation by `_repair_step_narration()` in `03_generate.py`
+   (`shared/logstep_narration.py` does the analysis); what survives the repair is
+   recorded in `03-generate.json` under `under_narrated_tests`.
 8. Locators: prefer `[data-cy='...']` > `[id='...']` > `[name='...']` > CSS > XPath.
 9. Assertions: ONLY `AssertHelper.*` — never `Assert.*`.
 10. Waits: ONLY `WaitHelper.*` — never `Thread.sleep()`.

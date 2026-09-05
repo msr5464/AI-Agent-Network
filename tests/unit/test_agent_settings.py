@@ -28,7 +28,7 @@ CLAUDE_CLI_PATH=claude
 
 # ── GitHub ──
 GITHUB_TOKEN=ghp_realsecrettoken_abc123
-MAX_FIX_ATTEMPTS=3
+AUTHORING_FIX_RETRY_COUNT=2
 
 # A key no schema entry covers
 UNRELATED_KEY=keepme
@@ -70,6 +70,24 @@ class TestSchema:
             if field["type"] == "select":
                 assert field.get("options"), f"{field['key']} is a select with no options"
 
+    def test_retry_budgets_are_per_agent(self):
+        """One shared MAX_FIX_ATTEMPTS meant setting healing's budget also set
+        authoring's — they need different numbers for different reasons."""
+        by_env = {f["env_var"]: f for f in agent_settings.SETTINGS_SCHEMA}
+        assert "MAX_FIX_ATTEMPTS" not in by_env
+        assert "MAX_ADAPT_ATTEMPTS" not in by_env
+        expected = {
+            "AUTHORING_FIX_RETRY_COUNT": ("authoring", 2),
+            "HEALING_RETRY_COUNT": ("healing", 4),
+            "ADAPTATION_RETRY_COUNT": ("adaptation", 2),
+        }
+        for env_var, (category, default) in expected.items():
+            field = by_env.get(env_var)
+            assert field is not None, f"{env_var} missing from the schema"
+            assert field["category"] == category
+            assert field["default"] == default
+            assert field["type"] == "number"
+
     def test_per_invocation_vars_are_not_exposed(self):
         """Writing these to config/.env would pin every run to one test."""
         forbidden = {"TEST_NAME", "FORCE", "REPAIR", "BUILD_TAG", "MODULE",
@@ -82,11 +100,11 @@ class TestSchema:
 class TestEnvFileWrites:
 
     def test_existing_key_is_updated_in_place(self, env_file):
-        agent_settings.set_many({"max_fix_attempts": 4})
-        assert "MAX_FIX_ATTEMPTS=4" in env_file.read_text()
+        agent_settings.set_many({"authoring_fix_retry_count": 4})
+        assert "AUTHORING_FIX_RETRY_COUNT=4" in env_file.read_text()
 
     def test_comments_and_unrelated_keys_survive(self, env_file):
-        agent_settings.set_many({"max_fix_attempts": 4})
+        agent_settings.set_many({"authoring_fix_retry_count": 4})
         text = env_file.read_text()
         assert "# ── GitHub ──" in text
         assert "# config/.env — shared configuration" in text
@@ -104,8 +122,8 @@ class TestEnvFileWrites:
     def test_save_updates_os_environ_for_the_next_run(self, env_file):
         """runner.py builds each run's env from os.environ.copy(), so this is
         what makes a save apply without restarting the server."""
-        agent_settings.set_many({"max_fix_attempts": 7})
-        assert os.environ["MAX_FIX_ATTEMPTS"] == "7"
+        agent_settings.set_many({"authoring_fix_retry_count": 7})
+        assert os.environ["AUTHORING_FIX_RETRY_COUNT"] == "7"
 
     def test_booleans_are_written_lowercase(self, env_file):
         """run.sh compares with [[ "$TESTING_MODE" == "true" ]] — no lowercasing,
@@ -143,12 +161,12 @@ class TestSecretMasking:
 class TestCoercion:
 
     def test_numbers_are_clamped_to_schema_bounds(self, env_file):
-        agent_settings.set_many({"max_fix_attempts": 999})
-        assert os.environ["MAX_FIX_ATTEMPTS"] == "10"
+        agent_settings.set_many({"authoring_fix_retry_count": 999})
+        assert os.environ["AUTHORING_FIX_RETRY_COUNT"] == "10"
 
     def test_garbage_numbers_fall_back_to_the_default(self, env_file):
-        agent_settings.set_many({"max_fix_attempts": "not-a-number"})
-        assert os.environ["MAX_FIX_ATTEMPTS"] == "3"
+        agent_settings.set_many({"authoring_fix_retry_count": "not-a-number"})
+        assert os.environ["AUTHORING_FIX_RETRY_COUNT"] == "2"
 
     def test_select_rejects_values_outside_its_options(self, env_file):
         agent_settings.set_many({"classifier_effort": "bogus"})

@@ -234,17 +234,20 @@ if [[ "$EXPLORE_ONLY" == "true" ]]; then
 fi
 
 # ── Step 04 — Adapt (with retry loop) ────────────────────────────────────────
-MAX_ADAPT_ATTEMPTS="${MAX_ADAPT_ATTEMPTS:-2}"
+ADAPTATION_RETRY_COUNT="${ADAPTATION_RETRY_COUNT:-2}"
+if [[ -n "${MAX_ADAPT_ATTEMPTS:-}" ]]; then
+  log "NOTE: MAX_ADAPT_ATTEMPTS is set but no longer read — use ADAPTATION_RETRY_COUNT (currently $ADAPTATION_RETRY_COUNT)"
+fi
 if [[ "$START_FROM_STEP" -le 4 ]]; then
   ADAPT_ATTEMPT=1
   while true; do
     export STEP_ATTEMPT="$ADAPT_ATTEMPT"
-    run_step "[04/05] Adapt (attempt $ADAPT_ATTEMPT/$MAX_ADAPT_ATTEMPTS)" \
+    run_step "[04/05] Adapt (attempt $ADAPT_ATTEMPT/$ADAPTATION_RETRY_COUNT)" \
       "ADAPT_ATTEMPT=$ADAPT_ATTEMPT python3 '$AGENT_DIR/actions/04_adapt.py'" adapt
     ADAPT_RESULT="skipped"
     [[ -f "$AUDIT_DIR/.fix-passed" ]] && ADAPT_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed")
     if [[ "$ADAPT_RESULT" == "true" || "$ADAPT_RESULT" == "skipped" ]]; then break; fi
-    if [[ "$ADAPT_ATTEMPT" -ge "$MAX_ADAPT_ATTEMPTS" ]]; then
+    if [[ "$ADAPT_ATTEMPT" -ge "$ADAPTATION_RETRY_COUNT" ]]; then
       log "Still failing after $ADAPT_ATTEMPT attempt(s) — shipping for review"
       break
     fi
