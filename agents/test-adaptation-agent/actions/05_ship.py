@@ -45,14 +45,14 @@ from shared.slack import send_slack
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
-SESSION_ID = os.environ.get("SESSION_ID", "")
+SESSION_ID = os.environ.get("SESSION_ID", AUDIT_DIR.name)
 MODULE = os.environ.get("MODULE", "")
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_ORG = os.environ.get("GITHUB_ORG", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO_AUTOMATION", "")
 BASE_BRANCH = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
-BRANCH_PREFIX = os.environ.get("ADAPT_BRANCH_PREFIX", "chore/qa-adapt")
+BRANCH_PREFIX = os.environ.get("ADAPTATION_BRANCH_PREFIX", "adaptation")
 REVIEWERS = [r.strip() for r in os.environ.get("GITHUB_PR_REVIEWERS", "").split(",") if r.strip()]
 AUTO_PUSH = os.environ.get("AUTO_PUSH", "true").lower() != "false"
 
@@ -120,22 +120,34 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
     not_run = scope.get("not_verified") or []
 
     parts = [
-        "## Why this PR exists",
+        f"## 🤖 Test Adaptation Agent — {MODULE}",
         "",
-        "The **product** changed. These tests were updated to match it — not because "
-        "they were flaky, and not because a locator went stale.",
+        "> Status: **NEEDS-REVIEW** — The product changed. Tests were updated to match the new behavior.",
         "",
         "> ⚠️ **This PR is always NEEDS-REVIEW.** An agent may change test *steps* "
         "here, not just selectors. Every mechanical check below passed, but only a "
         "human can confirm the test still means what it should.",
         "",
-        "## The change note, as written",
+        "### 📋 Overview",
+        "| Property | Value |",
+        "|---|---|",
+        "| **Agent** | `test-adaptation-agent` |",
+        f"| **Target** | `{MODULE}` |",
+        "| **Status** | `⚠️ Needs Review` |",
+        f"| **Items Adapted** | `{len(items)}` |",
+        f"| **Tests Verified** | `{len(verified)}` |",
+        f"| **Session ID** | `{SESSION_ID}` |",
+        "",
+        "### 🎯 Request / Context",
+        "<details open>",
+        "<summary>The change note (credentials masked)</summary>",
         "",
         "```",
         (plan.get("note_masked") or "").strip(),
         "```",
+        "</details>",
         "",
-        "## What was explored, and what was only assumed",
+        "### 🛠️ Changes Applied",
         "",
     ]
     if flow.get("steps"):
@@ -145,12 +157,12 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
         # filename's word for it.
         mapping = flow_map.describe_page_objects(flow)
         if mapping:
-            parts += ["### Measured page objects", mapping, ""]
+            parts += ["#### Measured page objects", mapping, ""]
     else:
         parts += ["_No flow map — nothing in the product was observed._", ""]
 
     if explore.get("unexplained_failures"):
-        parts += ["### ⚠️ Failures the change note does not account for", "",
+        parts += ["#### ⚠️ Failures the change note does not account for", "",
                   "A human asserted one change; that says nothing about a second, "
                   "unrelated defect. These escalated rather than being adapted to.",
                   ""]
@@ -158,9 +170,9 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
                   f"({u.get('category')})" for u in explore["unexplained_failures"]]
         parts.append("")
 
-    parts += ["## Changes, and what justified each one", ""]
+    parts += ["#### Detailed Changes & Justifications", ""]
     for item in items:
-        parts.append(f"### Item {item['index']} — `{item['kind']}` — **{item['status']}**")
+        parts.append(f"##### Item {item['index']} — `{item['kind']}` — **{item['status']}**")
         parts.append("")
         if item.get("summary"):
             parts += [item["summary"], ""]
@@ -184,12 +196,12 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
                 parts += [f"- assertion conservation ({report.get('test','')}): "
                           f"**{report.get('verdict')}** {report.get('reason','')}", ""]
 
-    parts += ["## Verification", ""]
+    parts += ["### 🧪 Validation & Test Results", ""]
     parts += [f"- ✅ verified: `{t}`" for t in verified] or ["- _nothing verified_"]
     if adapt.get("failed"):
         parts += [f"- ❌ still failing: `{t}`" for t in adapt["failed"]]
     if not_run:
-        parts += ["", f"**Not re-run** under `ADAPT_VERIFY_POLICY="
+        parts += ["", f"**Not re-run** under `ADAPTATION_VERIFY_POLICY="
                       f"{scope.get('verify_policy','')}` — please run these in CI:",
                   ""]
         parts += [f"- `{t}`" for t in not_run[:20]]
@@ -199,7 +211,7 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
 
     clashes = open_prs_touching(scope.get("edit_candidates") or [])
     if clashes:
-        parts += ["", "## ⚠️ Open PRs touching the same files", "",
+        parts += ["", "#### ⚠️ Open PRs touching the same files", "",
                   "Both branches came off `main`; whoever merges second gets the "
                   "conflict.", ""]
         parts += [f"- #{c['number']} {c['title']} — {', '.join(c['files'])}"
@@ -216,13 +228,22 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
         parts += ["", "</details>"]
 
     if adapt.get("escalations"):
-        parts += ["", "## Escalated — not attempted", ""]
+        parts += ["", "#### Escalated — not attempted", ""]
         parts += [f"- **{e['what']}** — {e['why']}" for e in adapt["escalations"]]
 
     if skip_reason:
         parts += ["", f"_Run outcome: `{skip_reason}`._"]
 
-    parts += ["", "---", f"_Session `{SESSION_ID}` · test-adaptation-agent_"]
+    parts += [
+        "",
+        "### 🔍 How to Review",
+        "1. Confirm the flow map steps match the actual intended product changes.",
+        "2. Verify that modified assertions preserve expected test intent.",
+        "3. Run the adapted tests locally in the target environment.",
+        "",
+        "---",
+        f"> 🤖 Generated by **test-adaptation-agent** · Audit Session: `{AUDIT_DIR.name}`",
+    ]
     return "\n".join(parts)
 
 
@@ -299,9 +320,9 @@ def main():
                     log(f"  item {item['index']} recorded no files — skipping commit")
                     continue
                 run_git(["add", "--"] + paths, workspace)
-                message = (f"test(adapt): item {item['index']} — {item['kind']}\n\n"
+                message = (f"adaptation: item {item['index']} — {item['kind']} ({MODULE})\n\n"
                            f"{item.get('summary','')}\n\n"
-                           f"Change note: {plan.get('module','')}\n"
+                           f"Change note: {plan.get('module','')}\n\n"
                            f"Session: {SESSION_ID}")
                 run_git(["commit", "-m", message], workspace)
                 log(f"  committed item {item['index']}")
@@ -319,11 +340,11 @@ def main():
                 ok, staged, _ = run_git(["diff", "--cached", "--name-only"], workspace)
                 if staged.strip():
                     run_git(["commit", "-m",
-                             f"test(adapt): refresh {len(baselines)} locator baseline(s)\n\n"
+                             f"adaptation: refresh {len(baselines)} locator baseline(s) for {MODULE}\n\n"
                              f"Element fingerprints recorded while the adapted tests were\n"
                              f"verified. They describe what each locator matched on the\n"
                              f"changed page, so the next drift is diagnosed against the\n"
-                             f"page as it is now rather than as it used to be.\n"
+                             f"page as it is now rather than as it used to be.\n\n"
                              f"Session: {SESSION_ID}"], workspace)
                     log(f"  committed {len(baselines)} locator baseline(s)")
                     result["baselines_committed"] = sorted(baselines)
@@ -337,7 +358,7 @@ def main():
                             "branch",
                             f"git -C {workspace} log --oneline {BASE_BRANCH}..{branch}"))
             else:
-                title = f"[NEEDS-REVIEW] Adapt {MODULE} tests to product change"
+                title = f"Adaptation: Modified {MODULE} tests to new product changes [NEEDS-REVIEW]"
                 url, gerr = create_pr(workspace, f"{GITHUB_ORG}/{GITHUB_REPO}",
                                       title, body, branch, BASE_BRANCH, REVIEWERS)
                 if url:

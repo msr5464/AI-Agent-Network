@@ -16,8 +16,8 @@ from pathlib import Path
 
 def properties_path(automation_framework_dir: Path) -> Path:
     """The properties file Config.java loads for this run's environment+country."""
-    environment = os.environ.get("AUTOCREATE_ENVIRONMENT", "staging").lower()
-    country     = os.environ.get("AUTOCREATE_COUNTRY", "SG").lower()
+    environment = os.environ.get("AUTHORING_ENVIRONMENT", "staging").lower()
+    country     = os.environ.get("AUTHORING_COUNTRY", "SG").lower()
     return automation_framework_dir / "parameters" / f"{environment}-{country}.properties"
 
 

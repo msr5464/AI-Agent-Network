@@ -136,7 +136,7 @@ PLAYWRIGHT_HEADLESS=false make run AGENT=test-authoring-agent MODULE=payments
 
 Increase timeout if the page is slow:
 ```bash
-PLAYWRIGHT_TIMEOUT_MS=60000 make run AGENT=test-authoring-agent MODULE=payments
+AUTHORING_PLAYWRIGHT_TIMEOUT_MS=60000 make run AGENT=test-authoring-agent MODULE=payments
 ```
 
 ---
@@ -147,7 +147,7 @@ PLAYWRIGHT_TIMEOUT_MS=60000 make run AGENT=test-authoring-agent MODULE=payments
 
 Agent 2 reads from MySQL. Ensure:
 1. The test runner inserts results before Agent 2 runs
-2. DB credentials in `config/.env` are correct (`DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`)
+2. DB credentials in `config/.env` are correct (`TRIAGING_DB_HOST`, `TRIAGING_DB_USER`, `TRIAGING_DB_PASSWORD`, `TRIAGING_DB_NAME`)
 3. The `buildTag` in MySQL matches the tag you're passing
 
 ```bash
@@ -159,7 +159,7 @@ python3 -c "import mysql.connector; c = mysql.connector.connect(host='localhost'
 
 All builds in the DB have already been analysed. Either:
 - Pass a specific build tag: `make run AGENT=test-triaging-agent BUILD_TAG=MyBuild-123`
-- Check if `SCOUT_LOOKBACK_DAYS` is too short (default: 7 days)
+- Check if `TRIAGING_SCOUT_LOOKBACK_DAYS` is too short (default: 7 days)
 
 ### Classification confidence is LOW
 
@@ -169,7 +169,7 @@ Claude isn't confident about a failure. Check the classifier prompt in the audit
 
 ### Verdict is NEEDS-HUMAN
 
-The reviewer disagreed with the classifier after `MAX_REVIEW_ROUNDS` rounds. This is intentional — it means the failure is genuinely ambiguous. Check:
+The reviewer disagreed with the classifier after `TRIAGING_MAX_REVIEW_ROUNDS` rounds. This is intentional — it means the failure is genuinely ambiguous. Check:
 ```bash
 make audit AGENT=test-triaging-agent SESSION=<id>
 # Then open the .verdict file and 04-review.json in the session folder

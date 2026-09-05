@@ -300,8 +300,8 @@ class TestCredentialPrecondition:
         return path
 
     def _write(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AUTOCREATE_ENVIRONMENT", "staging")
-        monkeypatch.setenv("AUTOCREATE_COUNTRY", "SG")
+        monkeypatch.setenv("AUTHORING_ENVIRONMENT", "staging")
+        monkeypatch.setenv("AUTHORING_COUNTRY", "SG")
         return credential_properties.write_credential_property(
             tmp_path, "naukari", {"username": "realuser", "password": "realpass"})
 

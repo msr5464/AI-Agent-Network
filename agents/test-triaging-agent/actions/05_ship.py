@@ -50,9 +50,9 @@ SLACK_ALERT_CHANNEL  = os.environ.get("SLACK_ALERT_CHANNEL", "")
 SKIP_FILE  = AGENT_DIR / "feedback" / "skip-buildtags.json"
 
 # test-healing-agent queue — handoff destination
-# Override with AUTOFIX_QUEUE_DIR env var if test-healing-agent lives elsewhere
-_queue_dir_env = os.environ.get("AUTOFIX_QUEUE_DIR", "")
-AUTOFIX_QUEUE_DIR = Path(_queue_dir_env) if _queue_dir_env else REPO_ROOT / "agents" / "test-healing-agent" / "queue"
+# Override with TRIAGING_AUTOFIX_QUEUE_DIR env var if test-healing-agent lives elsewhere
+_queue_dir_env = os.environ.get("TRIAGING_AUTOFIX_QUEUE_DIR", "")
+TRIAGING_AUTOFIX_QUEUE_DIR = Path(_queue_dir_env) if _queue_dir_env else REPO_ROOT / "agents" / "test-healing-agent" / "queue"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -185,9 +185,9 @@ def write_handoff(build_tag: str, classify_data: dict, collect_data: dict) -> st
     }
 
     # Write to test-healing-agent queue
-    AUTOFIX_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    TRIAGING_AUTOFIX_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     safe_tag = build_tag.replace("/", "-")
-    queue_file = AUTOFIX_QUEUE_DIR / f"{safe_tag}.json"
+    queue_file = TRIAGING_AUTOFIX_QUEUE_DIR / f"{safe_tag}.json"
     queue_file.write_text(json.dumps(handoff, indent=2))
     log(f"Handoff queued: {queue_file} ({len(automation_issues)} issues)")
     return str(queue_file)
@@ -204,7 +204,7 @@ def generate_html_report(collect_data: dict, classify_data: dict) -> str | None:
 
         build_tag  = collect_data.get("build_tag", "unknown")
         report_dir = collect_data.get("report_dir", "")
-        output_dir = os.environ.get("OUTPUT_DIR", Config.OUTPUT_DIR)
+        triaging_output_dir = os.environ.get("TRIAGING_OUTPUT_DIR", Config.TRIAGING_OUTPUT_DIR)
 
         # Reconstruct TestResult objects
         test_results = []
@@ -281,11 +281,11 @@ def generate_html_report(collect_data: dict, classify_data: dict) -> str | None:
             test_results=test_results,
             test_html_links=html_links,
             environment=os.environ.get("ENVIRONMENT", ""),
-            output_dir=output_dir,
+            triaging_output_dir=triaging_output_dir,
         )
 
         safe_tag = "".join(c for c in build_tag if c.isalnum() or c in ("-", "_")).strip()
-        html_path = Path(output_dir) / f"AI-Generated-Report_{safe_tag}.html"
+        html_path = Path(triaging_output_dir) / f"AI-Generated-Report_{safe_tag}.html"
         html_path.parent.mkdir(parents=True, exist_ok=True)
         saved = report_gen.save_report(html_content, str(html_path))
         log(f"HTML report saved: {saved}")

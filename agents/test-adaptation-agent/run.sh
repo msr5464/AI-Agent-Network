@@ -10,7 +10,7 @@ set -Eeuo pipefail
 #   make run AGENT=test-adaptation-agent MODULE=checkout
 #   make run AGENT=test-adaptation-agent                     # queue: oldest .txt
 #   EXPLORE_ONLY=true make run AGENT=test-adaptation-agent MODULE=checkout
-#   ADAPT_APPLY=false make run AGENT=test-adaptation-agent MODULE=checkout
+#   ADAPTATION_APPLY=false make run AGENT=test-adaptation-agent MODULE=checkout
 #   START_FROM_STEP=4 SESSION_ID=<sid> make run AGENT=test-adaptation-agent
 #
 # Unlike healing, the expensive step here is exploration, not the edit. So this

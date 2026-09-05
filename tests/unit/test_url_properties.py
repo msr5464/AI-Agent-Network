@@ -109,8 +109,8 @@ public class NaukriProfileSummaryHelper extends ApiHelper
 
 class TestWritingTheProperties:
     def _fw(self, tmp_path, monkeypatch, body=""):
-        monkeypatch.setenv("AUTOCREATE_ENVIRONMENT", "staging")
-        monkeypatch.setenv("AUTOCREATE_COUNTRY", "SG")
+        monkeypatch.setenv("AUTHORING_ENVIRONMENT", "staging")
+        monkeypatch.setenv("AUTHORING_COUNTRY", "SG")
         (tmp_path / "parameters").mkdir(parents=True, exist_ok=True)
         path = tmp_path / "parameters" / "staging-sg.properties"
         path.write_text(body)
@@ -204,8 +204,8 @@ public class NaukriProfileSummaryHelper extends ApiHelper
         monkeypatch.setenv("REPO_ROOT", str(root))
         monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path))
         monkeypatch.setenv("GITHUB_REPO_AUTOMATION", "fw")
-        monkeypatch.setenv("AUTOCREATE_ENVIRONMENT", "staging")
-        monkeypatch.setenv("AUTOCREATE_COUNTRY", "SG")
+        monkeypatch.setenv("AUTHORING_ENVIRONMENT", "staging")
+        monkeypatch.setenv("AUTHORING_COUNTRY", "SG")
         path = root / "agents" / "test-authoring-agent" / "actions" / "03_generate.py"
         spec = importlib.util.spec_from_file_location("authoring_03_url", path)
         module = importlib.util.module_from_spec(spec)

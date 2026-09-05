@@ -21,7 +21,7 @@ from pathlib import Path
 from shared import properties_file
 from typing import Dict, List, Optional
 
-_DIR_ENV = "BASELINE_DIR"
+_DIR_ENV = "HEALING_BASELINE_DIR"
 _DEFAULT_DIRNAME = "baselines"
 
 _UUID = re.compile(r"/[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}")

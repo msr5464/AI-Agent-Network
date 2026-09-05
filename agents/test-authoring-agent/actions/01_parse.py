@@ -34,7 +34,7 @@ AUTOMATION_FRAMEWORK_DIR    = workspace_helper.resolve(
     WORKSPACE_DIR, os.environ.get("GITHUB_REPO_AUTOMATION", ""),
     exclude=REPO_ROOT)
 
-MODEL = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
+MODEL = os.environ.get("AUTHORING_MODEL", "claude-opus-4-6")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

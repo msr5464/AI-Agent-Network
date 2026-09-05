@@ -243,10 +243,10 @@ checkout is, and leaves HEAD alone.
   file that is missing, or a login that runs but lands back on the login form.
   When the login the test itself uses does not authenticate, that is a finding
   about the module, not a reason to sign in some other way;
-- the flow's terminal action is destructive and `ADAPT_SANDBOX` is unset;
+- the flow's terminal action is destructive and `ADAPTATION_SANDBOX` is unset;
 - an **existing** page object would need regenerating wholesale;
 - assertion conservation would have to be violated to make the test green;
-- the blast radius exceeds `ADAPT_BLAST_MAX_TESTS` — bigger than one agent run;
+- the blast radius exceeds `ADAPTATION_BLAST_MAX_TESTS` — bigger than one agent run;
 - a changed expected string: propose, never apply.
 
 ## Two ways in
@@ -260,7 +260,7 @@ same writable `.txt` queue the authoring agent uses.
 ```bash
 make run AGENT=test-adaptation-agent MODULE=checkout
 EXPLORE_ONLY=true make run AGENT=test-adaptation-agent MODULE=checkout
-ADAPT_APPLY=false make run AGENT=test-adaptation-agent MODULE=checkout   # propose only
+ADAPTATION_APPLY=false make run AGENT=test-adaptation-agent MODULE=checkout   # propose only
 START_FROM_STEP=4 SESSION_ID=<sid> make run AGENT=test-adaptation-agent  # resume
 ```
 

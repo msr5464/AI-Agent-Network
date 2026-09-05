@@ -52,7 +52,7 @@ GITHUB_ORG             = os.environ.get("GITHUB_ORG", "")
 GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "")
 GITHUB_DEFAULT_BRANCH  = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
 GITHUB_PR_REVIEWERS    = [r.strip() for r in os.environ.get("GITHUB_PR_REVIEWERS", "").split(",") if r.strip()]
-BRANCH_PREFIX          = os.environ.get("AUTOCREATE_BRANCH_PREFIX", "feat/qa-autocreate")
+BRANCH_PREFIX          = os.environ.get("AUTHORING_BRANCH_PREFIX", "authoring")
 
 SLACK_BOT_TOKEN      = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_NOTIFY_CHANNEL = os.environ.get("SLACK_NOTIFY_CHANNEL", "")
@@ -264,10 +264,10 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
 
     if step3_contents:
         msg = (
-            f"[Authoring Agent]: First draft for {MODULE}\n\n"
+            f"authoring: generate initial test draft for {MODULE}\n\n"
             f"AI-generated test code — review before merge\n"
-            f"Session: {SESSION_ID}  Files: {len(step3_contents)}\n\n"
-            f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+            f"Files: {len(step3_contents)}\n\n"
+            f"Session: {SESSION_ID}"
         )
         if _stage_and_commit(step3_contents, msg):
             rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
@@ -278,10 +278,9 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
         n            = attempt_data.get("attempt", "?")
         fix_contents = attempt_data.get("fix_file_contents", {})
         msg = (
-            f"[Authoring Agent]: Fix attempt-{n} for {MODULE}\n\n"
-            f"Claude-generated fix — patched: {list(fix_contents.keys())}\n"
-            f"Session: {SESSION_ID}\n\n"
-            f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+            f"authoring: apply fix attempt {n} for {MODULE}\n\n"
+            f"Claude-generated fix — patched: {list(fix_contents.keys())}\n\n"
+            f"Session: {SESSION_ID}"
         )
         if _stage_and_commit(fix_contents, msg):
             rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
@@ -298,12 +297,11 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
         log(f"Committing {len(baseline_changed)} locator baseline(s): "
             f"{', '.join(Path(p).name for p in baseline_changed)}")
         msg = (
-            f"[Authoring Agent]: Locator baselines for {MODULE}\n\n"
+            f"authoring: update {len(baseline_changed)} locator baseline(s) for {MODULE}\n\n"
             f"Element fingerprints recorded while the generated test ran. They\n"
             f"describe what each page object locator matched when it worked, so a\n"
-            f"later drift can be diagnosed by comparison rather than by guesswork.\n"
-            f"Session: {SESSION_ID}\n\n"
-            f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+            f"later drift can be diagnosed by comparison rather than by guesswork.\n\n"
+            f"Session: {SESSION_ID}"
         )
         if _stage_and_commit(baseline_changed, msg):
             rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
@@ -385,9 +383,9 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
 
     # PR title
     if test_passed:
-        pr_title = f"Authoring Agent: {feature_class} automation for {MODULE} [done]"
+        pr_title = f"Authoring: Created {feature_class} automated tests [PASSED]"
     else:
-        pr_title = f"Authoring Agent: {feature_class} automation for {MODULE} [needs review]"
+        pr_title = f"Authoring: Created {feature_class} automated tests [NEEDS-REVIEW]"
 
     # Files section — show generated + fixed separately so reviewers can tell what changed
     baselines     = gen_data.get("baselines_committed") or []
@@ -445,7 +443,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
         raw_case = _read_original_test_case(plan)
         if raw_case.strip():
             masked_case = mask_credentials(raw_case, credentials_from_plan(plan))
-            test_case_section = f"""### Test Case
+            test_case_section = f"""### 🎯 Request / Context
 <details open>
 <summary>Original request (credentials masked)</summary>
 
@@ -480,33 +478,42 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
             "say so in the test input and re-run.\n\n"
             + "".join(f"- {c}\n" for c in dropped_checks) + "\n")
 
-    pr_body = f"""## QA Auto-Create — {feature_class}
+    status_tag = "PASSED" if test_passed else "NEEDS-REVIEW"
+    status_summary = ("Generated test was verified and passed locally."
+                      if test_passed
+                      else "Generated test requires manual review.")
 
-{test_case_section}{checks_section}### Summary
-| | Value |
+    pr_body = f"""## 🤖 Test Authoring Agent — {feature_class}
+
+> Status: **{status_tag}** — {status_summary}
+
+### 📋 Overview
+| Property | Value |
 |---|---|
-| Module | {feature_class} |
-| Test type | {test_type} |
-| Files generated | {len(files_written)} |
-| Fix attempts | {fix_attempts} |
-| Test result | {'✅ Passed' if test_passed else '❌ Needs review'} |
+| **Agent** | `test-authoring-agent` |
+| **Target** | `{feature_class}` |
+| **Test Type** | `{test_type}` |
+| **Status** | `{'✅ Passed' if test_passed else '⚠️ Needs Review'}` |
+| **Files Changed** | `{len(all_committed)}` |
+| **Fix Attempts** | `{fix_attempts}` |
+| **Session ID** | `{SESSION_ID}` |
 
-### Generated Files
+{test_case_section}{checks_section}### 🛠️ Changes Applied
 
 {files_section}
 
-### Validation
+### 🧪 Validation & Test Results
 
 {test_section}
 
-### How to review
+### 🔍 How to Review
 1. Verify locators match the actual DOM (check `[data-cy='...']` attributes)
 2. Confirm `allocateUser()` uses the correct `Module` enum value for this module
 3. Ensure the API endpoint paths match the actual backend routes
 4. Run locally: `mvn test -Dtest={gen_data.get('test_class', '')}#{gen_data.get('test_method', '')} -Denvironment=staging`
 
-> Audit trail: `{AUDIT_DIR.name}`
-> 🤖 Generated by test-authoring-agent
+---
+> 🤖 Generated by **test-authoring-agent** · Audit Session: `{AUDIT_DIR.name}`
 """
 
     log("Creating PR...")

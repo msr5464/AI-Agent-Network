@@ -41,7 +41,7 @@ AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 INPUT_FILE = Path(os.environ["INPUT_FILE"])
 MODULE = os.environ.get("MODULE", "")
-MODEL = os.environ.get("ADAPT_MODEL", "claude-opus-5")
+MODEL = os.environ.get("ADAPTATION_MODEL", "claude-opus-5")
 
 # What a change item can be. The kind selects the edit budget and the guards, so
 # it is a closed set — an unrecognised kind escalates rather than defaulting to

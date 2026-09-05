@@ -46,18 +46,18 @@ from shared.mcp_config import write_playwright_mcp_config
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
-MODEL = os.environ.get("ADAPT_MODEL", "claude-opus-5")
-TIMEOUT_S = int(os.environ.get("ADAPT_EXPLORE_TIMEOUT_S", "1800"))
-ATTEMPTS = int(os.environ.get("ADAPT_EXPLORE_ATTEMPTS", "1"))
+MODEL = os.environ.get("ADAPTATION_MODEL", "claude-opus-5")
+TIMEOUT_S = int(os.environ.get("ADAPTATION_EXPLORE_TIMEOUT_S", "1800"))
+ATTEMPTS = int(os.environ.get("ADAPTATION_EXPLORE_ATTEMPTS", "1"))
 HEADLESS = browser_mode.headless()
-SANDBOX = os.environ.get("ADAPT_SANDBOX", "false").lower() == "true"
+SANDBOX = os.environ.get("ADAPTATION_SANDBOX", "false").lower() == "true"
 # Minting is on by default. The hard stop exists to stop us exploring with a
 # *bad* session — one that lands on a login page and makes the whole flow look
 # changed. A freshly minted one is strictly better than stopping, and the
 # credential still never reaches a prompt: it goes from the framework's own
 # properties file into a local browser and nowhere else.
 MINT = os.environ.get("ADAPT_MINT_SESSION", "true").lower() != "false"
-SANDBOX_NOTE = os.environ.get("ADAPT_SANDBOX_NOTE", "")
+SANDBOX_NOTE = os.environ.get("ADAPTATION_SANDBOX_NOTE", "")
 RULES_FILE = REPO_ROOT / "config" / "prompts" / "explore.md"
 SYSTEM_PROMPT = REPO_ROOT / "config" / "skills" / "automation-repo.md"
 
@@ -231,7 +231,7 @@ def main():
     stop_before = ""
     if plan.get("outcome_is_destructive"):
         if SANDBOX and SANDBOX_NOTE:
-            log(f"ADAPT_SANDBOX=true — operator asserts a disposable environment: "
+            log(f"ADAPTATION_SANDBOX=true — operator asserts a disposable environment: "
                 f"{SANDBOX_NOTE}")
             result["sandbox_note"] = SANDBOX_NOTE
         else:

@@ -24,10 +24,10 @@ def log(msg): _log("review", msg)
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
-MAX_ROUNDS = int(os.environ.get("MAX_REVIEW_ROUNDS", "2"))
+MAX_ROUNDS = int(os.environ.get("TRIAGING_MAX_REVIEW_ROUNDS", "2"))
 
-REVIEWER_MODEL = os.environ.get("REVIEWER_MODEL", "claude-sonnet-4-6")
-REVIEWER_EFFORT = os.environ.get("REVIEWER_EFFORT", "medium")
+TRIAGING_REVIEWER_MODEL = os.environ.get("TRIAGING_REVIEWER_MODEL", "claude-sonnet-4-6")
+TRIAGING_REVIEWER_EFFORT = os.environ.get("TRIAGING_REVIEWER_EFFORT", "medium")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ def read_file(path: Path) -> str:
 
 from shared.claude import call_claude as _call_claude
 def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, REVIEWER_MODEL, str(REPO_ROOT))
+    output = _call_claude(prompt, TRIAGING_REVIEWER_MODEL, str(REPO_ROOT))
     if not output:
         log("Claude CLI returned empty response")
     return output

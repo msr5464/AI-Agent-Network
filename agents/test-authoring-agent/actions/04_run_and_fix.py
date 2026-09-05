@@ -48,9 +48,9 @@ AUTOMATION_FRAMEWORK_DIR    = workspace_helper.resolve(
     WORKSPACE_DIR, os.environ.get("GITHUB_REPO_AUTOMATION", ""),
     exclude=REPO_ROOT)
 
-MODEL        = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
-ENVIRONMENT  = os.environ.get("AUTOCREATE_ENVIRONMENT", "staging")
-COUNTRY      = os.environ.get("AUTOCREATE_COUNTRY", "SG")
+MODEL        = os.environ.get("AUTHORING_MODEL", "claude-opus-4-6")
+ENVIRONMENT  = os.environ.get("AUTHORING_ENVIRONMENT", "staging")
+COUNTRY      = os.environ.get("AUTHORING_COUNTRY", "SG")
 FIX_ATTEMPT  = int(os.environ.get("FIX_ATTEMPT", "1"))
 # Display only — run.sh owns the loop bound. Kept in sync with its default so the
 # "attempt N/M" lines in the console match what the loop will actually do.
@@ -1043,7 +1043,7 @@ def try_fix_infra_user(plan: dict) -> bool:
         log("User auto-repair: mysql binary not found")
         return False
 
-    environment  = os.environ.get("AUTOCREATE_ENVIRONMENT", "staging")
+    environment  = os.environ.get("AUTHORING_ENVIRONMENT", "staging")
     table        = f"users_{environment}"
     country      = plan.get("country", "SG")
     feature_enum = plan.get("feature_enum", "CARD")

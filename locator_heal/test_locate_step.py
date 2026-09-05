@@ -51,6 +51,9 @@ def world(tmp_path_factory):
     workspace = root / "ws" / "automation-repo"
     (workspace / "src/main/java/automation/modules").mkdir(parents=True)
     (workspace / "src/main/java/automation/modules/LoginPage.java").write_text(PAGE_OBJECT)
+    (workspace / "src/main/resources").mkdir(parents=True, exist_ok=True)
+    if capture.script_available():
+        (workspace / "src/main/resources/locator-capture.js").write_text(capture.script())
 
     baselines = root / "baselines"
     baselines.mkdir()
@@ -112,8 +115,8 @@ def run_step(world, audit, mode="shadow"):
            "REPO_ROOT": str(REPO),
            "WORKSPACE_DIR": str(world["workspace"].parent),
            "GITHUB_REPO_AUTOMATION": world["workspace"].name,
-           "BASELINE_DIR": str(world["baselines"]),
-           "LOCATE_MODE": mode}
+           "HEALING_BASELINE_DIR": str(world["baselines"]),
+           "HEALING_LOCATE_MODE": mode}
     done = subprocess.run([sys.executable, str(STEP)], env=env,
                           capture_output=True, text=True, timeout=300)
     out = audit / "01-locate.json"
@@ -152,7 +155,7 @@ def test_locate_never_aborts_the_run_on_a_broken_handoff(tmp_path):
     handoff = tmp_path / "bad.json"
     handoff.write_text("{ this is not json")
     env = {**os.environ, "AUDIT_DIR": str(audit), "HANDOFF_FILE": str(handoff),
-           "REPO_ROOT": str(REPO), "LOCATE_MODE": "shadow"}
+           "REPO_ROOT": str(REPO), "HEALING_LOCATE_MODE": "shadow"}
     done = subprocess.run([sys.executable, str(STEP)], env=env,
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr[-1500:]
@@ -166,7 +169,7 @@ def _load_fix_module(tmp_path, mode, resolutions):
                                                       "resolutions": resolutions}))
     handoff = tmp_path / "h.json"; handoff.write_text(json.dumps({"automation_issues": []}))
     os.environ.update({"AUDIT_DIR": str(audit), "HANDOFF_FILE": str(handoff),
-                       "REPO_ROOT": str(REPO), "LOCATE_MODE": mode})
+                       "REPO_ROOT": str(REPO), "HEALING_LOCATE_MODE": mode})
     path = REPO / "agents" / "test-healing-agent" / "actions" / "01_fix.py"
     spec = importlib.util.spec_from_file_location(f"fix_{mode}", path)
     module = importlib.util.module_from_spec(spec)

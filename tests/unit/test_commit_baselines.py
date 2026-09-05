@@ -12,7 +12,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 import commit_baselines  # noqa: E402
 
-BASELINE_DIR = "src/main/resources/baselines"
+HEALING_BASELINE_DIR = "src/main/resources/baselines"
 
 
 def _git(args, cwd):
@@ -25,7 +25,7 @@ def repo(tmp_path):
     _git(["init", "-q"], tmp_path)
     _git(["config", "user.email", "t@example.com"], tmp_path)
     _git(["config", "user.name", "T"], tmp_path)
-    directory = tmp_path / BASELINE_DIR
+    directory = tmp_path / HEALING_BASELINE_DIR
     directory.mkdir(parents=True)
     (directory / "LoginPage.json").write_text(json.dumps({
         "pageObject": "LoginPage", "recordedAt": "2026-01-01T00:00:00",
@@ -38,7 +38,7 @@ def repo(tmp_path):
 
 
 def _rewrite(repo, **changes):
-    path = repo / BASELINE_DIR / "LoginPage.json"
+    path = repo / HEALING_BASELINE_DIR / "LoginPage.json"
     data = json.loads(path.read_text())
     data.update(changes)
     path.write_text(json.dumps(data, indent=2))
@@ -59,7 +59,7 @@ def test_a_changed_fingerprint_is_a_change(repo):
 
 
 def test_a_new_page_object_is_a_change(repo):
-    (repo / BASELINE_DIR / "CartPage.json").write_text(
+    (repo / HEALING_BASELINE_DIR / "CartPage.json").write_text(
         json.dumps({"pageObject": "CartPage", "recordedAt": "2026-06-01T00:00:00"}))
     assert [p.name for p in commit_baselines.changed_baselines(repo)] == ["CartPage.json"]
 
@@ -77,7 +77,7 @@ def test_it_stages_only_the_baseline_directory(repo):
 
     committed = subprocess.run(["git", "show", "--name-only", "--format=", "HEAD"],
                                cwd=repo, capture_output=True, text=True).stdout
-    assert BASELINE_DIR in committed
+    assert HEALING_BASELINE_DIR in committed
     assert "Foo.java" not in committed, "source must never be staged by this job"
 
 
@@ -93,7 +93,7 @@ def test_a_pending_fingerprint_is_never_committed(repo):
     promote()/discard() empties it. A file left behind is an interrupted run,
     not a good-run fingerprint, and its name is a test key rather than a page
     object — exactly the record a later diagnosis must not compare against."""
-    pending = repo / BASELINE_DIR / "pending"
+    pending = repo / HEALING_BASELINE_DIR / "pending"
     pending.mkdir()
     (pending / "SomeTest.someMethod__LoginPage.json").write_text(
         json.dumps({"pageObject": "LoginPage", "recordedAt": "2026-06-01T00:00:00"}))
@@ -116,7 +116,7 @@ def test_a_baseline_read_before_the_checkout_survives_it(repo):
     The comparison must work from content the caller kept, because by the time it
     runs the files are no longer on disk.
     """
-    new = repo / BASELINE_DIR / "NaukriLoginPage.json"
+    new = repo / HEALING_BASELINE_DIR / "NaukriLoginPage.json"
     new.write_text(json.dumps({"pageObject": "NaukriLoginPage",
                                "recordedAt": "2026-09-05T15:23:39",
                                "coverage": {"usernameField": 1}}))
@@ -124,18 +124,18 @@ def test_a_baseline_read_before_the_checkout_survives_it(repo):
                 for path in baseline.promoted(repo)}
 
     _git(["checkout", "-f", "-B", "feature/new"], repo)   # what ship does next
-    _git(["clean", "-fd", "--", BASELINE_DIR], repo)
+    _git(["clean", "-fd", "--", HEALING_BASELINE_DIR], repo)
     assert not new.exists()
 
     changed = baseline.changed(repo, captured)
-    assert list(changed) == [f"{BASELINE_DIR}/NaukriLoginPage.json"]
-    assert "usernameField" in changed[f"{BASELINE_DIR}/NaukriLoginPage.json"]
+    assert list(changed) == [f"{HEALING_BASELINE_DIR}/NaukriLoginPage.json"]
+    assert "usernameField" in changed[f"{HEALING_BASELINE_DIR}/NaukriLoginPage.json"]
 
 
 def test_pending_fingerprints_are_never_committed(repo):
     """`pending/` holds records from a test that has not finished — an
     interrupted run, named by test key, never proof a page worked."""
-    pending = repo / BASELINE_DIR / "pending"
+    pending = repo / HEALING_BASELINE_DIR / "pending"
     pending.mkdir()
     (pending / "SomeTest_120000.json").write_text('{"pageObject": "SomeTest"}')
     assert baseline.changed(repo) == {}

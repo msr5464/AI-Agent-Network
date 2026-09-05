@@ -42,18 +42,18 @@ class TestLoad:
         (folder / "ProductsPage.json").write_text(json.dumps({
             "pageObject": "ProductsPage", "urlShape": "https://a.com/x",
             "title": "T", "bodyClass": "c", "coverage": {"a": 1}}))
-        monkeypatch.setenv("BASELINE_DIR", str(folder))
+        monkeypatch.setenv("HEALING_BASELINE_DIR", str(folder))
         loaded = baseline.load("ProductsPage")
         assert loaded["available"] is True
         assert loaded["coverage"] == {"a": 1}
 
     def test_absent_baseline_is_not_an_error(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("BASELINE_DIR", str(tmp_path))
+        monkeypatch.setenv("HEALING_BASELINE_DIR", str(tmp_path))
         assert baseline.load("NeverSeen")["available"] is False
 
     def test_corrupt_baseline_is_ignored(self, tmp_path, monkeypatch):
         (tmp_path / "P.json").write_text("{not json")
-        monkeypatch.setenv("BASELINE_DIR", str(tmp_path))
+        monkeypatch.setenv("HEALING_BASELINE_DIR", str(tmp_path))
         assert baseline.load("P")["available"] is False
 
 

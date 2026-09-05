@@ -17,7 +17,7 @@ Writes a resolution per locator. Applying it is 01_fix's job; this step never
 edits a file, so a wrong answer here cannot reach the repo on its own.
 
 Reads:   HANDOFF_FILE, AUDIT_DIR, WORKSPACE_DIR, GITHUB_REPO_AUTOMATION,
-         LOCATE_MODE (shadow|enforce), LOCATE_STORAGE_STATE
+         HEALING_LOCATE_MODE (shadow|enforce), HEALING_LOCATE_STORAGE_STATE
 Outputs: audit/<session>/01-locate.json + 01-locate.md
 
 Exits 0 in every non-crash case. "No baseline for this locator" and "this is not
@@ -52,7 +52,7 @@ from shared import locator_verify
 AUDIT_DIR    = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT    = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 HANDOFF_FILE = Path(os.environ["HANDOFF_FILE"])
-CONFIG_FILE  = Path(os.environ.get("LOCATE_CONFIG", REPO_ROOT / "config" / "locator.yaml"))
+CONFIG_FILE  = Path(os.environ.get("HEALING_LOCATE_CONFIG", REPO_ROOT / "config" / "locator.yaml"))
 
 # shadow: locate, verify, record what we would have done, and change nothing.
 # enforce: 01_fix applies a verified resolution instead of calling the model.
@@ -60,9 +60,9 @@ CONFIG_FILE  = Path(os.environ.get("LOCATE_CONFIG", REPO_ROOT / "config" / "loca
 # Shadow is the default for the same reason DIAGNOSIS_MODE is: this step can
 # refuse work the agent used to attempt, and that risk deserves a measurement
 # rather than a leap.
-LOCATE_MODE = os.environ.get("LOCATE_MODE", "shadow").strip().lower()
+HEALING_LOCATE_MODE = os.environ.get("HEALING_LOCATE_MODE", "shadow").strip().lower()
 
-STORAGE_STATE = os.environ.get("LOCATE_STORAGE_STATE", "")
+STORAGE_STATE = os.environ.get("HEALING_LOCATE_STORAGE_STATE", "")
 # Minting runs the test's own login through maven, so it costs a minute the
 # first time. Worth it: the alternative is refusing every locator on a page
 # the replay never actually reached.
@@ -574,12 +574,12 @@ def main() -> int:
 
     handoff = json.loads(HANDOFF_FILE.read_text())
     issues = handoff.get("automation_issues") or []
-    log(f"{len(issues)} issue(s) from the handoff; mode={LOCATE_MODE}")
+    log(f"{len(issues)} issue(s) from the handoff; mode={HEALING_LOCATE_MODE}")
 
     workspace = _workspace()
     if workspace is None:
         log("WORKSPACE_DIR/GITHUB_REPO_AUTOMATION not set — cannot read page objects")
-        _write({"mode": LOCATE_MODE, "resolutions": [], "reason": "no workspace"},
+        _write({"mode": HEALING_LOCATE_MODE, "resolutions": [], "reason": "no workspace"},
                started)
         return 0
 
@@ -618,10 +618,10 @@ def main() -> int:
 
     located = [r for r in resolutions if r["verdict"] == "HEALED"]
     log(f"located {len(located)} of {len(resolutions)} deterministically "
-        f"({'applied by fix' if LOCATE_MODE == 'enforce' else 'shadow — fix unchanged'})")
+        f"({'applied by fix' if HEALING_LOCATE_MODE == 'enforce' else 'shadow — fix unchanged'})")
 
     _write({
-        "mode": LOCATE_MODE,
+        "mode": HEALING_LOCATE_MODE,
         "attempted": len(resolutions),
         "located": len(located),
         "refused": len([r for r in resolutions
@@ -646,7 +646,7 @@ def _log_resolution(r: dict) -> None:
         if r.get("fragile"):
             log(f"  fragile: {r['fragile'][:100]}")
     else:
-        # Refusals carry the reason a human acts on — "set LOCATE_STORAGE_STATE",
+        # Refusals carry the reason a human acts on — "set HEALING_LOCATE_STORAGE_STATE",
         # "the feature was removed". Truncating at 90 characters cut off exactly
         # the actionable half. The console scrolls; the advice should survive.
         log(f"{name}  {r.get('classification') or r['verdict']} — {r.get('reason','')[:220]}")
@@ -700,7 +700,7 @@ if __name__ == "__main__":
         log(f"locate failed ({type(exc).__name__}: {exc}) — continuing to Fix")
         traceback.print_exc()
         try:
-            _write({"mode": LOCATE_MODE, "resolutions": [],
+            _write({"mode": HEALING_LOCATE_MODE, "resolutions": [],
                     "error": f"{type(exc).__name__}: {exc}"}, time.time())
         except Exception:                          # noqa: BLE001
             pass

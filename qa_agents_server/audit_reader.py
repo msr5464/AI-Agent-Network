@@ -546,10 +546,10 @@ def _locate_counts(locate_data: Optional[Dict]) -> Dict:
     a locator fixed without a model call, which is the whole point of the step.
     """
     if not locate_data:
-        return {"locate_mode": "", "located_deterministically": 0,
+        return {"healing_locate_mode": "", "located_deterministically": 0,
                 "locate_attempted": 0, "locate_refused": 0, "locate_verdicts": {}}
     return {
-        "locate_mode": locate_data.get("mode", ""),
+        "healing_locate_mode": locate_data.get("mode", ""),
         "located_deterministically": locate_data.get("located", 0),
         "locate_attempted": locate_data.get("attempted", 0),
         "locate_refused": locate_data.get("refused", 0),

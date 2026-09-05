@@ -193,7 +193,7 @@ def get_execution_logs_from_html(report_dir: str) -> tuple[Dict[str, str], Dict[
         # Base URL for constructing links (using Config if available)
         try:
             from ..settings import Config
-            base_url = Config.DASHBOARD_BASE_URL
+            base_url = Config.TRIAGING_DASHBOARD_BASE_URL
             report_name = Path(report_dir).name
             
             # Extract project name and job name using centralized builder

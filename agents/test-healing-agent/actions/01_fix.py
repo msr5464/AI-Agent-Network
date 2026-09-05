@@ -59,23 +59,24 @@ logging.basicConfig(level=logging.WARNING)
 AUDIT_DIR   = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR   = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT   = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
+SESSION_ID  = os.environ.get("SESSION_ID", AUDIT_DIR.name)
 FIX_ATTEMPT = int(os.environ.get("FIX_ATTEMPT", "1"))
 
 # Handoff file written by test-triaging-agent/05_ship.py
 HANDOFF_FILE = Path(os.environ["HANDOFF_FILE"])
 
-AUTOFIX_MODEL = os.environ.get("AUTOFIX_MODEL", "claude-opus-5")
+HEALING_MODEL = os.environ.get("HEALING_MODEL", "claude-opus-5")
 
 GITHUB_TOKEN           = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_ORG             = os.environ.get("GITHUB_ORG", "")
 GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "")
 GITHUB_DEFAULT_BRANCH  = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
-AUTOFIX_BRANCH_PREFIX  = os.environ.get("AUTOFIX_BRANCH_PREFIX", "chore/qa-autofix")
+HEALING_BRANCH_PREFIX  = os.environ.get("HEALING_BRANCH_PREFIX", "healing")
 
 # Step 01 (Locate) resolves locators deterministically. In enforce mode a
 # verified resolution replaces the model call entirely; in shadow it is recorded
 # and ignored, so the fix step behaves exactly as it did before.
-LOCATE_MODE = os.environ.get("LOCATE_MODE", "shadow").strip().lower()
+HEALING_LOCATE_MODE = os.environ.get("HEALING_LOCATE_MODE", "shadow").strip().lower()
 
 # AUTO_PUSH=false means "let me look at this first". Branching and committing
 # would defeat that: the change disappears from `git status`, and reviewing it
@@ -88,7 +89,7 @@ AUTO_PUSH = os.environ.get("AUTO_PUSH", "true").lower() == "true"
 
 KNOWN_ISSUES_FILE = AGENT_DIR / "feedback" / "known-issues.json"
 REPO_CONTEXT_FILE = os.environ.get("REPO_CONTEXT_FILE", "")
-MAX_FIXES         = int(os.environ.get("AUTO_FIX_MAX_FIXES_PER_RUN", "5"))
+MAX_FIXES         = int(os.environ.get("HEALING_MAX_FIXES_PER_RUN", "5"))
 MAX_LOG_CHARS     = 3000
 MAX_METHOD_CHARS  = 4000
 # Page objects hold the locators being fixed — give them room. The extractor
@@ -105,8 +106,8 @@ FIX_RULES_FILE      = REPO_ROOT / "config" / "prompts" / "fix.md"
 # A locator breaks because the DOM changed, which means the correct new value is
 # not present anywhere in the source. Reading the real page is the only way to
 # find it rather than guess it.
-INSPECT_DOM        = os.environ.get("AUTOFIX_INSPECT_DOM", "true").lower() == "true"
-AUTOFIX_BASE_URL   = os.environ.get("AUTOFIX_BASE_URL", "")
+INSPECT_DOM        = os.environ.get("HEALING_INSPECT_DOM", "true").lower() == "true"
+HEALING_BASE_URL   = os.environ.get("HEALING_BASE_URL", "")
 DOM_TIMEOUT_S      = int(os.environ.get("AUTOFIX_DOM_TIMEOUT_S", "600"))
 PW_HEADLESS        = browser_mode.headless()
 REPAIR_SESSION_FILE = os.environ.get("AUTOFIX_REPAIR_SESSION", "")
@@ -121,7 +122,7 @@ DIAGNOSIS_MODE = os.environ.get("DIAGNOSIS_MODE", "shadow").strip().lower()
 # someone has looked at it and still wants a fix attempted, they get one.
 FORCE = os.environ.get("FORCE", "false").strip().lower() == "true"
 
-TEST_TIMEOUT_S     = int(os.environ.get("AUTOFIX_TEST_TIMEOUT_S", "300"))
+TEST_TIMEOUT_S     = int(os.environ.get("HEALING_TEST_TIMEOUT_S", "300"))
 
 # ── I/O helpers ───────────────────────────────────────────────────────────────
 
@@ -199,7 +200,7 @@ def call_claude(prompt: str, cwd: Path, use_system_prompt: bool = True,
         # prompt, so Read is not new reach — but it is not the confinement an
         # earlier comment here claimed.
         tools.append("Read")
-    output = _call_claude(prompt, AUTOFIX_MODEL, str(cwd),
+    output = _call_claude(prompt, HEALING_MODEL, str(cwd),
                           system_prompt_file=system_prompt,
                           allowed_tools=(tools or None),
                           add_dir=(add_dir or artifact_dir or None),
@@ -284,7 +285,7 @@ def extract_likely_location(stack_trace: str, execution_log: str) -> str:
 def extract_page_url(issue: dict) -> str:
     """Best-effort recovery of the URL the failing step was on.
 
-    Checked in order: an explicit AUTOFIX_BASE_URL override, a `url=` marker
+    Checked in order: an explicit HEALING_BASE_URL override, a `url=` marker
     (the shape test-authoring-agent's STEP_FAILED protocol emits), then any
     http(s) URL in the log or error text.
     """
@@ -292,8 +293,8 @@ def extract_page_url(issue: dict) -> str:
     # over an operator-supplied base URL or anything scraped out of the log.
     if issue.get("failure_url"):
         return issue["failure_url"]
-    if AUTOFIX_BASE_URL:
-        return AUTOFIX_BASE_URL
+    if HEALING_BASE_URL:
+        return HEALING_BASE_URL
 
     combined = "\n".join(str(issue.get(k) or "") for k in
                          ("execution_log", "error_message", "stack_trace", "root_cause"))
@@ -532,9 +533,9 @@ def load_framework_properties(workspace: Path) -> dict:
     the same secrets as env vars would just be a second place to keep in sync.
     """
     environment = os.environ.get("AUTOFIX_ENVIRONMENT",
-                                 os.environ.get("AUTOCREATE_ENVIRONMENT", "staging")).lower()
+                                 os.environ.get("AUTHORING_ENVIRONMENT", "staging")).lower()
     country = os.environ.get("AUTOFIX_COUNTRY",
-                             os.environ.get("AUTOCREATE_COUNTRY", "SG")).lower()
+                             os.environ.get("AUTHORING_COUNTRY", "SG")).lower()
 
     props: dict = {}
     for name in ("config.properties", f"{environment}-{country}.properties"):
@@ -862,7 +863,7 @@ def inspect_live_dom(ctx: dict, url: str, workspace: Path, props: dict,
         # file the tests read it from.
         url = props.get(f"{module}.url") or props.get(f"{module}Url") or ""
     if not url:
-        result["status"] = "no page URL in the handoff, properties file, or AUTOFIX_BASE_URL"
+        result["status"] = "no page URL in the handoff, properties file, or HEALING_BASE_URL"
         return result
 
     elements = "\n".join(f"  - {e}" for e in ctx["element_names"][:6]) or "  - (none extracted)"
@@ -1245,7 +1246,7 @@ def locate_resolution(ctx: dict):
     01-locate.json for comparison, but the model keeps making the decision until
     the numbers say it should not.
     """
-    if LOCATE_MODE != "enforce":
+    if HEALING_LOCATE_MODE != "enforce":
         return None
     # Only on the first attempt. Reaching attempt 2 means the located locator was
     # applied and the test still failed, so re-applying the identical edit would
@@ -1854,10 +1855,10 @@ def _commit_baselines(workspace, build_tag: str) -> list:
         return []
     ok, out, err = run_git(
         ["commit", "-m",
-         f"fix(automation): refresh {len(paths)} locator baseline(s)\n\n"
-         f"Build tag: {build_tag}\n"
+         f"healing: refresh {len(paths)} locator baseline(s) for {build_tag}\n\n"
          f"Element fingerprints recorded while the healed tests were verified,\n"
-         f"so the next drift is diagnosed against the page as it is now."],
+         f"so the next drift is diagnosed against the page as it is now.\n\n"
+         f"Session: {SESSION_ID}"],
         workspace)
     if not ok and "nothing to commit" not in f"{out}{err}".lower():
         log(f"Warning: baseline commit failed: {(err or out).strip()[:120]}")
@@ -1962,10 +1963,10 @@ def main():
     log(f"{len(eligible)} eligible failing test(s) to analyse")
 
     # Create / checkout fix branch
-    # Branch name: <AUTOFIX_BRANCH_PREFIX>/<safe-build-tag>
+    # Branch name: <HEALING_BRANCH_PREFIX>/<safe-build-tag>
     # On retry (FIX_ATTEMPT > 1), reuse the same branch so commits stack
     safe_tag    = re.sub(r"[^a-zA-Z0-9_-]", "-", build_tag).lower()
-    branch_name = f"{AUTOFIX_BRANCH_PREFIX}/{safe_tag}"
+    branch_name = f"{HEALING_BRANCH_PREFIX}/{safe_tag}"
     on_branch = False
     if not AUTO_PUSH:
         # Dry run: no branch, no commit. The whole block below is skipped rather
@@ -2227,7 +2228,7 @@ def main():
             ctx["dom_findings"] = inspect_live_dom(ctx, ctx["page_url"], workspace,
                                                    framework_props)
         else:
-            ctx["dom_findings"] = {"status": "disabled (AUTOFIX_INSPECT_DOM=false)",
+            ctx["dom_findings"] = {"status": "disabled (HEALING_INSPECT_DOM=false)",
                                    "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
 
         ctx_slim = {k: v for k, v in ctx.items() if k != "repo_conventions"}
@@ -2508,9 +2509,9 @@ def main():
 
         fixed_names = ", ".join(f['test_name'].split(".")[-1] for f in applied[:5])
         commit_msg = (
-            f"fix(automation): update locators for {len(applied)} test(s)\n\n"
-            f"Build tag: {build_tag}\n"
-            f"Fixed: {fixed_names}"
+            f"healing: repair locators for {len(applied)} test(s) ({build_tag})\n\n"
+            f"Fixed: {fixed_names}\n\n"
+            f"Session: {SESSION_ID}"
         )
         ok, out, err = run_git(["commit", "-m", commit_msg], workspace)
         if ok:

@@ -36,7 +36,7 @@ def _fix_json(**overrides):
         "fix_attempt": 1, "eligible_count": 1, "attempted": 1,
         "succeeded": 1, "unverified": 0, "failed": 0,
         "distinct_fixes": 1, "distinct_unverified": 0,
-        "pr_branch": "chore/qa-autofix/local-x",
+        "pr_branch": "healing/local-x",
         "candidates": [], "fixes": [{"test_name": "T#m", "status": "applied"}],
         "unverified_fixes": [], "failed_fixes": [],
         "attempts": [{"attempt": 1, "entries": []}],

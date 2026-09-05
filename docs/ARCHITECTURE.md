@@ -81,7 +81,7 @@ Reads CI test results from MySQL, classifies every failure as `PRODUCT_BUG` or `
 | 01 Scout | Queries MySQL for build tags not yet analysed; scores and selects the best candidate |
 | 02 Collect | Full DB query + HTML log parse + flaky test detection + trend analysis |
 | 03 Classify | Claude batch-classifies each failure with confidence (`HIGH` / `MEDIUM` / `LOW`) |
-| 04 Review | A second Claude call independently reviews all classifications; up to `MAX_REVIEW_ROUNDS` debate rounds; issues a `.verdict` (APPROVED / NEEDS-HUMAN) |
+| 04 Review | A second Claude call independently reviews all classifications; up to `TRIAGING_MAX_REVIEW_ROUNDS` debate rounds; issues a `.verdict` (APPROVED / NEEDS-HUMAN) |
 | 05 Ship | Generates HTML report, writes handoff JSON to Agent 3's queue (if APPROVED + eligible failures), sends Slack notification |
 
 **Input:** MySQL database containing test run results  

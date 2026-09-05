@@ -59,7 +59,7 @@ def cluster_key(context: dict) -> str:
     right for locator breaks, and wrong for everything else: thirty tests failing
     because the environment is down are one cause but thirty different elements,
     so they would each consume a slot and then be truncated into "deferred" by
-    AUTO_FIX_MAX_FIXES_PER_RUN. Non-locator verdicts therefore group on the cause
+    HEALING_MAX_FIXES_PER_RUN. Non-locator verdicts therefore group on the cause
     itself, and are reported once.
     """
     verdict = (context.get("diagnosis") or {}).get("verdict") or ""

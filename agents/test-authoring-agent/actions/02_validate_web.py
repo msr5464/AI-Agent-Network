@@ -28,9 +28,9 @@ from shared import browser_mode      # noqa: E402  (after sys.path update)
 from shared.credential_extraction import credentials_from_plan  # noqa: E402
 
 CLAUDE_CLI  = os.environ.get("CLAUDE_CLI_PATH", "claude")
-MODEL       = os.environ.get("AUTOCREATE_MODEL", "claude-opus-4-6")
+MODEL       = os.environ.get("AUTHORING_MODEL", "claude-opus-4-6")
 # Per-action wait budget handed to Claude for individual browser interactions.
-PW_TIMEOUT  = int(os.environ.get("PLAYWRIGHT_TIMEOUT_MS", "30000"))
+PW_TIMEOUT  = int(os.environ.get("AUTHORING_PLAYWRIGHT_TIMEOUT_MS", "30000"))
 PW_HEADLESS = browser_mode.headless()
 # Wall-clock budget for the whole validation run. A login-gated flow of 10+ steps
 # on a heavy site routinely needs 15-25 minutes, so the default is generous;
@@ -295,7 +295,7 @@ CATEGORY_FIX_HINTS = {
     "login_failed": "Login failed — verify Username/Password in the queue input "
         "file, or check the screenshot for a CAPTCHA/2FA prompt.",
     "timeout": "Action timed out — the element may exist but load slowly, be "
-        "hidden, or be off-screen. Consider raising PLAYWRIGHT_TIMEOUT_MS.",
+        "hidden, or be off-screen. Consider raising AUTHORING_PLAYWRIGHT_TIMEOUT_MS.",
     "overlay_blocking": "A cookie-consent banner, modal, or popup blocked "
         "interaction and could not be dismissed automatically — check the "
         "screenshot for what's covering the target element.",

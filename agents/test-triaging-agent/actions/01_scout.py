@@ -23,7 +23,7 @@ def log(msg): _log("scout", msg)
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
-LOOKBACK_DAYS = int(os.environ.get("SCOUT_LOOKBACK_DAYS", "7"))
+LOOKBACK_DAYS = int(os.environ.get("TRIAGING_SCOUT_LOOKBACK_DAYS", "7"))
 
 SKIP_FILE = AGENT_DIR / "feedback" / "skip-buildtags.json"
 
@@ -46,11 +46,11 @@ def get_db_connection():
     from lib.settings import Config
     import pymysql
     return pymysql.connect(
-        host=Config.DB_HOST,
-        port=Config.DB_PORT,
-        user=Config.DB_USER,
-        password=Config.DB_PASSWORD,
-        database=Config.DB_NAME,
+        host=Config.TRIAGING_DB_HOST,
+        port=Config.TRIAGING_DB_PORT,
+        user=Config.TRIAGING_DB_USER,
+        password=Config.TRIAGING_DB_PASSWORD,
+        database=Config.TRIAGING_DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
         connect_timeout=10,
     )

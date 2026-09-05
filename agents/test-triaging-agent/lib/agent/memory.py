@@ -136,7 +136,7 @@ class AgentMemory:
                 msg = (
                     f"Table '{table_name}' does not exist in the database. "
                     "Ensure test results have been uploaded to the results table first (e.g. from your test run/CI), "
-                    "or verify --table-name and DB_NAME in config/.env."
+                    "or verify --table-name and TRIAGING_DB_NAME in config/.env."
                 )
                 logger.error(msg)
                 raise ValueError(msg) from e
@@ -332,7 +332,7 @@ class AgentMemory:
             # Calculate date threshold to prevent fetching ancient data
             # Use 90 days instead of 14 because CI runs may be infrequent;
             # we need enough executions per test to cross the min_occurrences threshold
-            # (e.g., FLAKY_TESTS_MIN_FAILURES=5). The actual per-test cap is
+            # (e.g., TRIAGING_FLAKY_TESTS_MIN_FAILURES=5). The actual per-test cap is
             # handled by limit_per_test in Python code below.
             date_threshold = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d %H:%M:%S')
             date_filter = f"AND {date_col} >= %s" if date_col else ""
@@ -664,7 +664,7 @@ class AgentMemory:
         test_history = self._get_test_execution_history_from_db(
             normalized_report_name, 
             test_names=test_names_to_query,
-            limit_per_test=Config.FLAKY_TESTS_LAST_RUNS,
+            limit_per_test=Config.TRIAGING_FLAKY_TESTS_LAST_RUNS,
             table_name=table_name
         )
         
@@ -778,7 +778,7 @@ class AgentMemory:
                 details = failure_details[test_name]
                 
                 # Always use execution order (not date buckets) to build history
-                executions = details['executions'][:Config.FLAKY_TESTS_LAST_RUNS]  # newest first
+                executions = details['executions'][:Config.TRIAGING_FLAKY_TESTS_LAST_RUNS]  # newest first
                 
                 # Build history from executions (oldest -> newest for display)
                 history = []
@@ -997,9 +997,9 @@ class AgentMemory:
         if excluded_tests:
             logger.info(f"Excluded {len(excluded_tests)} tests that didn't meet criteria:")
             for test_name, occ in excluded_tests[:10]:  # Log first 10
-                logger.info(f"  - {test_name}: {occ} occurrences (need >={min_occurrences} failures in last {Config.FLAKY_TESTS_LAST_RUNS} runs)")
+                logger.info(f"  - {test_name}: {occ} occurrences (need >={min_occurrences} failures in last {Config.TRIAGING_FLAKY_TESTS_LAST_RUNS} runs)")
         
-        logger.info(f"Found {len(recurring)} recurring failures from database, filtered to {len(filtered_recurring)} based on criteria (>={min_occurrences} failures in last {Config.FLAKY_TESTS_LAST_RUNS} runs)")
+        logger.info(f"Found {len(recurring)} recurring failures from database, filtered to {len(filtered_recurring)} based on criteria (>={min_occurrences} failures in last {Config.TRIAGING_FLAKY_TESTS_LAST_RUNS} runs)")
         return filtered_recurring
     
     def _classify_from_error_message(self, error_message: str) -> str:

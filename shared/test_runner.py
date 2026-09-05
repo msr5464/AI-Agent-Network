@@ -20,7 +20,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from shared import browser_mode, narration
 
-DEFAULT_TIMEOUT_S = int(os.environ.get("AUTOFIX_TEST_TIMEOUT_S", "300"))
+DEFAULT_TIMEOUT_S = int(os.environ.get("HEALING_TEST_TIMEOUT_S", "300"))
 
 # Never treated as a candidate module root when looking one level down.
 _NON_MODULE_DIRS = {"target", "build", "node_modules", "test-output", "venv", ".venv"}

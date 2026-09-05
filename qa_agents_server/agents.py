@@ -136,11 +136,11 @@ def auto_push_default() -> bool:
 def adapt_apply_default() -> bool:
     """Same story as AUTO_PUSH, for the adaptation agent's apply/propose switch.
 
-    `_adaptation_env` exports ADAPT_APPLY whenever the field is present, and a
+    `_adaptation_env` exports ADAPTATION_APPLY whenever the field is present, and a
     caller-exported var beats config/.env, so a checkbox that always renders
-    unticked silently turns an admin's ADAPT_APPLY=true into propose-only.
+    unticked silently turns an admin's ADAPTATION_APPLY=true into propose-only.
     """
-    return os.environ.get("ADAPT_APPLY", "false").strip().lower() == "true"
+    return os.environ.get("ADAPTATION_APPLY", "false").strip().lower() == "true"
 
 
 def _base_branch_env(payload: dict) -> Dict[str, str]:
@@ -259,7 +259,7 @@ def _adaptation_env(payload: dict) -> Dict[str, str]:
     if payload.get("explore_only"):
         env["EXPLORE_ONLY"] = "true"
     if payload.get("apply") is not None:
-        env["ADAPT_APPLY"] = "true" if payload["apply"] else "false"
+        env["ADAPTATION_APPLY"] = "true" if payload["apply"] else "false"
     return env
 
 

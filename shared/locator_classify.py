@@ -100,7 +100,7 @@ def classify(snap: dict, baseline: dict, match_count: int, matched: dict | None,
         if overlap < ct["landmark_overlap_min"]:
             replayed = page_comparison is not None
             # Naming the page we actually reached is the difference between an
-            # actionable refusal and a shrug. Pointing at LOCATE_STORAGE_STATE was
+            # actionable refusal and a shrug. Pointing at HEALING_LOCATE_STORAGE_STATE was
             # worse than nothing for a test that signs in with credentials and
             # names no session at all — there is no value to put there.
             landed = (snap.get("url") or "").strip()

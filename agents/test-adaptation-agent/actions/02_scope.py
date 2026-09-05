@@ -45,7 +45,7 @@ AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", str(REPO_ROOT.parent))
 GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "")
-VERIFY_POLICY = os.environ.get("ADAPT_VERIFY_POLICY", "named_only")
+VERIFY_POLICY = os.environ.get("ADAPTATION_VERIFY_POLICY", "named_only")
 
 
 def get_workspace():
@@ -201,7 +201,7 @@ def main():
     budget["over_limit"] = len(verify_rows) > blast_radius.MAX_TESTS
     mins = round(budget["est_seconds"] / 60)
     log(f"Budget: {len(verify_rows)} test(s) ≈ {mins} min"
-        + ("  ⚠️ over ADAPT_BLAST_MAX_TESTS — this change is bigger than one run"
+        + ("  ⚠️ over ADAPTATION_BLAST_MAX_TESTS — this change is bigger than one run"
            if budget["over_limit"] else ""))
 
     # How does the test under adaptation get itself signed in? It says so, and

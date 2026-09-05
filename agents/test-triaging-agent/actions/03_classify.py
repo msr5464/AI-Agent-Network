@@ -27,8 +27,8 @@ AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 
-CLASSIFIER_MODEL = os.environ.get("CLASSIFIER_MODEL", "claude-opus-4-6")
-CLASSIFIER_EFFORT = os.environ.get("CLASSIFIER_EFFORT", "medium")
+TRIAGING_CLASSIFIER_MODEL = os.environ.get("TRIAGING_CLASSIFIER_MODEL", "claude-opus-4-6")
+TRIAGING_CLASSIFIER_EFFORT = os.environ.get("TRIAGING_CLASSIFIER_EFFORT", "medium")
 
 MAX_LOG_CHARS = 4000   # Truncate execution log per failure to fit context
 BATCH_SIZE = 10        # Failures per Claude call (avoid context limits)
@@ -45,7 +45,7 @@ def load_json(filename):
 
 from shared.claude import call_claude as _call_claude
 def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, CLASSIFIER_MODEL, str(REPO_ROOT))
+    output = _call_claude(prompt, TRIAGING_CLASSIFIER_MODEL, str(REPO_ROOT))
     if not output:
         log("Claude CLI returned empty response")
     return output

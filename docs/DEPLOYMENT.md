@@ -27,8 +27,8 @@ This document summarizes the recommended steps for standing up the QA Agent Netw
    - Copies `config\.env.example` → `config\.env` if needed
 
 4. **Configure environment**
-   - Edit `config\.env` with DB credentials, AI provider (`LLM_PROVIDER`, `OPENAI_*` / `OLLAMA_*`), `INPUT_DIR`, and `OUTPUT_DIR`.
-   - Place automation report folders under `testdata\` (or update `INPUT_DIR`).
+   - Edit `config\.env` with DB credentials, AI provider (`LLM_PROVIDER`, `OPENAI_*` / `OLLAMA_*`), `TRIAGING_INPUT_DIR`, and `TRIAGING_OUTPUT_DIR`.
+   - Place automation report folders under `testdata\` (or update `TRIAGING_INPUT_DIR`).
 
 5. **Run the agent**
    ```powershell
@@ -81,7 +81,7 @@ This document summarizes the recommended steps for standing up the QA Agent Netw
                    powershell -ExecutionPolicy Bypass -File .\\scripts\\run.ps1 --input-dir "${reportDir}" --output-dir reports
                """
 
-   Adjust paths to match wherever Jenkins stores the automation output. If your Gradle job writes reports outside the agent repo, copy them under `testdata\` (or set `INPUT_DIR` accordingly) before calling `scripts\run.ps1`.
+   Adjust paths to match wherever Jenkins stores the automation output. If your Gradle job writes reports outside the agent repo, copy them under `testdata\` (or set `TRIAGING_INPUT_DIR` accordingly) before calling `scripts\run.ps1`.
 
 3. **Environment secrets**
    - Store DB passwords and API keys using Jenkins credentials.

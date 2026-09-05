@@ -340,7 +340,7 @@ def collect(issue: Dict, workspace=None, page_objects: Optional[List[Dict]] = No
     # Absent for a page never yet seen passing, which only lowers confidence.
     expected_name = evidence["expected_page_object"]
     evidence["baseline"] = baseline.load(expected_name, workspace,
-                                         issue.get("baseline_dir"),
+                                         issue.get("healing_baseline_dir"),
                                          not_after=header.get("capturedAt", ""))
     if evidence["baseline"].get("rejected"):
         evidence["notes"].append(

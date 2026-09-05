@@ -74,7 +74,7 @@ cp docs/examples/queue/test-adaptation-agent/web_field_added.txt \
 make run AGENT=test-adaptation-agent MODULE=saucedemo
 
 # propose without writing, for any change note
-ADAPT_APPLY=false make run AGENT=test-adaptation-agent MODULE=saucedemo
+ADAPTATION_APPLY=false make run AGENT=test-adaptation-agent MODULE=saucedemo
 ```
 
 `Affects:` is optional but worth giving. Without it the blast radius is derived

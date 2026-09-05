@@ -101,7 +101,7 @@ class TestLocateOutcome:
     def test_reported_in_shadow_mode_too(self, monkeypatch):
         """locate_resolution() withholds in shadow because it APPLIES an answer.
         locate_outcome() only reports one, so it must not withhold."""
-        monkeypatch.setattr(fix, "LOCATE_MODE", "shadow")
+        monkeypatch.setattr(fix, "HEALING_LOCATE_MODE", "shadow")
         monkeypatch.setattr(fix, "load_locate_resolutions", lambda: [
             {"failed_selector": "#b", "verdict": "HEALED", "new_expression": "x"}])
         ctx = {"failed_selector": "#b"}

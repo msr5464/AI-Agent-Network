@@ -255,7 +255,7 @@ Web Steps:
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary | `claude` |
-| `AUTOCREATE_MODEL` | Claude model for all AI steps | `claude-opus-4-6` |
+| `AUTHORING_MODEL` | Claude model for all AI steps | `claude-opus-4-6` |
 | `WORKSPACE_DIR` | Parent directory containing Jarvis | required |
 | `FRAMEWORK_DIR` | Absolute path to the checkout, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION` | optional |
 | `GITHUB_TOKEN` | GitHub auth token for PR creation | required |
@@ -263,14 +263,14 @@ Web Steps:
 | `GITHUB_REPO_AUTOMATION` | Name of the Jarvis repo dir | `Jarvis` |
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs | `main` |
 | `GITHUB_PR_REVIEWERS` | Comma-separated reviewer handles | optional |
-| `AUTOCREATE_BRANCH_PREFIX` | Branch name prefix | `feat/qa-autocreate` |
+| `AUTHORING_BRANCH_PREFIX` | Branch name prefix | `authoring` |
 | `AUTHORING_FIX_RETRY_COUNT` | Max retry cycles for failing tests. A ceiling — the loop stops early once an attempt can bring nothing new | `2` |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) | `true` |
-| `AUTOCREATE_ENVIRONMENT` | Maven `-Denvironment=` value | `staging` |
-| `AUTOCREATE_COUNTRY` | Maven `-Dcountry=` value | `SG` |
+| `AUTHORING_ENVIRONMENT` | Maven `-Denvironment=` value | `staging` |
+| `AUTHORING_COUNTRY` | Maven `-Dcountry=` value | `SG` |
 | `MAVEN_TEST_TIMEOUT_S` | Timeout (s) for a single `mvn test` run in step 04 | `300` |
 | `TEST_RESULTS_DIR_NAME` | Java framework's report/screenshot output dir name | `test-output` |
-| `PLAYWRIGHT_TIMEOUT_MS` | Timeout (ms) for each individual browser action | `30000` |
+| `AUTHORING_PLAYWRIGHT_TIMEOUT_MS` | Timeout (ms) for each individual browser action | `30000` |
 | `VALIDATE_WEB_TIMEOUT_S` | Wall-clock budget (s) for the whole step-02 run | `1800` |
 | `VALIDATE_WEB_RETRY_ATTEMPTS` | Extra full re-runs step 02 attempts on recoverable failures | `1` |
 | `PLAYWRIGHT_HEADLESS` | Set `false` to watch every browser this agent starts — step 02's validation and step 04's `mvn test` run | `true` |

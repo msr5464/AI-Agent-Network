@@ -88,6 +88,12 @@ class TestSchema:
             assert field["default"] == default
             assert field["type"] == "number"
 
+    def test_branch_prefixes_match_agent_defaults(self):
+        by_env = {f["env_var"]: f for f in agent_settings.SETTINGS_SCHEMA}
+        assert by_env["AUTHORING_BRANCH_PREFIX"]["default"] == "authoring"
+        assert by_env["HEALING_BRANCH_PREFIX"]["default"] == "healing"
+        assert by_env["ADAPTATION_BRANCH_PREFIX"]["default"] == "adaptation"
+
     def test_per_invocation_vars_are_not_exposed(self):
         """Writing these to config/.env would pin every run to one test."""
         forbidden = {"TEST_NAME", "FORCE", "REPAIR", "BUILD_TAG", "MODULE",
@@ -169,8 +175,8 @@ class TestCoercion:
         assert os.environ["AUTHORING_FIX_RETRY_COUNT"] == "2"
 
     def test_select_rejects_values_outside_its_options(self, env_file):
-        agent_settings.set_many({"classifier_effort": "bogus"})
-        assert os.environ["CLASSIFIER_EFFORT"] == "medium"
+        agent_settings.set_many({"triaging_classifier_effort": "bogus"})
+        assert os.environ["TRIAGING_CLASSIFIER_EFFORT"] == "medium"
 
 
 class TestWorkspaceValidation:
@@ -197,11 +203,11 @@ class TestWorkspaceValidation:
         before = env_file.read_text()
         with pytest.raises(agent_settings.SettingsValidationError):
             agent_settings.set_many({
-                "db_name": "should_not_land",
+                "triaging_db_name": "should_not_land",
                 "workspace_dir": "/nope/does/not/exist",
             })
         assert env_file.read_text() == before
-        assert os.environ.get("DB_NAME") != "should_not_land"
+        assert os.environ.get("TRIAGING_DB_NAME") != "should_not_land"
 
 
 class TestShadowDetection:
@@ -224,9 +230,9 @@ class TestShadowDetection:
     def test_an_agent_level_override_is_reported(self, env_file, fake_root):
         agent_dir = fake_root / "agents" / "test-healing-agent"
         agent_dir.mkdir(parents=True)
-        (agent_dir / ".env").write_text("AUTOFIX_MODEL=claude-opus-5\n")
+        (agent_dir / ".env").write_text("HEALING_MODEL=claude-opus-5\n")
         shadowed = agent_settings._find_shadowed()
-        assert shadowed["autofix_model"] == "agents/test-healing-agent/.env"
+        assert shadowed["healing_model"] == "agents/test-healing-agent/.env"
 
     def test_a_repo_root_override_is_reported(self, env_file, fake_root):
         (fake_root / ".env").write_text("AUTO_PUSH=false\n")
@@ -235,7 +241,7 @@ class TestShadowDetection:
     def test_commented_out_keys_do_not_count_as_shadowing(self, env_file, fake_root):
         agent_dir = fake_root / "agents" / "test-healing-agent"
         agent_dir.mkdir(parents=True)
-        (agent_dir / ".env").write_text("# AUTOFIX_MODEL=claude-opus-5\n")
+        (agent_dir / ".env").write_text("# HEALING_MODEL=claude-opus-5\n")
         assert agent_settings._find_shadowed() == {}
 
 

@@ -18,7 +18,7 @@ the model* — correct when the repo arrived broken, and completely wrong when o
 own edit broke it. Compiling immediately after the edit tells the two apart: clean
 before, broken after, is our fault.
 
-`ADAPT_APPLY=false` (the default while the guards earn trust) runs everything up to
+`ADAPTATION_APPLY=false` (the default while the guards earn trust) runs everything up to
 and including the guards, records the complete diff, and applies nothing.
 
 Reads:   01-parse-change.json, 02-scope.json, 03-explore.json
@@ -50,13 +50,13 @@ from lib.transaction import Transaction
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
-MODEL = os.environ.get("ADAPT_MODEL", "claude-opus-5")
+MODEL = os.environ.get("ADAPTATION_MODEL", "claude-opus-5")
 ATTEMPT = int(os.environ.get("ADAPT_ATTEMPT", "1"))
-APPLY = os.environ.get("ADAPT_APPLY", "false").lower() == "true"
-MAX_FILES = int(os.environ.get("ADAPT_MAX_FILES_PER_RUN", "6"))
-MAX_TOTAL_DIFF = int(os.environ.get("ADAPT_MAX_TOTAL_DIFF_LINES", "200"))
-TEST_TIMEOUT_S = int(os.environ.get("ADAPT_TEST_TIMEOUT_S", "300"))
-COMPILE_CMD = os.environ.get("TEST_COMPILE_CMD", "mvn -q test-compile -DskipTests")
+APPLY = os.environ.get("ADAPTATION_APPLY", "false").lower() == "true"
+MAX_FILES = int(os.environ.get("ADAPTATION_MAX_FILES_PER_RUN", "6"))
+MAX_TOTAL_DIFF = int(os.environ.get("ADAPTATION_MAX_TOTAL_DIFF_LINES", "200"))
+TEST_TIMEOUT_S = int(os.environ.get("ADAPTATION_TEST_TIMEOUT_S", "300"))
+COMPILE_CMD = os.environ.get("ADAPTATION_TEST_COMPILE_CMD", "mvn -q test-compile -DskipTests")
 RULES_FILE = REPO_ROOT / "config" / "prompts" / "adapt.md"
 SYSTEM_PROMPT = REPO_ROOT / "config" / "skills" / "automation-repo.md"
 
@@ -539,7 +539,7 @@ def main():
                                        "summary": record["summary"]})
             # Recorded with accepted=None: nobody has judged it yet, and "not
             # reviewed" must not average in with "rejected". Whether people accept
-            # proposals verbatim is the promotion criterion for turning ADAPT_APPLY
+            # proposals verbatim is the promotion criterion for turning ADAPTATION_APPLY
             # on, and it is only knowable if somebody writes it down.
             try:
                 verdict_feedback.record_proposal(
@@ -549,7 +549,7 @@ def main():
             except Exception as exc:
                 log(f"  (could not record the proposal: {exc})")
             result["items"].append(record)
-            log("  proposed (ADAPT_APPLY=false — nothing written)")
+            log("  proposed (ADAPTATION_APPLY=false — nothing written)")
             continue
 
         txn.apply()

@@ -176,7 +176,7 @@ def attach_baselines(issues: list, workspace: Path, audit_dir: Path, log=print) 
     if not workspace or not issues:
         return
     try:
-        source = Path(os.environ.get("BASELINE_DIR") or (Path(workspace) / "baselines"))
+        source = Path(os.environ.get("HEALING_BASELINE_DIR") or (Path(workspace) / "baselines"))
         if not source.exists():
             return
         preserved = audit_dir / "baselines"
@@ -188,7 +188,7 @@ def attach_baselines(issues: list, workspace: Path, audit_dir: Path, log=print) 
             copied += 1
         if copied:
             for issue in issues:
-                issue["baseline_dir"] = str(preserved)
+                issue["healing_baseline_dir"] = str(preserved)
             log(f"  {copied} baseline(s) preserved for the session")
     except Exception as e:
         log(f"  Could not preserve baselines: {e}")

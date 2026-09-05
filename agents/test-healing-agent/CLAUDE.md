@@ -213,7 +213,7 @@ is usually a handful of defects, so the agent works in phases:
    one unit of work. The selector recorded in the trace is the strongest key;
    element names and the triage grouping are fallbacks. The same element name in
    two different page objects is never merged.
-3. **`AUTO_FIX_MAX_FIXES_PER_RUN` caps distinct fixes, not tests.** Clusters are
+3. **`HEALING_MAX_FIXES_PER_RUN` caps distinct fixes, not tests.** Clusters are
    attempted largest-first, so a capped run unblocks the most tests it can.
    Deferred clusters are reported as such, not silently dropped.
 4. **One investigation, one edit, per cluster.** The member with the best
@@ -371,9 +371,9 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | Variable | Purpose |
 |---|---|
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary (default: claude) |
-| `AUTOFIX_MODEL` | Claude model for fix generation (default: `claude-opus-5`) |
-| `AUTOFIX_INSPECT_DOM` | Read the failing page in a real browser before fixing (default: true) |
-| `AUTOFIX_BASE_URL` | Page URL for DOM inspection, overriding whatever is recovered from the execution log |
+| `HEALING_MODEL` | Claude model for fix generation (default: `claude-opus-5`) |
+| `HEALING_INSPECT_DOM` | Read the failing page in a real browser before fixing (default: true) |
+| `HEALING_BASE_URL` | Page URL for DOM inspection, overriding whatever is recovered from the execution log |
 | `AUTOFIX_DOM_TIMEOUT_S` | Wall-clock budget for one browser inspection (default: 600) |
 | `PLAYWRIGHT_HEADLESS` | Set `false` to watch every browser this agent starts: DOM inspection, the locate replay, session minting, and the reproduce / verification / probe runs (as `-Dheadless`) |
 | `AUTOFIX_LOGIN_USERNAME`, `AUTOFIX_LOGIN_PASSWORD` | Credentials override. Normally unnecessary — a saved session or `parameters/*.properties` is used first |
@@ -381,22 +381,22 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `AUTOFIX_REPAIR_SESSION` | Explicit path to a `.repair-session.json`. Unset → looked for under the workspace's `test-output/` |
 | `AUTOFIX_MAX_DIFF_LINES` | Reject a fix whose diff exceeds this many lines (default: 40) |
 | `DIAGNOSIS_PROBE` | `false` to skip confirmation probes (default: on). A probe costs one test run and buys a measured verdict instead of an assumed one |
-| `BASELINE_DIR` | Where page baselines are read from. Unset → `<workspace>/test-output/baselines`. Point CI at a path that survives between builds, or baselines are discarded with every report directory |
+| `HEALING_BASELINE_DIR` | Where page baselines are read from. Unset → `<workspace>/test-output/baselines`. Point CI at a path that survives between builds, or baselines are discarded with every report directory |
 | `DIAGNOSIS_MODE` | `shadow` (default) — diagnose and log, but let the old behaviour decide. `enforce` — a stop verdict skips the work before any model call. Shadow exists so the verdicts can be measured against real outcomes before they refuse work the agent used to do |
 | `AUTOFIX_PAGE_OBJECT_CHARS` | Budget per page object shown to Claude (default: 8000). Declarations are always kept in full |
 | `PAGE_OBJECT_DIRS` | Comma-separated page-object search dirs. Unset → derived from the repo layout |
-| `AUTOFIX_TEST_TIMEOUT_S` | Timeout for one verification test run (default: 300) |
+| `HEALING_TEST_TIMEOUT_S` | Timeout for one verification test run (default: 300) |
 | `WORKSPACE_DIR` | Parent directory for the automation repo. Must be outside QA-Agent-Network. If the repo is not present, test-healing-agent clones it automatically using `GITHUB_TOKEN` + `GITHUB_ORG` + `GITHUB_REPO_AUTOMATION`. |
 | `GITHUB_REPO_AUTOMATION` | Name of the automation repo — the dir under `WORKSPACE_DIR` and the repo name on GitHub |
 | `FRAMEWORK_DIR` | Absolute path to the checkout, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION`. Unset → the derived path |
 | `GITHUB_TOKEN` | GitHub authentication for PR creation |
 | `GITHUB_ORG` | GitHub org owning the automation repo |
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs (default: main) |
-| `AUTOFIX_BRANCH_PREFIX` | Prefix for fix branches (default: `chore/qa-autofix`). Full name: `<prefix>/<build-tag>` |
+| `HEALING_BRANCH_PREFIX` | Prefix for fix branches (default: `healing`). Full name: `<prefix>/<build-tag>` |
 | `GITHUB_PR_REVIEWERS` | Comma-separated list of PR reviewers |
 | `REPO_CONTEXT_FILE` | Path to conventions file in the automation repo (relative to repo root or absolute). If unset or not found, falls back to `agents/test-healing-agent/CONVENTIONS.md` bundled in this agent. |
 | `TEST_RUNNER_CMD` | Override test runner — use `{class}`, `{class_simple}`, `{method}` placeholders. Without it, runners are auto-detected at the repo root and one level down; if none is found, fixes are reported `unverified` |
-| `AUTO_FIX_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
+| `HEALING_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
 | `HEALING_RETRY_COUNT` | Max retry cycles if tests fail (default: 4) |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) |
 | `SLACK_BOT_TOKEN`, `SLACK_NOTIFY_CHANNEL` | Slack notifications on success |

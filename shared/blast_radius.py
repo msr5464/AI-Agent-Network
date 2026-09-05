@@ -20,7 +20,7 @@ Three things make this honest rather than merely big:
   * **Hub suppression.** Every test transitively reaches `Element`, `Config` and
     `BasePage`. Propagating backwards through those returns the entire suite,
     which is the same as returning nothing. Types referenced by more files than
-    ADAPT_HUB_THRESHOLD do not propagate — but they are *reported with the count
+    ADAPTATION_HUB_THRESHOLD do not propagate — but they are *reported with the count
     they would have added*, never silently dropped, because "excluded as a hub" and
     "not related" are different answers and only one of them is a judgement call.
 
@@ -47,7 +47,7 @@ from shared.test_catalog import list_tests
 # How far a change is allowed to propagate in each direction. Three hops covers
 # test -> helper -> page object -> component; beyond that the relationship is
 # usually incidental.
-MAX_HOPS = int(os.environ.get("ADAPT_BLAST_MAX_HOPS", "3"))
+MAX_HOPS = int(os.environ.get("ADAPTATION_BLAST_MAX_HOPS", "3"))
 
 # A type referenced by more files than this is shared infrastructure, not a
 # neighbour. Expressed as a floor plus a proportion so it scales with the repo.
@@ -57,18 +57,18 @@ MAX_HOPS = int(os.environ.get("ADAPT_BLAST_MAX_HOPS", "3"))
 # the backward walk crossed them and returned all 55 tests in the suite. "Every
 # test is affected" is the same answer as "no idea". A tenth of the repo is the
 # line where a type has stopped being a neighbour and started being plumbing.
-_HUB_FLOOR = int(os.environ.get("ADAPT_HUB_THRESHOLD", "8"))
+_HUB_FLOOR = int(os.environ.get("ADAPTATION_HUB_THRESHOLD", "8"))
 _HUB_RATIO = 0.10
 
 # Types to force back in despite looking like hubs, comma-separated.
 _FORCE_INCLUDE = {n.strip() for n in
-                  os.environ.get("ADAPT_BLAST_INCLUDE", "").split(",") if n.strip()}
+                  os.environ.get("ADAPTATION_BLAST_INCLUDE", "").split(",") if n.strip()}
 
 # Rough wall-clock cost of verifying one test, for the budget line.
-SECONDS_PER_TEST = int(os.environ.get("ADAPT_SECONDS_PER_TEST", "180"))
+SECONDS_PER_TEST = int(os.environ.get("ADAPTATION_SECONDS_PER_TEST", "180"))
 
 # Beyond this the change is bigger than one agent run and must escalate.
-MAX_TESTS = int(os.environ.get("ADAPT_BLAST_MAX_TESTS", "40"))
+MAX_TESTS = int(os.environ.get("ADAPTATION_BLAST_MAX_TESTS", "40"))
 
 _CAPITALISED = re.compile(r"\b([A-Z]\w*)\b")
 _STRING_LITERAL = re.compile(r'"(?:\\.|[^"\\])*"' + r"|'(?:\\.|[^'\\])*'")
@@ -434,6 +434,6 @@ def describe(result: dict) -> str:
     mins = round(budget["est_seconds"] / 60)
     lines.append(f"**Budget:** {budget['tests_to_verify']} test(s) to verify "
                  f"≈ {mins} min at {budget['seconds_per_test']}s each"
-                 + ("  ⚠️ over ADAPT_BLAST_MAX_TESTS — escalate"
+                 + ("  ⚠️ over ADAPTATION_BLAST_MAX_TESTS — escalate"
                     if budget["over_limit"] else ""))
     return "\n".join(lines)
