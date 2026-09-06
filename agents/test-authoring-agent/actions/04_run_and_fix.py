@@ -222,7 +222,7 @@ def run_maven_test(test_class: str, test_method: str) -> tuple:
         f"-Dtest={test_arg}",
         f"-Denvironment={ENVIRONMENT}",
         f"-Dcountry={COUNTRY}",
-        # Only when PLAYWRIGHT_HEADLESS actually says so. Passing nothing lets
+        # Only when HEADLESS_BROWSER actually says so. Passing nothing lets
         # the framework's own parameters/config.properties decide, which is the
         # same rule shared/test_runner applies to every other agent's build.
         *(f"-D{key}={value}" for key, value in browser_mode.maven_properties().items()),

@@ -104,7 +104,7 @@ def mint(workspace, module: str, entry: Dict, headless: Optional[bool] = None,
          log=lambda m: None) -> Dict:
     """Run the entry path the test uses. Returns {ok, path, reason}.
 
-    `headless` unset means "whatever this run asked for" — PLAYWRIGHT_HEADLESS,
+    `headless` unset means "whatever this run asked for" — HEADLESS_BROWSER,
     then headless. A login is the one browser step worth watching when it goes
     wrong, so it must not be the step that ignores the switch.
     """

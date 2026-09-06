@@ -514,13 +514,10 @@ def _rule_too_slow(ev: Dict):
             "why this page got slower")
 
 
-_STRICT_MODE = re.compile(r"strict[ _-]?mode violation", re.I)
-
-
 def _rule_ambiguous_locator(ev: Dict):
     """The selector matched several elements, so no action could run on it.
 
-    Playwright resolves a locator strictly: two matches is an error thrown the
+    Some frameworks resolve a locator strictly: two matches is an error thrown the
     instant the wait starts, not a wait that ran out of time. The remedy is to
     narrow the selector to the one element the test means — which makes this a
     locator defect, and the exact case a match count above zero was previously
@@ -533,18 +530,21 @@ def _rule_ambiguous_locator(ev: Dict):
     matches = ev.get("failing_selector_matches") or 0
     if matches < 2:
         return None
-    strict = bool(_STRICT_MODE.search(ev.get("wait_error") or ""))
+    
+    from shared.frameworks import get_active_plugin
+    is_ambiguous = get_active_plugin().diagnostics.is_ambiguous_locator(ev.get("wait_error") or "")
+    
     # A snapshot count is an approximation of a different question. The real
     # locator may be chained off a parent or scoped to a frame, in which case
     # document-wide matches say nothing about whether it was ambiguous. Only a
     # count taken on the locator itself settles that.
-    if ev.get("matches_source") != "live" and not strict:
+    if ev.get("matches_source") != "live" and not is_ambiguous:
         return None
 
-    reasons = [f"the failing selector matches {matches} elements, so Playwright "
+    reasons = [f"the failing selector matches {matches} elements, so the automation framework "
                f"cannot decide which one the test means"]
-    if strict:
-        reasons.append("the framework recorded a strict mode violation, which is "
+    if is_ambiguous:
+        reasons.append("the framework recorded an ambiguous locator error (e.g. strict mode violation), which is "
                        "this failure by name")
     else:
         reasons.append("counted on the live locator at the moment it failed, so it "

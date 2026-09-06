@@ -74,7 +74,7 @@ def main() -> int:
                          "from --module when omitted")
     ap.add_argument("--workspace", default=None)
     ap.add_argument("--headed", action="store_true",
-                    help="watch the login happen. Without it, PLAYWRIGHT_HEADLESS "
+                    help="watch the login happen. Without it, HEADLESS_BROWSER "
                          "decides, as it does for every other browser here")
     args = ap.parse_args()
 

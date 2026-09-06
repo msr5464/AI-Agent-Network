@@ -60,6 +60,20 @@ _EFFORT_OPTIONS = [
 ]
 
 SETTINGS_SCHEMA: List[Dict[str, Any]] = [
+    {
+        "key": "automation_framework",
+        "env_var": "AUTOMATION_FRAMEWORK",
+        "label": "Automation Framework",
+        "description": "Select the automation framework used in your target repository.",
+        "type": "select",
+        "options": [
+            {"label": "Playwright", "value": "playwright"},
+            {"label": "Selenium", "value": "selenium"}
+        ],
+        "category": "common",
+        "default": "playwright",
+        "sensitive": False,
+    },
     # ── test-adaptation-agent ────────────────────────────────────────────────
     {"key": "adaptation_model", "env_var": "ADAPTATION_MODEL", "label": "Adaptation model",
      "description": "Claude model used to classify the change note and write edits.",

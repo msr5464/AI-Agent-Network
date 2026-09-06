@@ -17,7 +17,7 @@ The "Rules (MANDATORY)" section below is loaded at runtime; dynamic context (pla
    API methods call `execute()`/`executeAndVerify()`/`executeRaw()`.
    For token auth: call `setAuthToken(token)` on the helper after construction.
    Web methods only if they orchestrate 2+ page objects.
-6. Page objects: extend `BasePage`. Define all locators in constructor using `page.locator()`.
+6. Page objects: extend `BasePage`. Define all locators using the target framework's native locator syntax.
    Call `waitUntilLoaded()` LAST in constructor. `waitUntilLoaded()` uses `WaitHelper`.
    All interactions use `BasePage` methods (`click`, `fillText`, `getText`, `isElementDisplayed`).
    Navigation methods return the next page object.

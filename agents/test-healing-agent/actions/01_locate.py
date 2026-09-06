@@ -220,7 +220,7 @@ def _headless(workspace) -> bool:
     verdict reached on "Access Denied" is worse than no verdict — every locator
     looks removed and the page looks like the wrong one.
 
-    PLAYWRIGHT_HEADLESS governs, as it does for every other browser in the
+    HEADLESS_BROWSER governs, as it does for every other browser in the
     network; failing that, follow the framework's own answer in
     parameters/config.properties rather than guessing.
 

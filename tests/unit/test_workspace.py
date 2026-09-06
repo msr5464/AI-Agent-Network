@@ -125,7 +125,7 @@ class TestLoadRepoEnv:
             "WORKSPACE_DIR=/somewhere\n"
             "GITHUB_REPO_AUTOMATION=Repo\n"
             'FRAMEWORK_DIR="/quoted/path"\n'
-            "PLAYWRIGHT_HEADLESS=false\n"
+            "HEADLESS_BROWSER=false\n"
             "SLACK_BOT_TOKEN=xoxb-secret\n")
         return tmp_path
 
@@ -138,14 +138,14 @@ class TestLoadRepoEnv:
         assert os.environ["FRAMEWORK_DIR"] == "/quoted/path"
 
     def test_leaves_every_other_setting_alone(self, env_file, monkeypatch):
-        # The regression this exists for: PLAYWRIGHT_HEADLESS coming along for
+        # The regression this exists for: HEADLESS_BROWSER coming along for
         # the ride flipped the capture-parity test into a headed browser, whose
         # scrollbar takes layout width — so the geometry diverged from the Java
         # side and the failure read as a capture bug.
-        monkeypatch.delenv("PLAYWRIGHT_HEADLESS", raising=False)
+        monkeypatch.delenv("HEADLESS_BROWSER", raising=False)
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
         workspace.load_repo_env(env_file)
-        assert "PLAYWRIGHT_HEADLESS" not in os.environ
+        assert "HEADLESS_BROWSER" not in os.environ
         assert "SLACK_BOT_TOKEN" not in os.environ
 
     def test_an_exported_value_wins(self, env_file, monkeypatch):

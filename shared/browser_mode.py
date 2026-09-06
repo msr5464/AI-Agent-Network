@@ -35,17 +35,28 @@ _TRUE = {"true", "1", "yes", "on"}
 _FALSE = {"false", "0", "no", "off"}
 
 #: The switch every agent honours. Named for the library, not for one step.
-ENV_VAR = "PLAYWRIGHT_HEADLESS"
+ENV_VAR = "HEADLESS_BROWSER"
+LEGACY_ENV_VAR = "PLAYWRIGHT_HEADLESS"
+
+# Standardised across agents: the boolean flag parsed from the environment
+def _read_env() -> Optional[bool]:
+    """Parse the raw env var. None if missing or empty."""
+    val = os.environ.get(ENV_VAR)
+    if not val:
+        val = os.environ.get(LEGACY_ENV_VAR)
+    if not val:
+        return None
+    val = val.strip().lower()
+    if val in _TRUE:
+        return True
+    if val in _FALSE:
+        return False
+    return None
 
 
 def parse(raw: Optional[str]) -> Optional[bool]:
     """True / False for a recognised spelling, None for unset or unreadable."""
-    value = (raw or "").strip().lower()
-    if value in _TRUE:
-        return True
-    if value in _FALSE:
-        return False
-    return None
+    return _read_env()
 
 
 def configured() -> Optional[bool]:

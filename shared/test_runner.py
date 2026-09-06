@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from shared import browser_mode, narration
+from shared.frameworks import get_active_plugin
 
 DEFAULT_TIMEOUT_S = int(os.environ.get("HEALING_TEST_TIMEOUT_S", "300"))
 
@@ -63,7 +64,7 @@ def _as_properties(extra_properties: Optional[Dict[str, str]]) -> List[str]:
 
 def _apply_browser_mode(cmd: List[str],
                         properties: Dict[str, str]) -> Tuple[List[str], Dict[str, str]]:
-    """Make PLAYWRIGHT_HEADLESS reach the browser this runner is about to launch.
+    """Make HEADLESS_BROWSER reach the browser this runner is about to launch.
 
     The test run is where most of a session's browser time is actually spent —
     reproduce, verify, probe — and none of it honoured the switch before, so
@@ -91,38 +92,10 @@ def _apply_browser_mode(cmd: List[str],
 def detect_test_command(workspace: Path, class_simple: str, method: str,
                         log: Callable[[str], None] = lambda _m: None) -> List[str]:
     """Find a runner at the repo root or one level down (multi-module layouts)."""
-    # With no method, run the whole class.
-    gradle_filter = f"*.{class_simple}.{method}" if method else f"*.{class_simple}"
-    maven_filter = f"{class_simple}#{method}" if method else class_simple
-
-    def build_cmd(root: Path) -> Optional[List[str]]:
-        if (root / "gradlew").exists():
-            return ["./gradlew", "test", "--tests", gradle_filter, "-q", "--rerun-tasks"]
-        if (root / "build.gradle").exists() or (root / "build.gradle.kts").exists():
-            return ["gradle", "test", "--tests", gradle_filter, "-q"]
-        if (root / "pom.xml").exists():
-            return ["mvn", "test", f"-Dtest={maven_filter}", "--no-transfer-progress"]
-        if (root / "package.json").exists():
-            return ["npx", "playwright", "test", "--grep", method or class_simple, "-x"]
-        return None
-
-    cmd = build_cmd(workspace)
+    from shared.frameworks import get_active_plugin
+    cmd = get_active_plugin().runner.detect_command(workspace, class_simple, method)
     if cmd:
         return cmd
-
-    # Multi-module repo: the build file may live one directory down. Without
-    # this, such a layout silently reported every fix as verified.
-    try:
-        children = sorted(p for p in workspace.iterdir() if p.is_dir())
-    except OSError:
-        return []
-    for child in children:
-        if child.name.startswith(".") or child.name in _NON_MODULE_DIRS:
-            continue
-        cmd = build_cmd(child)
-        if cmd:
-            log(f"  Test runner found in submodule {child.name}")
-            return cmd
     return []
 
 
@@ -138,7 +111,7 @@ def run_test(test_name: str, workspace: Path,
     Config.getRunTimeProperty checks System.getProperty first, so this is how the
     reproduce step turns on tracing and repair mode for the run it triggers.
 
-    `headless` is added from PLAYWRIGHT_HEADLESS unless the caller passed its own
+    `headless` is added from HEADLESS_BROWSER unless the caller passed its own
     — see `_apply_browser_mode`.
     """
     full_class, class_simple, method = split_test_name(test_name)

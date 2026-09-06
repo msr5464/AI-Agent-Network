@@ -61,10 +61,8 @@ def _css(value: str) -> str:
     as "a guess". Single quotes need no escaping, and match the convention the
     repo already uses (img[alt='mukesh']).
     """
-    text = value or ""
-    if "'" not in text:
-        return "'" + text + "'"
-    return '"' + text.replace('"', '\\"') + '"'
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().code.quote_css_value(value)
 
 
 def _unique(ctx, sel: str, expect_index: int | None = None, snap: dict | None = None) -> bool:
@@ -143,15 +141,20 @@ def scoped_by_context(ctx, el: dict, expect_index: int, snap: dict | None) -> di
     # Still ambiguous: bring in a nearby text that tells the sections apart.
     texts = sorted((t for t in (el.get("neighbor_texts") or []) if t and len(t) <= 60),
                    key=lambda t: -text_stability(t))[:4]
+    from shared.frameworks import get_active_plugin
     for anchor in anchors:
         for text in texts:
             if text_stability(text) < 0:
                 continue
-            selector = f'{anchor}:has-text({_css(text)}) {tag}'
+            selector = get_active_plugin().code.build_has_text_selector(anchor, text, tag)
+            if selector in seen:
+                continue
+            seen.add(selector)
             if _unique(ctx, selector, expect_index, snap):
-                return {"strategy": "scoped-by-text", "sel": selector,
-                        "python": f"page.locator({_q(selector)})",
-                        "java": f"page.locator({_q(selector)})"}
+                code_snippet = get_active_plugin().code.emit_locator(selector=selector)
+                return {"strategy": "scoped-by-neighbor", "sel": selector,
+                        "python": code_snippet.get("python", ""),
+                        "java": code_snippet.get("java", "")}
     return None
 
 
@@ -314,4 +317,85 @@ def emit(ctx, el: dict, vol: Volatility, snap: dict | None = None) -> dict | Non
         return {"strategy": "xpath", "sel": f"xpath={xp}", "fragile": hint,
                 "python": f"page.locator({_q('xpath=' + xp)})",
                 "java": f"page.locator({_q('xpath=' + xp)})"}
+    return None
+
+
+def synthesize(ctx, el: dict, expect_index: int | None = None, snap: dict | None = None) -> dict | None:
+    """The best selector for this element. None if it could not be uniquely identified.
+
+    `expect_index` checks the generated selector actually resolves to the exact
+    node we started with (identified by index in the flat snapshot).
+    """
+    from shared.frameworks import get_active_plugin
+    code_engine = get_active_plugin().code
+    
+    if el.get("testid") and _unique(ctx, f'[data-testid={_css(el["testid"])}]', expect_index, snap):
+        code_snippet = code_engine.emit_locator(testid=el["testid"])
+        return {"strategy": "testid", "sel": f'[data-testid={_css(el["testid"])}]',
+                "python": code_snippet.get("python", ""),
+                "java": code_snippet.get("java", "")}
+
+    tag = el.get("tag", "")
+    role = el.get("role", "")
+    text = el.get("inner_text") or el.get("value") or ""
+    
+    jrole = code_engine.map_role(role)
+    if role and jrole and text and len(text) < 40 and text_stability(text) >= 0:
+        # getByRole allows a role filter and a text filter in one call, which is
+        # the single most durable way to identify an element.
+        test_sel = f"{tag}:has-text({_css(text)})" if text else tag
+        if _unique(ctx, test_sel, expect_index, snap):
+            code_snippet = code_engine.emit_locator(role=jrole, name=text, exact=True)
+            return {"strategy": "role-name", "sel": test_sel,
+                    "python": code_snippet.get("python", ""),
+                    "java": code_snippet.get("java", "")}
+
+    for attribute in ("placeholder", "alt", "aria_label", "title", "name"):
+        v = el.get(attribute)
+        if not v or len(v) > 60:
+            continue
+        sel = f"{tag}[{attribute.replace('_', '-')}={_css(v)}]"
+        if _unique(ctx, sel, expect_index, snap):
+            if attribute == "placeholder":
+                code_snippet = code_engine.emit_locator(placeholder=v)
+                return {"strategy": "placeholder", "sel": sel,
+                        "python": code_snippet.get("python", ""),
+                        "java": code_snippet.get("java", "")}
+            elif attribute in ("aria_label", "title", "alt"):
+                code_snippet = code_engine.emit_locator(label=v)
+                return {"strategy": "label", "sel": sel,
+                        "python": code_snippet.get("python", ""),
+                        "java": code_snippet.get("java", "")}
+            code_snippet = code_engine.emit_locator(selector=sel)
+            return {"strategy": "attribute", "sel": sel,
+                    "python": code_snippet.get("python", ""),
+                    "java": code_snippet.get("java", "")}
+
+    if text and len(text) < 40 and text_stability(text) >= 0:
+        sel = f"{tag}:has-text({_css(text)})"
+        if _unique(ctx, sel, expect_index, snap):
+            code_snippet = code_engine.emit_locator(text=text, exact=True)
+            return {"strategy": "text", "sel": sel,
+                    "python": code_snippet.get("python", ""),
+                    "java": code_snippet.get("java", "")}
+
+    if el.get("id") and not VOLATILE_SELECTOR.search(el["id"]) and _unique(ctx, f'#{el["id"]}', expect_index, snap):
+        code_snippet = code_engine.emit_locator(selector=f'#{el["id"]}')
+        return {"strategy": "id", "sel": f'#{el["id"]}',
+                "python": code_snippet.get("python", ""),
+                "java": code_snippet.get("java", "")}
+
+    classes = [c for c in (el.get("classes") or []) if not VOLATILE_SELECTOR.search(c)]
+    if classes:
+        sel = tag + "".join(f".{c}" for c in classes)
+        if _unique(ctx, sel, expect_index, snap):
+            code_snippet = code_engine.emit_locator(selector=sel)
+            return {"strategy": "class", "sel": sel,
+                    "python": code_snippet.get("python", ""),
+                    "java": code_snippet.get("java", "")}
+
+    scoped = scoped_by_context(ctx, el, expect_index, snap) if expect_index is not None else None
+    if scoped:
+        return scoped
+
     return None

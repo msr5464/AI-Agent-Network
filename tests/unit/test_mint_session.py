@@ -152,12 +152,12 @@ def test_minting_follows_playwright_headless_when_the_caller_says_nothing(
         tmp_path, monkeypatch):
     """A login is the browser step most worth watching when it goes wrong, so
     it must not be the one that ignores the switch everything else honours."""
-    monkeypatch.setenv("PLAYWRIGHT_HEADLESS", "false")
+    monkeypatch.setenv("HEADLESS_BROWSER", "false")
     assert "-Dheadless=false" in _mint_capturing_command(tmp_path, monkeypatch)
 
 
 def test_an_explicit_headless_argument_still_wins(tmp_path, monkeypatch):
-    monkeypatch.setenv("PLAYWRIGHT_HEADLESS", "false")
+    monkeypatch.setenv("HEADLESS_BROWSER", "false")
     seen = {}
 
     class Result:

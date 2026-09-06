@@ -151,7 +151,7 @@ from shared.claude import call_claude as _call_claude
 from shared.git import run_git
 
 try:
-    from shared.mcp_config import write_playwright_mcp_config
+    from shared.mcp_config import write_mcp_config
     _HAS_MCP_CONFIG = True
 except ImportError:
     _HAS_MCP_CONFIG = False
@@ -731,21 +731,19 @@ def _inspect_parked_browser(ctx: dict, session: dict) -> dict:
         failed_selector = (f"\nThe selector that failed at runtime was: "
                            f"{ctx['failed_selector']}\nIt no longer matches — find what replaced it.\n")
 
-    mcp_path = write_playwright_mcp_config(AUDIT_DIR, cdp_endpoint=endpoint)
+    mcp_path = write_mcp_config(AUDIT_DIR, cdp_endpoint=endpoint)
     prompt = _PARKED_PROMPT.format(elements=elements, failure=failure,
                                    failed_selector=failed_selector)
 
+    from shared.frameworks import get_active_plugin
     log(f"  Attaching to the parked browser at {endpoint}...")
     try:
         raw = call_claude(
             prompt, AUDIT_DIR,
             use_system_prompt=False,
             timeout=DOM_TIMEOUT_S,
-            allowed_tools=["mcp__playwright__*"],
-            mcp_config=str(mcp_path),
-            strict_mcp_config=True,
-            stream_json=True,
-            partial_on_timeout=True,
+            allowed_tools=get_active_plugin().mcp.allowed_tools(),
+            label="fix-repair-mode"
         )
         result["raw"] = raw[-4000:] if raw else ""
         if not raw:
@@ -885,7 +883,7 @@ def inspect_live_dom(ctx: dict, url: str, workspace: Path, props: dict,
             credentials = (f"\nCREDENTIALS (use exactly these):\n"
                            f"  username: {creds['username']}\n  password: {creds['password']}\n")
 
-    mcp_path = write_playwright_mcp_config(AUDIT_DIR, headless=PW_HEADLESS,
+    mcp_path = write_mcp_config(AUDIT_DIR, headless=PW_HEADLESS,
                                            storage_state=storage_state)
     prompt = _DOM_PROMPT.format(url=url, elements=elements, failure=failure,
                                 credentials=credentials)

@@ -30,7 +30,7 @@ from shared.credential_extraction import credentials_from_plan  # noqa: E402
 CLAUDE_CLI  = os.environ.get("CLAUDE_CLI_PATH", "claude")
 MODEL       = os.environ.get("AUTHORING_MODEL", "claude-opus-4-6")
 # Per-action wait budget handed to Claude for individual browser interactions.
-PW_TIMEOUT  = int(os.environ.get("AUTHORING_PLAYWRIGHT_TIMEOUT_MS", "30000"))
+PW_TIMEOUT  = int(os.environ.get("AUTHORING_BROWSER_TIMEOUT_MS", "30000"))
 PW_HEADLESS = browser_mode.headless()
 # Wall-clock budget for the whole validation run. A login-gated flow of 10+ steps
 # on a heavy site routinely needs 15-25 minutes, so the default is generous;
@@ -44,7 +44,7 @@ VALIDATE_RETRY_ATTEMPTS = int(os.environ.get("VALIDATE_WEB_RETRY_ATTEMPTS", "1")
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 from shared.claude import call_claude_ex            # noqa: E402  (after sys.path update)
-from shared.mcp_config import write_playwright_mcp_config  # noqa: E402
+from shared.mcp_config import write_mcp_config  # noqa: E402
 from shared.log import log as _log      # noqa: E402  (shared, redacts known secrets)
 from shared.page_identity import is_dom_selector    # noqa: E402
 from shared import check_provenance                  # noqa: E402
@@ -295,7 +295,7 @@ CATEGORY_FIX_HINTS = {
     "login_failed": "Login failed — verify Username/Password in the queue input "
         "file, or check the screenshot for a CAPTCHA/2FA prompt.",
     "timeout": "Action timed out — the element may exist but load slowly, be "
-        "hidden, or be off-screen. Consider raising AUTHORING_PLAYWRIGHT_TIMEOUT_MS.",
+        "hidden, or be off-screen. Consider raising AUTHORING_BROWSER_TIMEOUT_MS.",
     "overlay_blocking": "A cookie-consent banner, modal, or popup blocked "
         "interaction and could not be dismissed automatically — check the "
         "screenshot for what's covering the target element.",
@@ -522,7 +522,7 @@ CREDENTIALS (use exactly these — do NOT use any other values):
     # Write .mcp.json so the `claude -p` subprocess can use the Playwright MCP server
     mode_label = browser_mode.label(PW_HEADLESS)
     log(f"Browser mode: {mode_label}")
-    mcp_path = write_playwright_mcp_config(REPO_ROOT, headless=PW_HEADLESS)
+    mcp_path = write_mcp_config(REPO_ROOT, headless=PW_HEADLESS)
     log(f"Playwright MCP config written: {mcp_path}")
 
     steps_numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(web_steps))

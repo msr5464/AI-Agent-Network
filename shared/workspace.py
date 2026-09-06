@@ -81,7 +81,7 @@ def resolve(workspace_dir, repo_name: str = "", exclude=None) -> Path:
 
 
 # The only keys this module has any business injecting. Reading config/.env
-# wholesale looks harmless and is not: it also carries PLAYWRIGHT_HEADLESS,
+# wholesale looks harmless and is not: it also carries HEADLESS_BROWSER,
 # model names, DB credentials and Slack tokens, so a caller that wanted to know
 # where the repo lives would silently have its browser mode — and everything
 # else — reconfigured underneath it.

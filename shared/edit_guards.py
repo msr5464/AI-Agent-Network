@@ -286,8 +286,8 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
                 return False, (f"the replacement selector still matches {hits} "
                                f"elements in the DOM captured at failure, and the "
                                f"diagnosis is that matching more than one IS the "
-                               f"failure — it would throw the same strict mode "
-                               f"violation")
+                               f"failure — it would throw the same ambiguous locator "
+                               f"error")
             if hits == 0:
                 return False, ("the replacement selector matches nothing in the "
                                "DOM captured at failure, so it is a guess rather "

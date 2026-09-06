@@ -42,7 +42,7 @@ def log(msg): _log("explore-web", msg)
 from shared import browser_mode, entry_path, flow_map, mint_session, session_state
 from shared.code_analyzer import read_source
 from shared.claude import call_claude_ex
-from shared.mcp_config import write_playwright_mcp_config
+from shared.mcp_config import write_mcp_config
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
@@ -125,6 +125,24 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
             log(f"    step {seen['steps']}")
         elif text.startswith(("REFUSED:", "UNREACHABLE_STATE:")):
             log(f"    {text[:110]}")
+
+    prompt = _EXPLORE_PROMPT.format(steps=steps_text,
+                                    context=str(context))
+
+    from shared.frameworks import get_active_plugin
+    log("  Sending to Claude for exploration...")
+    try:
+        raw = call_claude_ex(
+            prompt,
+            AUDIT_DIR,
+            system_prompt_file=Path("config/prompts/adapt.md"),
+            timeout=int(os.environ.get("ADAPT_EXPLORE_TIMEOUT_MS", "300000")),
+            allowed_tools=get_active_plugin().mcp.allowed_tools(),
+            label="explore",
+        )
+    except Exception as e:
+        log(f"  Failed to call Claude: {e}")
+        raw = ""
 
     result = call_claude_ex(
         prompt=build_prompt(plan, rules, notes, stop_before),
@@ -241,7 +259,7 @@ def main():
 
     # .mcp.json goes in the audit dir: the repo root is shared mutable state, and
     # the server can be running another agent against it at the same time.
-    mcp_path = write_playwright_mcp_config(AUDIT_DIR, headless=HEADLESS,
+    mcp_path = write_mcp_config(AUDIT_DIR, headless=HEADLESS,
                                            storage_state=session.get("path"))
     log(f"Playwright MCP: {browser_mode.label(HEADLESS)}, "
         f"config {mcp_path.name}, "

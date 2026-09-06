@@ -42,6 +42,9 @@ A human learns the product changed (before anything goes red)
 
 Each agent runs completely independently. There is no orchestration layer — the handoff file written by Agent 2 is the only coupling between Agent 2 and Agent 3.
 
+**Framework Agnosticism & Plugins:**
+The agents themselves are entirely framework-agnostic. They communicate with the target automation repository via a **Framework Plugin Suite** (`shared/frameworks/`). Playwright and Selenium plugins are supported out of the box. To integrate a new framework, or to understand what your automation repository must output to be supported, see the [Framework Integration Guide](./FRAMEWORK_INTEGRATION.md).
+
 **Agents 3 and 4 are deliberately separate.** Healing is reactive and holds exactly one
 hypothesis: the selector string is stale. That narrowness is enforced at six layers on
 purpose, because the verification loop cannot catch a fix built on a wrong diagnosis —

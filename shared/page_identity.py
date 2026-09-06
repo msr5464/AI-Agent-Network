@@ -155,16 +155,8 @@ def is_dom_selector(raw: str) -> bool:
     `[ref=e71]` is the reverse — evaluable-looking and runtime-useless. Callers
     recording selectors for later code generation want this question, not that one.
     """
-    if not raw or not raw.strip():
-        return False
-    selector = raw.strip()
-    if _ARIA_REF.search(selector):
-        return False
-    if _TEXT_ATTR.search(selector):
-        return False
-    if _BARE_REF.match(selector):
-        return False
-    return True
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().code.is_dom_selector(raw)
 
 
 def normalize_selector(raw: str) -> Optional[str]:
@@ -173,30 +165,8 @@ def normalize_selector(raw: str) -> Optional[str]:
     None means "we cannot tell", and every caller must keep that distinct from a
     match count of zero.
     """
-    if not raw:
-        return None
-    selector = raw.strip()
-
-    # Playwright's Locator.toString() is what reaches us through error messages.
-    if selector.startswith("Locator@"):
-        selector = selector[len("Locator@"):].strip()
-
-    # Strip repeatedly: "a >> nth=0 >> visible=true" is legal.
-    while True:
-        stripped = _NARROWING_SUFFIX.sub("", selector)
-        if stripped == selector:
-            break
-        selector = stripped.strip()
-
-    if not selector:
-        return None
-    lowered = selector.lower()
-    if lowered.startswith(_UNEVALUABLE_PREFIX):
-        return None
-    if any(token in lowered for token in _UNEVALUABLE_TOKEN):
-        return None
-
-    return selector
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().code.normalize_selector(raw)
 
 
 def _compile_ok(soup, selector: str) -> bool:
@@ -274,70 +244,8 @@ def extract_locators(source: str) -> List[Dict[str, str]]:
     Reads the page-object source the fix step already loads, so no extra file
     access is needed. Duplicates are collapsed on the raw selector string.
     """
-    found: List[Dict[str, str]] = []
-    seen = set()
-    if not source:
-        return found
-
-    for index, pattern in enumerate(_LOCATOR_PATTERNS):
-        is_findby = index == 2
-        for match in pattern.finditer(source):
-            raw = _unescape(match.group("sel"))
-            if not raw or raw in seen:
-                continue
-            seen.add(raw)
-            name = match.groupdict().get("name") or ""
-            if not name and is_findby:
-                # @FindBy: the field is declared just after the annotation.
-                tail = source[match.end():match.end() + 200]
-                field = _FINDBY_FIELD.search(tail)
-                if field:
-                    name = field.group(1)
-            if not name:
-                # An accessor method: its name is behind us, not ahead.
-                head = _ACCESSOR_NAME.search(source[:match.start()])
-                if head:
-                    name = head.group(1)
-            found.append({"name": name, "raw": raw, "kind": "css",
-                          "value": "", "approx": False,
-                          "selector": normalize_selector(raw) or ""})
-
-    for pattern, kind in _GETBY_PATTERNS:
-        for match in pattern.finditer(source):
-            groups = match.groupdict()
-            value = groups.get("val") or groups.get("role") or ""
-            if not value:
-                continue
-            name = groups.get("name") or ""
-            if not name:
-                field = _FINDBY_FIELD.search(source[max(0, match.start() - 200):match.start()])
-                if field:
-                    name = field.group(1)
-            entry = {"name": name, "kind": kind, "value": value,
-                     "approx": kind in ("role", "text", "label"),
-                     "selector": "", "accessible_name": ""}
-            if kind == "role":
-                # setName() is a chained call, so look just past the match.
-                set_name = _SET_NAME.search(source[match.end():match.end() + 300])
-                entry["accessible_name"] = set_name.group("val") if set_name else ""
-                entry["selector"] = _ROLE_TAGS.get(value.upper(), "")
-                entry["raw"] = (f"getByRole({value}"
-                                + (f', name="{entry["accessible_name"]}"' if entry["accessible_name"] else "")
-                                + ")")
-            elif kind == "testid":
-                entry["selector"] = f"[data-testid='{value}']"
-                entry["raw"] = f'getByTestId("{value}")'
-            elif kind == "placeholder":
-                entry["selector"] = f"[placeholder='{value}']"
-                entry["raw"] = f'getByPlaceholder("{value}")'
-            else:  # text / label — matched by content, not by selector
-                entry["accessible_name"] = value
-                entry["raw"] = f'getBy{kind.capitalize()}("{value}")'
-            if entry["raw"] in seen:
-                continue
-            seen.add(entry["raw"])
-            found.append(entry)
-    return found
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().code.extract_locators(source)
 
 
 def locator_coverage(locators: List[Dict[str, str]], soup) -> Dict:
