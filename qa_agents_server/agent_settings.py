@@ -89,7 +89,11 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
                     "the shared surface. The verify set holds the single global run "
                     "slot, so 'all' can make the platform single-tasked for an hour.",
      "type": "select", "category": "adaptation", "default": "named_only",
-     "options": ["named_only", "tiered", "all"], "sensitive": False},
+     "options": [
+         {"value": "named_only", "label": "named_only"},
+         {"value": "tiered", "label": "tiered"},
+         {"value": "all", "label": "all"}
+     ], "sensitive": False},
     {"key": "adaptation_explore_timeout_s", "env_var": "ADAPTATION_EXPLORE_TIMEOUT_S",
      "label": "Exploration budget (s)",
      "description": "Wall-clock limit for one browser exploration.",
