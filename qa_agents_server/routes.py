@@ -57,11 +57,16 @@ def queue_list(agent: str):
     spec, err = _resolve(agent)
     if err:
         return err
+    user_id = request.headers.get("X-User-ID", "default")
     if spec.queue_kind == "txt":
-        return jsonify({"items": feature_files.list_features(spec.name)})
+        return jsonify({"items": feature_files.list_features(spec.name, user_id=user_id)})
     # A json queue holds handoffs written by another agent — read-only here;
     # nothing but that agent should be putting work in it.
     items = []
+    # Using spec.queue_dir without user_id because healing handoff is global from CI?
+    # Actually wait. If triaging output is global, then handoffs are global.
+    # Healing agent doesn't use queue_kind="txt", so it uses spec.queue_dir directly.
+    # Let's keep it that way for healing agent.
     if spec.queue_dir.exists():
         for path in sorted(spec.queue_dir.glob("*.json")):
             stat = path.stat()
@@ -75,6 +80,7 @@ def queue_create(agent: str):
     spec, err = _resolve(agent)
     if err:
         return err
+    user_id = request.headers.get("X-User-ID", "default")
     if spec.queue_kind != "txt":
         return jsonify({"error": f"{spec.name}'s queue is written by "
                                  f"another agent, not through this API"}), 405
@@ -82,7 +88,7 @@ def queue_create(agent: str):
     name = body.get("name")
     content = body.get("content")
     try:
-        result = feature_files.write_feature(name, content, spec.name)
+        result = feature_files.write_feature(name, content, spec.name, user_id=user_id)
     except feature_files.FeatureFileError as e:
         return jsonify({"error": str(e)}), e.status
     return jsonify(result), 201
@@ -93,13 +99,14 @@ def queue_read(agent: str, name: str):
     spec, err = _resolve(agent)
     if err:
         return err
+    user_id = request.headers.get("X-User-ID", "default")
     if spec.queue_kind != "txt":
         path = spec.queue_dir / f"{name}.json"
         if not path.exists():
             return jsonify({"error": f"handoff not found: {name}"}), 404
         return jsonify({"name": name, "content": path.read_text()})
     try:
-        return jsonify(feature_files.read_feature(name, spec.name))
+        return jsonify(feature_files.read_feature(name, spec.name, user_id=user_id))
     except feature_files.FeatureFileError as e:
         return jsonify({"error": str(e)}), e.status
 
@@ -359,6 +366,7 @@ def run_start(agent: str):
     if err:
         return err
     body = request.get_json(silent=True) or {}
+    user_id = request.headers.get("X-User-ID", "default")
 
     # Reject a bad base branch here rather than only in build_env. build_env
     # also runs on the reap thread that drains the pending queue, where a raise
@@ -382,7 +390,7 @@ def run_start(agent: str):
             }), 400
 
     try:
-        run = runner.start_run(body, agent=spec.name)
+        run = runner.start_run(body, agent=spec.name, user_id=user_id)
     except runner._QueuedNotification as q:
         return jsonify({
             "queued": True,
@@ -446,22 +454,29 @@ def run_active(agent: str):
     if err:
         return err
 
-    session_id = runner.get_active_session_id()
+    user_id = request.headers.get("X-User-ID", "default")
+    session_id = runner.get_active_session_id(user_id)
     run = runner.get_run(session_id) if session_id else None
+
+    # We now have multiple concurrent slots. So we check if the worker pool is full
+    # by importing MAX_CONCURRENT_RUNS logic.
+    with runner._registry_lock:
+        busy = len(runner._active_runs) >= runner.max_concurrent_runs()
+
     if run is None:
-        return jsonify({"active": False, "busy": False})
+        return jsonify({"active": False, "busy": busy})
 
     if run.agent != spec.name:
         return jsonify({
             "active": False,
-            "busy": True,
+            "busy": busy,
             "busy_agent": run.agent,
             "busy_since": run.started_at,
         })
 
     return jsonify({
         "active": True,
-        "busy": True,
+        "busy": busy,
         "busy_agent": run.agent,
         "agent": run.agent,
         "session_id": run.session_id,
@@ -540,9 +555,11 @@ def session_retry(agent: str, session_id: str):
     if original_base:
         payload["base_branch"] = original_base
 
+    user_id = request.headers.get("X-User-ID", "default")
+
     try:
         run = runner.start_run(payload, agent=spec.name,
-                               session_id=session_id, start_from_step=from_step)
+                               session_id=session_id, start_from_step=from_step, user_id=user_id)
     except runner._QueuedNotification as q:
         return jsonify({
             "queued": True,
@@ -574,6 +591,12 @@ def run_stream(agent: str, session_id: str):
         offset = int(request.args.get("offset", 0))
     except (TypeError, ValueError):
         offset = 0
+
+    user_id = request.headers.get("X-User-ID")
+    from qa_agents_server import storage
+    run_record = storage.get(session_id)
+    if run_record and user_id and run_record.get("user_id", "default") != user_id:
+        return jsonify({"error": "forbidden"}), 403
 
     live_run = runner.get_run(session_id)
 
@@ -617,9 +640,12 @@ def sessions_list(agent: str):
         offset = max(int(request.args.get("offset", 0)), 0)
     except (TypeError, ValueError):
         limit, offset = 50, 0
-    return jsonify({"items": audit_reader.list_sessions(limit=limit, offset=offset,
-                                                    agent=spec.name)})
 
+    user_id = request.headers.get("X-User-ID")
+    # If the requester is an admin, they might pass a specific user_id to filter,
+    # or skip it to see all. For now, we enforce X-User-ID isolation for members.
+    return jsonify({"items": audit_reader.list_sessions(limit=limit, offset=offset,
+                                                    agent=spec.name, user_id=user_id)})
 
 # Artefacts the framework wrote next to a failure — screenshot, DOM snapshot,
 # trace zip, video. The console logs them as absolute paths, but a browser will
@@ -639,6 +665,10 @@ def _artefact_roots(spec) -> list:
     workspace = _automation_workspace()
     if workspace:
         roots.append(Path(workspace) / "test-output")
+    # Add support for ephemeral worktrees.
+    tmp_qa_runs = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs")
+    if tmp_qa_runs:
+        roots.append(Path(tmp_qa_runs))
     return [r.resolve() for r in roots if r and Path(r).exists()]
 
 
@@ -705,6 +735,13 @@ def sessions_get(agent: str, session_id: str):
     spec, err = _resolve(agent)
     if err:
         return err
+
+    user_id = request.headers.get("X-User-ID")
+    from qa_agents_server import storage
+    run_record = storage.get(session_id)
+    if run_record and user_id and run_record.get("user_id", "default") != user_id:
+        return jsonify({"error": "forbidden"}), 403
+
     session = audit_reader.get_session(session_id, agent=spec.name)
     if session is None:
         return jsonify({"error": "session not found"}), 404
@@ -733,6 +770,34 @@ def session_metrics(agent: str, session_id: str):
 
 
 # ── Analytics (spans agents, so deliberately not under /agents/<agent>/) ───────
+@qa_bp.route("/analytics/clear", methods=["DELETE"])
+def analytics_clear():
+    user_id_param = (request.args.get("user_id") or "").strip() or None
+    window_param = (request.args.get("window") or "7d").strip()
+    
+    # 1. Clear in-memory / JSON history registry 
+    from qa_agents_server import storage
+    storage.clear(user_id=user_id_param, window=window_param)
+    
+    # 2. Clear analytics JSONL
+    removed_sids = analytics.clear_history(user_id=user_id_param, window=window_param)
+    
+    # 3. Clear from runner's in-memory registry
+    from qa_agents_server import runner
+    runner.remove_history(removed_sids)
+
+    # 4. Physically delete the audit directories
+    from qa_agents_server.agents import AGENTS
+    import shutil
+    for sid in removed_sids:
+        for spec in AGENTS.values():
+            audit_path = spec.audit_dir / sid
+            if audit_path.exists():
+                shutil.rmtree(audit_path, ignore_errors=True)
+                
+    return jsonify({"success": True})
+
+
 @qa_bp.route("/analytics/summary", methods=["GET"])
 def analytics_summary():
     """Per-agent and overall rollups over a window: 24h | 7d | 30d | all.
@@ -752,10 +817,21 @@ def analytics_summary():
         except ValueError:
             return None
 
+    # Note: AI-Test-Studio admin portal enforces auth and passes X-User-ID.
+    # Regular users can only see their own analytics; admins can filter by user_id or see all.
+    user_id_param = (request.args.get("user_id") or "").strip() or None
+    requester_user_id = request.headers.get("X-User-ID")
+    requester_role = request.headers.get("X-User-Role", "member")
+    
+    query_user_id = user_id_param
+    if requester_role != "admin":
+        query_user_id = requester_user_id
+
     return jsonify(analytics.query(
         window=window,
         agent=(request.args.get("agent") or "").strip() or None,
         since=_ts("from"), until=_ts("to"),
+        user_id=query_user_id
     ))
 
 

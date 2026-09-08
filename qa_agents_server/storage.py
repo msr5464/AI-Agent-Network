@@ -110,3 +110,35 @@ def get(session_id: str) -> Optional[Dict]:
         if entry.get("session_id") == session_id:
             return entry
     return None
+
+
+def clear(user_id: Optional[str] = None, window: str = "all"):
+    ADMIN_USER_ID = "21232f297a57"
+    import time
+    from qa_agents_server.analytics import WINDOWS
+    now = time.time()
+    since = None
+    if window in WINDOWS and WINDOWS[window] is not None:
+        since = now - WINDOWS[window]
+
+    with _lock:
+        data = _read_locked()
+        if (not user_id or user_id == "all") and since is None:
+            _atomic_write([])
+        else:
+            kept = []
+            for r in data:
+                r_user = r.get("user_id") or ADMIN_USER_ID
+                if r_user in ("default", "admin"):
+                    r_user = ADMIN_USER_ID
+                
+                if (not user_id or user_id == "all" or r_user == user_id):
+                    # Match on user. Check time.
+                    ts = float(r.get("started_at") or 0)
+                    if since is not None and ts < since:
+                        kept.append(r)
+                    else:
+                        pass # delete
+                else:
+                    kept.append(r)
+            _atomic_write(kept)

@@ -177,10 +177,17 @@ def _derive_status(session_dir: Path, ship_data: Optional[Dict],
 
 
 def list_sessions(limit: int = 50, offset: int = 0,
-                  agent: str = DEFAULT_AGENT) -> List[Dict]:
+                  agent: str = DEFAULT_AGENT, user_id: Optional[str] = None) -> List[Dict]:
     """Return session summaries for one agent, newest first."""
     spec = get_agent(agent)
-    return _dispatch("list", spec)(spec, limit, offset)
+    all_sessions = _dispatch("list", spec)(spec, 10000, 0)
+    
+    if user_id:
+        from qa_agents_server import storage
+        runs = {r.get("session_id"): r.get("user_id", "default") for r in storage.load_all()}
+        all_sessions = [s for s in all_sessions if runs.get(s["session_id"], "default") == user_id]
+
+    return all_sessions[offset : offset + limit]
 
 
 def _list_authoring_sessions(spec, limit: int, offset: int) -> List[Dict]:

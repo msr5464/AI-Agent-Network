@@ -31,7 +31,12 @@ export REPO_ROOT
 
 source "$REPO_ROOT/shared/session.sh"
 
-QUEUE_DIR="$AGENT_DIR/queue"
+USER_ID="${USER_ID:-${USER:-cli}}"
+if [[ "$USER_ID" == "default" || "$USER_ID" == "cli" ]]; then
+  QUEUE_DIR="$AGENT_DIR/queue"
+else
+  QUEUE_DIR="$AGENT_DIR/queue/$USER_ID"
+fi
 PROCESSED_DIR="$QUEUE_DIR/processed"
 mkdir -p "$PROCESSED_DIR"
 

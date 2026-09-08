@@ -125,11 +125,13 @@ class RunState:
     # no defaults, and a dataclass will not take a defaulted field before them.
     base_branch: str = ""
     payload: Dict = field(default_factory=dict)
+    user_id: str = "default"
 
     def snapshot(self) -> Dict:
         """Persistable snapshot (no Popen, no threading primitives)."""
         return {
             "session_id": self.session_id,
+            "user_id": self.user_id,
             "agent": self.agent,
             "module": self.module,
             "auto_push": self.auto_push,
@@ -158,11 +160,17 @@ class RunState:
 
 # ── Module state ──────────────────────────────────────────────────────────────
 _runs: Dict[str, RunState] = {}
-_active_session_id: Optional[str] = None
+_active_runs: Dict[str, RunState] = {}
 _registry_lock = threading.Lock()
 
+def max_concurrent_runs() -> int:
+    try:
+        return int(os.environ.get("QA_MAX_CONCURRENT_RUNS", "4"))
+    except ValueError:
+        return 4
+
 # ── Pending queue ─────────────────────────────────────────────────────────────
-# Each entry: {"agent": str, "payload": dict, "module": str, "auto_push": bool}
+# Each entry: {"agent": str, "payload": dict, "module": str, "auto_push": bool, "user_id": str}
 _pending_queue: List[Dict] = []
 # Set once shutdown begins. Killing the active run makes its reaper try to start
 # the next queued item, which would spawn fresh work while the server is on its
@@ -191,12 +199,33 @@ def _start_next_from_queue() -> None:
     with _queue_lock:
         if _shutting_down.is_set() or not _pending_queue:
             return
-        next_item = _pending_queue.pop(0)
+        
+        # Round-robin by user_id to prevent one user from starving the queue.
+        # Find the user whose turn it is. We can just count active runs per user.
+        with _registry_lock:
+            active_counts = {}
+            for r in _active_runs.values():
+                active_counts[r.user_id] = active_counts.get(r.user_id, 0) + 1
+        
+        # Find the pending item belonging to the user with the fewest active runs.
+        # Break ties by queue position (index).
+        best_idx = 0
+        best_count = active_counts.get(_pending_queue[0].get("user_id", "default"), 0)
+        
+        for i, item in enumerate(_pending_queue):
+            uid = item.get("user_id", "default")
+            count = active_counts.get(uid, 0)
+            if count < best_count:
+                best_idx = i
+                best_count = count
+                
+        next_item = _pending_queue.pop(best_idx)
     try:
         start_run(next_item.get("payload", {}),
                   agent=next_item.get("agent", DEFAULT_AGENT),
                   session_id=next_item.get("session_id"),
-                  start_from_step=next_item.get("start_from_step", 1))
+                  start_from_step=next_item.get("start_from_step", 1),
+                  user_id=next_item.get("user_id", "default"))
     except Exception as e:
         print(f"[runner] failed to start queued run for {next_item.get('module')!r} "
               f"(session {next_item.get('session_id')}): {e}")
@@ -371,6 +400,24 @@ def reconcile_on_boot() -> None:
                 _mark_interrupted(Path(entry["audit_dir"]))
 
     interrupted = storage.mark_all_running_as_interrupted()
+    
+    # Prune orphaned worktrees
+    try:
+        worktree_temp_dir = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs")
+        if Path(worktree_temp_dir).exists():
+            from shared import workspace as _workspace
+            main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""), os.environ.get("GITHUB_REPO_AUTOMATION", ""))
+            if main_repo and main_repo.exists():
+                _workspace._git(["worktree", "prune"], cwd=str(main_repo), timeout=120)
+                # Any directories still in QA_WORKTREE_TEMP_DIR might be untracked maven target files
+                # of crashed runs. If they are no longer linked as valid worktrees, they can be removed.
+                import shutil
+                for wt_dir in Path(worktree_temp_dir).iterdir():
+                    if wt_dir.is_dir():
+                        shutil.rmtree(wt_dir, ignore_errors=True)
+    except Exception as e:
+        print(f"[runner] failed to prune orphaned worktrees: {e}")
+
     if killed:
         print(f"[runner] killed {len(killed)} orphaned run(s) left by a previous "
               f"server process: {', '.join(killed)}")
@@ -415,17 +462,28 @@ def shutdown_all() -> None:
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
-def get_active_session_id() -> Optional[str]:
-    return _active_session_id
-
+def get_active_session_id(user_id: str = "default") -> Optional[str]:
+    with _registry_lock:
+        for run in _active_runs.values():
+            if run.user_id == user_id:
+                return run.session_id
+    return None
 
 def get_run(session_id: str) -> Optional[RunState]:
     return _runs.get(session_id)
 
 
+def remove_history(session_ids: List[str]) -> None:
+    """Remove inactive runs from the in-memory registry."""
+    with _registry_lock:
+        for sid in session_ids:
+            if sid in _runs and sid not in _active_runs:
+                del _runs[sid]
+
+
 def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
               session_id: Optional[str] = None, start_from_step: int = 1,
-              **legacy) -> RunState:
+              user_id: str = "default", **legacy) -> RunState:
     """Spawn an agent's run.sh. Raises RunnerError on validation.
 
     payload is the request body; each AgentSpec turns it into environment
@@ -442,8 +500,6 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
 
     **legacy accepts the pre-multi-agent keyword form start_run(module=..., auto_push=...).
     """
-    global _active_session_id
-
     payload = dict(payload or {})
     if "module" in legacy or "auto_push" in legacy:
         payload.setdefault("module", legacy.get("module"))
@@ -480,7 +536,7 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
         module = payload.get("module")
         if not module:
             raise RunnerError("module is required")
-        if feature_exists(module, spec.name) is None:
+        if feature_exists(module, spec.name, user_id=user_id) is None:
             raise RunnerError(
                 f"queue file not found: {module}.txt — create it first via "
                 f"POST /agents/{spec.name}/queue",
@@ -501,24 +557,21 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
         raise RunnerError(f"agent run.sh not found at {spec.run_sh}", status=500)
 
     with _registry_lock:
-        if _active_session_id is not None:
-            active = _runs.get(_active_session_id)
-            if active and active.status == "running":
-                # Queue instead of rejecting. The slot is deliberately global
-                # across agents: they all mutate the same automation-repo
-                # checkout, so overlapping runs would corrupt the working tree.
-                with _queue_lock:
-                    queued_session_id = (session_id if resuming
-                                         else _unique_session_id(spec, payload))
-                    _pending_queue.append({
-                        "agent": spec.name, "payload": payload,
-                        "module": label, "auto_push": bool(payload.get("auto_push")),
-                        "base_branch": (payload.get("base_branch") or "").strip(),
-                        "session_id": queued_session_id,
-                        "start_from_step": start_from_step,
-                    })
-                    position = len(_pending_queue)
-                raise _QueuedNotification(position, queued_session_id)
+        if len(_active_runs) >= max_concurrent_runs():
+            # Queue instead of rejecting.
+            with _queue_lock:
+                queued_session_id = (session_id if resuming
+                                     else _unique_session_id(spec, payload))
+                _pending_queue.append({
+                    "agent": spec.name, "payload": payload,
+                    "module": label, "auto_push": bool(payload.get("auto_push")),
+                    "base_branch": (payload.get("base_branch") or "").strip(),
+                    "session_id": queued_session_id,
+                    "start_from_step": start_from_step,
+                    "user_id": user_id,
+                })
+                position = len(_pending_queue)
+            raise _QueuedNotification(position, queued_session_id)
 
         if not session_id:
             with _queue_lock:
@@ -526,10 +579,38 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
         audit_dir = spec.audit_dir / session_id
         audit_dir.mkdir(parents=True, exist_ok=True)
 
+        # Create isolated git worktree for parallel execution
+        worktree_temp_dir = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs")
+        worktree_path = Path(worktree_temp_dir) / session_id
+        
+        from shared import workspace as _workspace
+        import tempfile
+        import shutil
+        
+        main_repo = _workspace.ensure(
+            os.environ.get("WORKSPACE_DIR", ""),
+            os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+            org=os.environ.get("GITHUB_ORG", ""),
+            token=os.environ.get("GITHUB_TOKEN", ""),
+            branch=payload.get("base_branch") or os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
+        )
+        if main_repo:
+            base_branch = payload.get("base_branch") or os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
+            wt_result = _workspace.prepare_worktree(
+                str(main_repo), str(worktree_path), base_branch
+            )
+            if not wt_result.get("ok"):
+                raise RunnerError(f"Failed to create isolated git worktree: {wt_result.get('reason')}", status=500)
+        else:
+            raise RunnerError("Automation repo not found and could not be cloned.", status=500)
+
         env = os.environ.copy()
         env.update(agent_env)
         env["SESSION_ID"] = session_id
         env["AUDIT_DIR"] = str(audit_dir)
+        env["USER_ID"] = user_id
+        env["FRAMEWORK_DIR"] = str(worktree_path)
+        env["QA_ISOLATED_WORKTREE_READY"] = "1"
 
         # Captured BEFORE Popen() (not after) — _audit_watcher uses this as the
         # cutoff for "did THIS run's own subprocess actually write this file,
@@ -562,9 +643,10 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
             proc=proc,
             pid=proc.pid,
             start_from_step=start_from_step,
+            user_id=user_id,
         )
         _runs[session_id] = run
-        _active_session_id = session_id
+        _active_runs[session_id] = run
 
     # Emit initial status event
     _append_event(run, "status", {
@@ -610,30 +692,23 @@ def cancel_run(session_id: str) -> bool:
     # Send SIGTERM to the entire process group (run.sh spawns python3 / mvn / claude).
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.terminate()
-        except OSError:
-            pass
+    except (ProcessLookupError, PermissionError):
+        pass
 
-    # Give it a grace period, then SIGKILL if still alive.
-    def _escalate():
-        time.sleep(CANCEL_GRACE_SECONDS)
-        if proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+    # Cleanup worktree on cancel
+    try:
+        worktree_path = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs") + "/" + session_id
+        from shared import workspace as _workspace
+        main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""), os.environ.get("GITHUB_REPO_AUTOMATION", ""))
+        if main_repo and Path(worktree_path).exists():
+            _workspace.cleanup_worktree(str(main_repo), str(worktree_path))
+    except Exception:
+        pass
 
-    threading.Thread(target=_escalate, daemon=True).start()
-    run.status = "cancelled"  # _wait_and_reap will confirm once proc exits
     return True
 
 
-def subscribe_stream(session_id: str, offset: int) -> Generator[Event, None, None]:
+def subscribe_stream(session_id: str, offset: int = 0) -> Generator[Event, None, None]:
     """Generator yielding events from `offset` onward until the run terminates.
 
     Safe to call from a Flask SSE endpoint — does not hold any lock while
@@ -878,8 +953,6 @@ def _audit_watcher(run: RunState) -> None:
 
 def _wait_and_reap(run: RunState) -> None:
     """Wait for the subprocess to exit, determine final status, emit done."""
-    global _active_session_id
-
     proc = run.proc
     if proc is None:
         return
@@ -923,6 +996,16 @@ def _wait_and_reap(run: RunState) -> None:
     else:
         final_status = "failed"
     run.status = final_status
+
+    # Cleanup worktree on completion
+    try:
+        worktree_path = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs") + "/" + run.session_id
+        from shared import workspace as _workspace
+        main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""), os.environ.get("GITHUB_REPO_AUTOMATION", ""))
+        if main_repo and Path(worktree_path).exists():
+            _workspace.cleanup_worktree(str(main_repo), str(worktree_path))
+    except Exception as e:
+        print(f"[runner] failed to cleanup worktree for {run.session_id}: {e}")
 
     # Authoritative final sweep — _audit_watcher polls on its own schedule
     # (every AUDIT_POLL_INTERVAL) and can lose the race against THIS thread for
@@ -1019,8 +1102,8 @@ def _wait_and_reap(run: RunState) -> None:
 
     # Clear active run marker
     with _registry_lock:
-        if _active_session_id == run.session_id:
-            _active_session_id = None
+        if run.session_id in _active_runs:
+            del _active_runs[run.session_id]
 
     # Kick off the next queued run, if any
     _start_next_from_queue()

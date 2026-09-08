@@ -66,7 +66,12 @@ _cache_save() {
 }
 
 # ── Locate input file ─────────────────────────────────────────────────────────
-QUEUE_DIR="$AGENT_DIR/queue"
+USER_ID="${USER_ID:-${USER:-cli}}"
+if [[ "$USER_ID" == "default" || "$USER_ID" == "cli" ]]; then
+  QUEUE_DIR="$AGENT_DIR/queue"
+else
+  QUEUE_DIR="$AGENT_DIR/queue/$USER_ID"
+fi
 PROCESSED_DIR="$QUEUE_DIR/processed"
 mkdir -p "$PROCESSED_DIR"
 
@@ -266,12 +271,16 @@ export GIT_TERMINAL_PROMPT=0
 # An explicitly empty GITHUB_DEFAULT_BRANCH means "branch from current HEAD",
 # which the CLI honours — matching actions/05_ship.py, which has always read a
 # blank value that way while this block was quietly defaulting it to main.
-log "Prerequisite: preparing $AUTOMATION_FRAMEWORK_DIR on ${GITHUB_DEFAULT_BRANCH:-<current HEAD>} ..."
-if ! (cd "$REPO_ROOT" && python3 -m shared.workspace prepare-base --checkout 2>&1); then
-  log "ERROR: could not prepare ${GITHUB_DEFAULT_BRANCH:-the checkout} in $AUTOMATION_FRAMEWORK_DIR — aborting"
-  exit 1
+if [[ "${QA_ISOLATED_WORKTREE_READY:-}" == "1" ]]; then
+  log "Prerequisite: running inside isolated worktree $AUTOMATION_FRAMEWORK_DIR"
+else
+  log "Prerequisite: preparing $AUTOMATION_FRAMEWORK_DIR on ${GITHUB_DEFAULT_BRANCH:-<current HEAD>} ..."
+  if ! (cd "$REPO_ROOT" && python3 -m shared.workspace prepare-base --checkout 2>&1); then
+    log "ERROR: could not prepare ${GITHUB_DEFAULT_BRANCH:-the checkout} in $AUTOMATION_FRAMEWORK_DIR — aborting"
+    exit 1
+  fi
+  log "Prerequisite: ${GITHUB_DEFAULT_BRANCH:-current HEAD} is ready"
 fi
-log "Prerequisite: ${GITHUB_DEFAULT_BRANCH:-current HEAD} is ready"
 
 # ── Step 01 — Parse ────────────────────────────────────────────────────────────
 if [[ "$START_FROM_STEP" -gt 1 ]]; then

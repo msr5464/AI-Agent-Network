@@ -163,7 +163,8 @@ def build_record(audit_dir: Path, agent: str = "", status: str = "",
                  exit_code: Optional[int] = None, module: str = "",
                  started_at: Optional[float] = None,
                  ended_at: Optional[float] = None,
-                 auto_push: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+                 auto_push: Optional[bool] = None,
+                 user_id: str = "default") -> Optional[Dict[str, Any]]:
     """Assemble one analytics row from a finished session's audit dir."""
     d = Path(audit_dir)
     if not d.is_dir():
@@ -197,6 +198,7 @@ def build_record(audit_dir: Path, agent: str = "", status: str = "",
     record = {
         "schema": SCHEMA_VERSION,
         "session_id": d.name,
+        "user_id": user_id,
         "agent": agent,
         "module": module or "",
         "started_at": started_at or session.get("started_at"),
@@ -327,7 +329,8 @@ def _accumulate(target: Dict[str, Any], row: Dict[str, Any]) -> None:
 
 
 def query(window: str = "7d", agent: Optional[str] = None,
-          since: Optional[float] = None, until: Optional[float] = None) -> Dict[str, Any]:
+          since: Optional[float] = None, until: Optional[float] = None,
+          user_id: Optional[str] = None) -> Dict[str, Any]:
     """Rollups over a time window.
 
     Returns raw counts, cost and duration only. Time-saved is deliberately NOT
@@ -343,6 +346,7 @@ def query(window: str = "7d", agent: Optional[str] = None,
     data_since = min((float(r.get("started_at") or 0) for r in rows
                       if r.get("started_at")), default=None)
 
+    ADMIN_USER_ID = "21232f297a57"
     selected = []
     for row in rows:
         started = float(row.get("started_at") or 0)
@@ -352,6 +356,12 @@ def query(window: str = "7d", agent: Optional[str] = None,
             continue
         if agent and row.get("agent") != agent:
             continue
+        if user_id:
+            row_user = row.get("user_id") or ADMIN_USER_ID
+            if row_user in ("default", "admin"):
+                row_user = ADMIN_USER_ID
+            if row_user != user_id:
+                continue
         selected.append(row)
 
     overall = _blank_rollup()
@@ -382,6 +392,43 @@ def query(window: str = "7d", agent: Optional[str] = None,
 def _window_label(window: str) -> str:
     return {"24h": "Last 24 hours", "7d": "Last 7 days",
             "30d": "Last 30 days", "all": "All time"}.get(window, window)
+
+
+def clear_history(user_id: Optional[str] = None, window: str = "all") -> List[str]:
+    ADMIN_USER_ID = "21232f297a57"
+    now = time.time()
+    since = None
+    if window in WINDOWS and WINDOWS[window] is not None:
+        since = now - WINDOWS[window]
+
+    path = _store_path()
+    removed_sessions = []
+    if path.exists():
+        rows = _read_all()
+        if (not user_id or user_id == "all") and since is None:
+            removed_sessions = [r.get("session_id") for r in rows if r.get("session_id")]
+            path.write_text("")
+        else:
+            kept = []
+            for row in rows:
+                row_user = row.get("user_id") or ADMIN_USER_ID
+                if row_user in ("default", "admin"):
+                    row_user = ADMIN_USER_ID
+                
+                if (not user_id or user_id == "all" or row_user == user_id):
+                    ts = float(row.get("started_at") or 0)
+                    if since is not None and ts < since:
+                        kept.append(row)
+                    else:
+                        if row.get("session_id"):
+                            removed_sessions.append(row.get("session_id"))
+                else:
+                    kept.append(row)
+
+            with path.open("w", encoding="utf-8") as f:
+                for r in kept:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return removed_sessions
 
 
 if __name__ == "__main__":

@@ -484,11 +484,58 @@ def checkout_base(path, branch: str, start_point: str = "",
     except ValueError as e:
         return {"ok": False, "reason": f"invalid branch name: {e}"}
     start = start_point or f"origin/{branch}"
-    result = _git(["checkout", "-f", "-B", branch, start], cwd=path, timeout=120)
+    if os.environ.get("QA_ISOLATED_WORKTREE"):
+        # Git prohibits multiple worktrees from checking out the exact same local branch.
+        # In a parallel worktree context, we must remain detached to avoid branch lock collisions.
+        result = _git(["checkout", "-f", "--detach", start], cwd=path, timeout=120)
+    else:
+        result = _git(["checkout", "-f", "-B", branch, start], cwd=path, timeout=120)
     if result.returncode != 0:
         return {"ok": False,
                 "reason": f"could not check out {branch}: {result.stderr.strip()[:200]}"}
     log(f"Checkout is on {branch}")
+    return {"ok": True, "reason": ""}
+
+
+def prepare_worktree(main_path, worktree_path, branch: str, log=lambda m: None) -> Dict:
+    """Create a detached git worktree for isolated execution."""
+    try:
+        branch = normalise_branch(branch)
+    except ValueError as e:
+        return {"ok": False, "reason": f"invalid branch name: {e}"}
+
+    # First fetch the branch to ensure it exists locally
+    # Fetching +refs/heads/branch:refs/remotes/origin/branch is handled by prepare_base
+    
+    # Add detached worktree. Detaching prevents branch lock collisions.
+    result = _git(["worktree", "add", "--detach", str(worktree_path), f"origin/{branch}"], cwd=main_path, timeout=120)
+    if result.returncode != 0:
+        # Check if the error is just because worktree path already exists and is valid
+        if Path(worktree_path).exists():
+            log(f"Worktree already exists at {worktree_path}, skipping creation.")
+            return {"ok": True, "reason": ""}
+            
+        return {"ok": False,
+                "reason": f"could not create worktree at {worktree_path}: {result.stderr.strip()[:200]}"}
+    
+    log(f"Created isolated git worktree at {worktree_path}")
+    return {"ok": True, "reason": ""}
+
+
+def cleanup_worktree(main_path, worktree_path, log=lambda m: None) -> Dict:
+    """Remove a git worktree and prune."""
+    _git(["worktree", "remove", "--force", str(worktree_path)], cwd=main_path, timeout=120)
+    
+    # Force remove directory in case untracked files (e.g. target/) remain
+    import shutil
+    try:
+        if Path(worktree_path).exists():
+            shutil.rmtree(worktree_path, ignore_errors=True)
+    except Exception:
+        pass
+        
+    _git(["worktree", "prune"], cwd=main_path, timeout=120)
+    log(f"Cleaned up worktree at {worktree_path}")
     return {"ok": True, "reason": ""}
 
 
@@ -530,6 +577,16 @@ def _cli(argv: List[str]) -> int:
     if not result["ok"]:
         emit(f"ERROR: {result['reason']}")
         return 1
+
+    worktree_path = os.environ.get("QA_ISOLATED_WORKTREE", "")
+    
+    if worktree_path:
+        wt_result = prepare_worktree(path, worktree_path, result["branch"], log=emit)
+        if not wt_result["ok"]:
+            emit(f"ERROR: {wt_result['reason']}")
+            return 1
+        print(str(worktree_path))
+        return 0
 
     if "--checkout" in argv[1:]:
         moved = checkout_base(path, result["branch"], result["sha"], log=emit)

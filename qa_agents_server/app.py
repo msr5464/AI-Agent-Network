@@ -53,7 +53,7 @@ def create_app() -> Flask:
             "status": "ok",
             "service": "qa_agents_server",
             "version": "0.1.0",
-            "active_run": runner.get_active_session_id(),
+            "active_run": None,  # For backward compatibility. Clients should use /api/agents/<agent>/run/active
         })
 
     @app.errorhandler(404)
@@ -62,7 +62,9 @@ def create_app() -> Flask:
 
     @app.errorhandler(500)
     def _internal(_e):
-        return jsonify({"error": "internal server error"}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "internal server error", "details": str(_e)}), 500
 
     # Ensure subprocesses are cleaned up on shutdown (Ctrl-C, SIGTERM, atexit).
     def _shutdown(*_args):

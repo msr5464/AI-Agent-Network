@@ -624,7 +624,7 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "label": "Run Timeout (s)",
         "description": "Wall-clock budget for a single agent run before it is killed",
         "type": "number",
-        "category": "server",
+        "category": "common",
         "default": 7200,
         "sensitive": False,
         "min": 60,
@@ -636,18 +636,40 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "label": "Stale After (s)",
         "description": "How long a run may go without progress before the UI marks it stale",
         "type": "number",
-        "category": "server",
+        "category": "common",
         "default": 900,
         "sensitive": False,
         "min": 30,
         "max": 86400,
+    },
+    {
+        "key": "qa_max_concurrent_runs",
+        "env_var": "QA_MAX_CONCURRENT_RUNS",
+        "label": "Max Concurrent Runs",
+        "description": "Maximum number of agent runs allowed to execute in parallel across all users",
+        "type": "number",
+        "category": "common",
+        "default": 4,
+        "sensitive": False,
+        "min": 1,
+        "max": 32,
+    },
+    {
+        "key": "qa_worktree_temp_dir",
+        "env_var": "QA_WORKTREE_TEMP_DIR",
+        "label": "Git Worktree Temp Dir",
+        "description": "Directory where ephemeral git worktrees are created for isolated runs",
+        "type": "text",
+        "category": "common",
+        "default": "/tmp/qa-runs",
+        "sensitive": False,
     },
 ]
 
 _SCHEMA_BY_KEY: Dict[str, Dict[str, Any]] = {s["key"]: s for s in SETTINGS_SCHEMA}
 
 CATEGORIES: List[str] = ["common", "authoring", "healing", "adaptation",
-                         "triaging", "server"]
+                         "triaging"]
 
 
 class SettingsValidationError(Exception):
