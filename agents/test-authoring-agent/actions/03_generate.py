@@ -1009,6 +1009,22 @@ def main() -> None:
     # Read current content of files that already exist so Claude can extend them
     existing_files_context = read_existing_files_context(files_to_generate)
 
+    # Locator syntax comes from the active framework's CodeEngine rather than
+    # being spelled out in the prompt. The rule used to say "using page.locator()",
+    # which is Playwright's API and would have had the model write Playwright
+    # calls into a Selenium repo. A worked example beats a description here: it
+    # shows the shape of a real call, in this repo's language.
+    try:
+        from shared.frameworks import active_framework, get_active_plugin
+        _engine = get_active_plugin().code
+        _sample = _engine.emit_locator(selector="[data-cy='submit']")
+        _example = _sample.get("findby") or _sample.get("java") or ""
+        _LOCATOR_SYNTAX_HINT = (
+            f"this repo uses {active_framework()}, so a locator looks like "
+            f"`{_example}`" if _example else "match the surrounding page objects")
+    except Exception:
+        _LOCATOR_SYNTAX_HINT = "match the syntax the surrounding page objects already use"
+
     def build_prompt(batch_files: list, generated_context: str = "") -> str:
         return f"""You are a Java test automation code generator for the Jarvis framework.
 
@@ -1061,18 +1077,19 @@ Rules (MANDATORY — violations will cause compilation failures):
    If api_hint below reports the auth as already confirmed working (step 02 pre-validated it via a
    real HTTP call), it's safe to assume the recipe itself is correct — any resulting 401/403 in the
    generated test points at how this code applies auth, not at the credentials or the API.
-6. Page objects: extend BasePage. Define all locators in constructor using page.locator().
+6. Page objects: extend BasePage. Define all locators in the constructor using the
+   target framework's native locator syntax — {_LOCATOR_SYNTAX_HINT}.
    Call waitUntilLoaded() LAST in constructor. waitUntilLoaded() uses WaitHelper.
    All interactions use BasePage methods (click, fillText, getText, isElementDisplayed).
    Navigation methods return the next page object.
-6b. NAVIGATION — never call page.navigate() directly. Use
+6b. NAVIGATION — never drive the browser's navigation API directly. Use
    BrowserHelper.navigateTo(config, url), which logs the action and waits for the
    page to load afterwards.
 6c. NAVIGATING AWAY AFTER AN ACTION THAT ITSELF NAVIGATES — mandatory, this is the
    single most common runtime failure in generated web code. Clicking Login/Submit
    starts a navigation. Issuing another navigation while that one is still in
    flight makes Playwright abort it:
-     com.microsoft.playwright.PlaywrightException: net::ERR_ABORTED at <url>
+     (e.g. com.microsoft.playwright.PlaywrightException: net::ERR_ABORTED at <url>)
    So let the first navigation settle BEFORE starting the second:
      click(loginButton, "Login button");
      WaitHelper.waitForPageLoad(config);            // let the post-login redirect finish

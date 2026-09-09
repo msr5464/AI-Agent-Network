@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 from shared import failure_context as _failure_context
 from shared.dom_snapshot import find_snapshot, parse_header
-from shared.playwright_trace import failing_action, read_actions
+from shared.telemetry import failing_action, read_actions
 
 
 def from_this_run(paths: list, not_before: Optional[float]) -> list:
@@ -70,8 +70,13 @@ def attach(issue: dict, results_dir: Path, method_name: str,
     elif context.get("rejected"):
         say(f"  Ignoring a failure context from another run — {context['rejected']}")
 
-    traces = from_this_run(list(results_dir.rglob(f"traces/{method_name}_*.zip")),
-                           not_before)
+    # Discovery is the framework's own business: Playwright writes
+    # traces/<method>_*.zip, another framework writes a JSONL action log
+    # somewhere else. Globbing for *.zip here meant a non-Playwright parser
+    # could never be handed a path it accepted.
+    from shared.frameworks import get_active_plugin
+    traces = from_this_run(
+        get_active_plugin().telemetry.discover(results_dir, method_name), not_before)
     if traces:
         trace = max(traces, key=lambda p: p.stat().st_mtime)
         issue["trace_path"] = str(trace)

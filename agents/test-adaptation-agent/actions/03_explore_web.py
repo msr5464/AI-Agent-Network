@@ -42,7 +42,7 @@ def log(msg): _log("explore-web", msg)
 from shared import browser_mode, entry_path, flow_map, mint_session, session_state
 from shared.code_analyzer import read_source
 from shared.claude import call_claude_ex
-from shared.mcp_config import write_mcp_config
+from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
@@ -137,7 +137,7 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
             AUDIT_DIR,
             system_prompt_file=Path("config/prompts/adapt.md"),
             timeout=int(os.environ.get("ADAPT_EXPLORE_TIMEOUT_MS", "300000")),
-            allowed_tools=get_active_plugin().mcp.allowed_tools(),
+            allowed_tools=mcp_allowed_tools(),
             label="explore",
         )
     except Exception as e:
@@ -148,7 +148,7 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
         prompt=build_prompt(plan, rules, notes, stop_before),
         model=MODEL, cwd=str(REPO_ROOT), timeout=TIMEOUT_S,
         on_output=on_output, log_dir=str(AUDIT_DIR),
-        allowed_tools=["mcp__playwright__*"],
+        allowed_tools=mcp_allowed_tools(),
         mcp_config=str(mcp_path), strict_mcp_config=True,
         stream_json=True,
         system_prompt_file=str(SYSTEM_PROMPT) if SYSTEM_PROMPT.exists() else None,

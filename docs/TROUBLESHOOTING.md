@@ -131,12 +131,12 @@ Agent 1 launches a headless browser to validate selectors. If selectors aren't f
 
 ```bash
 # Run in headed (visible) mode to watch what happens
-PLAYWRIGHT_HEADLESS=false make run AGENT=test-authoring-agent MODULE=payments
+HEADLESS_BROWSER=false make run AGENT=test-authoring-agent MODULE=payments
 ```
 
 Increase timeout if the page is slow:
 ```bash
-AUTHORING_PLAYWRIGHT_TIMEOUT_MS=60000 make run AGENT=test-authoring-agent MODULE=payments
+AUTHORING_BROWSER_TIMEOUT_MS=60000 make run AGENT=test-authoring-agent MODULE=payments
 ```
 
 ---

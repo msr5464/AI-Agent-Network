@@ -1,5 +1,17 @@
 """Execution-based verification.
 
+**Agent instrument, not target-repo code.** This drives a browser the AGENTS
+open to inspect a page — reading the DOM, counting how many elements a candidate
+selector matches, trying a corrected locator before any code is edited. It is
+deliberately always Playwright, whatever framework the repository under test
+uses, because it speaks CDP and a browser does not know or care what drove it
+there. (Selenium 4 exposes the same DevTools port, which is what lets a
+Selenium-launched browser be inspected this way.)
+
+So the direct `sync_playwright` / Playwright-selector usage below is correct and
+must NOT be routed through shared/frameworks. What IS pluggable is the syntax
+written into the target repo — see shared/frameworks/base.py CodeEngine.
+
 A candidate is a hypothesis until it has been executed. This is the step the
 published relocalization work skips entirely — Similo, VON Similo and Healenium
 all stop at "highest-scoring similar element" and hand it straight back to the

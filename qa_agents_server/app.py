@@ -80,8 +80,21 @@ def create_app() -> Flask:
 
 def main():
     port = int(os.getenv("QA_AGENT_SERVER_PORT", "8765"))
-    host = os.getenv("QA_AGENT_SERVER_HOST", "0.0.0.0")
+    # Localhost by default. This server implements no auth of its own — it
+    # trusts X-User-ID and X-User-Role from the AI-Test-Studio proxy, and both
+    # are headers any client can type — so routes.py has always documented that
+    # it "is expected to bind to localhost". It then defaulted to 0.0.0.0,
+    # contradicting its own precondition: anyone who could reach the port
+    # bypassed login, approval, roles and rate limiting entirely. Override
+    # deliberately for a real deployment, and set QA_AGENT_PROXY_SECRET (see
+    # routes._from_trusted_proxy) when you do.
+    host = os.getenv("QA_AGENT_SERVER_HOST", "127.0.0.1")
     app = create_app()
+    if host not in ("127.0.0.1", "localhost", "::1") and not (
+            os.getenv("QA_AGENT_PROXY_SECRET") or "").strip():
+        print(f"WARNING: binding {host} with no QA_AGENT_PROXY_SECRET set — "
+              f"identity headers are unauthenticated and anyone who can reach "
+              f"this port can act as any user.")
     print(f"QA Agent Server listening on http://{host}:{port}")
     # threaded=True is essential: SSE endpoints hold a connection open, and
     # the runner spawns background threads per run.

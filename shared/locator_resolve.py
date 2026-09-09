@@ -1,5 +1,17 @@
 """Locator resolution: R0..R6 with circuit breakers.
 
+**Agent instrument, not target-repo code.** This drives a browser the AGENTS
+open to inspect a page — reading the DOM, counting how many elements a candidate
+selector matches, trying a corrected locator before any code is edited. It is
+deliberately always Playwright, whatever framework the repository under test
+uses, because it speaks CDP and a browser does not know or care what drove it
+there. (Selenium 4 exposes the same DevTools port, which is what lets a
+Selenium-launched browser be inspected this way.)
+
+So the direct `sync_playwright` / Playwright-selector usage below is correct and
+must NOT be routed through shared/frameworks. What IS pluggable is the syntax
+written into the target repo — see shared/frameworks/base.py CodeEngine.
+
 Given a locator that stopped matching, work out which element it meant, prove the
 answer by performing the step, and hand back a locator that can be written into
 the page object. Diagnosis (is this even a locator problem?) is answered by

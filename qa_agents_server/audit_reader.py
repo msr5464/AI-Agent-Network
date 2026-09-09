@@ -183,9 +183,16 @@ def list_sessions(limit: int = 50, offset: int = 0,
     all_sessions = _dispatch("list", spec)(spec, 10000, 0)
     
     if user_id:
+        # Ownership resolved the same way analytics resolves it. These two
+        # disagreed: history defaulted a missing owner to "default" while
+        # analytics defaulted it to the admin id, so every pre-attribution run
+        # vanished from EVERYONE's history (no real user has id "default") while
+        # simultaneously appearing in the admin's analytics.
         from qa_agents_server import storage
-        runs = {r.get("session_id"): r.get("user_id", "default") for r in storage.load_all()}
-        all_sessions = [s for s in all_sessions if runs.get(s["session_id"], "default") == user_id]
+        from qa_agents_server.analytics import _owner_of
+        runs = {r.get("session_id"): _owner_of(r) for r in storage.load_all()}
+        all_sessions = [s for s in all_sessions
+                        if runs.get(s["session_id"]) == user_id]
 
     return all_sessions[offset : offset + limit]
 

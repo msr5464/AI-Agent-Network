@@ -9,7 +9,6 @@ from shared.frameworks.base import (
     CodeEngine,
     DiagnosticEngine,
     FrameworkPlugin,
-    MCPProvider,
     TelemetryParser,
     TestRunner,
 )
@@ -20,6 +19,13 @@ class PlaywrightTelemetryParser(TelemetryParser):
     # Actions that say nothing about locators; noise in a timeline.
     _UNINTERESTING = {"BrowserContext.newPage", "Frame.content", "BrowserContext.close",
                       "Browser.close", "Page.close", "Tracing.start", "Tracing.stop"}
+
+    def discover(self, results_dir: Path, method_name: str) -> List[Path]:
+        """Playwright's tracing writes one zip per test under traces/."""
+        results_dir = Path(results_dir)
+        if not results_dir.is_dir():
+            return []
+        return [p for p in results_dir.rglob(f"traces/{method_name}_*.zip") if p.is_file()]
 
     def read_actions(self, trace_path: Path) -> List[Dict]:
         trace_path = Path(trace_path)
@@ -345,6 +351,16 @@ class PlaywrightCodeEngine(CodeEngine):
                 "python": f"page.get_by_label({_q(kwargs['label'])})",
                 "java": f"page.getByLabel({_q(kwargs['label'])})"
             }
+        if "alt" in kwargs:
+            return {
+                "python": f"page.get_by_alt_text({_q(kwargs['alt'])})",
+                "java": f"page.getByAltText({_q(kwargs['alt'])})"
+            }
+        if "title" in kwargs:
+            return {
+                "python": f"page.get_by_title({_q(kwargs['title'])})",
+                "java": f"page.getByTitle({_q(kwargs['title'])})"
+            }
         if "text" in kwargs:
             text = kwargs["text"]
             exact = kwargs.get("exact", False)
@@ -365,45 +381,12 @@ class PlaywrightCodeEngine(CodeEngine):
         return {"python": "", "java": ""}
 
 
-class PlaywrightMCPProvider(MCPProvider):
-    def get_server_config(self, project_root: Path, headless: Optional[bool] = None, cdp_endpoint: Optional[str] = None, storage_state: Optional[str] = None) -> Dict:
-        version = os.environ.get("PLAYWRIGHT_MCP_VERSION", "0.0.79")
-        command = f"@playwright/mcp@{version}"
-        
-        if cdp_endpoint:
-            args = [command, "--cdp-endpoint", str(cdp_endpoint)]
-            return {"mcpServers": {"playwright": {"command": "npx", "args": args}}}
-            
-        args = [command, "--isolated", "--viewport-size=1920,1080"]
-        
-        from shared import browser_mode
-        if headless is None:
-            headless = browser_mode.headless()
-        if headless:
-            args.append("--headless")
-        if storage_state:
-            args.extend(["--storage-state", str(storage_state)])
-            
-        return {
-            "mcpServers": {
-                "playwright": {
-                    "command": "npx",
-                    "args": args,
-                }
-            }
-        }
-
-    def allowed_tools(self) -> List[str]:
-        return ["mcp__playwright__*"]
-
-
 class PlaywrightPlugin(FrameworkPlugin):
     def __init__(self):
         self._telemetry = PlaywrightTelemetryParser()
         self._runner = PlaywrightTestRunner()
         self._diagnostics = PlaywrightDiagnosticEngine()
         self._code = PlaywrightCodeEngine()
-        self._mcp = PlaywrightMCPProvider()
 
     @property
     def telemetry(self) -> TelemetryParser:
@@ -421,6 +404,3 @@ class PlaywrightPlugin(FrameworkPlugin):
     def code(self) -> CodeEngine:
         return self._code
 
-    @property
-    def mcp(self) -> MCPProvider:
-        return self._mcp

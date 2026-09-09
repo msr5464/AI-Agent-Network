@@ -35,7 +35,7 @@ from shared.test_runner import run_test, split_test_name
 from lib import probes
 from shared.code_analyzer import CodeAnalyzer
 from shared.dom_snapshot import find_snapshot, parse_header
-from shared.playwright_trace import read_actions, failing_action
+from shared.telemetry import read_actions, failing_action
 from shared import diagnosis
 from shared import workspace as workspace_helper
 from shared.git import run_git

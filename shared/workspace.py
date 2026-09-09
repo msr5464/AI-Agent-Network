@@ -25,13 +25,78 @@ lives and nothing else.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from shared.log import emit
+
+
+@contextlib.contextmanager
+def _repo_lock(main_path, timeout: int = 180):
+    """Serialise operations that mutate a repository's shared git state.
+
+    Worktrees share the object store, the ref namespace and .git/config with the
+    main checkout, so N parallel runs fetching the same branch contend on
+    refs/remotes/origin/<b>.lock, and `worktree add`/`prune` contend on
+    config.lock — surfacing as "fatal: cannot lock ref" from whichever run lost.
+
+    An O_EXCL lockfile rather than a threading.Lock, because the contending
+    parties are not all threads: the server holds some of these, and each agent
+    subprocess runs its own fetch and push. Falls through on timeout rather than
+    failing the run — an unserialised git call is a risk, a refused run is a
+    certainty.
+    """
+    # Resolve the COMMON git dir, not <path>/.git. In a worktree, .git is a
+    # file pointing at the main repo's .git/worktrees/<name>, so a naive join
+    # would put each worktree's lock somewhere different — serialising nothing,
+    # precisely in the case this exists for. --git-common-dir collapses every
+    # worktree and the main checkout onto one shared directory, hence one lock.
+    probe = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                           cwd=str(main_path), capture_output=True, text=True,
+                           timeout=30, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    if probe.returncode != 0:
+        yield False
+        return
+    common = Path(probe.stdout.strip())
+    if not common.is_absolute():
+        common = Path(main_path) / common
+    lock_path = common / "qa-agents.lock"
+    acquired = False
+    deadline = time.time() + timeout
+    fd = None
+    while time.time() < deadline:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            acquired = True
+            break
+        except FileExistsError:
+            # Reap a lock whose owner died without releasing it.
+            try:
+                if time.time() - lock_path.stat().st_mtime > timeout:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.2)
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.EACCES, errno.ENOTDIR):
+                break       # no git dir yet, or not ours to lock
+            break
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            with contextlib.suppress(OSError):
+                lock_path.unlink(missing_ok=True)
 
 
 _DIR_ENV = "FRAMEWORK_DIR"
@@ -450,7 +515,12 @@ def prepare_base(path, org: str, repo: str, token: str, branch: str,
     # so the ref lands in refs/remotes/ instead of vanishing into FETCH_HEAD.
     # The leading + lets a force-pushed base branch still update.
     fetch_args += [url, f"+refs/heads/{branch}:{ref}"]
-    fetched = _git(fetch_args, cwd=path, timeout=300)
+    # Locked: every concurrent run fetches the same base branch into the same
+    # refs/remotes/origin/<b>, and the loser of that race gets
+    # "fatal: cannot lock ref". Worktrees share the ref namespace with the main
+    # checkout, so agent subprocesses contend here too, not just server threads.
+    with _repo_lock(path):
+        fetched = _git(fetch_args, cwd=path, timeout=300)
     if fetched.returncode != 0:
         return {"ok": False, "branch": branch, "ref": "", "sha": "",
                 "reason": (f"git fetch of {branch} failed: "
@@ -484,9 +554,15 @@ def checkout_base(path, branch: str, start_point: str = "",
     except ValueError as e:
         return {"ok": False, "reason": f"invalid branch name: {e}"}
     start = start_point or f"origin/{branch}"
-    if os.environ.get("QA_ISOLATED_WORKTREE"):
+    if os.environ.get("QA_ISOLATED_WORKTREE_READY"):
         # Git prohibits multiple worktrees from checking out the exact same local branch.
         # In a parallel worktree context, we must remain detached to avoid branch lock collisions.
+        #
+        # The name must match what qa_agents_server.runner exports. It read
+        # QA_ISOLATED_WORKTREE while the runner set QA_ISOLATED_WORKTREE_READY,
+        # so this guard never fired once, every run took the -B branch below,
+        # and parallel runs failed with "'<branch>' is already used by worktree
+        # at ..." — the exact collision --detach exists to prevent.
         result = _git(["checkout", "-f", "--detach", start], cwd=path, timeout=120)
     else:
         result = _git(["checkout", "-f", "-B", branch, start], cwd=path, timeout=120)
@@ -504,37 +580,66 @@ def prepare_worktree(main_path, worktree_path, branch: str, log=lambda m: None) 
     except ValueError as e:
         return {"ok": False, "reason": f"invalid branch name: {e}"}
 
-    # First fetch the branch to ensure it exists locally
-    # Fetching +refs/heads/branch:refs/remotes/origin/branch is handled by prepare_base
-    
-    # Add detached worktree. Detaching prevents branch lock collisions.
-    result = _git(["worktree", "add", "--detach", str(worktree_path), f"origin/{branch}"], cwd=main_path, timeout=120)
-    if result.returncode != 0:
-        # Check if the error is just because worktree path already exists and is valid
-        if Path(worktree_path).exists():
-            log(f"Worktree already exists at {worktree_path}, skipping creation.")
+    # An existing path here is NOT a usable worktree. This used to return
+    # ok:True whenever the directory merely existed, which is an existence check
+    # wearing a validity check's clothes: a half-deleted leftover, a partial
+    # `worktree add`, or an unrelated directory in world-writable /tmp all made
+    # the run proceed against something that was not a worktree at all, and
+    # every later git call failed obscurely.
+    if Path(worktree_path).exists():
+        probe = _git(["rev-parse", "--is-inside-work-tree"], cwd=worktree_path, timeout=30)
+        if probe.returncode == 0 and probe.stdout.strip() == "true":
+            log(f"Reusing existing worktree at {worktree_path}")
             return {"ok": True, "reason": ""}
-            
+        log(f"Removing unusable directory at {worktree_path}")
+        cleanup_worktree(main_path, worktree_path, log=log)
+
+    with _repo_lock(main_path):
+        # Fetch before adding. The comment here used to claim prepare_base
+        # handled this, but the server calls ensure() -> prepare_worktree()
+        # directly and never goes through prepare_base — so origin/<branch> was
+        # whatever a previous run happened to leave behind, and every parallel
+        # run silently based itself on a stale ref. Worse, clone() is
+        # --depth 1 --branch <b>, so for any OTHER base branch the ref did not
+        # exist at all and `worktree add` simply failed.
+        fetched = _git(["fetch", "--no-tags", "origin",
+                        f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+                       cwd=main_path, timeout=300)
+        if fetched.returncode != 0:
+            return {"ok": False,
+                    "reason": f"could not fetch {branch}: {fetched.stderr.strip()[:200]}"}
+
+        # Add detached worktree. Detaching prevents branch lock collisions.
+        result = _git(["worktree", "add", "--detach", str(worktree_path),
+                       f"origin/{branch}"], cwd=main_path, timeout=120)
+
+    if result.returncode != 0:
         return {"ok": False,
                 "reason": f"could not create worktree at {worktree_path}: {result.stderr.strip()[:200]}"}
-    
+
     log(f"Created isolated git worktree at {worktree_path}")
     return {"ok": True, "reason": ""}
 
 
 def cleanup_worktree(main_path, worktree_path, log=lambda m: None) -> Dict:
-    """Remove a git worktree and prune."""
-    _git(["worktree", "remove", "--force", str(worktree_path)], cwd=main_path, timeout=120)
-    
-    # Force remove directory in case untracked files (e.g. target/) remain
+    """Remove a git worktree and prune.
+
+    Takes the same lock as prepare_worktree: an unserialised `prune` running
+    while another thread is mid-`worktree add` can deregister the worktree that
+    add just created.
+    """
     import shutil
-    try:
-        if Path(worktree_path).exists():
-            shutil.rmtree(worktree_path, ignore_errors=True)
-    except Exception:
-        pass
-        
-    _git(["worktree", "prune"], cwd=main_path, timeout=120)
+    with _repo_lock(main_path):
+        _git(["worktree", "remove", "--force", str(worktree_path)], cwd=main_path, timeout=120)
+
+        # Force remove directory in case untracked files (e.g. target/) remain
+        try:
+            if Path(worktree_path).exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+        except Exception:
+            pass
+
+        _git(["worktree", "prune"], cwd=main_path, timeout=120)
     log(f"Cleaned up worktree at {worktree_path}")
     return {"ok": True, "reason": ""}
 
@@ -578,8 +683,11 @@ def _cli(argv: List[str]) -> int:
         emit(f"ERROR: {result['reason']}")
         return 1
 
-    worktree_path = os.environ.get("QA_ISOLATED_WORKTREE", "")
-    
+    # A path, deliberately not the QA_ISOLATED_WORKTREE_READY boolean above:
+    # these are two different questions ("where should I create one" vs "am I
+    # already inside one") that used to share a single misspelled name.
+    worktree_path = os.environ.get("QA_WORKTREE_PATH", "")
+
     if worktree_path:
         wt_result = prepare_worktree(path, worktree_path, result["branch"], log=emit)
         if not wt_result["ok"]:

@@ -8,7 +8,7 @@ set -euo pipefail
 #
 # Env overrides:
 #   QA_AGENT_SERVER_PORT      (default 8765)
-#   QA_AGENT_SERVER_HOST      (default 0.0.0.0)
+#   QA_AGENT_SERVER_HOST      (default 127.0.0.1)
 #   AI_TEST_STUDIO_URL        (default http://localhost:5001) — CORS allowlist
 #   QA_SEED_EXAMPLES          (default true) — copy docs/examples/queue/<agent>/
 #                             into each agent's queue on boot, so the UI has
@@ -31,7 +31,7 @@ if [[ -f "$REPO_ROOT/shared/load_env.sh" ]]; then
 fi
 
 export QA_AGENT_SERVER_PORT="${QA_AGENT_SERVER_PORT:-8765}"
-export QA_AGENT_SERVER_HOST="${QA_AGENT_SERVER_HOST:-0.0.0.0}"
+export QA_AGENT_SERVER_HOST="${QA_AGENT_SERVER_HOST:-127.0.0.1}"
 export AI_TEST_STUDIO_URL="${AI_TEST_STUDIO_URL:-http://localhost:5001}"
 export QA_SEED_EXAMPLES="${QA_SEED_EXAMPLES:-true}"
 

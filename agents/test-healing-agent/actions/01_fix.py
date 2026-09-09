@@ -19,7 +19,7 @@ Gate file: .fix-passed
   - "skipped" — no eligible candidates or infrastructure not configured
 """
 
-import os, sys, json, subprocess, re, signal, time
+import os, sys, json, subprocess, re, signal, time, zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -151,7 +151,7 @@ from shared.claude import call_claude as _call_claude
 from shared.git import run_git
 
 try:
-    from shared.mcp_config import write_mcp_config
+    from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools
     _HAS_MCP_CONFIG = True
 except ImportError:
     _HAS_MCP_CONFIG = False
@@ -163,7 +163,7 @@ from shared.dom_snapshot import (distill as distill_dom,
 from shared import (adaptation_handoff, baseline, diagnosis, failure_identity,
                     locator_patch, narration, run_artifacts, verdict_feedback,
                     workspace as workspace_helper)
-from shared.playwright_trace import read_actions, format_for_prompt as format_trace
+from shared.telemetry import read_actions, format_for_prompt as format_trace
 
 # Edit application and the fix-integrity guards now live in shared/edit_guards.py
 # so test-adaptation-agent runs the same checks. Re-exported at module level:
@@ -405,10 +405,31 @@ def repair_possible(workspace: Path) -> tuple:
         return False, "running under CI (no display, and the browser would strand)"
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
         return False, "no DISPLAY"
-    port = os.environ.get("AUTOFIX_REPAIR_PORT", "9222")
+    port = repair_port()
     if _cdp_alive(f"http://localhost:{port}"):
         return False, f"port {port} already has a browser on it"
     return True, ""
+
+
+def repair_port() -> int:
+    """The CDP port THIS run parks its browser on.
+
+    Derived per session rather than fixed at 9222. With a shared port, the first
+    concurrent healing run took it and every other run saw "port 9222 already
+    has a browser on it" and silently skipped live repair — so with four workers,
+    three of them lost the strongest evidence the agent has, and the reason
+    appeared only as an easily-missed log line.
+
+    AUTOFIX_REPAIR_PORT still pins it explicitly when someone wants to attach a
+    debugger to a known port.
+    """
+    pinned = (os.environ.get("AUTOFIX_REPAIR_PORT") or "").strip()
+    if pinned.isdigit():
+        return int(pinned)
+    session = os.environ.get("SESSION_ID") or str(os.getpid())
+    # 9222-9321: high enough to avoid privileged ports, wide enough that
+    # collisions need ~12 concurrent runs before they are even likely.
+    return 9222 + (zlib.crc32(session.encode()) % 100)
 
 
 def _same_page(left: str, right: str) -> bool:
@@ -437,7 +458,11 @@ def park_browser_for_repair(workspace: Path, test_name: str,
     log("  Re-running the test with the browser parked, for a live inspection...")
     status, _ = run_test(
         test_name, workspace,
-        extra_properties={"repairMode": "true", "traceMode": "on"},
+        # repairPort tells the framework which port to park on. Without it the
+        # framework picks its own fixed default and only one concurrent run can
+        # ever be parked; repair_possible() above checks this exact port.
+        extra_properties={"repairMode": "true", "traceMode": "on",
+                          "repairPort": str(repair_port())},
         timeout_s=int(os.environ.get("AUTOFIX_REPRODUCE_TIMEOUT_S", "900")),
         log=log,
     )
@@ -742,7 +767,7 @@ def _inspect_parked_browser(ctx: dict, session: dict) -> dict:
             prompt, AUDIT_DIR,
             use_system_prompt=False,
             timeout=DOM_TIMEOUT_S,
-            allowed_tools=get_active_plugin().mcp.allowed_tools(),
+            allowed_tools=mcp_allowed_tools(),
             label="fix-repair-mode"
         )
         result["raw"] = raw[-4000:] if raw else ""
@@ -893,7 +918,7 @@ def inspect_live_dom(ctx: dict, url: str, workspace: Path, props: dict,
         prompt, AUDIT_DIR,
         use_system_prompt=False,
         timeout=DOM_TIMEOUT_S,
-        allowed_tools=["mcp__playwright__*"],
+        allowed_tools=mcp_allowed_tools(),
         mcp_config=str(mcp_path),
         strict_mcp_config=True,
         stream_json=True,

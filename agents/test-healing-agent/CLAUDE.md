@@ -196,9 +196,12 @@ GET  /agents/test-healing-agent/queue                # handoffs waiting from tri
 GET  /agents/test-healing-agent/sessions             # history
 ```
 
-The run slot is **global across agents**, not per agent: both drive the same
-automation-repo checkout, and repair mode binds a fixed CDP port, so a second
-request is queued rather than run concurrently. Steps stream as
+Runs execute in parallel, up to `QA_MAX_CONCURRENT_RUNS` (default 4). Each gets
+its own detached git worktree under `/tmp/qa-runs/<session>`, so agents no longer
+share one automation-repo checkout, and each derives its own CDP port from the
+session id — so repair mode works in several runs at once. Beyond the limit,
+requests queue, drained fewest-active-runs-first so one user cannot starve
+another. Steps stream as
 Reproduce → Fix → Ship; Reproduce only appears in standalone mode.
 
 ## Fixing by defect, not by test
@@ -375,7 +378,7 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `HEALING_INSPECT_DOM` | Read the failing page in a real browser before fixing (default: true) |
 | `HEALING_BASE_URL` | Page URL for DOM inspection, overriding whatever is recovered from the execution log |
 | `AUTOFIX_DOM_TIMEOUT_S` | Wall-clock budget for one browser inspection (default: 600) |
-| `PLAYWRIGHT_HEADLESS` | Set `false` to watch every browser this agent starts: DOM inspection, the locate replay, session minting, and the reproduce / verification / probe runs (as `-Dheadless`) |
+| `HEADLESS_BROWSER` | Set `false` to watch every browser this agent starts: DOM inspection, the locate replay, session minting, and the reproduce / verification / probe runs (as `-Dheadless`) |
 | `AUTOFIX_LOGIN_USERNAME`, `AUTOFIX_LOGIN_PASSWORD` | Credentials override. Normally unnecessary — a saved session or `parameters/*.properties` is used first |
 | `AUTOFIX_ENVIRONMENT`, `AUTOFIX_COUNTRY` | Which `parameters/{environment}-{country}.properties` to read (default: `staging` / `SG`) |
 | `AUTOFIX_REPAIR_SESSION` | Explicit path to a `.repair-session.json`. Unset → looked for under the workspace's `test-output/` |

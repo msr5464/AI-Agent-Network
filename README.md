@@ -312,8 +312,8 @@ login session, or when the flow ends in something that cannot be undone. See
 | `AUTHORING_COUNTRY` | `SG` | Maven `-Dcountry=` value |
 | `AUTHORING_FIX_RETRY_COUNT` | `2` | Max retry cycles if the generated test fails. The loop also stops early on its own |
 | `TESTING_MODE` | `false` | Set `true` to cache step-01 and step-02 outputs and skip them on reruns |
-| `AUTHORING_PLAYWRIGHT_TIMEOUT_MS` | `30000` | Timeout per step in the headless web validation script |
-| `PLAYWRIGHT_HEADLESS` | `true` | Set `false` to run **every** browser in every agent headed — validation, DOM inspection, exploration, session minting, and the Maven test runs (as `-Dheadless`). Unset, each browser keeps its own default and Maven follows the framework's `config.properties` |
+| `AUTHORING_BROWSER_TIMEOUT_MS` | `30000` | Timeout per step in the headless web validation script |
+| `HEADLESS_BROWSER` | `true` | Set `false` to run **every** browser in every agent headed — validation, DOM inspection, exploration, session minting, and the Maven test runs (as `-Dheadless`). Unset, each browser keeps its own default and Maven follows the framework's `config.properties` |
 | `AUTHORING_NODE_PATH` | `node` | Path to Node.js binary |
 
 ### Agent 2 — test-triaging-agent

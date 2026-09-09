@@ -265,8 +265,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "playwright_headless",
-        "env_var": "PLAYWRIGHT_HEADLESS",
+        "key": "headless_browser",
+        "env_var": "HEADLESS_BROWSER",
         "label": "Headless Browser",
         "description": "Turn off to watch every browser any agent starts — selector "
                        "validation, DOM inspection, exploration, session login, and the "
@@ -344,10 +344,10 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "max": 10,
     },
     {
-        "key": "authoring_playwright_timeout_ms",
-        "env_var": "AUTHORING_PLAYWRIGHT_TIMEOUT_MS",
-        "label": "Playwright Step Timeout (ms)",
-        "description": "Timeout for each Playwright step during selector validation",
+        "key": "authoring_browser_timeout_ms",
+        "env_var": "AUTHORING_BROWSER_TIMEOUT_MS",
+        "label": "Browser Step Timeout (ms)",
+        "description": "Timeout for each browser step during selector validation",
         "type": "number",
         "category": "authoring",
         "default": 30000,

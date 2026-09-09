@@ -113,9 +113,13 @@ def get(session_id: str) -> Optional[Dict]:
 
 
 def clear(user_id: Optional[str] = None, window: str = "all"):
-    ADMIN_USER_ID = "21232f297a57"
     import time
-    from qa_agents_server.analytics import WINDOWS
+    # One definition of who owns an unattributed row, shared with analytics.
+    # This logic was duplicated as a bare literal here and twice in analytics.py,
+    # free to drift — and history and analytics DID disagree, defaulting missing
+    # owners to "default" in one place and to the admin id in the other, so the
+    # same run belonged to two different people depending on which asked.
+    from qa_agents_server.analytics import WINDOWS, _owner_of
     now = time.time()
     since = None
     if window in WINDOWS and WINDOWS[window] is not None:
@@ -128,10 +132,8 @@ def clear(user_id: Optional[str] = None, window: str = "all"):
         else:
             kept = []
             for r in data:
-                r_user = r.get("user_id") or ADMIN_USER_ID
-                if r_user in ("default", "admin"):
-                    r_user = ADMIN_USER_ID
-                
+                r_user = _owner_of(r)
+
                 if (not user_id or user_id == "all" or r_user == user_id):
                     # Match on user. Check time.
                     ts = float(r.get("started_at") or 0)

@@ -11,13 +11,8 @@ import re
 from shared import locator_capture as capture
 from shared.locator_score import Volatility
 
-ROLE_TO_JAVA = {
-    "button": "BUTTON", "link": "LINK", "textbox": "TEXTBOX", "checkbox": "CHECKBOX",
-    "radio": "RADIO", "combobox": "COMBOBOX", "listbox": "LISTBOX", "heading": "HEADING",
-    "img": "IMG", "option": "OPTION", "tab": "TAB", "dialog": "DIALOG", "list": "LIST",
-    "listitem": "LISTITEM", "searchbox": "SEARCHBOX", "slider": "SLIDER",
-    "spinbutton": "SPINBUTTON", "table": "TABLE", "menuitem": "MENUITEM",
-}
+# The ARIA-role table lives in the framework plugins (CodeEngine.map_role);
+# this was a duplicate that drifted independently.
 # Text that tends to change on its own: prices, counts, dates, badges. Anchoring
 # a locator on any of it trades one kind of brittleness for another.
 VOLATILE_TEXT = re.compile(
@@ -159,69 +154,79 @@ def scoped_by_context(ctx, el: dict, expect_index: int, snap: dict | None) -> di
 
 
 def candidates_for(el: dict, vol: Volatility) -> list[dict]:
-    """The preference ladder, most maintainable first."""
+    """The preference ladder, most maintainable first.
+
+    Two different things are produced per candidate, and the distinction is the
+    whole reason this reads the way it does:
+
+      * `sel` is fed to the LIVE BROWSER to check whether the candidate resolves
+        uniquely. That is the agents' own instrument, which is always Playwright
+        whatever the target repo uses, so these stay Playwright selector syntax.
+      * `python` / `java` are CODE WRITTEN INTO THE TARGET REPO, so they come
+        from the active framework's CodeEngine.
+
+    Those were previously both hardcoded Playwright here, while a fully
+    plugin-routed `synthesize()` sat alongside being called by nothing — so the
+    CodeEngine had essentially no effect on emitted locators, and a Selenium
+    repo would have been handed `page.locator(...)` to write into its Java.
+    """
+    from shared.frameworks import get_active_plugin
+    code = get_active_plugin().code
+
     out: list[dict] = []
     tag = el["tag"]
     role, acc = el.get("role"), el.get("accessible_name")
 
+    def add(strategy: str, sel: str, **emit_kwargs) -> None:
+        snippet = code.emit_locator(**emit_kwargs)
+        candidate = {"strategy": strategy, "sel": sel,
+                     "python": snippet.get("python", ""),
+                     "java": snippet.get("java") or None}
+        # Page-object field form, where the framework has one (Selenium's
+        # @FindBy). Absent for frameworks that construct locators inline.
+        if snippet.get("findby"):
+            candidate["findby"] = snippet["findby"]
+        out.append(candidate)
+
     if el.get("testid"):
         t = el["testid"]
-        out.append({"strategy": "testid", "sel": f'[data-testid={_css(t)}]',
-                    "python": f"page.get_by_test_id({_q(t)})",
-                    "java": f"page.getByTestId({_q(t)})"})
+        add("testid", f'[data-testid={_css(t)}]', testid=t)
 
     if role and acc and role not in ("generic", "presentation"):
-        jrole = ROLE_TO_JAVA.get(role)
-        out.append({
-            "strategy": "role+name",
-            "sel": f'internal:role={role}[name={_q(acc)}s]',
-            "python": f"page.get_by_role({_q(role)}, name={_q(acc)}, exact=True)",
-            "java": (f"page.getByRole(AriaRole.{jrole}, new Page.GetByRoleOptions()"
-                     f".setName({_q(acc)}).setExact(true))") if jrole else None,
-        })
+        jrole = code.map_role(role)
+        if jrole:
+            add("role+name", f'internal:role={role}[name={_q(acc)}s]',
+                role=jrole, name=acc, exact=True)
 
     if el.get("placeholder"):
         v = el["placeholder"]
-        out.append({"strategy": "placeholder", "sel": f'[placeholder={_css(v)}]',
-                    "python": f"page.get_by_placeholder({_q(v)})",
-                    "java": f"page.getByPlaceholder({_q(v)})"})
+        add("placeholder", f'[placeholder={_css(v)}]', placeholder=v)
 
     if el.get("alt"):
         v = el["alt"]
-        out.append({"strategy": "alt", "sel": f'[alt={_css(v)}]',
-                    "python": f"page.get_by_alt_text({_q(v)})",
-                    "java": f"page.getByAltText({_q(v)})"})
+        add("alt", f'[alt={_css(v)}]', alt=v)
 
     if el.get("title"):
         v = el["title"]
-        out.append({"strategy": "title", "sel": f'[title={_css(v)}]',
-                    "python": f"page.get_by_title({_q(v)})",
-                    "java": f"page.getByTitle({_q(v)})"})
+        add("title", f'[title={_css(v)}]', title=v)
 
     _id = el.get("id")
     if _id and not vol.id_is_generated(_id):
-        out.append({"strategy": "id", "sel": f"#{_id}",
-                    "python": f"page.locator({_q('#' + _id)})",
-                    "java": f"page.locator({_q('#' + _id)})"})
+        add("id", f"#{_id}", selector=f"#{_id}")
 
     if el.get("name"):
         n = el["name"]
         sel = f'{tag}[name={_css(n)}]'
-        out.append({"strategy": "name", "sel": sel,
-                    "python": f"page.locator({_q(sel)})",
-                    "java": f"page.locator({_q(sel)})"})
+        add("name", sel, selector=sel)
 
     text = (el.get("text") or "").strip()
     if text and len(text) <= 60 and el["is_interactive"]:
-        out.append({"strategy": "text", "sel": f'{tag}:text-is({_css(text)})',
-                    "python": f"page.get_by_text({_q(text)}, exact=True)",
-                    "java": f"page.getByText({_q(text)}, new Page.GetByTextOptions().setExact(true))"})
+        add("text", f'{tag}:text-is({_css(text)})', text=text, exact=True)
 
     stable = vol.stable_classes(el.get("class_list"))
     if stable:
         sel = tag + "".join(f".{c}" for c in stable)
-        out.append({"strategy": "css-class", "sel": sel,
-                    "python": f"page.locator({_q(sel)})", "java": f"page.locator({_q(sel)})"})
+        add("css-class", sel, selector=sel)
 
     return out
 
@@ -320,82 +325,3 @@ def emit(ctx, el: dict, vol: Volatility, snap: dict | None = None) -> dict | Non
     return None
 
 
-def synthesize(ctx, el: dict, expect_index: int | None = None, snap: dict | None = None) -> dict | None:
-    """The best selector for this element. None if it could not be uniquely identified.
-
-    `expect_index` checks the generated selector actually resolves to the exact
-    node we started with (identified by index in the flat snapshot).
-    """
-    from shared.frameworks import get_active_plugin
-    code_engine = get_active_plugin().code
-    
-    if el.get("testid") and _unique(ctx, f'[data-testid={_css(el["testid"])}]', expect_index, snap):
-        code_snippet = code_engine.emit_locator(testid=el["testid"])
-        return {"strategy": "testid", "sel": f'[data-testid={_css(el["testid"])}]',
-                "python": code_snippet.get("python", ""),
-                "java": code_snippet.get("java", "")}
-
-    tag = el.get("tag", "")
-    role = el.get("role", "")
-    text = el.get("inner_text") or el.get("value") or ""
-    
-    jrole = code_engine.map_role(role)
-    if role and jrole and text and len(text) < 40 and text_stability(text) >= 0:
-        # getByRole allows a role filter and a text filter in one call, which is
-        # the single most durable way to identify an element.
-        test_sel = f"{tag}:has-text({_css(text)})" if text else tag
-        if _unique(ctx, test_sel, expect_index, snap):
-            code_snippet = code_engine.emit_locator(role=jrole, name=text, exact=True)
-            return {"strategy": "role-name", "sel": test_sel,
-                    "python": code_snippet.get("python", ""),
-                    "java": code_snippet.get("java", "")}
-
-    for attribute in ("placeholder", "alt", "aria_label", "title", "name"):
-        v = el.get(attribute)
-        if not v or len(v) > 60:
-            continue
-        sel = f"{tag}[{attribute.replace('_', '-')}={_css(v)}]"
-        if _unique(ctx, sel, expect_index, snap):
-            if attribute == "placeholder":
-                code_snippet = code_engine.emit_locator(placeholder=v)
-                return {"strategy": "placeholder", "sel": sel,
-                        "python": code_snippet.get("python", ""),
-                        "java": code_snippet.get("java", "")}
-            elif attribute in ("aria_label", "title", "alt"):
-                code_snippet = code_engine.emit_locator(label=v)
-                return {"strategy": "label", "sel": sel,
-                        "python": code_snippet.get("python", ""),
-                        "java": code_snippet.get("java", "")}
-            code_snippet = code_engine.emit_locator(selector=sel)
-            return {"strategy": "attribute", "sel": sel,
-                    "python": code_snippet.get("python", ""),
-                    "java": code_snippet.get("java", "")}
-
-    if text and len(text) < 40 and text_stability(text) >= 0:
-        sel = f"{tag}:has-text({_css(text)})"
-        if _unique(ctx, sel, expect_index, snap):
-            code_snippet = code_engine.emit_locator(text=text, exact=True)
-            return {"strategy": "text", "sel": sel,
-                    "python": code_snippet.get("python", ""),
-                    "java": code_snippet.get("java", "")}
-
-    if el.get("id") and not VOLATILE_SELECTOR.search(el["id"]) and _unique(ctx, f'#{el["id"]}', expect_index, snap):
-        code_snippet = code_engine.emit_locator(selector=f'#{el["id"]}')
-        return {"strategy": "id", "sel": f'#{el["id"]}',
-                "python": code_snippet.get("python", ""),
-                "java": code_snippet.get("java", "")}
-
-    classes = [c for c in (el.get("classes") or []) if not VOLATILE_SELECTOR.search(c)]
-    if classes:
-        sel = tag + "".join(f".{c}" for c in classes)
-        if _unique(ctx, sel, expect_index, snap):
-            code_snippet = code_engine.emit_locator(selector=sel)
-            return {"strategy": "class", "sel": sel,
-                    "python": code_snippet.get("python", ""),
-                    "java": code_snippet.get("java", "")}
-
-    scoped = scoped_by_context(ctx, el, expect_index, snap) if expect_index is not None else None
-    if scoped:
-        return scoped
-
-    return None

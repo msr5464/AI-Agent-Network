@@ -14,6 +14,7 @@ bind to localhost).
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -51,13 +52,96 @@ def _resolve(agent: str):
         return None, (jsonify({"error": e.message}), e.status)
 
 
+# ── Identity ──────────────────────────────────────────────────────────────────
+# Identity is resolved ONCE, here, and validated before it is used. It used to be
+# re-read with request.headers.get("X-User-ID") at each call site, which went
+# wrong in two different ways at once:
+#
+#   * The value reached feature_files as a raw path segment, so an absolute or
+#     ../-laden id escaped the queue directory entirely — arbitrary directory
+#     creation and file write as the server user.
+#   * Ownership checks spelled `if run_record and user_id and ...` treated a
+#     MISSING header as permission granted, so omitting it read any user's run.
+#
+# AI-Test-Studio derives ids as md5(username)[:12]; anything else is a client
+# talking to this server directly, and gets the anonymous id rather than a path.
+_USER_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+ANONYMOUS_USER_ID = "default"
+
+
+def current_user_id() -> str:
+    """The validated caller identity. Never attacker-controlled path content."""
+    if not _from_trusted_proxy():
+        return ANONYMOUS_USER_ID
+    raw = (request.headers.get("X-User-ID") or "").strip()
+    return raw if _USER_ID_RE.match(raw) else ANONYMOUS_USER_ID
+
+
+def _from_trusted_proxy() -> bool:
+    """Whether this request carries the shared secret proving it came from the
+    AI-Test-Studio proxy rather than straight off the network.
+
+    When QA_AGENT_PROXY_SECRET is unset the answer is True, preserving existing
+    local setups — that case is covered by binding to localhost instead (see
+    qa_agents_server.app). Setting it is what makes the identity headers
+    trustworthy, and it is the only thing that does: X-User-Role is a header any
+    client can type, and it was previously the sole admin assertion in the
+    entire server.
+    """
+    expected = (os.environ.get("QA_AGENT_PROXY_SECRET") or "").strip()
+    if not expected:
+        return True
+    import hmac
+    presented = (request.headers.get("X-Proxy-Secret") or "").strip()
+    return bool(presented) and hmac.compare_digest(presented, expected)
+
+
+def _is_admin() -> bool:
+    """Admin only when the proxy vouched for the request AND said so."""
+    return (_from_trusted_proxy()
+            and (request.headers.get("X-User-Role") or "").strip().lower() == "admin")
+
+
+def _owns(session_id: str) -> bool:
+    """Whether the caller may see/act on this session. Default-deny."""
+    from qa_agents_server import storage
+    if _is_admin():
+        return True
+    record = storage.get(session_id)
+    if record is None:
+        # Unknown session: fall back to the live registry, then refuse. An
+        # evicted record must not become an access-control hole.
+        run = runner.get_run(session_id)
+        if run is None:
+            return False
+        return run.user_id == current_user_id()
+    return record.get("user_id", ANONYMOUS_USER_ID) == current_user_id()
+
+
+def owns_session(view):
+    """Refuse a session-scoped route unless the caller owns the session.
+
+    A decorator rather than four lines repeated per route: the previous
+    per-endpoint approach was applied to two of the seven session-scoped
+    endpoints, and both copies had the missing-header bypass. /events, /metrics,
+    /cancel, /retry and /artifact had no check at all.
+    """
+    @functools.wraps(view)
+    def guarded(*args, **kwargs):
+        session_id = kwargs.get("session_id")
+        if session_id and not _owns(session_id):
+            return jsonify({"error": "forbidden"}), 403
+        return view(*args, **kwargs)
+    return guarded
+
+
 # ── Module file CRUD ──────────────────────────────────────────────────────────
 @qa_bp.route(f"{_BASE}/queue", methods=["GET"])
 def queue_list(agent: str):
     spec, err = _resolve(agent)
     if err:
         return err
-    user_id = request.headers.get("X-User-ID", "default")
+    user_id = current_user_id()
     if spec.queue_kind == "txt":
         return jsonify({"items": feature_files.list_features(spec.name, user_id=user_id)})
     # A json queue holds handoffs written by another agent — read-only here;
@@ -80,7 +164,7 @@ def queue_create(agent: str):
     spec, err = _resolve(agent)
     if err:
         return err
-    user_id = request.headers.get("X-User-ID", "default")
+    user_id = current_user_id()
     if spec.queue_kind != "txt":
         return jsonify({"error": f"{spec.name}'s queue is written by "
                                  f"another agent, not through this API"}), 405
@@ -99,7 +183,7 @@ def queue_read(agent: str, name: str):
     spec, err = _resolve(agent)
     if err:
         return err
-    user_id = request.headers.get("X-User-ID", "default")
+    user_id = current_user_id()
     if spec.queue_kind != "txt":
         path = spec.queue_dir / f"{name}.json"
         if not path.exists():
@@ -366,7 +450,7 @@ def run_start(agent: str):
     if err:
         return err
     body = request.get_json(silent=True) or {}
-    user_id = request.headers.get("X-User-ID", "default")
+    user_id = current_user_id()
 
     # Reject a bad base branch here rather than only in build_env. build_env
     # also runs on the reap thread that drains the pending queue, where a raise
@@ -415,12 +499,18 @@ def run_start(agent: str):
 
 @qa_bp.route(f"{_BASE}/run/queue", methods=["GET"])
 def pending_queue_list(agent: str):
-    # The queue is global — the run slot is shared — but each caller sees only
+    # The queue is global — the worker pool is shared — but each caller sees only
     # its own agent's rows, so one panel never lists the other's pending runs.
+    #
+    # Rows carry `mine` rather than being filtered to the caller: a person whose
+    # run is queued behind two of someone else's needs to see that the wait is
+    # real, and `mine` is what marks the ones they may cancel. Ownership is
+    # enforced on the DELETE regardless of what is listed here.
     spec, err = _resolve(agent)
     if err:
         return err
-    return jsonify({"queue": runner.get_queue(spec.name)})
+    return jsonify({"queue": runner.get_queue(spec.name, user_id=current_user_id()),
+                    "capacity": runner.capacity(current_user_id())})
 
 
 @qa_bp.route(f"{_BASE}/run/queue/<int:index>", methods=["DELETE"])
@@ -429,19 +519,25 @@ def pending_queue_remove(agent: str, index: int):
     if err:
         return err
     # index is the row's slot in the GLOBAL queue; passing spec.name makes the
-    # runner refuse it if that slot belongs to a different agent.
-    removed = runner.remove_from_queue(index, spec.name)
+    # runner refuse it if that slot belongs to a different agent, and user_id
+    # if it belongs to a different user — an index is a position, not a
+    # capability, so without the latter any user could cancel anyone's queued
+    # run by counting rows.
+    removed = runner.remove_from_queue(
+        index, spec.name, user_id=None if _is_admin() else current_user_id())
     if not removed:
         return jsonify({"error": "index out of range"}), 404
-    return jsonify({"removed": True, "queue": runner.get_queue(spec.name)})
+    return jsonify({"removed": True,
+                    "queue": runner.get_queue(spec.name, user_id=current_user_id()),
+                    "capacity": runner.capacity(current_user_id())})
 
 
 @qa_bp.route(f"{_BASE}/run/active", methods=["GET"])
 def run_active(agent: str):
     """The run active FOR THIS AGENT, if any.
 
-    The execution slot is global — every agent drives the same automation-repo
-    checkout, so only one may run at a time — but "something is running" and
+    Runs are parallel now (each gets its own worktree), up to
+    QA_MAX_CONCURRENT_RUNS — but "something is running" and
     "your run is running" are different questions. Answering the first when the
     second was asked made the authoring panel adopt a healing session and stream
     its logs under its own step labels.
@@ -454,47 +550,67 @@ def run_active(agent: str):
     if err:
         return err
 
-    user_id = request.headers.get("X-User-ID", "default")
-    session_id = runner.get_active_session_id(user_id)
-    run = runner.get_run(session_id) if session_id else None
+    user_id = current_user_id()
+    capacity = runner.capacity(user_id)
+    busy = capacity["busy"]
 
-    # We now have multiple concurrent slots. So we check if the worker pool is full
-    # by importing MAX_CONCURRENT_RUNS logic.
-    with runner._registry_lock:
-        busy = len(runner._active_runs) >= runner.max_concurrent_runs()
+    # Every run this user has in flight, not just the first one found. The
+    # single-session answer made a user's SECOND concurrent run invisible: which
+    # one you got depended on dict ordering, and the other had no representation
+    # in the UI at all. `runs` is what a session switcher renders.
+    mine = runner.get_active_runs(user_id)
+    this_agent = [r for r in mine if r.agent == spec.name]
 
-    if run is None:
-        return jsonify({"active": False, "busy": busy})
+    def summarise(run, full: bool = False) -> dict:
+        row = {
+            "session_id": run.session_id,
+            "agent": run.agent,
+            "module": run.module,
+            "status": run.status,
+            "started_at": run.started_at,
+        }
+        if full:
+            row.update({
+                "auto_push": run.auto_push,
+                "base_branch": run.base_branch,
+                "step_progress": run.step_progress,
+                # step_progress keeps its historic string-map shape; timing and
+                # cost ride alongside so no existing consumer has to change.
+                "step_metrics": run.step_metrics,
+                "metrics": run.metrics_totals,
+                "start_from_step": run.start_from_step,
+            })
+        return row
 
-    if run.agent != spec.name:
-        return jsonify({
-            "active": False,
-            "busy": busy,
-            "busy_agent": run.agent,
-            "busy_since": run.started_at,
-        })
-
-    return jsonify({
-        "active": True,
+    # Shared by every response shape below, so a UI can render capacity and the
+    # switcher without caring whether THIS agent happens to have a run.
+    envelope = {
         "busy": busy,
-        "busy_agent": run.agent,
-        "agent": run.agent,
-        "session_id": run.session_id,
-        "module": run.module,
-        "auto_push": run.auto_push,
-        "base_branch": run.base_branch,
-        "status": run.status,
-        "started_at": run.started_at,
-        "step_progress": run.step_progress,
-        # step_progress keeps its historic string-map shape; timing and cost ride
-        # alongside so no existing consumer has to change.
-        "step_metrics": run.step_metrics,
-        "metrics": run.metrics_totals,
-        "start_from_step": run.start_from_step,
-    })
+        "capacity": capacity,
+        "runs": [summarise(r) for r in this_agent],
+        # This user's runs on OTHER agents, so a global switcher can offer them
+        # without polling every agent endpoint in turn.
+        "other_agent_runs": [summarise(r) for r in mine if r.agent != spec.name],
+    }
+
+    if not this_agent:
+        # `busy_agent` historically meant "the thing occupying the shared slot".
+        # With a pool there may be several, so it names the user's own other run
+        # when there is one — which is what the message built from it says.
+        other = next((r for r in mine), None)
+        return jsonify({**envelope, "active": False,
+                        **({"busy_agent": other.agent,
+                            "busy_since": other.started_at} if other else {})})
+
+    # The primary run keeps the exact top-level shape it has always had, so
+    # existing panels keep working untouched while `runs` is adopted.
+    primary = this_agent[0]
+    return jsonify({**envelope, "active": True, "busy_agent": primary.agent,
+                    **summarise(primary, full=True)})
 
 
 @qa_bp.route(f"{_BASE}/run/<session_id>/cancel", methods=["POST"])
+@owns_session
 def run_cancel(agent: str, session_id: str):
     spec, err = _resolve(agent)
     if err:
@@ -511,6 +627,7 @@ def run_cancel(agent: str, session_id: str):
 
 
 @qa_bp.route(f"{_BASE}/sessions/<session_id>/retry", methods=["POST"])
+@owns_session
 def session_retry(agent: str, session_id: str):
     """Re-run an existing (usually finished/failed) session starting from a
     specific step, reusing its steps-before-that output rather than starting
@@ -555,7 +672,7 @@ def session_retry(agent: str, session_id: str):
     if original_base:
         payload["base_branch"] = original_base
 
-    user_id = request.headers.get("X-User-ID", "default")
+    user_id = current_user_id()
 
     try:
         run = runner.start_run(payload, agent=spec.name,
@@ -583,6 +700,7 @@ def session_retry(agent: str, session_id: str):
 
 # ── Live + history stream (unified endpoint) ──────────────────────────────────
 @qa_bp.route(f"{_BASE}/run/<session_id>/stream", methods=["GET"])
+@owns_session
 def run_stream(agent: str, session_id: str):
     spec, err = _resolve(agent)
     if err:
@@ -591,12 +709,6 @@ def run_stream(agent: str, session_id: str):
         offset = int(request.args.get("offset", 0))
     except (TypeError, ValueError):
         offset = 0
-
-    user_id = request.headers.get("X-User-ID")
-    from qa_agents_server import storage
-    run_record = storage.get(session_id)
-    if run_record and user_id and run_record.get("user_id", "default") != user_id:
-        return jsonify({"error": "forbidden"}), 403
 
     live_run = runner.get_run(session_id)
 
@@ -641,9 +753,11 @@ def sessions_list(agent: str):
     except (TypeError, ValueError):
         limit, offset = 50, 0
 
-    user_id = request.headers.get("X-User-ID")
-    # If the requester is an admin, they might pass a specific user_id to filter,
-    # or skip it to see all. For now, we enforce X-User-ID isolation for members.
+    # An admin sees everything; everyone else sees only their own. Passing the
+    # raw header meant a request without one filtered on None, and
+    # audit_reader's `if user_id:` then applied no filter at all — so omitting
+    # the header returned every user's history.
+    user_id = None if _is_admin() else current_user_id()
     return jsonify({"items": audit_reader.list_sessions(limit=limit, offset=offset,
                                                     agent=spec.name, user_id=user_id)})
 
@@ -660,15 +774,22 @@ _ARTEFACT_TYPES = {
 
 
 def _artefact_roots(spec) -> list:
-    """Directories an artefact may legitimately come from."""
+    """Directories an artefact may legitimately come from.
+
+    The ephemeral worktree root (QA_WORKTREE_TEMP_DIR) is deliberately NOT here.
+    It was added so worktree artefacts could be served, but the worktree is
+    destroyed by _wait_and_reap before the terminal event is even emitted, so
+    every such link was a 404 by the time anyone could click it — while the root
+    itself exposed every user's screenshots and DOM snapshots to every other
+    user, and, living under world-writable /tmp, let any local process drop a
+    servable file into it. Runs now copy test-output/ into their own audit
+    directory instead (runner._preserve_worktree_artefacts), which is already
+    the first root below and is per-session.
+    """
     roots = [spec.audit_dir]
     workspace = _automation_workspace()
     if workspace:
         roots.append(Path(workspace) / "test-output")
-    # Add support for ephemeral worktrees.
-    tmp_qa_runs = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs")
-    if tmp_qa_runs:
-        roots.append(Path(tmp_qa_runs))
     return [r.resolve() for r in roots if r and Path(r).exists()]
 
 
@@ -696,6 +817,16 @@ def artifact(agent: str):
     roots = _artefact_roots(spec)
     if not any(target == r or r in target.parents for r in roots):
         return jsonify({"error": "path is outside the artefact directories"}), 403
+
+    # Confine the caller to their own sessions. spec.audit_dir/<session_id>/...
+    # is shared by every user, so containment alone let anyone read anyone
+    # else's screenshots and DOM snapshots by guessing a session id.
+    try:
+        relative = target.relative_to(spec.audit_dir.resolve())
+        if relative.parts and not _owns(relative.parts[0]):
+            return jsonify({"error": "forbidden"}), 403
+    except ValueError:
+        pass        # not under audit_dir — the shared test-output root
     if target.suffix.lower() not in _ARTEFACT_TYPES:
         return jsonify({"error": f"unsupported artefact type: {target.suffix}"}), 403
     if not target.is_file():
@@ -710,6 +841,7 @@ def artifact(agent: str):
 
 
 @qa_bp.route(f"{_BASE}/sessions/<session_id>/events", methods=["GET"])
+@owns_session
 def session_events(agent: str, session_id: str):
     """The full event list for a FINISHED session, as one JSON response.
 
@@ -731,16 +863,11 @@ def session_events(agent: str, session_id: str):
 
 
 @qa_bp.route(f"{_BASE}/sessions/<session_id>", methods=["GET"])
+@owns_session
 def sessions_get(agent: str, session_id: str):
     spec, err = _resolve(agent)
     if err:
         return err
-
-    user_id = request.headers.get("X-User-ID")
-    from qa_agents_server import storage
-    run_record = storage.get(session_id)
-    if run_record and user_id and run_record.get("user_id", "default") != user_id:
-        return jsonify({"error": "forbidden"}), 403
 
     session = audit_reader.get_session(session_id, agent=spec.name)
     if session is None:
@@ -749,6 +876,7 @@ def sessions_get(agent: str, session_id: str):
 
 
 @qa_bp.route(f"{_BASE}/sessions/<session_id>/metrics", methods=["GET"])
+@owns_session
 def session_metrics(agent: str, session_id: str):
     """Time and cost for one session: run totals plus the per-stage breakdown."""
     spec, err = _resolve(agent)
@@ -772,7 +900,16 @@ def session_metrics(agent: str, session_id: str):
 # ── Analytics (spans agents, so deliberately not under /agents/<agent>/) ───────
 @qa_bp.route("/analytics/clear", methods=["DELETE"])
 def analytics_clear():
+    # This deletes analytics rows, the run registry and audit directories from
+    # disk, irreversibly, for whoever is named. It had no check of any kind:
+    # DELETE /analytics/clear?window=all with no headers wiped every user's
+    # history. A member may clear only their own.
     user_id_param = (request.args.get("user_id") or "").strip() or None
+    if not _is_admin():
+        caller = current_user_id()
+        if caller == ANONYMOUS_USER_ID:
+            return jsonify({"error": "forbidden"}), 403
+        user_id_param = caller
     window_param = (request.args.get("window") or "7d").strip()
     
     # 1. Clear in-memory / JSON history registry 
@@ -820,12 +957,10 @@ def analytics_summary():
     # Note: AI-Test-Studio admin portal enforces auth and passes X-User-ID.
     # Regular users can only see their own analytics; admins can filter by user_id or see all.
     user_id_param = (request.args.get("user_id") or "").strip() or None
-    requester_user_id = request.headers.get("X-User-ID")
-    requester_role = request.headers.get("X-User-Role", "member")
-    
+
     query_user_id = user_id_param
-    if requester_role != "admin":
-        query_user_id = requester_user_id
+    if not _is_admin():
+        query_user_id = current_user_id()
 
     return jsonify(analytics.query(
         window=window,

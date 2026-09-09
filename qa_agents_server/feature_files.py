@@ -27,12 +27,26 @@ QUEUE_DIR: Path = REPO_ROOT / "agents" / "test-authoring-agent" / "queue"
 PROCESSED_DIR: Path = QUEUE_DIR / "processed"
 
 
+# Same treatment the feature NAME already gets below, for the same reason. This
+# value arrives from the X-User-ID header and is joined straight onto a path, so
+# without it "/tmp/pwn" replaced the queue directory outright (pathlib lets an
+# absolute segment win) and "../.." walked out of it — arbitrary directory
+# creation and .txt read/write as the server user. routes.current_user_id()
+# validates at the edge; this is the second lock on the same door.
+_USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
+
+
+def _safe_user_id(user_id: str) -> str:
+    candidate = (user_id or "").strip()
+    return candidate if _USER_ID_RE.match(candidate) else "default"
+
+
 def _queue_dir(agent: str = DEFAULT_AGENT, user_id: str = "default") -> Path:
     spec = get_agent(agent)
     if spec.queue_kind != "txt":
         raise FeatureFileError(
             f"{spec.name}'s queue is not human-authored text", status=405)
-    return spec.queue_dir / user_id
+    return spec.queue_dir / _safe_user_id(user_id)
 
 
 def _processed_dir(agent: str = DEFAULT_AGENT, user_id: str = "default") -> Path:

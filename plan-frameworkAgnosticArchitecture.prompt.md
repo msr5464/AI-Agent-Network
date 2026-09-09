@@ -1,74 +1,146 @@
-## Plan: Framework Agnostic Architecture via Plugin Suite
+# Framework Agnostic Architecture
 
-**TL;DR** 
-The current QA Agent Network is tightly coupled to Playwright conventions (trace parsing, MCP tools, runner arguments, locator strictness rules, and code generation syntax). To support multiple automation frameworks (like Selenium), we will adopt **Option B: Adapter / Plugin Architecture**. However, fresh eyes analysis reveals a standard runtime adapter is insufficient. We must build a **Framework Plugin Suite** because the coupling exists across 5 dimensions: Runtime, Telemetry, Diagnostics, Code Synthesis, and LLM MCP integration.
+**Status: implemented.** This document describes what the system does, and — where
+the original plan turned out to be aimed wrongly — what was discarded and why.
 
-### Analysis & Assessment
-1. **Current architecture assessment**: Four agents share a common `shared/` library. The system implicitly assumes Playwright at multiple levels (traces, locators, page modes, test runners, headless toggles, code parsers, and the `@playwright/mcp` server). 
-2. **Hidden Framework-coupling analysis**: 
-    - **Diagnostics**: Hardcoded rules for Playwright's "strict mode violation".
-    - **Telemetry**: Depends on Playwright `.zip` traces containing `trace.trace` event streams.
-    - **Code Parsing/Synthesis**: Explicit regex for `page.locator(...)`, `getByRole`, and Playwright pseudo-classes (`:has-text`).
-    - **Agent Control (MCP)**: Relies on `@playwright/mcp` for the LLM to drive the browser.
-3. **Feasibility assessment**: High feasibility, but requires a wider interface than initially planned. The Plugin must handle code synthesis and diagnostic rules, not just test execution.
-4. **Recommended architecture**: **Option B (Core + Framework Plugin Suite)**. We define a standard internal API for common capabilities (`TelemetryParser`, `TestRunner`, `DiagnosticEngine`, `CodeEngine`, `MCPProvider`). A `PlaywrightPlugin` provides the concrete implementations. 
-5. **Alternative approaches considered**: 
-    - *Option A (Configuration-driven)*: Insufficient. Frameworks have different trace artifacts, DOM semantics, and different execution commands.
-    - *Option C (Framework-specific agents)*: Rejected due to immense duplication of prompt logic and AI agent workflows.
+## Goal
 
----
+The agent network should work against any automation framework, not just
+Playwright. A repo written in Selenium + TestNG should be authored, healed and
+adapted as well as a Playwright one.
 
-**Steps**
-1. **Define the Plugin Interfaces (Contracts)**
-   - Create a new `shared/frameworks/` module to house framework contracts.
-   - Define interfaces for the 5 pillars:
-     - `TelemetryParser` (reads traces/logs/screenshots)
-     - `TestRunner` (executes tests, handles CLI args)
-     - `DiagnosticEngine` (interprets framework-specific errors like strict-mode vs NoSuchElement)
-     - `CodeEngine` (AST/Regex for parsing and generating locators)
-     - `MCPProvider` (provides the correct MCP server config for Claude)
-2. **Implement Playwright Plugin (Reference Implementation)**
-   - Create `shared/frameworks/playwright/` containing implementations for the defined contracts.
-   - Move existing Playwright-specific logic (from `playwright_trace.py`, `page_identity.py`, `dom_snapshot.py`, `mcp_config.py`, `browser_mode.py`, `test_runner.py`) into this plugin.
-3. **Refactor Core Shared Helpers to Use Plugins**
-   - Update `shared/test_runner.py` and `shared/diagnosis.py` to route requests to the active plugin.
-   - Generalize the `PLAYWRIGHT_HEADLESS` logic to a generic `FRAMEWORK_HEADLESS` state.
-4. **Refactor Agents** *(Parallel with Step 3)*
-   - Update `test-authoring-agent`, `test-healing-agent`, and others to load the framework plugin via environment variable (e.g. `AUTOMATION_FRAMEWORK=playwright`), and use plugin methods.
-5. **Update Prompts and Instructions**
-   - Generalize prompts in `config/prompts/` to refer to the "automation framework" rather than "Playwright" directly. Inject framework-specific conventions, wrappers, and code syntax via the `CodeEngine`.
-6. **Establish New Framework Integration Workflow**
-   - Document the mandatory and optional interfaces a new framework plugin (like Selenium) must implement.
+## The central distinction
 
-**Relevant files**
-- `/shared/frameworks/base.py` — *New*: Defines the core contracts (TelemetryParser, TestRunner, DiagnosticEngine, CodeEngine, MCPProvider).
-- `/shared/frameworks/playwright_plugin.py` — *New*: The concrete implementation migrating Playwright code.
-- `/shared/playwright_trace.py` — Migrate to `TelemetryParser` implementation.
-- `/shared/test_runner.py` — Update to delegate test execution to the active plugin.
-- `/shared/diagnosis.py` — Migrate strict-mode rules to `DiagnosticEngine`.
-- `/shared/page_identity.py` / `/shared/locator_emit.py` — Migrate regex/generation to `CodeEngine`.
-- `/agents/*/actions/*.py` — Replace direct Playwright/MCP calls with plugin delegates.
+The original plan treated "Playwright" as one coupling to be abstracted behind
+five pillars. It is two different things wearing the same name, and separating
+them is what made the work tractable:
 
-**Verification**
-1. **Unit Tests Validation**: Run the existing `pytest` suite in `/tests/unit/` to ensure no functionality is broken (specifically `test_browser_mode.py`, `test_diagnosis.py`, `test_page_identity.py`).
-2. **End-to-End Run**: Execute a `test-healing-agent` run using the Playwright plugin and verify it still successfully diagnoses, fixes, and verifies a broken locator in the Jarvis repo.
-3. **Mock Plugin Check**: Create a dummy plugin (e.g. `SeleniumMockPlugin`), inject it, and ensure the agents fail cleanly at the plugin boundaries or correctly generate non-Playwright code in dry-runs.
-4. **Adapter Capability & Quality Benchmarking**: Use the existing `locator-eval/` suite to benchmark new plugins (like Selenium) against the Playwright baselines. This ensures objective measurement of agent confidence and fix quality across frameworks.
-5. **Strict Artifact Contracts**: Plugins must guarantee standard contextual outputs (e.g., DOM snapshots at failure, action timelines). If a framework (like Selenium) lacks native traces, the plugin contract defines what custom listeners/wrappers are required in the target repository to achieve parity.
+| | **Convention** — the target repo's | **Instrument** — the agents' own |
+|---|---|---|
+| What | The syntax its tests are written in (`page.locator(...)` vs `@FindBy`), how they run, what artifacts they leave, what its errors mean | A live browser the agents open to read a DOM, score candidate locators and verify a fix |
+| Pluggable? | Yes — this is the whole job | **No. Always Playwright** |
+| Where | `shared/frameworks/*_plugin.py` | `shared/mcp_config.py`, `shared/locator_verify.py`, `shared/locator_candidates.py`, `shared/locator_resolve.py` |
 
-### Additions During Implementation (Post-Plan Discoveries)
-The following steps were executed during implementation to achieve full agnosticism and went beyond the initial plan:
+The instrument speaks CDP, which is a browser-level protocol — a browser does not
+know or care which framework drove it there. Selenium 4 exposes the same DevTools
+port, so a Selenium-launched browser is inspected with the Playwright MCP server.
 
-1. **Implemented the Selenium Plugin**: Despite the initial scope limitation, the `SeleniumPlugin` was fully implemented (`shared/frameworks/selenium_plugin.py`) as the primary proof of the architecture. It handles `driver.findElement` syntax, parses JSONL logs for telemetry instead of `.zip` traces, and translates text matching to XPath.
-2. **Selenium MCP Fallback Strategy**: Discovered there is no robust open-source Selenium MCP. The `SeleniumMCPProvider` was built to fall back to the `@playwright/mcp` server. By mandating Selenium 4 in the target repository, we can expose the underlying Chrome DevTools Protocol (CDP) port. Because CDP is a browser-level protocol, Playwright's MCP can successfully attach to a browser launched by Selenium, allowing live DOM inspection to work natively.
-3. **Global Headless Environment Variable Rename**: The system was globally hardcoded to `PLAYWRIGHT_HEADLESS`. This was renamed to `HEADLESS_BROWSER` across all shell scripts, python code, tests, and API settings (`qa_agents_server/agent_settings.py`) to prevent framework-specific configuration leakage. `AUTHORING_PLAYWRIGHT_TIMEOUT_MS` was also renamed to `AUTHORING_BROWSER_TIMEOUT_MS`.
-4. **Generalizing Agent Prompts**: Hardcoded Playwright syntax instructions in `config/prompts/authoring.md` (e.g., "use `page.locator()`") were removed and replaced with dynamic instructions to use the target framework's native syntax. 
-5. **Generalizing Edit Guards**: The safety mechanisms in `shared/edit_guards.py` were refactored to check for generic "ambiguous locator errors" instead of explicitly searching for Playwright's "strict mode violation" string.
-6. **Framework Integration Guide Creation**: To solve the onboarding problem for new frameworks, a detailed `docs/FRAMEWORK_INTEGRATION.md` guide was authored. It explicitly defines the mandatory artifacts (DOM snapshots, action telemetry JSONL, and optional CDP port) that a target repository must generate to integrate successfully with the agents.
+The original plan reached this conclusion and then mislabelled it, describing the
+Selenium plugin's use of `@playwright/mcp` as a regrettable *"Selenium MCP
+Fallback Strategy"*. It is the correct design, not a fallback. Naming it properly
+removed an interface and a large amount of would-be migration work.
 
-**Decisions**
-- **Existing Conventions First**: The plugin must expose the target repository's existing base classes, wrappers, and structures to the AI prompt. The AI will strictly reuse existing framework conventions.
-- **Framework Discovery**: The active framework will initially be set via an environment variable (`AUTOMATION_FRAMEWORK`), defaulting to `playwright` for backward compatibility.
-- **Scope limitation**: We are NOT building the second framework plugin yet. We are building the architecture and the *Playwright Reference Plugin* as proof of concept. *(Update: Overruled. Selenium Plugin was built and proven).*
-- **AI Test Studio UI Integration**: The framework configuration must be passed from the AI Test Studio UI when triggering an agent run (e.g., via the API in `qa_agents_server/routes.py`). The UI layer will eventually need a dropdown/configuration option to specify the target framework.
-- **Selenium MCP Requirement**: A key finding is that Playwright agents use an MCP server (`@playwright/mcp`) for live browser exploration. For a future Selenium plugin to achieve parity, a "Selenium MCP Server" will need to be developed or sourced. *(Update: Handled via the Selenium 4 CDP Fallback Strategy).*
+## What exists
+
+Four contracts in `shared/frameworks/base.py`, implemented by `PlaywrightPlugin`
+and `SeleniumPlugin`:
+
+- **`TelemetryParser`** — `discover()` finds the framework's artifacts,
+  `read_actions()` parses them into one shared action schema
+  (`ACTION_KEYS`), `failing_action()` picks the one that broke.
+- **`TestRunner`** — `detect_command()`, `apply_browser_mode()`.
+- **`DiagnosticEngine`** — `is_ambiguous_locator()`,
+  `is_locator_resolution_failure()`.
+- **`CodeEngine`** — `extract_locators()`, `normalize_selector()`,
+  `emit_locator()`, `build_has_text_selector()`, `map_role()`, plus an optional
+  `findby` output for frameworks that declare locators as page-object fields.
+
+Selection is in `shared/frameworks/detect.py` and `__init__.py`.
+`docs/FRAMEWORK_INTEGRATION.md` is the guide for adding a framework.
+
+## Decisions
+
+**Framework is derived from the repository, not configured.** `detect.py` reads
+the repo's build files (`pom.xml`, `package.json`, …), with `repo-map.json` as a
+secondary source and `AUTOMATION_FRAMEWORK` as an explicit override that warns
+loudly when it contradicts what the repo contains. A repo either is or is not a
+Playwright repo, so a setting can only agree or be wrong.
+
+*It was wrong.* `config/.env` said `selenium` while the target repo was
+Playwright-Java. Locator extraction returned `[]` for every page object, every
+trace was rejected, and `AMBIGUOUS_LOCATOR` could never fire — silently, with no
+error anywhere. Deriving it deleted that entire class of bug, and with it four
+planned work items: the UI dropdown, per-run payload plumbing, the process-global
+plugin singleton, and the "one framework per server" limitation. Framework became
+per-run for free, because `FRAMEWORK_DIR` already points at each run's own
+worktree.
+
+**No `MCPProvider`.** Discarded — see the table above. Both implementations
+returned the same server and the same allowed-tools list. One implementation now
+lives in `shared/mcp_config.py`.
+
+**The instrument stays Playwright, deliberately.** `locator_verify.py`,
+`locator_candidates.py` and `locator_resolve.py` use `sync_playwright` directly
+and should keep doing so. They are marked as such so the next reader does not
+"fix" them.
+
+**Existing conventions first.** The plugin exposes the target repo's own idiom to
+the prompt. The Selenium repo uses `@FindBy` PageFactory exclusively, so
+`emit_locator` emits `@FindBy` for it — emitting inline `driver.findElement`
+would have contradicted the repo on every fix.
+
+## Things that were reported done and were not
+
+Recorded because each one *looked* complete in review:
+
+- **The headless env rename.** `agent_settings.py` still wrote
+  `PLAYWRIGHT_HEADLESS` while `browser_mode.py` read `HEADLESS_BROWSER`, and
+  `config/.env` had both with opposite values — so the admin toggle did nothing
+  *and displayed the inverse of reality*. Likewise `AUTHORING_PLAYWRIGHT_TIMEOUT_MS`
+  was written by the UI and read by nobody, silently reverting the timeout to 30s.
+- **Prompt generalisation.** `config/prompts/authoring.md` was edited to say "the
+  target framework's native locator syntax". Nothing loaded that file. The live
+  prompt — an f-string in `03_generate.py` — still said "using `page.locator()`".
+  The file is gone; the live prompt now injects the syntax from the CodeEngine.
+  `config/prompts/README.md` records the invariant that every file there must
+  have a loader.
+- **Plugin routing.** `locator_emit.synthesize()` was fully plugin-routed and
+  called by nothing; the live path (`emit()` → `candidates_for()`) was hardcoded
+  Playwright. The CodeEngine had almost no effect on emitted locators.
+  `candidates_for` is now routed and `synthesize` is deleted. Same pattern in
+  `test_runner._apply_browser_mode`, a private duplicate that shadowed the
+  plugin's method.
+- **Selenium telemetry.** Every discovery site globbed `traces/*.zip` while the
+  Selenium parser accepted only `.jsonl` — it could never be handed a path it
+  would take. Fixed by putting `discover()` in the contract.
+
+The common thread: **a plugin-routed function that nothing calls looks identical
+to a completed migration in review.** `tests/unit/test_frameworks.py` exists
+because none of the above had a test that would have failed.
+
+## Verification
+
+- `pytest tests/unit/test_frameworks.py` — contracts, parametrised over every
+  registered plugin; detection against both real target repos.
+- `pytest tests/unit/` — 1240 tests. `tests/conftest.py` pins the framework so
+  the suite no longer depends on the developer's environment.
+- `locator-eval/` is a Playwright-specific benchmark, useful for checking
+  Playwright has not regressed, not for grading a new plugin.
+
+## Still open
+
+**No agent has ever run against a Selenium repo.** This is the largest gap and
+worth stating plainly, because everything else about Selenium is verified and
+that can read as more than it is. What IS proven: the plugin contracts
+(`tests/unit/test_frameworks.py`, parametrised over both plugins), `@FindBy`
+emission, generated XPath validated against a real DOM, diagnostics against real
+Selenium exception text, detection resolving `Selenium-Automation-Framework` from
+its `pom.xml`, and a Java→Python telemetry round trip using output from a
+compiled `AgentTelemetry`. What is NOT: `detect_command` producing a working
+Maven invocation, `dom_snapshot.py` finding and parsing a real snapshot, and the
+locator ladder emitting into a live `@FindBy` page object during an actual fix.
+
+Related, and blocking a meaningful Selenium run: `AgentTelemetry.recordAction`
+is currently called only from `onTestFailure`, so a real run there would produce
+a one-line timeline rather than the "which selectors worked before the one that
+did not" that makes it useful. It needs wiring into that repo's interaction
+wrappers — work in the target repository, not here.
+
+Smaller items:
+
+- The healing agent's `00_reproduce.py` classifies errors from a hardcoded list
+  mixing both frameworks' strings; it should go through `DiagnosticEngine`.
+- Several inline prompts in `01_fix.py` and `02_validate_web.py` still describe
+  Playwright behaviour in prose.
+- `shared/page_identity.py` retains ~110 lines of Playwright constants left
+  behind when its functions were delegated. Dead, not harmful.

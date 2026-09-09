@@ -44,7 +44,7 @@ VALIDATE_RETRY_ATTEMPTS = int(os.environ.get("VALIDATE_WEB_RETRY_ATTEMPTS", "1")
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 from shared.claude import call_claude_ex            # noqa: E402  (after sys.path update)
-from shared.mcp_config import write_mcp_config  # noqa: E402
+from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools  # noqa: E402
 from shared.log import log as _log      # noqa: E402  (shared, redacts known secrets)
 from shared.page_identity import is_dom_selector    # noqa: E402
 from shared import check_provenance                  # noqa: E402
@@ -519,10 +519,15 @@ CREDENTIALS (use exactly these — do NOT use any other values):
     for page_def in web_pages:
         all_locators.extend(page_def.get("locators_needed", []))
 
-    # Write .mcp.json so the `claude -p` subprocess can use the Playwright MCP server
+    # .mcp.json goes in the audit dir, not the repo root: the root is shared
+    # mutable state and the server can be running another agent against it at
+    # the same time, so two concurrent runs with different headless settings
+    # clobbered each other's config and the loser's browser launched with the
+    # winner's settings. The other two agents already did it this way — this was
+    # the last one writing to the shared root.
     mode_label = browser_mode.label(PW_HEADLESS)
     log(f"Browser mode: {mode_label}")
-    mcp_path = write_mcp_config(REPO_ROOT, headless=PW_HEADLESS)
+    mcp_path = write_mcp_config(AUDIT_DIR, headless=PW_HEADLESS)
     log(f"Playwright MCP config written: {mcp_path}")
 
     steps_numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(web_steps))
@@ -904,7 +909,7 @@ Begin executing the steps now using the browser tools.
             timeout=VALIDATE_TIMEOUT,
             on_output=_on_output,
             log_dir=str(AUDIT_DIR),
-            allowed_tools=["mcp__playwright__*"],
+            allowed_tools=mcp_allowed_tools(),
             # Load NO built-in tools. allowed_tools above only gates permission —
             # every built-in stays *defined*, costing ~10k tokens of system prompt
             # on every one of the ~50 turns this step takes, and arriving deferred

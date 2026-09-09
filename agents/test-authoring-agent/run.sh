@@ -45,7 +45,12 @@ source "$REPO_ROOT/shared/session.sh"
 # Clear the cache manually to force a fresh run:
 #   rm -rf agents/test-authoring-agent/cache/<module>/
 TESTING_MODE="${TESTING_MODE:-false}"
-CACHE_DIR="$AGENT_DIR/cache/$MODULE"
+# Resolved here rather than further down, because the cache path depends on it.
+USER_ID="${USER_ID:-${USER:-cli}}"
+# Scoped by user. Two people running the same module name shared one cache
+# directory, so run A's cached step output was restored into run B's audit dir —
+# cross-user content leakage, plus torn reads from a concurrent cp.
+CACHE_DIR="$AGENT_DIR/cache/$USER_ID/$MODULE"
 
 # _cache_hit <filename>  → returns 0 if cache exists and TESTING_MODE=true
 _cache_hit() {
@@ -66,7 +71,6 @@ _cache_save() {
 }
 
 # ── Locate input file ─────────────────────────────────────────────────────────
-USER_ID="${USER_ID:-${USER:-cli}}"
 if [[ "$USER_ID" == "default" || "$USER_ID" == "cli" ]]; then
   QUEUE_DIR="$AGENT_DIR/queue"
 else

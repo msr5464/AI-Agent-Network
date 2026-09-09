@@ -30,7 +30,7 @@ from shared.log import log as _log
 from shared.dom_snapshot import find_snapshot, parse_header
 from shared import diagnosis
 from lib import artifacts
-from shared.playwright_trace import read_actions, failing_action
+from shared.telemetry import read_actions, failing_action
 from shared.slack import send_slack as _send_slack
 def log(msg): _log("ship", msg)
 def send_slack(channel: str, text: str) -> bool:

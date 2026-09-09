@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from shared.dom_snapshot import find_snapshot, parse_header
-from shared.playwright_trace import read_actions, failing_action
+from shared.telemetry import read_actions, failing_action
 from shared import failure_context as _failure_context
 
 
@@ -70,13 +70,20 @@ def attach_trace(issue: dict, report_dir: Path, method_name: str,
     if not report_dir or not method_name:
         return
     try:
-        traces = [p for p in Path(report_dir).rglob(f"traces/{method_name}_*.zip")]
+        # The framework knows where it writes its own telemetry; this used to
+        # glob for Playwright's traces/*.zip regardless of which framework
+        # produced the run.
+        from shared.frameworks import get_active_plugin
+        traces = get_active_plugin().telemetry.discover(Path(report_dir), method_name)
         if not traces:
             return
         trace = max(traces, key=lambda p: p.stat().st_mtime)
         trace_dir = audit_dir / "traces"
         trace_dir.mkdir(parents=True, exist_ok=True)
-        preserved = trace_dir / f"{method_name}.zip"
+        # Keep the original extension: a Selenium repo's telemetry is a .jsonl
+        # action log, not a zip, and CI cleans up report_dir before the healing
+        # agent reads the handoff — so this copy is what has to stay valid.
+        preserved = trace_dir / f"{method_name}{trace.suffix}"
         preserved.write_bytes(trace.read_bytes())
 
         issue["trace_path"] = str(preserved)

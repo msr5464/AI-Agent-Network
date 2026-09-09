@@ -71,22 +71,15 @@ def _apply_browser_mode(cmd: List[str],
     setting it headed showed you the DOM-inspection browser and hid every run
     that mattered.
 
-    How it is expressed depends on the runner: a JVM build takes `-Dheadless`,
-    which the framework reads ahead of parameters/config.properties, while
-    `npx playwright test` has no such property and spells it `--headed`. When
-    the switch is unset, nothing is added and each runner keeps the default it
-    had before — for Maven that is the framework's own config file, which is
-    the one place a sensible answer already lives.
+    How it is expressed is the target framework's business (a JVM build takes
+    `-Dheadless`; `npx playwright test` spells it `--headed`), so it is the
+    plugin's to answer. This was a private duplicate of the plugin's method,
+    including its own `"playwright" in runner` test, and it was the copy that
+    actually ran — the plugin's was dead. Kept as a thin wrapper because
+    tests/unit/test_browser_mode.py exercises it by this name.
     """
-    decided = browser_mode.configured()
-    if decided is None or "headless" in properties:
-        return cmd, properties          # unset, or the caller was explicit
-    runner = " ".join(cmd[:3]).lower()
-    if any(tool in runner for tool in ("mvn", "maven", "gradle")):
-        properties = {**properties, **browser_mode.maven_properties()}
-    elif "playwright" in runner and not decided and "--headed" not in cmd:
-        cmd = cmd + ["--headed"]
-    return cmd, properties
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().runner.apply_browser_mode(cmd, properties)
 
 
 def detect_test_command(workspace: Path, class_simple: str, method: str,

@@ -270,10 +270,10 @@ Web Steps:
 | `AUTHORING_COUNTRY` | Maven `-Dcountry=` value | `SG` |
 | `MAVEN_TEST_TIMEOUT_S` | Timeout (s) for a single `mvn test` run in step 04 | `300` |
 | `TEST_RESULTS_DIR_NAME` | Java framework's report/screenshot output dir name | `test-output` |
-| `AUTHORING_PLAYWRIGHT_TIMEOUT_MS` | Timeout (ms) for each individual browser action | `30000` |
+| `AUTHORING_BROWSER_TIMEOUT_MS` | Timeout (ms) for each individual browser action | `30000` |
 | `VALIDATE_WEB_TIMEOUT_S` | Wall-clock budget (s) for the whole step-02 run | `1800` |
 | `VALIDATE_WEB_RETRY_ATTEMPTS` | Extra full re-runs step 02 attempts on recoverable failures | `1` |
-| `PLAYWRIGHT_HEADLESS` | Set `false` to watch every browser this agent starts — step 02's validation and step 04's `mvn test` run | `true` |
+| `HEADLESS_BROWSER` | Set `false` to watch every browser this agent starts — step 02's validation and step 04's `mvn test` run | `true` |
 | `PLAYWRIGHT_MCP_VERSION` | `@playwright/mcp` version the browser steps launch (pinned, not `latest`) | `0.0.79` |
 | `VALIDATE_API_REQUEST_TIMEOUT_S` | Timeout (s) for each real HTTP call in Validate API | `15` |
 | `VALIDATE_API_RETRY_ON_ERROR` | Set `false` to disable the one connection-error retry in Validate API | `true` |

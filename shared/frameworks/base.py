@@ -3,12 +3,55 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 class TelemetryParser(abc.ABC):
-    """Parses framework-specific execution artifacts (traces, logs) into standard structures."""
-    
+    """Reads a framework's execution artifacts into one shared action shape.
+
+    ACTION SCHEMA — every parser must return dicts of this shape, and consumers
+    may rely on nothing else:
+
+        {"action":   str,          # "click", "fill", "navigate", ...
+         "selector": str,          # "" when the action names no element
+         "url":      str,          # "" when unknown
+         "value":    str,          # "" when the action carries no value
+         "error":    str,          # "" for actions that succeeded
+         "inferred": bool}         # True when derived, not directly recorded
+
+    Keys are REQUIRED, values may be empty. This was previously unspecified, and
+    the shared prompt formatter indexed a["action"], a["selector"] and a["url"]
+    directly — so a parser returning its raw log records (as the Selenium one
+    did) crashed the prompt builder with a KeyError on the first real trace.
+    """
+
+    #: Normalised keys, with the empty value each defaults to.
+    ACTION_KEYS = {"action": "", "selector": "", "url": "", "value": "",
+                   "error": "", "inferred": False}
+
+    @classmethod
+    def normalise(cls, raw: Dict) -> Dict:
+        """Coerce one parsed record into the shared schema. Never raises."""
+        record = dict(cls.ACTION_KEYS)
+        for key, default in cls.ACTION_KEYS.items():
+            value = raw.get(key, default)
+            record[key] = bool(value) if isinstance(default, bool) else (
+                "" if value is None else str(value))
+        return record
+
+    @abc.abstractmethod
+    def discover(self, results_dir: Path, method_name: str) -> List[Path]:
+        """Every telemetry artifact this framework wrote for one test method.
+
+        Order does not matter; callers pick by mtime. Discovery belongs here
+        because the layout is the framework's own: Playwright writes
+        traces/<method>_*.zip, another framework may write a JSONL log or
+        nothing at all. Callers used to glob for *.zip themselves, which meant a
+        non-Playwright parser could never be handed a path it accepted — its
+        telemetry was unreachable however correct the parser was.
+        """
+        pass
+
     @abc.abstractmethod
     def read_actions(self, trace_path: Path) -> List[Dict]:
-        """Return the ordered actions in a trace, each with its selector and error.
-        
+        """The ordered actions in one artifact, each matching ACTION_KEYS.
+
         Must return [] if the artifact is missing or malformed.
         """
         pass
@@ -86,20 +129,6 @@ class CodeEngine(abc.ABC):
         pass
 
 
-class MCPProvider(abc.ABC):
-    """Provides configuration for the framework's Live Browser Exploration MCP server."""
-    
-    @abc.abstractmethod
-    def get_server_config(self, project_root: Path, headless: Optional[bool] = None, cdp_endpoint: Optional[str] = None, storage_state: Optional[str] = None) -> Dict:
-        """Return the JSON-serializable MCP server configuration dictionary."""
-        pass
-
-    @abc.abstractmethod
-    def allowed_tools(self) -> List[str]:
-        """Return the list of MCP tools the LLM is allowed to call for this framework (e.g., ['mcp__playwright__*'])."""
-        pass
-
-
 class FrameworkPlugin(abc.ABC):
     """The central registry for a framework's capabilities."""
     
@@ -123,7 +152,8 @@ class FrameworkPlugin(abc.ABC):
     def code(self) -> CodeEngine:
         pass
 
-    @property
-    @abc.abstractmethod
-    def mcp(self) -> MCPProvider:
-        pass
+    # There is deliberately no `mcp` here. Browser inspection is the agents' own
+    # instrument rather than a target-repo convention, it speaks CDP, and CDP is
+    # a browser-level protocol — so it is always Playwright and lives in
+    # shared/mcp_config.py. The interface this replaced had two implementations
+    # that returned the same server and the same allowed-tools list.

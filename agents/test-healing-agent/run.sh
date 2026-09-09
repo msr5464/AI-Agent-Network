@@ -69,13 +69,33 @@ elif [[ -n "$BUILD_TAG" ]]; then
   MODE="direct"
 
 else
-  # Queue mode — pick the oldest .json file in queue/
-  HANDOFF_FILE=$(ls -t "$QUEUE_DIR"/*.json 2>/dev/null | tail -1 || true)
+  # Queue mode — claim the oldest .json file in queue/.
+  #
+  # Claiming, not just picking: `ls | tail -1` gave two concurrent healing runs
+  # the same handoff, so both fixed the same test, raced on the same files, and
+  # both then tried to move one handoff to processed. `mv` within a filesystem
+  # is atomic and fails for the loser, which makes it the claim.
+  CLAIM_DIR="$QUEUE_DIR/.claimed/$$"
+  mkdir -p "$CLAIM_DIR"
+  HANDOFF_FILE=""
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    if mv "$candidate" "$CLAIM_DIR/" 2>/dev/null; then
+      HANDOFF_FILE="$CLAIM_DIR/$(basename "$candidate")"
+      break
+    fi
+    log "Handoff $(basename "$candidate") was claimed by another run — trying the next"
+  done < <(ls -tr "$QUEUE_DIR"/*.json 2>/dev/null || true)
+
   if [[ -z "$HANDOFF_FILE" ]]; then
+    rmdir "$CLAIM_DIR" 2>/dev/null || true
     log "Queue is empty — nothing to fix."
     log "Run test-triaging-agent first to populate the queue."
     exit 0
   fi
+  # Whatever happens next, this run must not strand its claim in .claimed/.
+  # shellcheck disable=SC2064
+  trap "[[ -f \"$HANDOFF_FILE\" ]] && mv \"$HANDOFF_FILE\" \"$QUEUE_DIR/\" 2>/dev/null; rmdir \"$CLAIM_DIR\" 2>/dev/null; true" EXIT
   BUILD_TAG=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['build_tag'])" "$HANDOFF_FILE")
   SAFE_TAG="${BUILD_TAG//\//-}"
   MODE="queue"
@@ -229,6 +249,11 @@ fi
 if [[ "$MODE" == "local" ]]; then
   log "Standalone run — handoff kept with the session: $HANDOFF_FILE"
 elif [[ "$SKIP_REASON" == "infra" ]]; then
+  # Return the claim to the queue so another run (or a retry) picks it up.
+  if [[ -n "${CLAIM_DIR:-}" && -f "$HANDOFF_FILE" ]]; then
+    mv "$HANDOFF_FILE" "$QUEUE_DIR/" 2>/dev/null || true
+    HANDOFF_FILE="$QUEUE_DIR/$(basename "$HANDOFF_FILE")"
+  fi
   log "Infra skip — leaving handoff queued for retry: $HANDOFF_FILE"
 else
   mv "$HANDOFF_FILE" "$PROCESSED_DIR/$(basename "$HANDOFF_FILE")"

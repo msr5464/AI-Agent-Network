@@ -15,12 +15,51 @@ Duplicate session ids are resolved newest-wins by `query`.
 
 import json
 import os
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from shared import metrics as _metrics
 from shared import workspace as _workspace
+
+# Serialises whole-file rewrites against each other. Plain appends do not need
+# it — a single O_APPEND write is atomic — but a read-modify-rewrite does, and
+# every run's reap thread appends while a clear may be rewriting.
+_write_lock = threading.Lock()
+
+# md5("admin")[:12], the id AI-Test-Studio derives for its bootstrap admin.
+# Rows written before user attribution existed carry no owner, and showing them
+# to nobody would silently lose history, so they are attributed here. This was
+# duplicated as a bare literal in three places that could drift apart.
+ADMIN_USER_ID = "21232f297a57"
+_UNATTRIBUTED = ("", "default", "admin", None)
+
+
+def _owner_of(row: Dict[str, Any]) -> str:
+    """Who an analytics row belongs to, resolving legacy/unattributed rows."""
+    owner = row.get("user_id")
+    return ADMIN_USER_ID if owner in _UNATTRIBUTED else owner
+
+
+def _atomic_write_rows(rows: List[Dict[str, Any]]) -> None:
+    """Replace the store in one step, never truncating it in place."""
+    path = _store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".run_analytics.", suffix=".tmp",
+                               dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 SCHEMA_VERSION = 1
 _STORE = Path(__file__).resolve().parent / "storage" / "run_analytics.jsonl"
@@ -346,7 +385,6 @@ def query(window: str = "7d", agent: Optional[str] = None,
     data_since = min((float(r.get("started_at") or 0) for r in rows
                       if r.get("started_at")), default=None)
 
-    ADMIN_USER_ID = "21232f297a57"
     selected = []
     for row in rows:
         started = float(row.get("started_at") or 0)
@@ -356,12 +394,8 @@ def query(window: str = "7d", agent: Optional[str] = None,
             continue
         if agent and row.get("agent") != agent:
             continue
-        if user_id:
-            row_user = row.get("user_id") or ADMIN_USER_ID
-            if row_user in ("default", "admin"):
-                row_user = ADMIN_USER_ID
-            if row_user != user_id:
-                continue
+        if user_id and _owner_of(row) != user_id:
+            continue
         selected.append(row)
 
     overall = _blank_rollup()
@@ -395,39 +429,43 @@ def _window_label(window: str) -> str:
 
 
 def clear_history(user_id: Optional[str] = None, window: str = "all") -> List[str]:
-    ADMIN_USER_ID = "21232f297a57"
+    """Drop analytics rows. Returns the session ids removed.
+
+    Serialised and atomic, which it was not. Appends come from every run's reap
+    thread, so a clear running concurrently with a finishing run silently lost
+    whatever was written between _read_all() and the rewrite — and a crash
+    mid-rewrite left a truncated store, because the file was opened "w" and
+    written in place. storage.py already had the mkstemp + os.replace pattern;
+    this now uses the same one.
+    """
     now = time.time()
     since = None
     if window in WINDOWS and WINDOWS[window] is not None:
         since = now - WINDOWS[window]
 
     path = _store_path()
-    removed_sessions = []
-    if path.exists():
+    removed_sessions: List[str] = []
+    with _write_lock:
+        if not path.exists():
+            return removed_sessions
         rows = _read_all()
         if (not user_id or user_id == "all") and since is None:
             removed_sessions = [r.get("session_id") for r in rows if r.get("session_id")]
-            path.write_text("")
-        else:
-            kept = []
-            for row in rows:
-                row_user = row.get("user_id") or ADMIN_USER_ID
-                if row_user in ("default", "admin"):
-                    row_user = ADMIN_USER_ID
-                
-                if (not user_id or user_id == "all" or row_user == user_id):
-                    ts = float(row.get("started_at") or 0)
-                    if since is not None and ts < since:
-                        kept.append(row)
-                    else:
-                        if row.get("session_id"):
-                            removed_sessions.append(row.get("session_id"))
-                else:
-                    kept.append(row)
+            _atomic_write_rows([])
+            return removed_sessions
 
-            with path.open("w", encoding="utf-8") as f:
-                for r in kept:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        kept = []
+        for row in rows:
+            row_user = _owner_of(row)
+            if not user_id or user_id == "all" or row_user == user_id:
+                ts = float(row.get("started_at") or 0)
+                if since is not None and ts < since:
+                    kept.append(row)
+                elif row.get("session_id"):
+                    removed_sessions.append(row.get("session_id"))
+            else:
+                kept.append(row)
+        _atomic_write_rows(kept)
     return removed_sessions
 
 
@@ -439,4 +477,9 @@ if __name__ == "__main__":
         append_from_session(Path(target),
                             status=os.environ.get("RUN_STATUS", ""),
                             module=os.environ.get("MODULE") or os.environ.get("TEST_NAME")
-                                   or os.environ.get("BUILD_TAG", ""))
+                                   or os.environ.get("BUILD_TAG", ""),
+                            # The runner exports USER_ID into every agent's
+                            # environment; this path never read it, so rows
+                            # written by the agent itself (which is the path a
+                            # plain `make run` takes) lost their owner.
+                            user_id=os.environ.get("USER_ID") or "default")

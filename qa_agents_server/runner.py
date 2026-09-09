@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -59,7 +60,6 @@ from qa_agents_server.agents import (
 AGENT = DEFAULT_AGENT
 MAX_BUFFERED_EVENTS = 10_000
 AUDIT_POLL_INTERVAL = 0.5  # seconds
-CANCEL_GRACE_SECONDS = 5
 # Whole-pipeline (run.sh, all 5 steps) kill timeout — not just one step's budget.
 # Worst case with current per-step defaults: step02 alone can now take up to
 # VALIDATE_WEB_TIMEOUT_S x (1+VALIDATE_WEB_RETRY_ATTEMPTS) = 1800x2 = 3600s;
@@ -126,6 +126,11 @@ class RunState:
     base_branch: str = ""
     payload: Dict = field(default_factory=dict)
     user_id: str = "default"
+    # Stored, not recomputed from QA_WORKTREE_TEMP_DIR at teardown time: the
+    # admin Agent Settings page can change that variable while runs are in
+    # flight, and cleanup would then look for a path that never existed and
+    # silently leak both the directory and its .git/worktrees admin entry.
+    worktree_path: str = ""
 
     def snapshot(self) -> Dict:
         """Persistable snapshot (no Popen, no threading primitives)."""
@@ -161,6 +166,13 @@ class RunState:
 # ── Module state ──────────────────────────────────────────────────────────────
 _runs: Dict[str, RunState] = {}
 _active_runs: Dict[str, RunState] = {}
+# Session ids that have passed the capacity gate but do not yet have a RunState:
+# preparing a run means cloning and creating a git worktree, which can take
+# minutes, and that used to happen while _registry_lock was held — blocking
+# GET /run/active and every other registry reader for the duration. The slot is
+# reserved here instead, so capacity stays correct while the git work runs
+# unlocked. Guarded by _registry_lock.
+_starting: set = set()
 _registry_lock = threading.Lock()
 
 def max_concurrent_runs() -> int:
@@ -168,6 +180,49 @@ def max_concurrent_runs() -> int:
         return int(os.environ.get("QA_MAX_CONCURRENT_RUNS", "4"))
     except ValueError:
         return 4
+
+
+DEFAULT_WORKTREE_TEMP_DIR = "/tmp/qa-runs"
+# Paths a worktree root must never be. reconcile_on_boot deletes directories
+# under this root, so an admin typing "/" or "$HOME" into the Agent Settings box
+# would otherwise turn the next boot into a recursive delete of their home.
+# Compared as RESOLVED paths: on macOS /tmp is a symlink to /private/tmp, so a
+# literal string set silently missed the likeliest typo of the lot.
+_FORBIDDEN_WORKTREE_ROOTS = {"/", "/home", "/Users", "/tmp", "/var", "/etc", "/usr",
+                             "/private/tmp", "/private/var", "/private/etc"}
+
+
+def _worktree_temp_dir() -> str:
+    """The worktree root, or the default when the configured value is unsafe.
+
+    Validated on every read rather than at save time, because the value can also
+    arrive from the environment and from config/.env, neither of which goes
+    through the settings validator.
+    """
+    raw = (os.environ.get("QA_WORKTREE_TEMP_DIR") or "").strip()
+    if not raw:
+        return DEFAULT_WORKTREE_TEMP_DIR
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return DEFAULT_WORKTREE_TEMP_DIR
+    forbidden = set()
+    for candidate in _FORBIDDEN_WORKTREE_ROOTS:
+        forbidden.add(candidate)
+        try:
+            forbidden.add(str(Path(candidate).resolve()))
+        except (OSError, RuntimeError):
+            pass
+    if not resolved.is_absolute() or str(resolved) in forbidden:
+        print(f"[runner] refusing unsafe QA_WORKTREE_TEMP_DIR {raw!r}; "
+              f"using {DEFAULT_WORKTREE_TEMP_DIR}")
+        return DEFAULT_WORKTREE_TEMP_DIR
+    home = Path.home().resolve()
+    if resolved == home or resolved == home.parent:
+        print(f"[runner] refusing unsafe QA_WORKTREE_TEMP_DIR {raw!r}; "
+              f"using {DEFAULT_WORKTREE_TEMP_DIR}")
+        return DEFAULT_WORKTREE_TEMP_DIR
+    return str(resolved)
 
 # ── Pending queue ─────────────────────────────────────────────────────────────
 # Each entry: {"agent": str, "payload": dict, "module": str, "auto_push": bool, "user_id": str}
@@ -195,40 +250,56 @@ class _QueuedNotification(Exception):
 
 
 def _start_next_from_queue() -> None:
-    """Pick the first pending item and start it. Runs in the reap thread."""
-    with _queue_lock:
-        if _shutting_down.is_set() or not _pending_queue:
+    """Pick the next pending item and start it. Runs in the reap thread.
+
+    Lock order is REGISTRY BEFORE QUEUE, everywhere, without exception — see
+    _unique_session_id, which depends on both being held in that order. This
+    function used to take them the other way round (queue, then registry) while
+    start_run took them registry-then-queue, which is a textbook ABBA deadlock:
+    a run finishing at the same moment as a run starting would wedge the entire
+    run subsystem, permanently, along with every endpoint that touches either
+    lock. Snapshotting the active counts under _registry_lock and RELEASING it
+    before taking _queue_lock is what keeps the order honest here.
+    """
+    while True:
+        if _shutting_down.is_set():
             return
-        
-        # Round-robin by user_id to prevent one user from starving the queue.
-        # Find the user whose turn it is. We can just count active runs per user.
+
         with _registry_lock:
-            active_counts = {}
+            active_counts: Dict[str, int] = {}
             for r in _active_runs.values():
                 active_counts[r.user_id] = active_counts.get(r.user_id, 0) + 1
-        
-        # Find the pending item belonging to the user with the fewest active runs.
-        # Break ties by queue position (index).
-        best_idx = 0
-        best_count = active_counts.get(_pending_queue[0].get("user_id", "default"), 0)
-        
-        for i, item in enumerate(_pending_queue):
-            uid = item.get("user_id", "default")
-            count = active_counts.get(uid, 0)
-            if count < best_count:
-                best_idx = i
-                best_count = count
-                
-        next_item = _pending_queue.pop(best_idx)
-    try:
-        start_run(next_item.get("payload", {}),
-                  agent=next_item.get("agent", DEFAULT_AGENT),
-                  session_id=next_item.get("session_id"),
-                  start_from_step=next_item.get("start_from_step", 1),
-                  user_id=next_item.get("user_id", "default"))
-    except Exception as e:
-        print(f"[runner] failed to start queued run for {next_item.get('module')!r} "
-              f"(session {next_item.get('session_id')}): {e}")
+
+        with _queue_lock:
+            if _shutting_down.is_set() or not _pending_queue:
+                return
+            # Fewest active runs wins; min() breaks ties by queue position, so
+            # one user firing ten runs cannot starve everyone queued behind them.
+            best_idx = min(
+                range(len(_pending_queue)),
+                key=lambda i: active_counts.get(
+                    _pending_queue[i].get("user_id", "default"), 0),
+            )
+            next_item = _pending_queue.pop(best_idx)
+
+        try:
+            start_run(next_item.get("payload", {}),
+                      agent=next_item.get("agent", DEFAULT_AGENT),
+                      session_id=next_item.get("session_id"),
+                      start_from_step=next_item.get("start_from_step", 1),
+                      user_id=next_item.get("user_id", "default"))
+            return
+        except _QueuedNotification:
+            # The pool refilled between our snapshot and the call, so start_run
+            # put it back. Whoever frees the next slot will pick it up.
+            return
+        except Exception as e:
+            print(f"[runner] failed to start queued run for {next_item.get('module')!r} "
+                  f"(session {next_item.get('session_id')}): {e}")
+            # Keep draining. Dropping the item AND returning would strand the
+            # rest of the queue forever whenever this was the last active run,
+            # because nothing else would ever call us again.
+            continue
 
 
 def _unique_session_id(spec, payload: dict) -> str:
@@ -248,7 +319,8 @@ def _unique_session_id(spec, payload: dict) -> str:
     against the existing registry-then-queue ordering.
     """
     base = spec.make_session_id(payload)
-    taken = {item.get("session_id") for item in _pending_queue} | set(_runs.keys())
+    taken = ({item.get("session_id") for item in _pending_queue}
+             | set(_runs.keys()) | set(_starting))
 
     candidate = base
     suffix = 2
@@ -258,16 +330,20 @@ def _unique_session_id(spec, payload: dict) -> str:
     return candidate
 
 
-def get_queue(agent: Optional[str] = None) -> List[Dict]:
+def get_queue(agent: Optional[str] = None,
+              user_id: Optional[str] = None) -> List[Dict]:
     """
     Return a snapshot of pending queue items.
 
-    The queue itself is global — the run slot is shared, because every agent
-    drives the same automation-repo checkout. But a caller asking on behalf of
-    one agent wants only its own rows, so `agent` filters them. Each row keeps
+    The queue is global — the worker pool is shared across agents and users —
+    but a caller asking on behalf of one agent wants only its own rows, so
+    `agent` filters them, and `user_id` filters to one person's. Each row keeps
     `index`, its position in the GLOBAL queue, which is what remove_from_queue
     takes; `position` is only the 1-based rank within the filtered view and is
     not a valid index once filtering is in play.
+
+    `mine` lets a UI show every row (so the wait is explicable) while marking
+    which ones the viewer may cancel.
     """
     with _queue_lock:
         rows = [{"agent": item.get("agent", DEFAULT_AGENT),
@@ -275,26 +351,35 @@ def get_queue(agent: Optional[str] = None) -> List[Dict]:
                  "base_branch": item.get("base_branch", ""),
                  "session_id": item.get("session_id"),
                  "start_from_step": item.get("start_from_step", 1),
+                 "user_id": item.get("user_id", "default"),
                  "index": i}
                 for i, item in enumerate(_pending_queue)]
     if agent:
         rows = [r for r in rows if r["agent"] == agent]
+    if user_id:
+        rows = [r for r in rows if r["user_id"] == user_id]
     for rank, row in enumerate(rows):
         row["position"] = rank + 1
+        row["mine"] = (user_id is not None and row["user_id"] == user_id)
     return rows
 
 
-def remove_from_queue(index: int, agent: Optional[str] = None) -> bool:
+def remove_from_queue(index: int, agent: Optional[str] = None,
+                      user_id: Optional[str] = None) -> bool:
     """
     Remove the item at 0-based GLOBAL index. Returns True if removed.
 
     `agent`, when given, must match the item's own agent — one panel must not
-    be able to delete another agent's queued run by index collision.
+    be able to delete another agent's queued run by index collision. `user_id`
+    is the same argument applied to people: None means "no ownership check"
+    (an admin), otherwise the row must belong to that user.
     """
     with _queue_lock:
         if not (0 <= index < len(_pending_queue)):
             return False
         if agent and _pending_queue[index].get("agent", DEFAULT_AGENT) != agent:
+            return False
+        if user_id is not None and _pending_queue[index].get("user_id", "default") != user_id:
             return False
         _pending_queue.pop(index)
         return True
@@ -360,6 +445,33 @@ def _kill_group(pid: int, label: str = "") -> bool:
     return True
 
 
+def _preserve_worktree_artefacts(run: "RunState") -> None:
+    """Copy a run's artefacts out of its worktree before the worktree is removed.
+
+    Screenshots, DOM snapshots and traces are written inside the ephemeral
+    worktree, which _wait_and_reap deletes as soon as the process exits — while
+    the audit record keeps pointing at those now-deleted paths. Copying
+    test-output/ into the session's audit directory (already an artefact root)
+    is what makes those links resolve after the run ends.
+
+    Best-effort by design: a run that produced nothing, or a partial copy, must
+    never turn a finished run into a failed one.
+    """
+    worktree = (run.worktree_path or "").strip()
+    if not worktree:
+        return
+    source = Path(worktree) / "test-output"
+    if not source.is_dir():
+        return
+    destination = run.audit_dir / "test-output"
+    try:
+        if destination.exists():
+            return          # a resumed session already preserved this
+        shutil.copytree(source, destination, symlinks=False, dirs_exist_ok=True)
+    except Exception as e:
+        print(f"[runner] could not preserve artefacts for {run.session_id}: {e}")
+
+
 def _mark_interrupted(audit_dir: Path) -> None:
     """Leave a marker the status derivation can read.
 
@@ -401,20 +513,32 @@ def reconcile_on_boot() -> None:
 
     interrupted = storage.mark_all_running_as_interrupted()
     
-    # Prune orphaned worktrees
+    # Prune worktrees left behind by an interrupted or crashed server process.
+    #
+    # This used to rmtree EVERY subdirectory unconditionally, despite a comment
+    # claiming it checked whether they were still valid worktrees — so a second
+    # server instance (or a create_app() in a test) wiped the first instance's
+    # live runs, and a typo in the admin Settings box became recursive deletion
+    # of whatever was typed. It also pruned BEFORE removing, so the prune saw
+    # the directories still present, removed nothing, and left the
+    # .git/worktrees admin entries orphaned to collide with a later add.
     try:
-        worktree_temp_dir = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs")
-        if Path(worktree_temp_dir).exists():
+        worktree_temp_dir = _worktree_temp_dir()
+        if worktree_temp_dir and Path(worktree_temp_dir).is_dir():
             from shared import workspace as _workspace
-            main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""), os.environ.get("GITHUB_REPO_AUTOMATION", ""))
+            main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""),
+                                            os.environ.get("GITHUB_REPO_AUTOMATION", ""))
             if main_repo and main_repo.exists():
-                _workspace._git(["worktree", "prune"], cwd=str(main_repo), timeout=120)
-                # Any directories still in QA_WORKTREE_TEMP_DIR might be untracked maven target files
-                # of crashed runs. If they are no longer linked as valid worktrees, they can be removed.
-                import shutil
+                # A worktree whose session is still marked running belongs to
+                # another live server process — never touch it.
+                live = {r.get("session_id") for r in storage.load_all()
+                        if r.get("status") == "running"}
                 for wt_dir in Path(worktree_temp_dir).iterdir():
-                    if wt_dir.is_dir():
-                        shutil.rmtree(wt_dir, ignore_errors=True)
+                    if not wt_dir.is_dir() or wt_dir.name in live:
+                        continue
+                    _workspace.cleanup_worktree(str(main_repo), str(wt_dir))
+                # Prune AFTER removal, so the stale admin entries actually go.
+                _workspace._git(["worktree", "prune"], cwd=str(main_repo), timeout=120)
     except Exception as e:
         print(f"[runner] failed to prune orphaned worktrees: {e}")
 
@@ -463,11 +587,58 @@ def shutdown_all() -> None:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 def get_active_session_id(user_id: str = "default") -> Optional[str]:
+    """One of this user's active runs. Prefer get_active_runs().
+
+    Returns the FIRST match, which is dict-ordering-dependent and therefore
+    arbitrary once a user has more than one run in flight — the reason a second
+    concurrent run was invisible in the UI. Kept because callers that genuinely
+    want a single session still use it.
+    """
     with _registry_lock:
         for run in _active_runs.values():
             if run.user_id == user_id:
                 return run.session_id
     return None
+
+
+def get_active_runs(user_id: str = "default",
+                    agent: Optional[str] = None) -> List[RunState]:
+    """Every run this user has in flight, oldest first.
+
+    Oldest first so the list is stable as runs come and go: a UI that renders
+    one tab per run must not have them reorder underneath the person using it.
+    """
+    with _registry_lock:
+        runs = [r for r in _active_runs.values() if r.user_id == user_id]
+    if agent:
+        runs = [r for r in runs if r.agent == agent]
+    return sorted(runs, key=lambda r: r.started_at)
+
+
+def capacity(user_id: Optional[str] = None) -> Dict:
+    """Worker-pool occupancy, for the UI's capacity indicator.
+
+    The server reported only a boolean `busy`, which cannot render "2 of 4
+    workers busy" — so the numerator and denominator were missing on the server
+    side as well as unused on the client side.
+    """
+    with _registry_lock:
+        active = len(_active_runs)
+        mine_active = sum(1 for r in _active_runs.values() if r.user_id == user_id) \
+            if user_id else 0
+    with _queue_lock:
+        queued = len(_pending_queue)
+        mine_queued = sum(1 for item in _pending_queue
+                          if item.get("user_id", "default") == user_id) if user_id else 0
+    maximum = max_concurrent_runs()
+    return {
+        "active": active,
+        "max": maximum,
+        "queued": queued,
+        "busy": active >= maximum,
+        "mine_active": mine_active,
+        "mine_queued": mine_queued,
+    }
 
 def get_run(session_id: str) -> Optional[RunState]:
     return _runs.get(session_id)
@@ -556,8 +727,12 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
     if not spec.run_sh.exists():
         raise RunnerError(f"agent run.sh not found at {spec.run_sh}", status=500)
 
+    # Capacity gate and slot reservation. Everything slow — clone, fetch,
+    # worktree creation, spawn — happens AFTER this block releases the lock:
+    # holding _registry_lock across a git clone (300s timeout) blocked every
+    # registry reader, GET /run/active included, for as long as it took.
     with _registry_lock:
-        if len(_active_runs) >= max_concurrent_runs():
+        if len(_active_runs) + len(_starting) >= max_concurrent_runs():
             # Queue instead of rejecting.
             with _queue_lock:
                 queued_session_id = (session_id if resuming
@@ -576,17 +751,17 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
         if not session_id:
             with _queue_lock:
                 session_id = _unique_session_id(spec, payload)
+        _starting.add(session_id)
+
+    try:
         audit_dir = spec.audit_dir / session_id
         audit_dir.mkdir(parents=True, exist_ok=True)
 
         # Create isolated git worktree for parallel execution
-        worktree_temp_dir = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs")
-        worktree_path = Path(worktree_temp_dir) / session_id
-        
+        worktree_path = Path(_worktree_temp_dir()) / session_id
+
         from shared import workspace as _workspace
-        import tempfile
-        import shutil
-        
+
         main_repo = _workspace.ensure(
             os.environ.get("WORKSPACE_DIR", ""),
             os.environ.get("GITHUB_REPO_AUTOMATION", ""),
@@ -644,7 +819,17 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
             pid=proc.pid,
             start_from_step=start_from_step,
             user_id=user_id,
+            worktree_path=str(worktree_path),
         )
+    except BaseException:
+        # The slot must not stay reserved after a failed start, or the pool
+        # leaks capacity until restart.
+        with _registry_lock:
+            _starting.discard(session_id)
+        raise
+
+    with _registry_lock:
+        _starting.discard(session_id)
         _runs[session_id] = run
         _active_runs[session_id] = run
 
@@ -689,21 +874,30 @@ def cancel_run(session_id: str) -> bool:
 
     _append_event(run, "status", {"status": "cancelling"})
 
-    # Send SIGTERM to the entire process group (run.sh spawns python3 / mvn / claude).
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
+    # Set BEFORE signalling, so _wait_and_reap — which is already blocked in
+    # proc.wait() and wakes the instant the process dies — sees "cancelled"
+    # when it derives the final status. Without this the run reports "failed"
+    # (a non-zero exit from SIGTERM is indistinguishable from a real failure),
+    # the .cancelled marker never gets written, and shared/session.sh
+    # mis-reports the analytics row to match.
+    run.status = "cancelled"
 
-    # Cleanup worktree on cancel
-    try:
-        worktree_path = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs") + "/" + session_id
-        from shared import workspace as _workspace
-        main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""), os.environ.get("GITHUB_REPO_AUTOMATION", ""))
-        if main_repo and Path(worktree_path).exists():
-            _workspace.cleanup_worktree(str(main_repo), str(worktree_path))
-    except Exception:
-        pass
+    # Escalate SIGTERM -> SIGKILL on the whole process group, in a thread so the
+    # HTTP request does not block for the grace period. run.sh itself does
+    # little; its children (claude, mvn, the JVM surefire forks) are what burn
+    # time and tokens, and a child that ignores SIGTERM would otherwise hold its
+    # slot until the 2h run timeout.
+    #
+    # Worktree teardown deliberately does NOT happen here: it is _wait_and_reap's
+    # job, once proc.wait() has actually returned. Removing it here raced the
+    # dying process, rm -rf-ing the directory out from under a still-running
+    # mvn/JVM that had it as cwd.
+    threading.Thread(
+        target=_kill_group,
+        args=(proc.pid, f"cancelled run {session_id} (pid {proc.pid})"),
+        daemon=True,
+        name=f"cancel-{session_id}",
+    ).start()
 
     return True
 
@@ -997,13 +1191,24 @@ def _wait_and_reap(run: RunState) -> None:
         final_status = "failed"
     run.status = final_status
 
-    # Cleanup worktree on completion
+    # Preserve anything the run left in the worktree before tearing it down.
+    # /tmp/qa-runs is an artefact root (see routes._artefact_roots), but the
+    # worktree is removed here, BEFORE the terminal "done" event — so every
+    # artefact link pointing into it was a guaranteed 404 by the time the UI
+    # could follow it.
+    _preserve_worktree_artefacts(run)
+
+    # Cleanup worktree on completion. run.worktree_path is what this run was
+    # actually given; re-deriving it from QA_WORKTREE_TEMP_DIR meant a settings
+    # change mid-flight leaked the directory and its .git admin entry forever.
     try:
-        worktree_path = os.environ.get("QA_WORKTREE_TEMP_DIR", "/tmp/qa-runs") + "/" + run.session_id
-        from shared import workspace as _workspace
-        main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""), os.environ.get("GITHUB_REPO_AUTOMATION", ""))
-        if main_repo and Path(worktree_path).exists():
-            _workspace.cleanup_worktree(str(main_repo), str(worktree_path))
+        worktree_path = run.worktree_path
+        if worktree_path:
+            from shared import workspace as _workspace
+            main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""),
+                                            os.environ.get("GITHUB_REPO_AUTOMATION", ""))
+            if main_repo and Path(worktree_path).exists():
+                _workspace.cleanup_worktree(str(main_repo), str(worktree_path))
     except Exception as e:
         print(f"[runner] failed to cleanup worktree for {run.session_id}: {e}")
 
@@ -1090,10 +1295,15 @@ def _wait_and_reap(run: RunState) -> None:
     # Duplicate session ids are resolved newest-wins at read time.
     try:
         from qa_agents_server import analytics
+        # user_id was the one field never passed, though it sits right here on
+        # the run. Every row was therefore written as "default", which query()
+        # rewrites to the hardcoded admin id — so ALL cost was attributed to the
+        # admin and every member's analytics dashboard was empty.
         analytics.append_from_session(run.audit_dir, agent=run.agent,
                                       status=final_status, exit_code=exit_code,
                                       module=run.module, started_at=run.started_at,
-                                      ended_at=run.ended_at, auto_push=run.auto_push)
+                                      ended_at=run.ended_at, auto_push=run.auto_push,
+                                      user_id=run.user_id)
     except Exception:
         pass
 

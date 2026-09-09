@@ -120,7 +120,9 @@ else
   MODE="queue"
 fi
 export INPUT_FILE MODULE
-CACHE_DIR="$AGENT_DIR/cache/$MODULE"
+# Scoped by user — see the note in test-authoring-agent/run.sh. USER_ID is
+# already resolved above, where the queue directory is chosen.
+CACHE_DIR="$AGENT_DIR/cache/${USER_ID:-cli}/$MODULE"
 
 SAFE_MODULE="$(printf '%s' "$MODULE" | tr -c 'a-zA-Z0-9_-' '-' | sed 's/-\{2,\}/-/g; s/-$//')"
 SESSION_ID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)-adapt-${SAFE_MODULE}}"

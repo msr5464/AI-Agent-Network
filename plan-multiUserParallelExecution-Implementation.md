@@ -1,168 +1,163 @@
-# Comprehensive Implementation Plan: Multi-User Parallel Execution
+# Multi-User Parallel Execution
 
-This document outlines the end-to-end implementation plan for migrating `QA-Agent-Network` to a multi-user, parallel-execution architecture using **Git Worktrees** and **Threaded Worker Pools**, while ensuring compatibility with `Ai-Test-Studio`.
+**Status: implemented.** This document describes what the system does, the
+defects found when it was audited against the original plan, and what was
+discarded as the wrong shape.
 
-## Phase 1: `Ai-Test-Studio` (Proxy & UI) Updates
+## Goal
 
-Since `Ai-Test-Studio` acts as the authentication boundary and front-end interface, it must securely propagate user identity to the `qa_agents_server`.
+Several people run agents at the same time, isolated from each other's files,
+history and logs. One user's run must not see, disturb or be delayed by another's.
 
-### 1. User Signup, Authentication & Admin Approval / Role Gate
-- **Signup Flow (Self-Service + Admin Gate):**
-  - User fills out the Signup Form with Name, Email, and Password.
-  - Upon submission, a new user account is created with `status = 'pending_approval'` and `role = 'member'`.
-  - The user sees an immediate onboarding state: *"Your account has been created and is pending administrator approval."*
-- **Login Behavior for Pending Users:**
-  - If a user attempts to log in while `status = 'pending_approval'`, the login responds with `403 Forbidden` (or a dedicated status code) and the UI routes to a clean **Pending Approval Status Screen**.
-  - No access is granted to queues, active runs, or agent triggers until approved.
-- **Reusing & Extending Existing Admin User Management:**
-  - Leverage and extend the existing **Admin User Management** interface (`/admin/users`) in `Ai-Test-Studio`.
-  - **Approval Workflow:** Admins can view pending requests and execute one-click **Approve** (activates account) or **Reject**.
-  - **Role Management / Role Promotion:** Admins can promote any user to `admin` (or demote an admin to `member`) via a role toggle dropdown anytime.
-  - **Account Controls:** Admins can suspend or deactivate users on demand.
-- **Hierarchical Role Model (`admin` $\supset$ `member`):**
-  - Role permissions are strictly hierarchical: an `admin` automatically inherits **full `member` access**.
-  - Admins can author, heal, and adapt tests, run workflows, maintain user-scoped queues, and inspect live sessions just like regular members, while retaining exclusive privileges to access admin settings and user approval panels.
-- **User Data Model & Storage in `Ai-Test-Studio`:**
-  - Uses `Ai-Test-Studio`'s native lightweight file/JSON/SQLite storage (e.g. `storage/users.json` / `data/users.json` with atomic writes **and file-level locking** (e.g., via `filelock` package) to prevent corruption during concurrent signups/updates — **no external MySQL database required**).
-  - **First Boot Bootstrap:** On initial boot, if no admin exists, automatically seed the default admin account with `role = 'admin'` and `status = 'active'` (credentials generated securely and printed on boot, or configured via `ADMIN_DEFAULT_EMAIL` / `ADMIN_DEFAULT_PASSWORD`). This account immediately has **both Admin and Member access** out-of-the-box.
-  - **User Record Schema:**
-    - `id`: string (e.g., `usr_9812`)
-    - `name`: string (e.g., `Mukesh Rajput`)
-    - `email`: string (e.g., `engineer@company.com`)
-    - `password_hash`: string (bcrypt hashed)
-    - `role`: string (`admin` | `member`)
-    - `status`: string (`pending_approval` | `active` | `rejected` | `suspended`)
-    - `created_at`: ISO timestamp string
-    - `approved_by`: string | null (admin user ID)
-    - `approved_at`: ISO timestamp string | null
-- **Auth Middleware & Route Protection:**
-  - `requireAuth`: Validates JWT / session cookie (allows both `admin` and `member`).
-  - `requireActiveUser`: Ensures `req.user.status === 'active'`. Blocks API proxying to `qa_agents_server` if not active.
-  - `requireAdmin`: Protects admin settings, role elevation, and user approval endpoints. Allows `admin` only.
+## How isolation works
 
-### 2. Backend API Proxy Enhancements
-- **Intercept & Inject User ID:** In the API gateway/proxy layer (`backend/routes/api.js` or similar proxy controller), parse the authenticated user's JWT/session token.
-- **Header Injection:** For all proxied requests to `qa_agents_server` (e.g., `/api/agents/*`), inject the following headers:
-  - `X-User-ID`: The unique identifier of the user (e.g., `usr_123`).
-  - `X-User-Name`: The user's name/handle for audit trails.
-- **Settings API Gate:** For `GET/PUT /settings` (`/api/admin/agent-settings`), continue enforcing admin-only access (`requireAdmin`). Global settings still apply across all users.
+**Execution** — every run gets its own git worktree under `QA_WORKTREE_TEMP_DIR`
+(default `/tmp/qa-runs/<session_id>`), created detached:
 
-### 3. Frontend UI Enhancements
-- **Queue Partitioning:** Update the UI for managing queue files so that users understand they are seeing *their* workspace queues.
-- **Multi-Run Active Panel & Session Switcher:**
-  - Instead of binding the UI panel to a single global active session, allow the user to see a list of their active in-flight runs (e.g. tabs or a session selector: `payments [running]`, `checkout [running]`).
-  - The live SSE log stream listens to the currently selected active session.
-- **Busy Indicator & Global Capacity:**
-  - Update the "System Busy" indicator. Since `qa_agents_server` will now allow up to $N$ concurrent runs, the UI displays capacity (e.g., "2/4 Workers Busy") and handles `queued: true` states gracefully with "Queue Position: X" when the thread pool is saturated.
-- **User-Level Analytics Dashboard (`Ai-Test-Studio` Admin UI):**
-  - Update the Analytics panel to include a **User Filter** dropdown.
-  - By default, it displays aggregate data ("All Users"), but admins can select a specific user to view individual LLM cost, time saved, and run counts.
+```
+git worktree add --detach /tmp/qa-runs/<session_id> origin/<base_branch>
+```
 
----
+Detached because git refuses to check out one local branch in two worktrees at
+once, which is exactly the collision N parallel runs on `main` would hit. The
+runner exports `FRAMEWORK_DIR` at the worktree and `QA_ISOLATED_WORKTREE_READY=1`,
+which is what makes `checkout_base` detach rather than move a branch.
 
-## Phase 2: `qa_agents_server` (Python Backend) Updates
+**Concurrency** — `runner._active_runs` holds up to `QA_MAX_CONCURRENT_RUNS`
+(default 4). Beyond that, runs queue. The queue is drained fewest-active-runs
+first, ties broken by position, so one user firing ten runs cannot starve
+everyone behind them.
 
-The Python server needs to stop using global locks and single directories, and start respecting the `X-User-ID` header.
+**Identity** — `AI-Test-Studio` authenticates, then injects `X-User-ID` /
+`X-User-Name` / `X-User-Role` into every proxied request, stripping any copy the
+client sent. `qa_agents_server` validates the id once at the edge
+(`routes.current_user_id`) and never trusts it as a path segment.
 
-### 1. User-Scoped Queue Files (`qa_agents_server/feature_files.py`)
-- Extract `user_id` from Flask `request.headers.get("X-User-ID", "default")`.
-- Update `_queue_dir()` and `_processed_dir()` to append the `user_id` to the path:
-  `agents/<agent>/queue/<user_id>/<module>.txt`
-- Ensure directory creation (`mkdir -p`) handles the new nested structure.
+## Decisions
 
-### 2. Thread Pool & Concurrency Release (`qa_agents_server/runner.py`)
-- Remove the strict `_active_session_id` singleton.
-- Introduce `_active_runs = {}` (Dictionary of `session_id -> RunState`).
-- Define `MAX_CONCURRENT_RUNS = int(os.environ.get("QA_MAX_CONCURRENT_RUNS", 4))`.
-- Update `start_run()`:
-  - If `len(_active_runs) < MAX_CONCURRENT_RUNS`, spawn the process immediately.
-  - Else, append to `_pending_queue`.
-- **Fair Queue Scheduling:** Update the queue popping mechanism (`_start_next_from_queue()`) to prioritize fairly (e.g. round-robin by `user_id`) rather than strict FIFO, so one user submitting 10 runs doesn't starve other users.
-- Update `RunState` dataclass to include `user_id: str`.
-- Update `get_active_session_id()` / `run_active()` to accept `user_id` and return the specific user's active run:
-  `next((r for r in _active_runs.values() if r.user_id == user_id), None)`
+**Identity is resolved once, and ownership is a decorator.** The original plan
+said to add ownership checks endpoint by endpoint. That produced seven
+session-scoped endpoints of which two were checked — and both copies had the same
+bug, `if run_record and user_id and ...`, where **omitting the header granted
+access**. Five had no check at all, including `/events` (the endpoint the UI
+actually uses), `/cancel` (any user could kill any run) and `/retry`.
 
-### 3. Audit Storage, History, Streams & Artifacts (`qa_agents_server/storage.py` & `routes.py`)
-- Add `user_id` to the JSON snapshot saved in `agent_runs.json` and ensure it propagates into the analytics store (`storage/run_analytics.jsonl`).
-- Update `routes.py` `GET /agents/<agent>/sessions` to filter the loaded sessions by `request.headers.get("X-User-ID")` (allow bypassing if an admin flag is passed).
-- **Stream & Session Privacy Guard:** Ensure that `GET /run/<session_id>/stream` (live SSE logs) and `GET /sessions/<session_id>` both validate that the requested session belongs to the requesting `X-User-ID` (unless the requester is an Admin). This prevents User A from snooping on User B's live logs or history.
-- **User-Level Analytics (`qa_agents_server/analytics.py` & `routes.py`):**
-  - Update `analytics.py` queries to accept an optional `user_id` filter.
-  - Expose this via `GET /analytics/summary?user_id=...`.
-  - Admins can query by specific users, while regular members only see their own rolled-up analytics.
-- **Dynamic Artifact Serving (`_artefact_roots` in `routes.py`):**
-  - Update `_artefact_roots` to include `/tmp/qa-runs/` so screenshots, DOM snapshots, and traces generated inside ephemeral worktrees can be served securely via `/agents/<agent>/artifact?path=...`.
+Replaced with `@owns_session` plus `current_user_id()`. One implementation,
+default-deny, impossible to forget on the next endpoint — which is the failure
+mode that produced the list.
 
----
+**The server binds localhost, and admin needs a shared secret.**
+`qa_agents_server` implements no auth of its own; `routes.py` documented that it
+"is expected to bind to localhost" while defaulting to `0.0.0.0`, contradicting
+its own precondition. Anyone reaching the port bypassed login, approval and roles
+entirely, and `X-User-Role: admin` — a header any client can type — was the only
+admin assertion in the server.
 
-## Phase 3: Workspace & Git Isolation (`shared/workspace.py` & `run.sh`)
+Now `127.0.0.1` by default, and `QA_AGENT_PROXY_SECRET` (set in both repos'
+`config/.env`) must match for identity or admin headers to be honoured. This one
+change makes most header-spoofing analysis moot, which is why it outranks the
+per-endpoint work.
 
-This is the core execution isolation. Instead of editing files in `WORKSPACE_DIR/Jarvis`, every run gets a temporary Git Worktree.
+**Artifacts are copied out before teardown.** `/tmp/qa-runs` was added as an
+artifact root so worktree artifacts could be served — but `_wait_and_reap`
+deletes the worktree *before* the terminal event, so every such link was a 404,
+while the root itself exposed every user's screenshots to every other user and,
+under world-writable `/tmp`, let any local process drop a servable file in.
+Runs now copy `test-output/` into their own audit directory
+(`_preserve_worktree_artefacts`), and the temp root is no longer an artifact root.
 
-### 1. Git Worktree Integration (`shared/workspace.py`)
-- Maintain a clean bare repository or main clone at `WORKSPACE_DIR/Jarvis`.
-- In `prepare-base` or a new `prepare-worktree` function:
-  - Generate a unique worktree path: `worktree_path = f"/tmp/qa-runs/{session_id}"`
-  - **Detached HEAD Creation (Avoids Branch Lock Collisions):**
-    - Execute: `git fetch origin +refs/heads/{base_branch}:refs/remotes/origin/{base_branch}`
-    - Execute: `git --git-dir=WORKSPACE_DIR/Jarvis/.git worktree add --detach {worktree_path} origin/{base_branch}`
-    - *Why `--detach`:* Git prohibits two worktrees from checking out the same local branch simultaneously. Detached HEAD allows $N$ parallel runs on `main` without collision.
-  - Export the environment variable `FRAMEWORK_DIR={worktree_path}`.
+**Per-worktree Maven builds are fine here.** Considered and rejected as a
+concern: the target repo is 12 test files with a 2.5 MB `target/`, so cold
+compiles are cheap and no worktree pooling is needed.
 
-### 2. Subprocess Environment (`qa_agents_server/runner.py`)
-- When calling `subprocess.Popen(["bash", str(spec.run_sh)])`, ensure the `FRAMEWORK_DIR` environment variable is explicitly set to the worktree path so `run.sh` inherently targets the isolated directory.
-- Scope any local cache (`TESTING_MODE` cache) to `agents/<agent>/cache/<user_id>/<module>` to prevent cache race conditions.
+## Defects found and fixed
 
-### 3. Bash Script Updates (`agents/*/run.sh`)
-- `run.sh` currently has prerequisite checks for `AUTOMATION_FRAMEWORK_DIR`. These checks will pass cleanly because `FRAMEWORK_DIR` is provided.
-- **Queue Location Fallback:** Modify the script to locate the input file correctly based on the user context:
-  - If `USER_ID` is present, it looks in `queue/<USER_ID>/<module>.txt`.
-  - If `USER_ID` is missing (e.g. running from CLI), it defaults to `cli` or the root `queue/` folder to maintain **100% backward compatibility for standalone scripts**.
-- Change the `cd "$REPO_ROOT" && python3 -m shared.workspace prepare-base` step to use the new worktree logic.
-- Ensure all Maven commands (`mvn test`) run inside `AUTOMATION_FRAMEWORK_DIR` (each worktree has its own isolated `target/` build directory).
-- Ensure Git pushes (`05_ship.py`, `02_ship.py`) operate correctly from within the worktree (branch creation `git checkout -b <branch_name>` and `git push origin <branch_name>` work seamlessly in a worktree).
+Every item below shipped and was verified broken before being fixed.
 
-### 4. Cleanup & Resource Management
-- In `qa_agents_server/runner.py` process reapers (when the process completes, fails, or is cancelled), add a hook to tear down the worktree:
-  - Execute: `git --git-dir=WORKSPACE_DIR/Jarvis/.git worktree remove --force {worktree_path}`
-  - Execute: `rm -rf {worktree_path}` (to remove untracked Maven `target/` files)
-  - Execute: `git --git-dir=WORKSPACE_DIR/Jarvis/.git worktree prune`
-- **Boot Reconciliation (`reconcile_on_boot`):**
-  - On server restart, prune any orphaned worktrees in `/tmp/qa-runs/` left behind from interrupted or crashed processes.
+| | Defect |
+|---|---|
+| **Deadlock** | `_start_next_from_queue` took `_queue_lock` → `_registry_lock`; `start_run` took them the other way. Textbook ABBA — a run finishing while another started wedged the whole run subsystem, permanently. `_unique_session_id`'s own docstring warned about this hazard. Fixed by one global order, registry before queue, everywhere. |
+| **Worktree isolation never engaged** | The runner exported `QA_ISOLATED_WORKTREE_READY`; `workspace.py` read `QA_ISOLATED_WORKTREE`. The names never matched, so every run took the `checkout -B` path. Already visible in committed audit output as *"'adaptation-agent' is already used by worktree at ..."*. |
+| **Stale base for every run** | `prepare_worktree` never fetched, on a comment's claim that `prepare_base` handled it — but the server calls `ensure()` → `prepare_worktree()` directly and never goes through `prepare_base`. Combined with a `--depth 1 --branch` clone, any non-default base branch had no `origin/<b>` ref at all. |
+| **False success** | `prepare_worktree` returned `ok: True` whenever the path merely *existed* — an existence check dressed as a validity check. Now probes with `rev-parse --is-inside-work-tree` and recreates. |
+| **Cancel broken three ways** | `run.status = "cancelled"` was set nowhere, so cancelled runs reported as **failed** and the `.cancelled` marker was never written; `CANCEL_GRACE_SECONDS` was unused so there was no SIGKILL escalation; and cleanup `rm -rf`'d the worktree microseconds after SIGTERM, out from under a still-running JVM. |
+| **Queue could strand** | A failed `start_run` popped the item, logged, and did not re-kick — so if that was the last active run, the rest of the queue waited for a restart. |
+| **Arbitrary file write** | `X-User-ID` was joined straight onto a path (`spec.queue_dir / user_id`) while the feature *name* beside it was rigorously validated. `Path("…/queue") / "/tmp/pwn"` is `/tmp/pwn`. Validated at both the edge and in `feature_files`. |
+| **Blanket `rm -rf` on boot** | `reconcile_on_boot` deleted every subdirectory of `QA_WORKTREE_TEMP_DIR` despite a comment claiming it checked validity, pruned *before* deleting (so it pruned nothing and orphaned admin entries), and the setting had no validation — a typo in the admin UI became recursive deletion on next boot. |
+| **No git lock** | `workspace.py` had no `threading` import at all. Concurrent `fetch` / `worktree add` / `prune` on the shared `.git` contend on `index.lock`, `config.lock` and `refs/remotes/origin/<b>.lock`. Now serialised by a lockfile on the **common** git dir, so worktrees and agent subprocesses share it. |
+| **All cost billed to admin** | `build_record` accepted `user_id` and neither writer passed it, though `run.user_id` was on the object. Every row was `"default"`, which `query()` rewrote to the admin id — so members saw an empty dashboard. History and analytics also disagreed about legacy rows, defaulting them to `"default"` and to the admin id respectively; both now use one `_owner_of()`. |
+| **Cross-user cache leak** | `cache/<module>` was shared, so with `TESTING_MODE=true` two users on the same module name read each other's cached step output. Now `cache/<user_id>/<module>`. |
+| **`.mcp.json` collision** | The authoring agent wrote it to the shared repo root while the other two agents used their audit dir — one of which carries the comment *"the repo root is shared mutable state"*. |
+| **One repair browser per host** | The CDP port was fixed at 9222, so the first healing run took it and every other silently skipped live repair. Now derived per session and passed to the framework as `repairPort`. |
+| **Two runs, one handoff** | Healing's queue mode picked the oldest `.json` with no claim, so concurrent runs both fixed the same test. Now claimed by atomic `mv`. |
 
----
+## Verification
 
-## Phase 4: CI/CD, Deployment & Admin Settings
+- `pytest tests/unit/` — 1240 tests, including `test_parallel_isolation.py`,
+  which pins each defect above that can be expressed as a unit test: lock
+  ordering (read from the AST, since a timing test would pass by luck), the
+  worktree flag agreement between writer and reader, hostile `X-User-ID` values,
+  and ownership default-deny.
+- Concurrency, checked directly: six simultaneous `prepare_worktree` calls all
+  succeed, detached, serialised, with no stale admin entries after cleanup.
+- Privacy, checked directly: another user's session returns 403 on
+  `/stream`, `/events`, `/metrics`, `/cancel` and `/retry` — **with and without**
+  the header — while the owner passes.
+- Claim safety, checked directly: six concurrent claimers against three handoffs
+  claim each exactly once.
+- Cancellation: `test_parallel_isolation.py` covers status, SIGKILL escalation
+  and teardown ordering, each mutation-tested — reverting any one of the three
+  fixes fails its test. The escalation case needs a child that genuinely ignores
+  SIGTERM *and* a readiness handshake; without the handshake the signal arrives
+  before bash installs its trap, the child dies with rc=-15, and the test passes
+  without ever reaching the SIGKILL path.
+- Full GUI end-to-end against `Playwright-Automation-Framework`: signup → pending
+  gate → approval; two concurrent authoring runs with independent worktrees and a
+  working session switcher; authoring + healing concurrently, both running Maven;
+  a third run queued at position 1 that auto-started 2s after a slot freed; and
+  a second user receiving 403 on every path to the first user's live session.
 
-### 1. Config Variables (`config/.env`) & Admin Settings UI
-- Introduce `QA_MAX_CONCURRENT_RUNS` (Default: 4).
-- Introduce `QA_WORKTREE_TEMP_DIR` (Default: `/tmp/qa-runs`).
-- **Update `qa_agents_server/agent_settings.py`:** Add these two new variables to the exposed configuration schema so they immediately appear in the **Admin Settings UI** in `Ai-Test-Studio`. This allows admins to dynamically scale the worker pool or change the temp directory without a server restart.
+## Seeing your runs
 
-### 2. Machine Sizing
-- If running 4 concurrent agents that each run headless Chrome (Playwright) + `mvn test`, the host machine should have at least 8 vCPUs and 16GB of RAM.
-- Ensure the `~/.m2` Maven cache is safe for concurrent access. (Maven 3+ handles concurrent local repository downloads fairly well, but keep an eye on download lock warnings).
+`GET /run/active` reports every run the caller has in flight, not just the first
+one the registry happened to yield:
 
-## Final Checklist & E2E Validation
+```jsonc
+{
+  "active": true, "session_id": "…", "module": "payments",   // unchanged
+  "runs": [ {session_id, agent, module, status, started_at}, … ],  // this agent
+  "other_agent_runs": [ … ],                                       // their other agents
+  "capacity": {"active": 3, "max": 5, "queued": 1, "busy": false,
+               "mine_active": 2, "mine_queued": 1}
+}
+```
 
-### Code Implementation
-- [ ] Build Customer Portal Signup/Login UI, user storage schema (`data/users.json` with `filelock`) with `status` and `role` fields, and Auth flow in `Ai-Test-Studio`.
-- [ ] Extend existing Admin User Management (`/admin/users`) with Signup Approvals and Admin Role Promotion/Demotion.
-- [ ] Add `requireActiveUser` guard in `Ai-Test-Studio` proxy to block unapproved users from agent routes.
-- [ ] Update `Ai-Test-Studio` proxy to pass `X-User-ID` and `X-User-Name`.
-- [ ] Update `feature_files.py` to scope queues by user.
-- [ ] Add `QA_MAX_CONCURRENT_RUNS` and `QA_WORKTREE_TEMP_DIR` to `agent_settings.py` so they are manageable via the Admin Settings UI.
-- [ ] Refactor `runner.py` to use a bounded worker pool (`_active_runs`) with Fair Queue Scheduling (round-robin).
-- [ ] Enhance `storage.py`, SSE streams, and history endpoints to enforce `X-User-ID` privacy bounds.
-- [ ] Add User filter to Analytics UI and update `analytics.py` to support `user_id` filtering.
-- [ ] Implement `git worktree add --detach` in `shared/workspace.py`.
-- [ ] Inject `FRAMEWORK_DIR={worktree_path}` during subprocess spawn and handle fallback paths in `run.sh`.
-- [ ] Implement `git worktree remove --force` upon process termination and boot reconciliation.
+`runs` is oldest-first, so tabs do not reorder underneath the person using them.
+The additions are purely additive — every historic top-level field is still
+there, so panels that were never updated keep working.
 
-### Full End-to-End GUI Testing Scenarios
-1. **The Onboarding Flow:** User A signs up via the UI. Verifies they hit the `pending_approval` gate and cannot run tests.
-2. **The Admin Approval:** Admin logs into the UI, navigates to `/admin/users`, approves User A. User A logs back in and gains full dashboard access.
-3. **Stream Privacy:** User A runs a test. User B logs in. Verify User B *cannot* see User A's run in the Active Run Panel, History Panel, or via direct `/stream` URL interception.
-4. **Parallel Execution (Same Agent):** User A submits Feature X. User B submits Feature Y to the *same* agent. Verify the UI correctly streams the logs for both independently, both spawn isolated worktrees in `/tmp/qa-runs/`, and both Maven tests compile without `~/.m2` cache race conditions.
-5. **Parallel Execution (Different Agents):** User A runs Authoring. User A runs Healing in parallel. Verify the Session Switcher / UI Tabs elegantly track both active streams without state bleeding.
-6. **Thread Pool Saturation & Queueing:** Set Admin setting `QA_MAX_CONCURRENT_RUNS=2`. Submit 3 jobs. Verify the third job stays queued, UI shows "Queue Position: 1", and it automatically spins up when a slot frees.
+The UI renders this as one row of chips above the live console, plus an
+occupancy pill in the header. Both are written once
+(`QA_RENDER_SWITCHER` / `QA_RENDER_CAPACITY`, driven by panel prefix) rather than
+pasted into three panels that would then drift.
+
+**Both hide themselves when they have nothing to say** — the switcher below two
+runs, the pill below two active workers. A permanent "1/5" is noise, and noise is
+what teaches people to stop reading an indicator that will later matter.
+Cross-agent runs appear as dashed, non-clickable chips: a healing session
+rendered under authoring's step labels is exactly the confusion the per-agent
+scoping exists to prevent.
+
+## Still open
+
+- `/admin/users` is a tab, not a route, so that URL 404s.
+- The Studio's role vocabulary is split three ways (`customer`/`member`/`admin`);
+  the create and edit forms disagree.
+- `SESSION_COOKIE_SECURE` defaults false — set it true when serving over HTTPS.
+- The queue card lists rows with a `mine` flag but does not yet visually
+  distinguish someone else's queued runs from your own.
+- The Studio has no JavaScript test harness, so the switcher's behaviour is
+  pinned by browser-driven checks rather than by a committed test. Two bugs in
+  it were found only by driving the real UI — `apiFetch` being out of scope in
+  the global watcher, and the queue card never being populated on init — both of
+  which a synthetic test that called the render functions directly had missed.

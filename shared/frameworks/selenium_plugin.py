@@ -8,47 +8,96 @@ from shared.frameworks.base import (
     CodeEngine,
     DiagnosticEngine,
     FrameworkPlugin,
-    MCPProvider,
     TelemetryParser,
     TestRunner,
 )
 
 
 class SeleniumTelemetryParser(TelemetryParser):
-    def read_actions(self, trace_path: Path) -> List[Dict]:
+    """Reads the JSONL action log a Selenium repo's WebDriverListener writes.
+
+    Selenium has no native trace format, so the target repository has to produce
+    one — see docs/FRAMEWORK_INTEGRATION.md for the listener contract.
+    """
+
+    # Names a repo might reasonably give that log. Checked in order.
+    _LOG_PATTERNS = ("telemetry/{method}_*.jsonl", "telemetry/{method}.jsonl",
+                     "traces/{method}_*.jsonl", "logs/{method}_*.jsonl",
+                     "{method}_*.jsonl")
+
+    def discover(self, results_dir: Path, method_name: str) -> List[Path]:
+        """Find this method's action log.
+
+        Without this, every caller globbed traces/<method>_*.zip themselves —
+        Playwright's layout — so this parser, which only accepts .jsonl, could
+        never be handed a path it would accept. Selenium telemetry was
+        unreachable by construction, not by bug.
         """
-        Selenium does not have native .zip traces.
-        We assume the target automation repo implements a WebDriverEventListener
-        that writes a JSONL file (e.g., selenium-actions.jsonl).
+        results_dir = Path(results_dir)
+        if not results_dir.is_dir():
+            return []
+        found: List[Path] = []
+        for pattern in self._LOG_PATTERNS:
+            found.extend(p for p in results_dir.rglob(pattern.format(method=method_name))
+                         if p.is_file())
+        # rglob patterns overlap; keep first-seen order without duplicates.
+        return list(dict.fromkeys(found))
+
+    def read_actions(self, trace_path: Path) -> List[Dict]:
+        """Parse the JSONL log into the shared action schema.
+
+        Records are normalised rather than returned raw: consumers index
+        "action", "selector" and "url" directly, so raw log records — whose keys
+        are whatever the repo's listener happened to write — raised KeyError in
+        the prompt builder.
         """
         trace_path = Path(trace_path)
         if not trace_path.exists():
             return []
-            
-        # Try to find a jsonl log
+
         if trace_path.is_dir():
-            log_files = list(trace_path.glob("*.jsonl"))
+            log_files = sorted(trace_path.glob("*.jsonl"))
             if not log_files:
                 return []
             trace_path = log_files[0]
-            
+
         if not trace_path.name.endswith(".jsonl"):
             return []
-            
-        events = []
+
+        actions: List[Dict] = []
         try:
-            with open(trace_path, "r") as f:
-                for line in f:
+            with open(trace_path, "r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
                     line = line.strip()
-                    if line:
-                        try:
-                            events.append(json.loads(line))
-                        except ValueError:
-                            continue
-        except Exception:
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(record, dict):
+                        actions.append(self._to_action(record))
+        except OSError:
             return []
-            
-        return events
+        return actions
+
+    # Field names a listener plausibly uses, mapped onto the shared schema.
+    _ALIASES = {
+        "action": ("action", "command", "event", "method", "name"),
+        "selector": ("selector", "locator", "target", "by", "element"),
+        "url": ("url", "currentUrl", "page"),
+        "value": ("value", "text", "input", "args"),
+        "error": ("error", "exception", "message", "failure"),
+    }
+
+    def _to_action(self, record: Dict) -> Dict:
+        flattened = {}
+        for key, aliases in self._ALIASES.items():
+            for alias in aliases:
+                if record.get(alias) not in (None, ""):
+                    flattened[key] = record[alias]
+                    break
+        return self.normalise(flattened)
 
     def failing_action(self, actions: List[Dict]) -> Optional[Dict]:
         return next((a for a in actions if a.get("error")), None)
@@ -100,11 +149,31 @@ class SeleniumTestRunner(TestRunner):
 
 
 class SeleniumDiagnosticEngine(DiagnosticEngine):
+    # Phrases that actually appear in Selenium/WebDriver failures. The previous
+    # implementation matched "multiple elements matched", which no Selenium
+    # binding emits, so this returned False for every input and the
+    # AMBIGUOUS_LOCATOR verdict could never fire on a Selenium repo.
+    _AMBIGUOUS_SIGNALS = (
+        "multiple elements",           # custom wrappers that assert uniqueness
+        "more than one element",
+        "matched 2 elements", "matched more than",
+    )
+    # Selenium reports "not found" and "found but unusable" as distinct
+    # exceptions; both mean the locator no longer identifies what it meant to.
+    _RESOLUTION_SIGNALS = (
+        "nosuchelementexception",
+        "staleelementreferenceexception",
+        "elementnotinteractableexception",
+        "elementclickinterceptedexception",
+    )
+
     def is_ambiguous_locator(self, error_message: str) -> bool:
-        # Selenium typically uses driver.findElement, which returns the first element
-        # and doesn't throw if there are multiple. If someone uses findElements and
-        # throws a custom exception, we could detect it here.
-        return "multiple elements matched" in (error_message or "").lower()
+        text = (error_message or "").lower()
+        return any(signal in text for signal in self._AMBIGUOUS_SIGNALS)
+
+    def is_locator_resolution_failure(self, error_message: str) -> bool:
+        text = (error_message or "").lower().replace(" ", "")
+        return any(signal in text for signal in self._RESOLUTION_SIGNALS)
 
 
 class SeleniumCodeEngine(CodeEngine):
@@ -179,93 +248,120 @@ class SeleniumCodeEngine(CodeEngine):
         return '"' + text.replace('"', '\\"') + '"'
 
     def build_has_text_selector(self, anchor: str, text: str, tag: str) -> str:
-        # BeautifulSoup supports :contains() which simulates searching for text
-        return f'{anchor}:contains({self.quote_css_value(text)}) {tag}'
+        """An XPath, not a CSS :contains().
+
+        This returned `<anchor>:contains(...)` on the reasoning that
+        BeautifulSoup understands it. Its only caller hands the result to a live
+        browser locator, not BeautifulSoup — where :contains() is not a valid
+        selector, so the call threw, uniqueness came back False, and the whole
+        scoped-by-neighbor strategy was silently dead under Selenium.
+        """
+        return f"//{anchor or '*'}[contains(., {self._xq(text)})]//{tag or '*'}"
+
+    # ARIA roles have no native Selenium accessor, but they are ordinary DOM
+    # semantics: an explicit role attribute, or the implicit role of a tag.
+    # Returning None for every role meant emit_locator had no branch to take and
+    # handed back an empty snippet.
+    _ROLE_TAGS = {
+        "button": ("button", "input[@type='button' or @type='submit']"),
+        "link": ("a",),
+        "textbox": ("input[not(@type) or @type='text' or @type='email' or @type='password']",
+                    "textarea"),
+        "checkbox": ("input[@type='checkbox']",),
+        "radio": ("input[@type='radio']",),
+        "combobox": ("select",),
+        "heading": ("h1", "h2", "h3", "h4", "h5", "h6"),
+        "img": ("img",),
+        "list": ("ul", "ol"),
+        "listitem": ("li",),
+        "table": ("table",),
+    }
+
+    @staticmethod
+    def _xq(value: str) -> str:
+        """Quote a literal for XPath, including values containing quotes."""
+        text = value or ""
+        if '"' not in text:
+            return f'"{text}"'
+        if "'" not in text:
+            return f"'{text}'"
+        parts = text.split('"')
+        return "concat(" + ', \'"\', '.join(f'"{p}"' for p in parts) + ")"
 
     def map_role(self, role: str) -> Optional[str]:
-        # Selenium has no native getByRole
-        return None
+        return (role or "").strip().lower() or None
+
+    def _role_xpath(self, role: str, name: str = "") -> str:
+        """XPath matching an explicit role attribute or the tags that imply it."""
+        role = (role or "").strip().lower()
+        branches = [f"//*[@role={self._xq(role)}]"]
+        for tag in self._ROLE_TAGS.get(role, ()):  # implicit roles
+            branches.append(f"//{tag}" if "[" not in tag else f"//{tag}")
+        if not name:
+            return " | ".join(branches)
+        return " | ".join(f"{b}[normalize-space(.)={self._xq(name)}]" for b in branches)
 
     def emit_locator(self, **kwargs) -> Dict[str, str]:
+        """Native Selenium code for a locator.
+
+        Attribute values go through quote_css_value rather than being
+        interpolated bare: `[data-testid=my testid]` is not valid CSS, and any
+        value with a space, quote or leading digit produced exactly that.
+
+        `findby` is emitted alongside because the target repo defines locators
+        as @FindBy PageFactory fields, not inline driver.findElement calls —
+        emitting only the latter would have contradicted the repo's own
+        conventions on every fix.
+        """
         def _q(s: str) -> str:
             return '"' + (s or "").replace('\\', '\\\\').replace('"', '\\"') + '"'
 
-        if "testid" in kwargs:
+        def css(selector: str) -> Dict[str, str]:
             return {
-                "python": f"driver.find_element(By.CSS_SELECTOR, {_q(f'[data-testid={kwargs['testid']}]')})",
-                "java": f"driver.findElement(By.cssSelector({_q(f'[data-testid={kwargs['testid']}]')}))"
+                "python": f"driver.find_element(By.CSS_SELECTOR, {_q(selector)})",
+                "java": f"driver.findElement(By.cssSelector({_q(selector)}))",
+                "findby": f"@FindBy(css = {_q(selector)})",
             }
-        if "placeholder" in kwargs:
+
+        def xpath(expression: str) -> Dict[str, str]:
             return {
-                "python": f"driver.find_element(By.CSS_SELECTOR, {_q(f'[placeholder={kwargs['placeholder']}]')})",
-                "java": f"driver.findElement(By.cssSelector({_q(f'[placeholder={kwargs['placeholder']}]')}))"
+                "python": f"driver.find_element(By.XPATH, {_q(expression)})",
+                "java": f"driver.findElement(By.xpath({_q(expression)}))",
+                "findby": f"@FindBy(xpath = {_q(expression)})",
             }
-        if "label" in kwargs:
-            return {
-                "python": f"driver.find_element(By.CSS_SELECTOR, {_q(f'[aria-label={kwargs['label']}]')})",
-                "java": f"driver.findElement(By.cssSelector({_q(f'[aria-label={kwargs['label']}]')}))"
-            }
+
+        # role first, and deliberately so: "name" is overloaded. Alongside a role
+        # it is the ACCESSIBLE name, on its own it is the HTML name attribute.
+        # Checking the attribute list first turned every role+name request into
+        # a [name=...] attribute selector.
+        if "role" in kwargs:
+            return xpath(self._role_xpath(kwargs["role"], kwargs.get("name", "")))
+
+        for attribute, key in (("data-testid", "testid"), ("placeholder", "placeholder"),
+                               ("aria-label", "label"), ("alt", "alt"), ("title", "title"),
+                               ("name", "name")):
+            if key in kwargs:
+                return css(f"[{attribute}={self.quote_css_value(kwargs[key])}]")
+
         if "text" in kwargs:
             text = kwargs["text"]
-            exact = kwargs.get("exact", False)
-            if exact:
-                xpath = f"//*[text()={_q(text)}]"
-            else:
-                xpath = f"//*[contains(text(), {_q(text)})]"
-            return {
-                "python": f"driver.find_element(By.XPATH, {_q(xpath)})",
-                "java": f"driver.findElement(By.xpath({_q(xpath)}))"
-            }
+            if kwargs.get("exact", False):
+                return xpath(f"//*[normalize-space(text())={self._xq(text)}]")
+            return xpath(f"//*[contains(text(), {self._xq(text)})]")
+
         if "selector" in kwargs:
             sel = kwargs["selector"]
+            if sel.startswith("/") or sel.startswith("("):
+                return xpath(sel)
             if sel.startswith("#") and " " not in sel and "." not in sel[1:]:
                 return {
                     "python": f"driver.find_element(By.ID, {_q(sel[1:])})",
-                    "java": f"driver.findElement(By.id({_q(sel[1:])}))"
+                    "java": f"driver.findElement(By.id({_q(sel[1:])}))",
+                    "findby": f"@FindBy(id = {_q(sel[1:])})",
                 }
-            return {
-                "python": f"driver.find_element(By.CSS_SELECTOR, {_q(sel)})",
-                "java": f"driver.findElement(By.cssSelector({_q(sel)}))"
-            }
-        return {"python": "", "java": ""}
+            return css(sel)
 
-
-class SeleniumMCPProvider(MCPProvider):
-    def get_server_config(self, project_root: Path, headless: Optional[bool] = None, cdp_endpoint: Optional[str] = None, storage_state: Optional[str] = None) -> Dict:
-        # Fallback to Playwright MCP for DOM exploration since DOM structure is identical
-        # and Selenium lacks a robust open-source MCP server for navigation right now.
-        #
-        # If parked repair mode is used (cdp_endpoint is present), this relies on the
-        # target automation repository using Selenium 4+ and exposing the underlying
-        # Chrome DevTools Protocol (CDP) port. Because CDP is a browser-level protocol,
-        # @playwright/mcp can attach to a browser that was originally launched by Selenium.
-        version = os.environ.get("PLAYWRIGHT_MCP_VERSION", "0.0.79")
-        command = f"@playwright/mcp@{version}"
-        
-        if cdp_endpoint:
-            args = [command, "--cdp-endpoint", str(cdp_endpoint)]
-            return {"mcpServers": {"playwright": {"command": "npx", "args": ["-y"] + args}}}
-            
-        args = [command, "--isolated", "--viewport-size=1920,1080"]
-        
-        from shared import browser_mode
-        if headless is None:
-            headless = browser_mode.headless()
-        if headless:
-            args.append("--headless")
-            
-        return {
-            "mcpServers": {
-                # We name it 'playwright' so the allowed_tools prompt constraint natively picks it up
-                "playwright": {
-                    "command": "npx",
-                    "args": ["-y"] + args,
-                }
-            }
-        }
-
-    def allowed_tools(self) -> List[str]:
-        return ["mcp__playwright__*"]
+        return {"python": "", "java": "", "findby": ""}
 
 
 class SeleniumPlugin(FrameworkPlugin):
@@ -274,7 +370,6 @@ class SeleniumPlugin(FrameworkPlugin):
         self._runner = SeleniumTestRunner()
         self._diagnostics = SeleniumDiagnosticEngine()
         self._code = SeleniumCodeEngine()
-        self._mcp = SeleniumMCPProvider()
 
     @property
     def telemetry(self) -> TelemetryParser:
@@ -292,6 +387,3 @@ class SeleniumPlugin(FrameworkPlugin):
     def code(self) -> CodeEngine:
         return self._code
 
-    @property
-    def mcp(self) -> MCPProvider:
-        return self._mcp

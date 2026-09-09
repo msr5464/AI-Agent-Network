@@ -138,7 +138,7 @@ from shared import diagnosis as _diagnosis
 from shared import failure_context as _failure_context
 from shared.dom_snapshot import (find_snapshot, distill as distill_dom,
                                  format_for_prompt as format_dom)
-from shared.playwright_trace import (read_actions, failing_action,
+from shared.telemetry import (read_actions, failing_action,
                                      format_for_prompt as format_trace)
 # Mechanical guards, shared with test-healing-agent and test-adaptation-agent.
 # Deliberately NOT imported: validate_diagnosis_fit (rejects any edit touching a

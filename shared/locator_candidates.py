@@ -1,5 +1,17 @@
 """Candidate generation — the T0..T5 ladder.
 
+**Agent instrument, not target-repo code.** This drives a browser the AGENTS
+open to inspect a page — reading the DOM, counting how many elements a candidate
+selector matches, trying a corrected locator before any code is edited. It is
+deliberately always Playwright, whatever framework the repository under test
+uses, because it speaks CDP and a browser does not know or care what drove it
+there. (Selenium 4 exposes the same DevTools port, which is what lets a
+Selenium-launched browser be inspected this way.)
+
+So the direct `sync_playwright` / Playwright-selector usage below is correct and
+must NOT be routed through shared/frameworks. What IS pluggable is the syntax
+written into the target repo — see shared/frameworks/base.py CodeEngine.
+
 Every scorable element on the page is a candidate (that is T4, the guaranteed
 fallback). The cheaper tiers do not produce a *separate* candidate list; they
 annotate elements they can reach by a direct, clean query. That annotation is

@@ -1,8 +1,15 @@
 """Read the network log out of a Playwright trace zip.
 
-A trace carries two logs. `trace.trace` holds the action timeline and is already
-parsed by `shared/playwright_trace.py`; `trace.network` holds every HTTP request
-the page made, in HAR-shaped records, and until now was never opened at all.
+A trace carries two logs. `trace.trace` holds the action timeline and is parsed
+via `shared/telemetry.py`; `trace.network` holds every HTTP request the page
+made, in HAR-shaped records, and until now was never opened at all.
+
+**Playwright-only, on purpose.** This is an enrichment channel rather than a
+required one: no other framework records an equivalent, and there is nothing to
+abstract. For a non-Playwright artefact every function here returns empty —
+a .jsonl action log raises BadZipFile, which is caught below — so a Selenium run
+simply loses this evidence channel rather than failing. That is the honest
+outcome; synthesising one would be worse.
 
 That file is the generic evidence channel for a whole family of failures that
 reach the fixer disguised as a missing element: the host was unreachable, the
