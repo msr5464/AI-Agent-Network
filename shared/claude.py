@@ -23,7 +23,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 
 # ── Result type ────────────────────────────────────────────────────────────────
@@ -52,6 +52,17 @@ class ClaudeResult(NamedTuple):
     num_turns:      int = 0
     duration_api_s: float = 0.0
     model_resolved: str = ""
+    # How many REAL tool_use blocks the model emitted. None means "not counted"
+    # (the non-streaming path cannot see them), which is not the same as zero:
+    # zero on a run that was supposed to drive tools means the model had none and
+    # narrated the work instead. Only meaningful with stream_json=True.
+    tool_uses:      Optional[int] = None
+    # Every URL the model actually told a browser to open, in order. The most
+    # trustworthy record of where a validation run went: a step summary is prose
+    # the model chose to write, this is the argument it passed. Step 02 harvests
+    # URL properties from it, so a navigation whose summary omits the URL still
+    # mints a key. Only meaningful with stream_json=True.
+    navigated_urls: list = []
 
     @property
     def ok(self) -> bool:
@@ -168,9 +179,25 @@ class _StreamJsonDecoder:
     def __init__(self):
         self.text_parts:  list = []
         self.result_text: str = ""
+        self.tool_uses:   int = 0
+        self.navigated_urls: list = []
         # Usage reported by the CLI in its `result` / `system.init` events. The
         # CLI computes cost itself, so no rate card is needed on our side.
         self.usage: dict = {}
+
+    def _note_navigation(self, block: dict) -> None:
+        """Record the URL of a browser_navigate call, first occurrence wins.
+
+        Matched on the tool-name suffix rather than the full MCP name, because the
+        server prefix (`mcp__playwright__`) is configuration, not protocol.
+        """
+        name = block.get("name") or ""
+        if not name.endswith("browser_navigate"):
+            return
+        inp = block.get("input")
+        url = inp.get("url") if isinstance(inp, dict) else None
+        if isinstance(url, str) and url.strip() and url.strip() not in self.navigated_urls:
+            self.navigated_urls.append(url.strip())
 
     def feed(self, raw_line: str) -> list:
         """Consume one JSONL line. Returns progress lines to surface to the caller."""
@@ -203,6 +230,8 @@ class _StreamJsonDecoder:
                         self.text_parts.append(text)
                         progress.extend(text.splitlines())
                 elif block.get("type") == "tool_use":
+                    self.tool_uses += 1
+                    self._note_navigation(block)
                     progress.append(f"→ {_describe_tool_use(block)}")
 
         elif etype == "result":
@@ -320,7 +349,17 @@ def call_claude_ex(
     if tools is not None:
         # `is not None`, not truthiness: "" is the meaningful value that loads no
         # built-in tools at all, and is the whole point of the flag.
-        cmd.extend(["--tools", tools if isinstance(tools, str) else ",".join(tools)])
+        names = [t for t in (tools.split(",") if isinstance(tools, str) else tools) if t]
+        if mcp_config and "ToolSearch" not in names:
+            # MCP tools arrive DEFERRED: the turn's tool list carries their names
+            # only, and ToolSearch is the sole way to load their schemas. Dropping
+            # it along with the other built-ins leaves a run holding an MCP server
+            # and zero callable tools — and a model told to "use the browser tools"
+            # then writes the entire session as prose: invented <function_calls>,
+            # invented results, invented selectors, no browser ever launched, for
+            # the full wall-clock budget. Verified against CLI 2.1.265.
+            names.append("ToolSearch")
+        cmd.extend(["--tools", ",".join(names)])
     if disable_slash_commands:
         cmd.append("--disable-slash-commands")
     if add_dir:
@@ -499,6 +538,8 @@ def call_claude_ex(
         num_turns=int(usage.get("num_turns") or 0),
         duration_api_s=float(usage.get("duration_api_s") or 0.0),
         model_resolved=str(usage.get("model_resolved") or ""),
+        tool_uses=decoder.tool_uses if decoder is not None else None,
+        navigated_urls=list(decoder.navigated_urls) if decoder is not None else [],
     )
 
     # One choke point instruments every call site. Best-effort by construction —

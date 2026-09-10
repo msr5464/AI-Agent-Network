@@ -63,6 +63,43 @@ class TestCollectingUrls:
                 "web_steps_for_validation": ["connect http://localhost:9222"]}
         assert url_properties.collect_urls(plan, {}) == {}
 
+    def test_a_page_the_browser_opened_is_minted_even_when_no_step_names_it(self):
+        """The observed failure, exactly.
+
+        Step 02 walked to the profile page and reported it as "Navigate to the
+        profile page" — prose with no URL in it. Nothing minted a key, the
+        generated test read naukari.profile.url from a file that never defined
+        it, and Playwright died on "url: expected string, got undefined".
+        """
+        plan = {"feature_name": "naukari", "web_base_url": "https://www.naukri.com",
+                "web_steps_for_validation": ["Navigate to the profile page"]}
+        web = {"steps_passed": ["Navigate to the profile page"],
+               "urls_visited": ["https://www.naukri.com/nlogin/login",
+                                "https://www.naukri.com/mnjuser/profile"]}
+        assert url_properties.collect_urls(plan, web) == {
+            "naukari.url":         "https://www.naukri.com",
+            "naukari.login.url":   "https://www.naukri.com/nlogin/login",
+            "naukari.profile.url": "https://www.naukri.com/mnjuser/profile",
+        }
+
+    def test_a_visited_url_names_the_key_before_the_step_prose_can(self):
+        """urls_visited is read first, so it decides the key when both mention
+        the same URL — the step text can then only add ones it did not."""
+        plan = {"feature_name": "app"}
+        web = {"urls_visited": ["https://app.io/settings/profile"],
+               "steps_passed": ["Open https://app.io/settings/profile",
+                                "Open https://app.io/billing"]}
+        assert url_properties.collect_urls(plan, web) == {
+            "app.profile.url": "https://app.io/settings/profile",
+            "app.billing.url": "https://app.io/billing",
+        }
+
+    def test_a_visited_url_is_still_subject_to_the_exempt_host_rule(self):
+        plan = {"feature_name": "app"}
+        web = {"urls_visited": ["http://localhost:9222", "https://app.io/login"]}
+        assert url_properties.collect_urls(plan, web) == {
+            "app.login.url": "https://app.io/login"}
+
 
 class TestTheGuard:
     HELPER = '''

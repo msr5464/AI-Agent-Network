@@ -914,8 +914,9 @@ Begin executing the steps now using the browser tools.
             # every built-in stays *defined*, costing ~10k tokens of system prompt
             # on every one of the ~50 turns this step takes, and arriving deferred
             # so the model burns whole round-trips on ToolSearch before it can
-            # navigate, evaluate or press a key. Verified against the CLI: MCP
-            # tools are unaffected by this flag and are then callable directly.
+            # navigate, evaluate or press a key. call_claude_ex keeps ToolSearch
+            # itself, because MCP tools also arrive deferred and it is the only
+            # thing that can load their schemas — see shared/claude.py.
             tools="",
             # Skills and slash commands are equally unreachable from a headless
             # run and equally present in the prompt until asked to leave.
@@ -1055,6 +1056,7 @@ Begin executing the steps now using the browser tools.
             status=r.status,
             raw_output=p["output"][-3000:] if p["output"] else "",
             attempts=len(attempts),
+            urls_visited=list(getattr(r, "navigated_urls", []) or []),
         )
 
     attempt_notes = ""
@@ -1063,6 +1065,20 @@ Begin executing the steps now using the browser tools.
             log(f"Retry attempt {attempt_num}/{max_attempts} — re-running the full "
                 f"flow (fresh isolated browser; no mid-flow resume is possible)")
         result = _run_attempt(attempt_notes)
+        if result.tool_uses == 0:
+            # No browser tool was ever called, so nothing on the page was ever
+            # seen. A model handed a browser-driving prompt and no usable tools
+            # does not stop — it narrates the whole session, inventing
+            # <function_calls> blocks, their results, and selectors that look
+            # exactly like real ones to the parsers below. Parsing that output
+            # would ship a page object built from fiction, so refuse it here.
+            log("ERROR: Claude drove the browser zero times — every step in its "
+                "output is narrated, not observed, and has been discarded.\n"
+                "       → FIX: the Playwright MCP tools never reached the model. "
+                "Check .mcp.json in this audit dir and that --tools still admits "
+                "ToolSearch, which is what loads deferred MCP tool schemas.")
+            _write_empty(reason="Playwright MCP tools unavailable — Claude fabricated the run instead of driving a browser")
+            sys.exit(1)
         parsed = _parsed(result.stdout)
         attempts.append((result, parsed))
         _persist_snapshot()
@@ -1130,6 +1146,12 @@ Begin executing the steps now using the browser tools.
         f"Interaction hints: {len(interaction_hints)}"
     )
 
+    urls_visited = list(getattr(result, "navigated_urls", []) or [])
+    if urls_visited:
+        log(f"URLs visited: {len(urls_visited)} — step 03 mints a property for each")
+        for url in urls_visited:
+            log(f"  {url}")
+
     if selectors:
         for name, sel in selectors.items():
             log(f"  {name} = {sel}")
@@ -1190,7 +1212,7 @@ def _write_result(selectors, steps_passed, steps_failed,
                   skipped=False, reason=None, status="ok", raw_output="",
                   attempts=1, selector_counts=None, steps_unverified=None,
                   selector_visibles=None, rejected_selectors=None,
-                  mechanisms=None) -> None:
+                  mechanisms=None, urls_visited=None) -> None:
     # Every selector that survives parse_selector_output() was measured at exactly
     # one element, and every hint that survives reconcile_hints() is either backed
     # by one of those or measured itself. Assert it rather than trusting it: this
@@ -1225,6 +1247,12 @@ def _write_result(selectors, steps_passed, steps_failed,
         "rejected_selectors": rejected_selectors or {},
         "steps_passed":      steps_passed,
         "steps_failed":      steps_failed,
+        # Every URL the browser was actually told to open, in order. steps_passed
+        # is prose the model chose to write and often omits the URL ("Navigate to
+        # the profile page"); this is the argument it passed. Step 03 mints a URL
+        # property per entry, so a page whose summary named no URL still gets a key
+        # instead of a getRunTimeProperty that returns null at runtime.
+        "urls_visited":      urls_visited or [],
         # Steps whose action completed but whose claimed outcome was never
         # observed. Neither a pass nor a failure — step 03 decides, on whether
         # the user asked for the check or the pipeline invented it.

@@ -182,7 +182,7 @@ never touches the queue that triaging feeds.
 
 ## Driving it from the GUI
 
-`qa_agents_server` (`bash scripts/run-server.sh`, port 8765) exposes this agent at
+`qa_agents_server` (`bash scripts/run-server.sh`, port 6001) exposes this agent at
 `/agents/test-healing-agent/*`, alongside the authoring agent. AI-Test-Studio
 proxies those paths under `/api/agents/*` and renders the **Auto-Heal Tests**
 panel against them.

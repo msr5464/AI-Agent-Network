@@ -22,16 +22,17 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from qa_agents_server.agents import AGENTS, AgentSpec
 from qa_agents_server.paths import REPO_ROOT
 
 EXAMPLES_DIR: Path = REPO_ROOT / "docs" / "examples" / "queue"
 
-# Lives inside the queue directory, which is git-ignored, so it is per-checkout.
-# Clearing the queue directory also clears this, which is the intended escape
-# hatch: an empty inbox gets the examples back.
+# Lives inside the queue directory it seeded, which is git-ignored — so it is
+# per-checkout for the shared root and per-user for a private queue. Clearing
+# that directory also clears this, which is the intended escape hatch: an empty
+# inbox gets the examples back.
 MARKER_NAME = ".examples-seeded"
 
 
@@ -40,13 +41,18 @@ def enabled() -> bool:
         "false", "0", "no", "off")
 
 
-def seed_agent(spec: AgentSpec) -> List[str]:
-    """Copy this agent's examples into its queue. Returns the filenames copied."""
+def seed_agent(spec: AgentSpec, queue: Optional[Path] = None) -> List[str]:
+    """Copy this agent's examples into a queue. Returns the filenames copied.
+
+    `queue` defaults to the agent's shared queue root. feature_files passes a
+    per-user directory instead: a private queue starts as empty as a fresh
+    checkout does, so the marker applies per user rather than per checkout.
+    """
     source = EXAMPLES_DIR / spec.name
     if not source.is_dir():
         return []
 
-    queue = spec.queue_dir
+    queue = spec.queue_dir if queue is None else queue
     if (queue / MARKER_NAME).exists():
         return []
 

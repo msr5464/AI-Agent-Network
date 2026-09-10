@@ -15,6 +15,7 @@ bind to localhost).
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -66,15 +67,47 @@ def _resolve(agent: str):
 # AI-Test-Studio derives ids as md5(username)[:12]; anything else is a client
 # talking to this server directly, and gets the anonymous id rather than a path.
 _USER_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+# The readable identity, built from X-User-Name. Deliberately as tight as the
+# hash pattern it replaces, because this value is still joined onto a path: one
+# leading letter/digit, then letters, digits, underscore or hyphen. Anything
+# else (a dot, a slash, a space, 40 characters of unicode) fails to match and
+# falls back to the hash, so a surprising username degrades to the old
+# behaviour rather than escaping the queue directory.
+_USER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
 ANONYMOUS_USER_ID = "default"
 
 
 def current_user_id() -> str:
-    """The validated caller identity. Never attacker-controlled path content."""
+    """The validated caller identity. Never attacker-controlled path content.
+
+    Prefers a readable `user-<username>` over the md5 hash, so queue and cache
+    directories say who they belong to. The hash was never a secret — it is
+    md5(username)[:12] and AI-Test-Studio notes it is derivable — so spelling
+    the name out loses no protection, and the pattern above keeps the value as
+    path-safe as the hash was.
+    """
     if not _from_trusted_proxy():
         return ANONYMOUS_USER_ID
     raw = (request.headers.get("X-User-ID") or "").strip()
-    return raw if _USER_ID_RE.match(raw) else ANONYMOUS_USER_ID
+    if not _USER_ID_RE.match(raw):
+        return ANONYMOUS_USER_ID
+    # The name must HASH TO the id it arrives with. X-User-Name is otherwise a
+    # second, independent way to name a directory, and the two headers could
+    # disagree — through a proxy bug, or a session whose username changed after
+    # the id was minted. Checking md5(name)[:12] == id makes the readable form
+    # provably the same identity rather than a parallel one, and it costs one
+    # hash. It also disposes of the proxy's "Unknown" placeholder for free: it
+    # does not hash to a real id, so an unauthenticated caller keeps falling
+    # through to the anonymous shared queue exactly as before.
+    name = (request.headers.get("X-User-Name") or "").strip()
+    if (_USER_NAME_RE.match(name)
+            and hashlib.md5(name.encode()).hexdigest()[:12] == raw):
+        # ponytail: not lower-cased, so "Admin" and "admin" stay distinct ids
+        # as their hashes are. They collide on a case-insensitive filesystem
+        # (macOS default); if two such accounts ever exist, hash the name into
+        # the directory suffix instead of rejecting the login.
+        return f"user-{name}"
+    return raw
 
 
 def _from_trusted_proxy() -> bool:

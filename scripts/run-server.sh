@@ -7,15 +7,17 @@ set -euo pipefail
 # The server is separate from the Makefile CLI entry points — both coexist.
 #
 # Env overrides:
-#   QA_AGENT_SERVER_PORT      (default 8765)
+#   QA_AGENT_SERVER_PORT      (default 6001)
 #   QA_AGENT_SERVER_HOST      (default 127.0.0.1)
 #   AI_TEST_STUDIO_URL        (default http://localhost:5001) — CORS allowlist
 #   QA_SEED_EXAMPLES          (default true) — copy docs/examples/queue/<agent>/
 #                             into each agent's queue on boot, so the UI has
 #                             something in it on a fresh checkout. Seeds once per
-#                             checkout: it never overwrites a queued file, never
-#                             re-creates one already in processed/, and stops
-#                             once each queue has its .examples-seeded marker.
+#                             queue — the shared root on boot, a user's own queue
+#                             the first time they open it: it never overwrites a
+#                             queued file, never re-creates one already in
+#                             processed/, and stops once a queue has its
+#                             .examples-seeded marker.
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +32,7 @@ if [[ -f "$REPO_ROOT/shared/load_env.sh" ]]; then
   source "$REPO_ROOT/shared/load_env.sh"
 fi
 
-export QA_AGENT_SERVER_PORT="${QA_AGENT_SERVER_PORT:-8765}"
+export QA_AGENT_SERVER_PORT="${QA_AGENT_SERVER_PORT:-6001}"
 export QA_AGENT_SERVER_HOST="${QA_AGENT_SERVER_HOST:-127.0.0.1}"
 export AI_TEST_STUDIO_URL="${AI_TEST_STUDIO_URL:-http://localhost:5001}"
 export QA_SEED_EXAMPLES="${QA_SEED_EXAMPLES:-true}"

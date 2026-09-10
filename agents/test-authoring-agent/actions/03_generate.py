@@ -23,7 +23,9 @@ Writes: Java files into Thanos-pw repo
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -61,6 +63,16 @@ URL_REPAIR_MAX_DIFF_LINES = int(os.environ.get("URL_REPAIR_MAX_DIFF_LINES", "60"
 # few lines per step — larger than the URL swap, still nowhere near a rewrite.
 NARRATION_REPAIR_MAX_DIFF_LINES = int(
     os.environ.get("NARRATION_REPAIR_MAX_DIFF_LINES", "120"))
+# Compile what was just written, before step 04 spends a maven run, a browser
+# launch and a fix attempt discovering it does not build. The framework's own
+# CLAUDE.md has always made compiling step 1 of its mandatory self-test; this is
+# the agent finally doing it. Set false for a non-Maven framework plugin.
+COMPILE_CHECK = os.environ.get("GENERATE_COMPILE_CHECK", "true").lower() != "false"
+COMPILE_TIMEOUT_S = int(os.environ.get("GENERATE_COMPILE_TIMEOUT_S", "180"))
+# Diff budget for the compile repair pass. A wrong import, a missing one, a bad
+# symbol: each is a line. Anything past this is a rewrite wearing a fix's clothes.
+COMPILE_REPAIR_MAX_DIFF_LINES = int(
+    os.environ.get("COMPILE_REPAIR_MAX_DIFF_LINES", "60"))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -133,6 +145,13 @@ def read_reference_files() -> dict:
         "src/main/java/automation/modules/github/GitHubHelper.java",
         "src/main/java/automation/modules/github/api/GitHubApi.java",
         "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
+        # The only page object here, and it earns its place: without one, the model
+        # has never seen a real `extends BasePage` import block and infers the
+        # package from the directory it is writing into — modules/<f>/web/ became
+        # `import automation.core.web.BasePage`, which does not exist. core/ is flat.
+        # SauceDemo's rather than GitHub's: GitHub's calls Log.step() in a page
+        # object, which CLAUDE.md forbids outside test classes.
+        "src/main/java/automation/modules/saucedemo/web/LoginPage.java",
         "src/main/java/automation/core/api/ApiHelper.java",
         "src/test/java/automation/github/GitHubApiTest.java",
         "src/test/java/automation/github/GitHubLoginTest.java",   # shows correct credential pattern
@@ -564,6 +583,203 @@ contents. No prose.
         else:
             remaining.pop(path, None)
     return files_map, remaining
+
+
+# ── The compile gate ──────────────────────────────────────────────────────────
+
+# javac through maven: "[ERROR] /abs/path/File.java:[11,38] cannot find symbol"
+_JAVAC_ERROR = re.compile(r"^\[ERROR\]\s+(?P<path>/\S+?\.java):\[(?P<line>\d+),\d+\]\s*(?P<msg>.*)$")
+
+
+def compile_errors(output: str, root: Path) -> dict:
+    """{repo-relative path: ["line: message", ...]} from a maven compile failure.
+
+    Maven repeats every error twice — once in the COMPILATION ERROR block and
+    again in the "Failed to execute goal" summary — so entries are de-duplicated.
+    """
+    found: dict = {}
+    for raw in (output or "").splitlines():
+        m = _JAVAC_ERROR.match(raw.strip())
+        if not m:
+            continue
+        try:
+            rel = str(Path(m.group("path")).resolve().relative_to(Path(root).resolve()))
+        except ValueError:
+            rel = m.group("path")
+        entry = f"{m.group('line')}: {m.group('msg')}".rstrip()
+        if entry not in found.setdefault(rel, []):
+            found[rel].append(entry)
+    return found
+
+
+def _core_class_index() -> str:
+    """Every class under automation/core, as the exact import a file would write.
+
+    The repair pass exists mostly to fix an invented package, so handing it the
+    real ones is the whole job: a generated page object imported
+    `automation.core.web.BasePage` because it sits in modules/<f>/web/ and assumed
+    core mirrored that. core/ is flat, and this says so with names, not prose.
+    """
+    core = AUTOMATION_FRAMEWORK_DIR / "src/main/java/automation/core"
+    if not core.is_dir():
+        return ""
+    names = sorted(
+        "automation." + str(f.relative_to(core.parent).with_suffix("")).replace("/", ".")
+        for f in core.rglob("*.java"))
+    return "".join(f"  import {n};\n" for n in names)
+
+
+def _run_test_compile() -> tuple:
+    """(ok, output) for `mvn test-compile` in the framework checkout.
+
+    test-compile, not compile: the generated test class is a source file too, and
+    the import that broke the observed run could just as easily have been in it.
+    """
+    command = ["mvn", "-q", "test-compile", "--no-transfer-progress"]
+    started = time.time()
+    try:
+        result = subprocess.run(command, capture_output=True, text=True,
+                                timeout=COMPILE_TIMEOUT_S,
+                                cwd=str(AUTOMATION_FRAMEWORK_DIR))
+        output = (result.stdout or "") + (result.stderr or "")
+        ok = result.returncode == 0
+    except subprocess.TimeoutExpired:
+        # No process-group dance needed here, unlike run_maven_test: a compile
+        # forks no surefire JVM to outlive the maven process.
+        output = f"compile timed out after {COMPILE_TIMEOUT_S}s"
+        ok = None
+    except OSError as exc:
+        output = f"could not run maven: {exc}"
+        ok = None
+    try:
+        from shared import metrics
+        verdict = "error" if ok is None else ("pass" if ok else "fail")
+        metrics.record_tool("compile", " ".join(command), time.time() - started, verdict)
+    except Exception:
+        pass
+    return ok, output
+
+
+def _repair_compile_errors(written_contents: dict, errors: dict) -> dict:
+    """One targeted pass over the generated files javac rejected.
+
+    Same shape as the URL and narration repairs: only the offending files, guarded
+    by validate_fix so a "repair" cannot drop half a class, accepted per-file only.
+    Returns the files it actually rewrote, {rel_path: content}.
+    """
+    offending = "".join(
+        f"\n--- {path} ---\n{written_contents[path]}\n" for path in errors)
+    error_table = "".join(
+        f"  {path}\n" + "".join(f"    line {e}\n" for e in msgs)
+        for path, msgs in errors.items())
+    index = _core_class_index()
+    index_block = (
+        f"\nThese are the ONLY classes under automation.core — the package is flat, "
+        f"there is no automation.core.web and no automation.modules.core:\n\n{index}"
+        if index else "")
+
+    prompt = f"""These generated Java files do not compile. javac said:
+
+{error_table}{index_block}
+Fix ONLY what the compiler complained about — a wrong or missing import, a symbol
+that does not exist, a signature that does not match. Do not rename anything, do
+not add or remove a method, do not touch a locator, an assertion, or a logStep,
+and do not introduce a literal URL.
+
+{offending}
+Return ONLY a JSON object mapping each file path above to its complete corrected
+contents. No prose.
+"""
+    response = call_claude(prompt, label=" [compile-repair]")
+    repaired = extract_json(response) or {}
+    if not repaired:
+        log("  compile-repair returned nothing — leaving the files as generated")
+        return {}
+
+    applied = {}
+    for path, content in repaired.items():
+        if path not in errors or not (content or "").strip():
+            continue
+        ok, reason = validate_fix(written_contents[path], content, Path(path).name,
+                                  COMPILE_REPAIR_MAX_DIFF_LINES)
+        if not ok:
+            log(f"  compile-repair REJECTED for {Path(path).name} — {reason}")
+            continue
+        write_file(path, content)
+        applied[path] = content
+        log(f"  compile-repair applied to {Path(path).name}")
+    return applied
+
+
+def _compile_check(written_contents: dict) -> dict:
+    """Compile what was just written; repair once; abort if it still does not build.
+
+    This is the cheapest guard in the pipeline and it did not exist. The observed
+    run shipped `import automation.core.web.BasePage` — a package that has never
+    existed — and paid for it with the whole initial maven run, a no-change
+    re-run to rule out flakiness, and one of only two fix attempts. A compile is
+    seconds, needs no browser, and cannot be flaky.
+
+    Returns written_contents with any repaired file replaced.
+    """
+    if not COMPILE_CHECK:
+        return written_contents
+    if not (AUTOMATION_FRAMEWORK_DIR / "pom.xml").exists():
+        log("Compile check: skipped — no pom.xml in the framework checkout")
+        return written_contents
+
+    log("Compile check: mvn test-compile ...")
+    ok, output = _run_test_compile()
+    if ok:
+        log("Compile check: OK")
+        return written_contents
+    if ok is None:
+        # Could not run maven at all. That is an infra problem, not generated code
+        # being wrong, and failing the run on it would blame the wrong thing.
+        log(f"Compile check: skipped — {output}")
+        return written_contents
+
+    errors = compile_errors(output, AUTOMATION_FRAMEWORK_DIR)
+    ours = {p: msgs for p, msgs in errors.items() if p in written_contents}
+    log(f"GUARD: generated code does not compile — {sum(len(m) for m in errors.values())} "
+        f"error(s) in {len(errors)} file(s):")
+    for path, msgs in errors.items():
+        log(f"  {Path(path).name}: {msgs[0]}" + (f" (+{len(msgs) - 1} more)" if len(msgs) > 1 else ""))
+
+    if not ours:
+        # Every error is in a file this run did not write, so there is nothing here
+        # to repair — the checkout was already broken.
+        log("ERROR: the compile failure is entirely in files this run did not "
+            "generate — the framework checkout does not build on its own.")
+        (AUDIT_DIR / "03-generate.json").write_text(json.dumps({
+            "error": "compile_failed",
+            "compile_errors": errors,
+            "files_written": sorted(written_contents),
+        }, indent=2))
+        sys.exit(1)
+
+    applied = _repair_compile_errors(written_contents, ours)
+    if applied:
+        written_contents = {**written_contents, **applied}
+        log("Compile check: re-compiling after repair ...")
+        ok, output = _run_test_compile()
+        if ok:
+            log("Compile check: OK after repair")
+            return written_contents
+        errors = compile_errors(output, AUTOMATION_FRAMEWORK_DIR) or errors
+
+    log("ERROR: generated code still does not compile after one repair pass — "
+        "not handing step 04 a module that cannot build.")
+    for path, msgs in errors.items():
+        for entry in msgs:
+            log(f"  {Path(path).name}:{entry}")
+    (AUDIT_DIR / "03-generate.json").write_text(json.dumps({
+        "error": "compile_failed",
+        "compile_errors": errors,
+        "repaired_files": sorted(applied),
+        "files_written": sorted(written_contents),
+    }, indent=2))
+    sys.exit(1)
 
 
 def _repair_step_narration(files_map: dict, plan: dict) -> tuple:
@@ -1101,7 +1317,12 @@ Rules (MANDATORY — violations will cause compilation failures):
    remove the need for the wait on the line above it.
 7. Test classes: extend TestBase. Use @Test(dataProvider="getConfig", groups={{...}}).
    Every @Test method has @TestVariables(automatedBy = QA.Mukesh).
-   Use config.logStep() in test methods only.
+   LOGGING — decided by the KIND of class, never by what you want to say:
+     - test class  -> config.logStep("...")            NEVER Log.step / Log.comment
+     - every other class (page objects, helpers, builders)
+                   -> Log.comment(config, "...")       NEVER config.logStep / Log.step
+   automation.modules.github.web.LoginPage calls Log.step() in a page object. That is a
+   known violation, not a pattern — copy saucedemo/web/LoginPage.java instead.
 7b. STEP NARRATION — one logStep per step, never one summary line. The run report
    prints ONE LINE PER logStep: a test narrated once produces a one-line report for
    the whole scenario, and when it fails the report cannot say which step broke.
@@ -1286,8 +1507,8 @@ Return ONLY a JSON object, no prose:
 
     # The mirror-image failure: code that reads a URL property nobody ever wrote.
     # getRunTimeProperty returns null, navigation goes nowhere, and step 04 sees a
-    # page that never loaded rather than a missing setting. Guessing a value would
-    # be worse than saying so.
+    # page that never loaded rather than a missing setting. Recover what the browser
+    # can vouch for; abort on the rest rather than writing a test that cannot run.
     props_path = properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR)
     known = properties_file.read_values(
         props_path.read_text() if props_path.exists() else "")
@@ -1296,9 +1517,47 @@ Return ONLY a JSON object, no prose:
         for key in url_properties.referenced_keys(content or "")
         if key not in known})
     if missing_url_props:
-        log(f"WARNING: generated code reads {len(missing_url_props)} URL "
-            f"propert(ies) that parameters/{props_file_name} does not define — "
-            f"add a value for: {', '.join(missing_url_props)}")
+        # First, try to satisfy the key from a URL the browser actually opened.
+        # collect_urls() already mints one property per visited URL, so this only
+        # fires when the model named the key slightly differently from derive_key
+        # — real, and cheap to repair, because the value is not a guess: it is an
+        # address step 02 loaded.
+        visited = {}
+        for url in (web_data.get("urls_visited") or []):
+            clean = url_properties.normalize(url)
+            if clean:
+                visited.setdefault(
+                    url_properties.derive_key(feature.lower(), clean), clean)
+        recovered = {k: visited[k] for k in missing_url_props if k in visited}
+        if recovered:
+            url_properties.write_url_properties(
+                AUTOMATION_FRAMEWORK_DIR, recovered, feature.lower(), log=log)
+            log(f"Recovered {len(recovered)} URL propert(ies) from the pages step 02 "
+                f"actually opened: {', '.join(sorted(recovered))}")
+            url_props.update(recovered)
+            missing_url_props = [k for k in missing_url_props if k not in recovered]
+
+    if missing_url_props:
+        # What is left cannot be recovered: no page step 02 opened maps to this key.
+        # getRunTimeProperty would return null, and the first navigation would die as
+        # "url: expected string, got undefined" — a Playwright protocol error that
+        # reads nothing like the missing setting it is. Guessing a value would be
+        # worse than saying so, and writing the files anyway is worse than both: it
+        # spends a maven run, a browser launch and a fix attempt rediscovering what
+        # is already known here.
+        log(f"ERROR: generated code reads {len(missing_url_props)} URL "
+            f"propert(ies) that parameters/{props_file_name} does not define, and no "
+            f"page step 02 opened supplies them: {', '.join(missing_url_props)}")
+        log("  → FIX: add a value for each key to "
+            f"parameters/{props_file_name}, or re-run step 02 so the browser visits "
+            "that page and the key is minted from the URL it loaded.")
+        (AUDIT_DIR / "03-generate.json").write_text(json.dumps({
+            "error": "missing_url_properties",
+            "missing_url_properties": missing_url_props,
+            "url_properties": url_props,
+            "urls_visited": list(web_data.get("urls_visited") or []),
+        }, indent=2))
+        sys.exit(1)
 
     # Write each file to Thanos-pw, saving content for per-step git commits in ship step
     written = []
@@ -1341,6 +1600,10 @@ Return ONLY a JSON object, no prose:
         written_contents[rel_path] = content
 
     log(f"Generated {len(written)} files")
+
+    # Compile before step 04 does. A wrong import is seconds to catch here and a
+    # maven run, a browser launch and a fix attempt to catch there.
+    written_contents = _compile_check(written_contents)
 
     # A dropped check that reappears in the generated code is the whole pruning
     # step defeated: the locator would be guessed, the assertion would fail, and

@@ -454,16 +454,19 @@ The repo ships a thin HTTP + SSE server (`qa_agents_server/`) used by the AI Tes
 
 ```bash
 bash scripts/run-server.sh
-# Listens on http://0.0.0.0:8765 by default
+# Listens on http://0.0.0.0:6001 by default
 ```
 
 On its first boot in a checkout the server copies
 [`docs/examples/queue/<agent>/`](docs/examples/queue/) into each agent's queue,
-so the UI's queue view has something in it rather than being empty. It seeds once
-per checkout and never overwrites: a file already queued is left alone, a name
-already in `processed/` is not re-created, and once an agent has been seeded it
-is skipped — so an example you delete stays deleted. Set `QA_SEED_EXAMPLES=false`
-to turn it off, or clear an agent's queue directory to get the examples back.
+so the UI's queue view has something in it rather than being empty. Each signed-in
+user then gets their own copy the first time they open the queue, because a
+per-user queue starts as empty as a fresh checkout does. It seeds once per queue
+and never overwrites: a file already queued is left alone, a name already in
+`processed/` is not re-created, and a queue carrying the `.examples-seeded`
+marker is skipped — so an example you delete stays deleted. Set
+`QA_SEED_EXAMPLES=false` to turn it off, or delete a queue directory (the
+agent's, or one user's) to get its examples back.
 
 Note that seeded items are ordinary queue items: `make run AGENT=<agent>` with no
 `MODULE`/`BUILD_TAG` picks the oldest one and runs it. Pass an explicit target, or
@@ -490,7 +493,7 @@ Environment overrides:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `QA_AGENT_SERVER_HOST` | `0.0.0.0` | Bind host |
-| `QA_AGENT_SERVER_PORT` | `8765` | Bind port |
+| `QA_AGENT_SERVER_PORT` | `6001` | Bind port |
 | `AI_TEST_STUDIO_URL` | `http://localhost:5001` | CORS allowlist |
 | `QA_SEED_EXAMPLES` | `true` | Seed each agent's queue from `docs/examples/queue/` on first boot |
 | `QA_AGENT_RUN_TIMEOUT_SECONDS` | `7200` | SIGKILL after this many seconds |

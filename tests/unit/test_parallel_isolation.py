@@ -163,6 +163,126 @@ def test_legitimate_user_id_is_preserved():
     assert feature_files._safe_user_id("21232f297a57") == "21232f297a57"
 
 
+def test_readable_user_id_is_a_safe_path_segment():
+    """`user-admin` replaced the hash as the identity, so it is now what gets
+    joined onto the queue path and must survive _safe_user_id unchanged."""
+    assert feature_files._safe_user_id("user-admin") == "user-admin"
+    assert feature_files._safe_user_id("user-tester_1788776099") == "user-tester_1788776099"
+
+
+# ── Readable identity ─────────────────────────────────────────────────────────
+def _identity(headers: dict) -> str:
+    """current_user_id() under a request carrying `headers`."""
+    from flask import Flask
+    from qa_agents_server import routes
+
+    app = Flask(__name__)
+    with app.test_request_context(headers=headers):
+        return routes.current_user_id()
+
+
+def test_username_that_matches_its_hash_becomes_the_identity():
+    """The whole point: a person recognises queue/user-admin as theirs."""
+    assert _identity({"X-User-ID": "21232f297a57",
+                      "X-User-Name": "admin"}) == "user-admin"
+
+
+def test_username_that_does_not_hash_to_the_id_is_ignored():
+    """X-User-Name is otherwise a second, independent way to name a directory —
+    a proxy bug or a stale session could point it at someone else's queue. The
+    id is authoritative; a name that does not derive from it is discarded."""
+    assert _identity({"X-User-ID": "21232f297a57",
+                      "X-User-Name": "someone-else"}) == "21232f297a57"
+
+
+def test_unauthenticated_placeholder_stays_anonymous():
+    """The proxy sends "Unknown" when no one is logged in. That must not mint a
+    user-unknown queue — it has to keep falling through to the shared one."""
+    assert _identity({"X-User-Name": "Unknown"}) == routes_anonymous()
+    assert _identity({"X-User-ID": "not-a-hash",
+                      "X-User-Name": "Unknown"}) == routes_anonymous()
+
+
+def test_hostile_username_cannot_escape_the_queue_directory():
+    """A name is path content the moment it is trusted, so it is regex-gated
+    before it can become one — and never reaches _safe_user_id as `../`."""
+    for hostile in ("../../etc", "/tmp/pwn", "a/b", "..", "with space"):
+        assert _identity({"X-User-ID": "21232f297a57",
+                          "X-User-Name": hostile}) == "21232f297a57"
+
+
+def routes_anonymous() -> str:
+    from qa_agents_server import routes
+    return routes.ANONYMOUS_USER_ID
+
+
+# ── The server and run.sh must look in the same directory ─────────────────────
+def test_server_and_run_sh_agree_on_the_queue_directory():
+    """A spec written where run.sh does not look can be listed but never run.
+
+    _queue_dir appended the id unconditionally, so the anonymous/CLI identity
+    put the server in queue/default while run.sh read queue/ — and nothing the
+    boot seeder wrote was visible to anyone.
+    """
+    from qa_agents_server.agents import AGENTS
+
+    for name, spec in AGENTS.items():
+        if spec.queue_kind != "txt":
+            continue
+        shared = set(re.findall(r'"\$USER_ID" == "(\w+)"', spec.run_sh.read_text()))
+        assert shared == set(feature_files._SHARED_QUEUE_IDS), (
+            f"{name}/run.sh shares the queue root with {sorted(shared)}, "
+            f"the server with {sorted(feature_files._SHARED_QUEUE_IDS)}")
+
+        for anon in shared:
+            assert feature_files._queue_dir(name, anon) == spec.queue_dir
+        assert (feature_files._queue_dir(name, "21232f297a57")
+                == spec.queue_dir / "21232f297a57")
+
+
+def test_a_new_users_queue_gets_the_shipped_examples(tmp_path, monkeypatch):
+    """Boot-time seeding fills the queue ROOT, which no logged-in user reads —
+    so every picker in the UI was empty and said so."""
+    from dataclasses import replace
+
+    from qa_agents_server import seed_examples
+    from qa_agents_server.agents import AGENTS
+
+    examples = tmp_path / "examples" / "test-authoring-agent"
+    examples.mkdir(parents=True)
+    (examples / "demo.txt").write_text("Module: demo\nType: web\n\nSteps:\n1. Go\n")
+    monkeypatch.setattr(seed_examples, "EXAMPLES_DIR", tmp_path / "examples")
+    monkeypatch.delenv("QA_SEED_EXAMPLES", raising=False)
+    spec = replace(AGENTS["test-authoring-agent"], queue_dir=tmp_path / "queue")
+    monkeypatch.setattr(feature_files, "get_agent", lambda _name: spec)
+
+    listed = feature_files.list_features("test-authoring-agent", user_id="21232f297a57")
+    assert [item["name"] for item in listed] == ["demo"]
+
+    # Once per user: an example they delete stays deleted.
+    (tmp_path / "queue" / "21232f297a57" / "demo.txt").unlink()
+    assert feature_files.list_features(
+        "test-authoring-agent", user_id="21232f297a57") == []
+
+
+def test_per_user_seeding_respects_the_off_switch(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from qa_agents_server import seed_examples
+    from qa_agents_server.agents import AGENTS
+
+    examples = tmp_path / "examples" / "test-authoring-agent"
+    examples.mkdir(parents=True)
+    (examples / "demo.txt").write_text("Module: demo\n")
+    monkeypatch.setattr(seed_examples, "EXAMPLES_DIR", tmp_path / "examples")
+    monkeypatch.setenv("QA_SEED_EXAMPLES", "false")
+    spec = replace(AGENTS["test-authoring-agent"], queue_dir=tmp_path / "queue")
+    monkeypatch.setattr(feature_files, "get_agent", lambda _name: spec)
+
+    assert feature_files.list_features(
+        "test-authoring-agent", user_id="21232f297a57") == []
+
+
 # ── Ownership defaults to deny ────────────────────────────────────────────────
 def test_missing_identity_header_does_not_grant_access():
     """The old guard read `if run_record and user_id and ...`, so omitting the

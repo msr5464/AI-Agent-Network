@@ -108,9 +108,15 @@ def _plan_text(plan: dict) -> list:
 def collect_urls(plan: dict, web_validation: dict = None) -> dict:
     """{property_key: url} for every URL this module needs, base URLs first.
 
-    Sources, in priority order: the plan's declared base URLs, the steps the
-    browser validation actually walked (the most trustworthy — they loaded), then
+    Sources, in priority order: the plan's declared base URLs, the URLs the
+    browser was actually told to open, then the text of the steps it walked, then
     the steps the plan asked for.
+
+    `urls_visited` outranks the step text because it is the only source that
+    cannot be silent. A step summary is prose the model chose to write, and
+    "Navigate to the profile page" names no URL at all — which is how a generated
+    test came to read naukari.profile.url from a properties file that never
+    defined it, and navigate to null.
     """
     feature = (plan.get("feature_name") or "app").lower()
     web_validation = web_validation or {}
@@ -130,6 +136,8 @@ def collect_urls(plan: dict, web_validation: dict = None) -> dict:
 
     add(plan.get("web_base_url"), f"{feature}.url")
     add(plan.get("api_base_url"), f"{feature}.api.url")
+    for visited in (web_validation.get("urls_visited") or []):
+        add(visited)
     for text in (list(web_validation.get("steps_passed") or [])
                  + list(web_validation.get("steps_failed") or [])
                  + _plan_text(plan)):

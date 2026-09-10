@@ -126,24 +126,7 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
         elif text.startswith(("REFUSED:", "UNREACHABLE_STATE:")):
             log(f"    {text[:110]}")
 
-    prompt = _EXPLORE_PROMPT.format(steps=steps_text,
-                                    context=str(context))
-
-    from shared.frameworks import get_active_plugin
     log("  Sending to Claude for exploration...")
-    try:
-        raw = call_claude_ex(
-            prompt,
-            AUDIT_DIR,
-            system_prompt_file=Path("config/prompts/adapt.md"),
-            timeout=int(os.environ.get("ADAPT_EXPLORE_TIMEOUT_MS", "300000")),
-            allowed_tools=mcp_allowed_tools(),
-            label="explore",
-        )
-    except Exception as e:
-        log(f"  Failed to call Claude: {e}")
-        raw = ""
-
     result = call_claude_ex(
         prompt=build_prompt(plan, rules, notes, stop_before),
         model=MODEL, cwd=str(REPO_ROOT), timeout=TIMEOUT_S,

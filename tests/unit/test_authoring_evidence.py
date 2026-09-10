@@ -1151,3 +1151,94 @@ class TestEvidenceSurvivesARejectedAttempt:
         mod, audit = self._mod(tmp_path, monkeypatch)
         mod._write_result({"attempt": 0, "passed": True, "fixes_applied": []}, [], 0)
         assert json.loads((audit / "04-run-and-fix.json").read_text())["passed"] is True
+
+
+class TestTheGeneratedCodeCompiles:
+    """A wrong import is the cheapest failure in the pipeline and cost the most.
+
+    The observed run generated `import automation.core.web.BasePage` — a package
+    that has never existed; BasePage is `automation.core.BasePage`. Nothing in
+    step 03 ran a compiler, so it reached step 04 intact and spent the initial
+    maven run, the no-change re-run that rules out flakiness, and one of only two
+    fix attempts. These pin the parser that feeds the repair pass.
+    """
+
+    # Verbatim from the failing run's maven output, including the duplicate block
+    # maven prints under "Failed to execute goal".
+    MAVEN_OUTPUT = """\
+[INFO] Compiling 92 source files with javac [debug target 21] to target/classes
+[ERROR] COMPILATION ERROR :
+[ERROR] /tmp/qa-runs/x/src/main/java/automation/modules/naukari/web/NaukriLoginPage.java:[4,27] package automation.core.web does not exist
+[ERROR] /tmp/qa-runs/x/src/main/java/automation/modules/naukari/web/NaukriLoginPage.java:[11,38] cannot find symbol
+  symbol: class BasePage
+[ERROR] /tmp/qa-runs/x/src/main/java/automation/modules/naukari/web/NaukriProfilePage.java:[5,27] package automation.core.web does not exist
+[INFO] 3 errors
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.12.1:compile
+[ERROR] /tmp/qa-runs/x/src/main/java/automation/modules/naukari/web/NaukriLoginPage.java:[4,27] package automation.core.web does not exist
+[ERROR] /tmp/qa-runs/x/src/main/java/automation/modules/naukari/web/NaukriLoginPage.java:[11,38] cannot find symbol
+[ERROR] -> [Help 1]
+"""
+
+    def test_it_names_the_files_to_repair_relative_to_the_repo(self, tmp_path, monkeypatch):
+        gen = _load_action("03_generate.py", tmp_path, monkeypatch)
+        errors = gen.compile_errors(self.MAVEN_OUTPUT, Path("/tmp/qa-runs/x"))
+        assert sorted(errors) == [
+            "src/main/java/automation/modules/naukari/web/NaukriLoginPage.java",
+            "src/main/java/automation/modules/naukari/web/NaukriProfilePage.java",
+        ]
+
+    def test_maven_printing_every_error_twice_is_not_two_errors(self, tmp_path, monkeypatch):
+        gen = _load_action("03_generate.py", tmp_path, monkeypatch)
+        errors = gen.compile_errors(self.MAVEN_OUTPUT, Path("/tmp/qa-runs/x"))
+        login = errors["src/main/java/automation/modules/naukari/web/NaukriLoginPage.java"]
+        assert login == ["4: package automation.core.web does not exist",
+                         "11: cannot find symbol"]
+
+    def test_a_clean_build_reports_nothing(self, tmp_path, monkeypatch):
+        gen = _load_action("03_generate.py", tmp_path, monkeypatch)
+        assert gen.compile_errors("[INFO] BUILD SUCCESS\n", Path("/tmp/qa-runs/x")) == {}
+        assert gen.compile_errors("", Path("/tmp/qa-runs/x")) == {}
+
+
+class TestWhereTheBrowserActuallyWent:
+    """steps_passed is prose the model chose to write; navigated_urls is the
+    argument it passed. A run reported "Navigate to the profile page" and no key
+    was ever minted for it, so the generated test navigated to null."""
+
+    @staticmethod
+    def _feed(decoder, name, inp):
+        return decoder.feed(json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": name, "input": inp}]},
+        }))
+
+    def test_a_navigation_is_recorded_even_when_no_step_text_names_it(self):
+        from shared.claude import _StreamJsonDecoder
+        decoder = _StreamJsonDecoder()
+        self._feed(decoder, "mcp__playwright__browser_navigate",
+                   {"url": "https://www.naukri.com/mnjuser/profile"})
+        assert decoder.navigated_urls == ["https://www.naukri.com/mnjuser/profile"]
+
+    def test_other_tools_carrying_a_url_are_not_navigations(self):
+        from shared.claude import _StreamJsonDecoder
+        decoder = _StreamJsonDecoder()
+        self._feed(decoder, "mcp__playwright__browser_click",
+                   {"url": "https://example.com", "element": "Save"})
+        self._feed(decoder, "WebFetch", {"url": "https://docs.example.com"})
+        assert decoder.navigated_urls == []
+
+    def test_revisiting_a_page_does_not_record_it_twice(self):
+        from shared.claude import _StreamJsonDecoder
+        decoder = _StreamJsonDecoder()
+        for _ in range(3):
+            self._feed(decoder, "mcp__playwright__browser_navigate",
+                       {"url": "https://app.io/profile"})
+        assert decoder.navigated_urls == ["https://app.io/profile"]
+
+    def test_a_navigation_with_no_url_argument_is_ignored(self):
+        from shared.claude import _StreamJsonDecoder
+        decoder = _StreamJsonDecoder()
+        self._feed(decoder, "mcp__playwright__browser_navigate", {})
+        self._feed(decoder, "mcp__playwright__browser_navigate", {"url": "   "})
+        self._feed(decoder, "browser_navigate", {"url": None})
+        assert decoder.navigated_urls == []

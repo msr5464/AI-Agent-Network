@@ -278,6 +278,9 @@ Web Steps:
 | `VALIDATE_API_REQUEST_TIMEOUT_S` | Timeout (s) for each real HTTP call in Validate API | `15` |
 | `VALIDATE_API_RETRY_ON_ERROR` | Set `false` to disable the one connection-error retry in Validate API | `true` |
 | `ALLOW_MISSING_SELECTORS` | Let step 03 generate when step 02 confirmed nothing | `false` |
+| `GENERATE_COMPILE_CHECK` | Set `false` to skip step 03's `mvn test-compile` gate (a non-Maven framework plugin) | `true` |
+| `GENERATE_COMPILE_TIMEOUT_S` | Timeout (s) for that compile | `180` |
+| `COMPILE_REPAIR_MAX_DIFF_LINES` | Diff budget for the compile repair pass | `60` |
 | `FORCE` | Let a step 04 fix through even when it weakens an assertion. For a human who has read the diff — never for the loop | `false` |
 | `SLACK_BOT_TOKEN` | Slack bot token | optional |
 | `SLACK_NOTIFY_CHANNEL` | Slack channel for success notifications | optional |
@@ -375,10 +378,60 @@ The rule is enforced at four points, all reading `shared/url_properties.py`:
 
 | Where | What happens |
 |-------|--------------|
-| **03 Generate**, before codegen | `collect_urls()` harvests every URL from the plan (`web_base_url`, `api_base_url`, validation steps) and from `02-validate-web.json`'s `steps_passed`, names a key for each, and writes them to `parameters/{environment}-{country}.properties`. The key table goes into the codegen prompt. |
+| **03 Generate**, before codegen | `collect_urls()` harvests every URL from the plan (`web_base_url`, `api_base_url`, validation steps) and from `02-validate-web.json` — `urls_visited` first, then `steps_passed`. It names a key for each and writes them to `parameters/{environment}-{country}.properties`. The key table goes into the codegen prompt. |
+| **03 Generate**, after codegen | A key the generated code reads that the properties file does not define is **recovered from `urls_visited` or the run aborts** — see "A URL property is not a warning" below. |
 | **03 Generate**, after codegen | Any file still holding a literal URL gets one targeted repair pass, guarded by `validate_fix`. What survives is logged and recorded in `03-generate.json` → `hardcoded_urls`. |
 | **04 Run & Fix** | `ensure_url_properties()` rewrites the keys before the first run (`git checkout -f` in run.sh discards them). `no_hardcoded_url` is a fix guard: a fix that adds a literal URL is rejected before it reaches disk. |
 | **05 Ship** | The URL keys are committed — added to HEAD's copy of the properties file, never the working copy, so the run's real credentials in that same file are not committed with them. |
+
+### `urls_visited` — why the step text was not enough
+
+`collect_urls()` used to read URLs only out of step 02's step *summaries*, which are prose
+the model chooses to write. A run that navigated to `https://www.naukri.com/mnjuser/profile`
+reported it as `STEP_PASSED: Navigate to the profile page` — no URL in the string — so no
+key was minted, the generated test read `naukari.profile.url` from a file that never
+defined it, and Playwright died on `url: expected string, got undefined`.
+
+So step 02 now records the URL of every `browser_navigate` call the model made, straight
+off the tool stream (`shared/claude.py` collects `navigated_urls`; `02-validate-web.json`
+carries them as `urls_visited`). It is the only URL source that cannot be silent: a step
+summary is what the model chose to say, this is the argument it actually passed.
+
+### A URL property is not a warning
+
+Reading a key nobody wrote is unrunnable code, and step 03 already knew it — it computed
+the list, logged `WARNING`, and wrote the files anyway. Step 04 then spent a maven run, a
+browser launch and a fix attempt rediscovering it. Now the same block:
+
+1. recovers the key from `urls_visited` when a page step 02 opened supplies it — not a
+   guess, an address the browser loaded;
+2. `sys.exit(1)` on anything left, with `"error": "missing_url_properties"` in the audit.
+
+A key that survives (1) means the browser never visited that page, so the test navigates
+somewhere step 02 never validated — which is the one thing this pipeline does not do.
+`BrowserHelper.navigateTo` also rejects a null URL by name now, so the same mistake made
+by hand reads as a missing property rather than a Playwright protocol error.
+
+---
+
+## The compile gate — step 03 builds what it wrote
+
+Every other guard in step 03 reads the generated code. None of them ran a compiler, so
+`import automation.core.web.BasePage` — a package that has never existed — reached step 04
+intact and cost the initial run, the no-change flakiness re-run, and one of only two fix
+attempts. The framework's own CLAUDE.md has always made `mvn compile` step 1 of its
+mandatory self-test; this is the agent finally doing it.
+
+| Where | What happens |
+|-------|--------------|
+| **03 Generate**, after the write loop | `mvn -q test-compile` in the framework checkout. `test-compile`, not `compile`, so the generated *test* class is covered too. |
+| on failure | `compile_errors()` parses javac's `[ERROR] path:[line,col] msg` lines. One targeted repair pass over only the generated files named, handed the real `automation.core` class list so an invented package has somewhere to land. Guarded by `validate_fix` under `COMPILE_REPAIR_MAX_DIFF_LINES`, accepted per file. |
+| still failing | `sys.exit(1)` with `"error": "compile_failed"` and the javac errors in `03-generate.json`. |
+| errors only in files this run did not write | abort too, saying so — the checkout does not build on its own, which is not something a repair pass can fix. |
+| maven missing, timed out, or no `pom.xml` | skipped, not failed. That is infra, and failing the run on it blames the wrong thing. |
+
+Safe to place in step 03 because there is no `git checkout -f` between steps 03 and 04 in
+the isolated worktree — what step 03 compiles is what step 04 runs.
 
 Key naming: the host alone is `{feature}.url` (matching the existing `saucedemo.url`), the
 API base is `{feature}.api.url`, and anything with a path is named for its last meaningful

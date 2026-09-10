@@ -15,12 +15,12 @@ agent.
 | `test-triaging-agent` | *none* — it has no queue | — | — |
 
 **The server seeds these automatically.** On its first boot in a checkout,
-`qa_agents_server` copies each agent's examples into its queue so the UI has
-something to show — see
+`qa_agents_server` copies each agent's examples into its queue root, and each
+signed-in user gets their own copy the first time they open that queue — see
 [`seed_examples.py`](../../../qa_agents_server/seed_examples.py). It never
 overwrites a queued file, never re-creates one already in `processed/`, and skips
-an agent once seeded, so anything you delete stays deleted. `QA_SEED_EXAMPLES=false`
-disables it; clearing an agent's queue directory re-arms it. The `cp` commands
+a queue once seeded, so anything you delete stays deleted. `QA_SEED_EXAMPLES=false`
+disables it; deleting a queue directory re-arms it for that queue. The `cp` commands
 below are for putting an example back by hand.
 
 `test-triaging-agent` takes a CI build tag instead (`make run

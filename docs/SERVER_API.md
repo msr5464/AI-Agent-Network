@@ -8,7 +8,7 @@
 
 ```bash
 bash scripts/run-server.sh
-# Listens on http://0.0.0.0:8765 by default
+# Listens on http://0.0.0.0:6001 by default
 ```
 
 Environment overrides:
@@ -16,7 +16,7 @@ Environment overrides:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `QA_AGENT_SERVER_HOST` | `0.0.0.0` | Bind host |
-| `QA_AGENT_SERVER_PORT` | `8765` | Bind port |
+| `QA_AGENT_SERVER_PORT` | `6001` | Bind port |
 | `AI_TEST_STUDIO_URL` | `http://localhost:5001` | CORS allowlist |
 | `QA_AGENT_RUN_TIMEOUT_SECONDS` | `1800` | Kill a run after this many seconds |
 
@@ -27,7 +27,7 @@ The server does not implement authentication — it is expected to run on localh
 ## Base URL
 
 ```
-http://localhost:8765
+http://localhost:6001
 ```
 
 All agent routes are scoped under `/agents/<agent>/`, where `<agent>` is one of:
@@ -371,7 +371,7 @@ live stream, so a run reads identically before and after a page reload.
 
 **Example (curl):**
 ```bash
-curl -N "http://localhost:8765/agents/test-authoring-agent/run/20260507-102341-payments/stream"
+curl -N "http://localhost:6001/agents/test-authoring-agent/run/20260507-102341-payments/stream"
 ```
 
 **Example (JavaScript):**

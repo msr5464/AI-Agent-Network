@@ -79,7 +79,7 @@ def create_app() -> Flask:
 
 
 def main():
-    port = int(os.getenv("QA_AGENT_SERVER_PORT", "8765"))
+    port = int(os.getenv("QA_AGENT_SERVER_PORT", "6001"))
     # Localhost by default. This server implements no auth of its own — it
     # trusts X-User-ID and X-User-Role from the AI-Test-Studio proxy, and both
     # are headers any client can type — so routes.py has always documented that

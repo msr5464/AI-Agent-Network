@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import List, Dict, Optional
 
+from qa_agents_server import seed_examples
 from qa_agents_server.agents import DEFAULT_AGENT, get_agent
 from qa_agents_server.paths import REPO_ROOT
 
@@ -41,12 +42,22 @@ def _safe_user_id(user_id: str) -> str:
     return candidate if _USER_ID_RE.match(candidate) else "default"
 
 
+# Each agent's run.sh applies exactly this carve-out where it locates its input
+# file, and the server has to agree with it — a spec written where run.sh does
+# not look can be listed and edited but never run. The anonymous and CLI
+# identities work out of the queue root; everyone else gets a private
+# subdirectory. Appending "default" unconditionally, as this used to, put the
+# server in agents/<a>/queue/default while run.sh read agents/<a>/queue.
+_SHARED_QUEUE_IDS = frozenset({"default", "cli"})
+
+
 def _queue_dir(agent: str = DEFAULT_AGENT, user_id: str = "default") -> Path:
     spec = get_agent(agent)
     if spec.queue_kind != "txt":
         raise FeatureFileError(
             f"{spec.name}'s queue is not human-authored text", status=405)
-    return spec.queue_dir / _safe_user_id(user_id)
+    safe = _safe_user_id(user_id)
+    return spec.queue_dir if safe in _SHARED_QUEUE_IDS else spec.queue_dir / safe
 
 
 def _processed_dir(agent: str = DEFAULT_AGENT, user_id: str = "default") -> Path:
@@ -67,6 +78,24 @@ class FeatureFileError(Exception):
 def _ensure_dirs(agent: str = DEFAULT_AGENT, user_id: str = "default"):
     _queue_dir(agent, user_id).mkdir(parents=True, exist_ok=True)
     _processed_dir(agent, user_id).mkdir(parents=True, exist_ok=True)
+    _seed_once(agent, user_id)
+
+
+def _seed_once(agent: str, user_id: str) -> None:
+    """Put the shipped examples in this user's queue the first time it is used.
+
+    Boot-time seeding fills the queue ROOT, which under per-user queues only the
+    anonymous and CLI identities read. Every logged-in user's picker was
+    therefore empty — and examples nobody can see are the whole point of
+    seeding. seed_agent's marker file keeps this to once per user, so an example
+    someone deletes stays deleted.
+    """
+    if not seed_examples.enabled():
+        return
+    try:
+        seed_examples.seed_agent(get_agent(agent), _queue_dir(agent, user_id))
+    except OSError:
+        pass  # an empty picker is cosmetic; it must not fail the request
 
 
 def _validate_name(name: str) -> str:
