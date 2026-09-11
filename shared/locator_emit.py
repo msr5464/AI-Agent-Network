@@ -119,6 +119,15 @@ def scoped_by_context(ctx, el: dict, expect_index: int, snap: dict | None) -> di
         value = el.get(attribute)
         if value:
             inners.append(f'{tag}[{attribute.replace("_", "-")}={_css(value)}]')
+    # A wrapper that names itself only through its child — the <span> around an
+    # <img alt="PencilSimple">. `:has(> …)` keeps the locator on the wrapper,
+    # which is the element the test clicks and the one verified by index.
+    child = el.get("child") or {}
+    for attribute in ("testid", "alt", "aria_label", "title"):
+        value = child.get(attribute)
+        if value:
+            name = "data-testid" if attribute == "testid" else attribute.replace("_", "-")
+            inners.append(f'{tag}:has(> {child["tag"]}[{name}={_css(value)}])')
     inners.append(tag)
 
     seen: set[str] = set()

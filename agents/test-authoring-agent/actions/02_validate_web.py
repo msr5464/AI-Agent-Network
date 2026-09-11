@@ -897,9 +897,23 @@ Begin executing the steps now using the browser tools.
         f"{max_attempts} attempt(s))..."
     )
 
+    # Same allowlist shape as 03_generate.py: the decoder turns every line of the
+    # model's prose into a progress line, and a browser-driving run closes with a
+    # markdown run-summary table that repeats markers already streamed above. The
+    # raw transcript in claude-*.log keeps all of it for post-mortem; the console
+    # only needs the markers and the tool heartbeat.
+    _PROGRESS_PREFIXES = ("STEP_", "SELECTOR_FOUND", "INTERACTION_HINT",
+                          "MECHANISM_FOUND", "PAGE_DUMP", "API retry", "MCP server",
+                          "→ ")
+
     def _on_output(label: str, line: str) -> None:
-        if label == "stdout":
-            log(f"  {line}")
+        # Matched on the stripped line for the same reason the marker parsers do:
+        # a marker the model happened to indent is still a marker.
+        if label != "stdout" or not line.strip().startswith(_PROGRESS_PREFIXES):
+            return
+        # The mcp__playwright__browser_ prefix is on every tool line and carries no
+        # information — a 25-line burst of browser_evaluate reads as noise with it.
+        log(f"  {line.replace('mcp__playwright__browser_', '')[:200]}")
 
     def _run_attempt(attempt_notes: str):
         return call_claude_ex(
@@ -1035,10 +1049,14 @@ Begin executing the steps now using the browser tools.
     attempts: list = []  # list of (result, parsed_dict)
 
     def _persist_snapshot() -> None:
-        """Persist the best result seen so far. Called after every attempt —
-        without this, nothing is written until the very end of main(), so a
-        cancel arriving during attempt 2 would discard attempt 1's fully
-        completed, perfectly usable results too, not just attempt 2's."""
+        """Persist the best result seen so far. Called after every attempt, and
+        the last of those calls IS the final write — a cancel arriving during
+        attempt 2 would otherwise discard attempt 1's fully completed, perfectly
+        usable results too, not just attempt 2's.
+
+        Do not add a second call after the loop: every path through the body
+        reaches this one, `attempts` cannot change afterwards, so a trailing call
+        only rewrites the same file and logs the selector tally twice."""
         r, p = max(attempts, key=lambda ra: _score(ra[0], ra[1]))
         _write_result(
             selectors=p["selectors"],
@@ -1191,10 +1209,6 @@ Begin executing the steps now using the browser tools.
         log("  → If you asked for one of these, the product did not do it. Step 03 "
             "keeps the assertion and the test will fail on purpose; a check the "
             "pipeline invented is dropped instead.")
-
-    # Final authoritative write (same helper used after every attempt above —
-    # single source of truth for what "the result" means).
-    _persist_snapshot()
 
 
 def _write_empty(reason: str) -> None:

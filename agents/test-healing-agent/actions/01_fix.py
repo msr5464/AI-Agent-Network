@@ -768,7 +768,8 @@ def _inspect_parked_browser(ctx: dict, session: dict) -> dict:
             use_system_prompt=False,
             timeout=DOM_TIMEOUT_S,
             allowed_tools=mcp_allowed_tools(),
-            label="fix-repair-mode"
+            mcp_config=str(mcp_path),
+            strict_mcp_config=True,
         )
         result["raw"] = raw[-4000:] if raw else ""
         if not raw:
@@ -776,6 +777,8 @@ def _inspect_parked_browser(ctx: dict, session: dict) -> dict:
             return result
 
         _parse_browser_markers(raw, result)
+        path = ctx.get("dom_snapshot_path") or ""
+        _keep_unique(result, _snapshot_soup({"dom_snapshot": path}), load_fingerprints(path))
         if result["selectors"]:
             result["status"] = "ok (live, parked on the failing page)"
             log(f"  Live selectors confirmed against the failing page: {result['selectors']}")
@@ -784,6 +787,25 @@ def _inspect_parked_browser(ctx: dict, session: dict) -> dict:
         return result
     finally:
         _reap_parked_browser(session)
+
+
+def _keep_unique(result: dict, soup, prints: dict) -> None:
+    """Drop live selectors the failure capture shows matching other than one element.
+
+    The browser run is told to report a selector only once it counts exactly one
+    match, but that count is its own claim: it reported `button:has-text("Login")`,
+    which also matches "Use OTP to Login". The capture is the same page, so the
+    guard's own counter settles it before the model is told it was confirmed.
+    """
+    if soup is None:
+        return
+    from shared.dom_snapshot import selector_visibility
+    for name, selector in list(result["selectors"].items()):
+        counted = selector_visibility(selector, soup, prints)
+        if counted and counted[0] != 1:
+            del result["selectors"][name]
+            log(f"  Live inspection reported {selector!r} for {name}, but it matches "
+                f"{counted[0]} elements in the failure capture — not confirmed")
 
 
 def _parse_browser_markers(raw: str, result: dict) -> None:
@@ -970,7 +992,8 @@ def load_dom_snapshot(issue: dict, element_names: list) -> dict:
     prints = load_fingerprints(path)
     if prints.get("elements"):
         distilled = candidates_from_fingerprints(
-            prints, element_names, issue.get("failed_selector") or "")
+            prints, element_names, issue.get("failed_selector") or "",
+            soup=_snapshot_soup(issue))
         if not distilled.get("error"):
             log(f"  DOM candidates from the failure capture: "
                 f"{distilled['total_elements']} visible element(s), "
@@ -1998,6 +2021,10 @@ def main():
         _, current, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace)
         log(f"AUTO_PUSH=false — staying on {current.strip() or 'the current branch'}; "
             f"edits will be left uncommitted for review")
+        # Name the checkout, not just the branch: the run may be in the
+        # developer's own clone (AUTO_PUSH=false) or in a worktree, and "go look
+        # at it" is useless without knowing which.
+        log(f"  review with: git -C {workspace} status")
     else:
         # Attempt 1 establishes the base and records it. Later attempts reuse
         # that recorded SHA and deliberately do NOT re-fetch: origin/<base> may
@@ -2154,11 +2181,14 @@ def main():
         # fault. A handoff from triaging never runs step 00, so this is the only
         # place the pipeline path gets asked the question at all.
         ctx["diagnosis"] = {}
-        snapshot_soup, snapshot_prints = None, {}
+        snapshot_soup, snapshot_prints, acted_on = None, {}, False
         try:
             evidence = diagnosis.collect(issue, workspace=workspace,
                                          page_objects=ctx.get("page_objects"),
                                          audit_dir=AUDIT_DIR.parent)
+            # The test failed clicking or filling this element, so the guard can
+            # demand a replacement matching exactly one (Playwright strict mode).
+            acted_on = (evidence.get("context") or {}).get("kind") == "ELEMENT_INTERACTION"
             verdict = diagnosis.diagnose(evidence)
             ctx["diagnosis"] = verdict
             snapshot_soup = _snapshot_soup(issue)
@@ -2335,7 +2365,7 @@ def main():
             valid, invalid_reason = validate_diagnosis_fit(
                 target_original, fixed_content,
                 (ctx.get("diagnosis") or {}).get("verdict", ""), snapshot_soup,
-                snapshot_prints)
+                snapshot_prints, require_unique=acted_on)
         # Guards built for test-adaptation-agent, evaluated here but never acting.
         # They are about to become load-bearing for edits far larger than a
         # locator, and the cheapest place to find out that one of them is wrong is
@@ -2595,6 +2625,9 @@ def main():
         "succeeded":      tests_fixed,
         "unverified":     tests_unverified,
         "failed":         len(failed_fixes),
+        # What .fix-passed says; the UI's step status reads it
+        # (audit_reader._step_has_error).
+        "fix_gate":       gate,
         # How much rework clustering avoided: one edit can green several tests.
         "distinct_fixes":     len(fixes),
         "distinct_unverified": len(unverified_fixes),

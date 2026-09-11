@@ -240,6 +240,14 @@ def agent_config(agent: str):
     spec, err = _resolve(agent)
     if err:
         return err
+    # Which branch a dry run would actually use. With auto-push off the run
+    # executes in this checkout rather than a worktree cut from origin/<base>,
+    # so the panel's branch picker has exactly one honest answer and needs to be
+    # told what it is. None when the workspace is missing or is not a git
+    # checkout — the UI leaves the field alone in that case.
+    workspace = _automation_workspace()
+    checkout = _checkout_state(workspace) if workspace is not None \
+        else {"branch": None, "dirty": None}
     return jsonify({
         "agent": spec.name,
         "auto_push_default": auto_push_default(),
@@ -248,6 +256,8 @@ def agent_config(agent: str):
         # the field from this rather than hardcoding "main", so a panel never
         # shows a default the server would not actually use.
         "default_branch": default_branch(),
+        "local_branch": checkout["branch"],
+        "local_dirty": checkout["dirty"],
     })
 
 

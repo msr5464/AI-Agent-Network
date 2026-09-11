@@ -91,6 +91,7 @@ Thread.sleep(3000);
 - Positional XPath: `//div[1]/span[2]`
 - Auto-generated class names (hash-like strings)
 - Exact text XPath: `//button[text()='Submit']` — use `contains()` instead
+- Escaped double quotes inside a selector string: write `button:has-text('Login')` and `[data-cy='x']`, not `has-text(\"Login\")`. Use double quotes only when the value itself contains an apostrophe.
 
 ### @FindBy declaration pattern
 ```java

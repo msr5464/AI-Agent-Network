@@ -538,6 +538,18 @@ def prepare_base(path, org: str, repo: str, token: str, branch: str,
     return {"ok": True, "branch": branch, "ref": ref, "sha": sha, "reason": ""}
 
 
+# Exported by qa_agents_server.runner for a run that executes in the developer's
+# own checkout rather than a throwaway worktree — i.e. AUTO_PUSH=false, where the
+# whole point is to work on top of their uncommitted changes and leave the edits
+# behind for review. checkout_base() below refuses outright while it is set.
+LOCAL_RUN_ENV = "QA_LOCAL_CHECKOUT_RUN"
+
+
+def local_checkout_run() -> bool:
+    """Is this run executing in the developer's own checkout?"""
+    return os.environ.get(LOCAL_RUN_ENV, "").strip() == "1"
+
+
 def checkout_base(path, branch: str, start_point: str = "",
                   log=lambda m: None) -> Dict:
     """Put the checkout ON `branch`. DESTROYS uncommitted work — gate on that.
@@ -548,7 +560,18 @@ def checkout_base(path, branch: str, start_point: str = "",
     case the old retry could not handle, because `git fetch <url> <b>` creates
     neither a local branch nor a remote-tracking ref), and it cannot conflict,
     because there is no merge.
+
+    The refusal below is the one gate that matters. Three agents call this, each
+    with its own idea of when it is safe, and a local-checkout run must survive
+    all three plus any call site added later — so the destruction is refused
+    here, at the only place that performs it, rather than at each caller. Every
+    caller already reads ok:False as "carry on where you are".
     """
+    if local_checkout_run():
+        log(f"Local-checkout run — staying on this checkout rather than "
+            f"moving it to {branch}")
+        return {"ok": False,
+                "reason": "local-checkout run — refusing to move your checkout"}
     try:
         branch = normalise_branch(branch)
     except ValueError as e:

@@ -248,3 +248,33 @@ class TestAmbiguousLocatorGuard:
         ok, _ = g.validate_diagnosis_fit(original, updated, "LOCATOR_STALE",
                                        self._soup(), {})
         assert ok
+
+
+class TestStaleLocatorActedOn:
+    """A stale locator the test clicks must be replaced by one matching one element.
+
+    Both attempts on the run this pins matched Login and Use OTP to Login —
+    `#loginForm button:has-text('Login')`, then `button[type='submit']` — and each
+    was found out by a 40-second Maven run and a revert.
+    """
+
+    def _fit(self, selector, extra=""):
+        from bs4 import BeautifulSoup
+        original, updated = TestAmbiguousLocatorGuard()._edit(selector)
+        soup = BeautifulSoup(TestAmbiguousLocatorGuard.PAGE, "html.parser")
+        return g.validate_diagnosis_fit(original + extra, updated + extra, "LOCATOR_STALE",
+                                        soup, {}, require_unique=True)
+
+    def test_a_replacement_matching_two_is_rejected(self):
+        ok, reason = self._fit("#loginForm button[type='submit']:has-text('Login')")
+        assert not ok and "matches 2 elements" in reason
+
+    def test_exact_text_is_unique(self):
+        assert self._fit("#loginForm button[type='submit']:text-is('Login')")[0]
+
+    def test_a_field_used_as_a_list_may_match_several(self):
+        assert self._fit("#loginForm button[type='submit']",
+                         "\n    loginButton.first().click();")[0]
+
+    def test_positional_narrowing_in_the_selector_is_one_element(self):
+        assert self._fit("#loginForm button[type='submit'] >> nth=0")[0]

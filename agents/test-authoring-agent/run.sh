@@ -275,8 +275,18 @@ export GIT_TERMINAL_PROMPT=0
 # An explicitly empty GITHUB_DEFAULT_BRANCH means "branch from current HEAD",
 # which the CLI honours — matching actions/05_ship.py, which has always read a
 # blank value that way while this block was quietly defaulting it to main.
+#
+# AUTO_PUSH=false is the third case, and it takes neither branch: `prepare-base
+# --checkout` force-checks-out, which would destroy the very uncommitted work a
+# dry run exists to build on top of. 05_ship.py already writes its files to the
+# working tree and stops there, so the run is self-consistent — it reads the
+# developer's code and leaves its own edits beside it.
 if [[ "${QA_ISOLATED_WORKTREE_READY:-}" == "1" ]]; then
   log "Prerequisite: running inside isolated worktree $AUTOMATION_FRAMEWORK_DIR"
+elif [[ "${AUTO_PUSH:-true}" == "false" ]]; then
+  _LOCAL_BRANCH="$(git -C "$AUTOMATION_FRAMEWORK_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
+  log "Prerequisite: AUTO_PUSH=false — using your checkout $AUTOMATION_FRAMEWORK_DIR as it stands"
+  log "  on branch $_LOCAL_BRANCH, uncommitted changes included; nothing will be committed"
 else
   log "Prerequisite: preparing $AUTOMATION_FRAMEWORK_DIR on ${GITHUB_DEFAULT_BRANCH:-<current HEAD>} ..."
   if ! (cd "$REPO_ROOT" && python3 -m shared.workspace prepare-base --checkout 2>&1); then
@@ -334,7 +344,7 @@ if _cache_hit "02-validate-api.json"; then
   STEP_DURATIONS+=(0)
   record_stage "validate_api" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
 else
-  run_step "[02/05] Validate API" "python3 '$AGENT_DIR/actions/02_validate_api.py'" validate_web
+  run_step "[02/05] Validate API" "python3 '$AGENT_DIR/actions/02_validate_api.py'" validate_api
   # Only cache if it actually ran a real validation (not skipped as non-API/no-endpoints)
   if python3 -c "
 import json, os, sys

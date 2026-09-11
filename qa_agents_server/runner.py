@@ -52,6 +52,7 @@ from qa_agents_server.agents import (
     AgentConfigError,
     AgentSpec,
     DEFAULT_AGENT,
+    effective_auto_push,
     get_agent,
 )
 
@@ -131,6 +132,13 @@ class RunState:
     # flight, and cleanup would then look for a path that never existed and
     # silently leak both the directory and its .git/worktrees admin entry.
     worktree_path: str = ""
+    # Where the run actually executed. In an isolated run this is the worktree;
+    # in a local-checkout run it is the developer's own clone, which must never
+    # be handed to worktree_path above — that field is what teardown deletes.
+    work_dir: str = ""
+    # AUTO_PUSH=false: the run works in the developer's checkout, on top of their
+    # uncommitted changes, and leaves its edits there uncommitted for review.
+    local_mode: bool = False
 
     def snapshot(self) -> Dict:
         """Persistable snapshot (no Popen, no threading primitives)."""
@@ -173,7 +181,22 @@ _active_runs: Dict[str, RunState] = {}
 # reserved here instead, so capacity stays correct while the git work runs
 # unlocked. Guarded by _registry_lock.
 _starting: set = set()
+# Session ids of local-checkout runs between the capacity gate and the registry
+# insert. Without it two dry runs fired together both see an empty _active_runs
+# and start in the same working tree.
+_starting_local: set = set()
 _registry_lock = threading.Lock()
+
+
+def _local_slot_busy() -> bool:
+    """Is the developer's checkout already in use? Caller holds _registry_lock.
+
+    One working tree cannot host two runs: they would read each other's edits
+    and each other's test output. Isolated worktree runs stay parallel — only
+    local-vs-local contends.
+    """
+    return bool(_starting_local) or any(r.local_mode for r in _active_runs.values())
+
 
 def max_concurrent_runs() -> int:
     try:
@@ -269,14 +292,23 @@ def _start_next_from_queue() -> None:
             active_counts: Dict[str, int] = {}
             for r in _active_runs.values():
                 active_counts[r.user_id] = active_counts.get(r.user_id, 0) + 1
+            local_busy = _local_slot_busy()
 
         with _queue_lock:
             if _shutting_down.is_set() or not _pending_queue:
                 return
+            # A local-checkout run whose checkout is still occupied is skipped
+            # rather than started-and-requeued: start_run would push it back and
+            # this function would return, stranding every isolated run queued
+            # behind it until something else finished.
+            eligible = [i for i in range(len(_pending_queue))
+                        if not (local_busy and _pending_queue[i].get("local_mode"))]
+            if not eligible:
+                return
             # Fewest active runs wins; min() breaks ties by queue position, so
             # one user firing ten runs cannot starve everyone queued behind them.
             best_idx = min(
-                range(len(_pending_queue)),
+                eligible,
                 key=lambda i: active_counts.get(
                     _pending_queue[i].get("user_id", "default"), 0),
             )
@@ -457,10 +489,13 @@ def _preserve_worktree_artefacts(run: "RunState") -> None:
     Best-effort by design: a run that produced nothing, or a partial copy, must
     never turn a finished run into a failed one.
     """
-    worktree = (run.worktree_path or "").strip()
-    if not worktree:
+    # work_dir, not worktree_path: a local-checkout run has no worktree, and
+    # reading the field that names one would skip artefact preservation for
+    # every dry run — the runs whose output a human is most likely to open.
+    work_dir = (run.work_dir or run.worktree_path or "").strip()
+    if not work_dir:
         return
-    source = Path(worktree) / "test-output"
+    source = Path(work_dir) / "test-output"
     if not source.is_dir():
         return
     destination = run.audit_dir / "test-output"
@@ -731,8 +766,13 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
     # worktree creation, spawn — happens AFTER this block releases the lock:
     # holding _registry_lock across a git clone (300s timeout) blocked every
     # registry reader, GET /run/active included, for as long as it took.
+    # AUTO_PUSH decides WHERE the run executes, not just whether a PR is raised:
+    # false means the developer's own checkout, uncommitted changes and all.
+    local_mode = not effective_auto_push(agent_env)
+
     with _registry_lock:
-        if len(_active_runs) + len(_starting) >= max_concurrent_runs():
+        if (len(_active_runs) + len(_starting) >= max_concurrent_runs()
+                or (local_mode and _local_slot_busy())):
             # Queue instead of rejecting.
             with _queue_lock:
                 queued_session_id = (session_id if resuming
@@ -741,6 +781,7 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
                     "agent": spec.name, "payload": payload,
                     "module": label, "auto_push": bool(payload.get("auto_push")),
                     "base_branch": (payload.get("base_branch") or "").strip(),
+                    "local_mode": local_mode,
                     "session_id": queued_session_id,
                     "start_from_step": start_from_step,
                     "user_id": user_id,
@@ -752,6 +793,8 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
             with _queue_lock:
                 session_id = _unique_session_id(spec, payload)
         _starting.add(session_id)
+        if local_mode:
+            _starting_local.add(session_id)
 
     try:
         audit_dir = spec.audit_dir / session_id
@@ -769,23 +812,57 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
             token=os.environ.get("GITHUB_TOKEN", ""),
             branch=payload.get("base_branch") or os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
         )
-        if main_repo:
+        if not main_repo:
+            raise RunnerError("Automation repo not found and could not be cloned.", status=500)
+
+        if local_mode:
+            # AUTO_PUSH=false. Run where the developer is working: a worktree cut
+            # from origin/<base> cannot see the locator they broke on purpose or
+            # the credentials they refuse to commit, and the edits every agent
+            # promises to "leave uncommitted for review" would be deleted with
+            # the worktree seconds later.
+            #
+            # worktree_path stays EMPTY on the run record below. Teardown deletes
+            # whatever that field names, and it must never name this directory.
+            work_dir = main_repo
+        else:
+            work_dir = worktree_path
             base_branch = payload.get("base_branch") or os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
             wt_result = _workspace.prepare_worktree(
                 str(main_repo), str(worktree_path), base_branch
             )
             if not wt_result.get("ok"):
                 raise RunnerError(f"Failed to create isolated git worktree: {wt_result.get('reason')}", status=500)
-        else:
-            raise RunnerError("Automation repo not found and could not be cloned.", status=500)
 
         env = os.environ.copy()
         env.update(agent_env)
         env["SESSION_ID"] = session_id
         env["AUDIT_DIR"] = str(audit_dir)
         env["USER_ID"] = user_id
-        env["FRAMEWORK_DIR"] = str(worktree_path)
-        env["QA_ISOLATED_WORKTREE_READY"] = "1"
+        env["FRAMEWORK_DIR"] = str(work_dir)
+        if local_mode:
+            # Tells shared/workspace.checkout_base to refuse: every agent has its
+            # own idea of when moving the checkout is safe, and none of them are
+            # right about a checkout the developer is standing in.
+            #
+            # HEALING_BASELINE_DIR is deliberately NOT dropped here. It is an
+            # absolute ${WORKSPACE_DIR}/${GITHUB_REPO_AUTOMATION}/... path, which
+            # in a local run already points inside the checkout being used.
+            env[_workspace.LOCAL_RUN_ENV] = "1"
+        else:
+            env["QA_ISOLATED_WORKTREE_READY"] = "1"
+            # Every other path pinned to the old checkout has to follow
+            # FRAMEWORK_DIR, and HEALING_BASELINE_DIR is one: inherited into a
+            # worktree run it splits the two halves — the Java framework writes
+            # its fingerprints into the developer's main checkout while ship reads
+            # baseline.repo_directory(worktree), which rejects an out-of-tree
+            # override and falls back inside the worktree. Ship then finds only
+            # the baselines the checkout came with, logs "none changed", and the
+            # PR carries a new page object with no baseline for it while the real
+            # one sits untracked in the main checkout forever. Dropping it makes
+            # both halves resolve the framework's own worktree-relative
+            # `baselineDir` instead.
+            env.pop("HEALING_BASELINE_DIR", None)
 
         # Captured BEFORE Popen() (not after) — _audit_watcher uses this as the
         # cutoff for "did THIS run's own subprocess actually write this file,
@@ -819,17 +896,21 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
             pid=proc.pid,
             start_from_step=start_from_step,
             user_id=user_id,
-            worktree_path=str(worktree_path),
+            worktree_path="" if local_mode else str(worktree_path),
+            work_dir=str(work_dir),
+            local_mode=local_mode,
         )
     except BaseException:
         # The slot must not stay reserved after a failed start, or the pool
         # leaks capacity until restart.
         with _registry_lock:
             _starting.discard(session_id)
+            _starting_local.discard(session_id)
         raise
 
     with _registry_lock:
         _starting.discard(session_id)
+        _starting_local.discard(session_id)
         _runs[session_id] = run
         _active_runs[session_id] = run
 
@@ -1101,8 +1182,13 @@ def _audit_watcher(run: RunState) -> None:
                 if attempts <= int(slot.get("_emitted_attempts") or 1):
                     continue
                 slot["_emitted_attempts"] = attempts
+                # The retry rewrote the step's file: judge that outcome, not the
+                # previous attempt's, or a fix that passed on attempt 2 stays red.
+                status = "failed" if _step_has_error(
+                    _safe_load_json(run.audit_dir / fname)) else "done"
+                run.step_progress[key] = status
                 _append_event(run, "step", {
-                    "key": key, "display": display, "status": prior,
+                    "key": key, "display": display, "status": status,
                     **_mark_step_done(run, key),
                 })
                 continue

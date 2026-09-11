@@ -41,18 +41,23 @@ def _landmark_overlap(base_marks: list[str], now_marks: list[str]) -> float:
     return jaccard(set(base_marks or []), set(now_marks or []))
 
 
-def _neighbour_survival(base_neighbours: list[str], snap: dict, depth: int = 3) -> float:
-    """How much of the element's immediate textual context is still on the page.
+def _neighbour_survival(base_neighbours: list[str], snap: dict,
+                        depth: int = 3) -> tuple[float, list[str]]:
+    """How much of the element's immediate textual context is still on the page,
+    and which of those texts are missing.
 
     If the label, the heading and the sibling copy all vanished together, the
     feature was deleted — and healing would bind the test to something unrelated.
     """
     closest = [n for n in (base_neighbours or []) if n][:depth]
     if not closest:
-        return 1.0                       # no evidence either way; don't block
+        return 1.0, []                   # no evidence either way; don't block
     page_text = " ".join(e.get("text") or "" for e in snap["elements"]).lower()
-    hits = sum(1 for n in closest if n.lower() in page_text)
-    return hits / len(closest)
+    # Whole words: as a bare substring "Or" matches inside "Forgot", "for",
+    # "more" — so every page scored it as present.
+    missing = [n for n in closest
+               if not re.search(rf"(?<!\w){re.escape(n.lower())}(?!\w)", page_text)]
+    return 1 - len(missing) / len(closest), missing
 
 
 _SIGN_IN_URL = re.compile(r"/(login|signin|sign-in|sso|auth)\b", re.I)
@@ -69,7 +74,8 @@ def _looks_like_sign_in(url: str, snap: dict) -> bool:
 def classify(snap: dict, baseline: dict, match_count: int, matched: dict | None,
              cfg: dict, vol: Volatility | None = None,
              http_status: int | None = None,
-             page_comparison: dict | None = None) -> Verdict:
+             page_comparison: dict | None = None,
+             failure_elements: list | None = None) -> Verdict:
     base_el = baseline["element"]
     ct = cfg["classify"]
 
@@ -145,12 +151,27 @@ def classify(snap: dict, baseline: dict, match_count: int, matched: dict | None,
         return Verdict("NOT_LOCATOR", "element resolves and is actionable — likely a timing flake")
 
     # 4. Did the element's whole context disappear with it?
-    survival = _neighbour_survival(base_el.get("neighbor_texts"), snap)
+    neighbours = base_el.get("neighbor_texts")
+    survival, missing = _neighbour_survival(neighbours, snap)
     if survival < ct["neighbour_survival_min"]:
+        # Name what was examined and what was not there: a refusal nobody can
+        # check is how a wrong one goes unquestioned.
+        seen = (f"examined {snap.get('url') or 'an unknown URL'} "
+                f"({(snap.get('title') or '')[:60]!r}); missing: "
+                + ", ".join(repr(m) for m in missing))
+        detail = {"missing": missing, "url": snap.get("url"), "title": snap.get("title")}
+        # The failing run's own capture breaks the tie: if the context is still
+        # there, the feature was not removed — this replay reached a page without it.
+        if failure_elements and _neighbour_survival(
+                neighbours, {"elements": failure_elements})[0] >= ct["neighbour_survival_min"]:
+            return Verdict("WRONG_STATE",
+                           f"the page examined lacks the element's context, but the "
+                           f"failure capture still has it, so the feature was not "
+                           f"removed — {seen}", detail)
         return Verdict("FEATURE_REMOVED",
                        f"element and its context are both gone "
-                       f"({survival:.0%} of neighbouring text survives)",
-                       {"neighbours": base_el.get("neighbor_texts", [])[:3]})
+                       f"({survival:.0%} of neighbouring text survives) — {seen}",
+                       {"neighbours": (neighbours or [])[:3], **detail})
 
     # 5. Element gone, page intact, context intact → genuine locator drift.
     return Verdict(DRIFT, "element absent but page and context intact")

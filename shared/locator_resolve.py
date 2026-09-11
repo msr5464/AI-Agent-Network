@@ -332,7 +332,8 @@ def heal(page, baseline: dict, cfg: dict, url: str, *, post=None, llm=None,
          explain: bool = False, session: "HealSession | None" = None,
          browser=None, storage_state=None, replay=None,
          assertion_fields: set | None = None,
-         page_comparison: dict | None = None) -> HealResult:
+         page_comparison: dict | None = None,
+         failure_elements: list | None = None) -> HealResult:
     t0 = time.time()
     vol = Volatility(cfg)
     raw, action = baseline["raw_locator"], baseline.get("action", "click")
@@ -402,7 +403,8 @@ def heal(page, baseline: dict, cfg: dict, url: str, *, post=None, llm=None,
 
     # Phase B — the gate.
     verdict = classify.classify(snap, baseline, n, matched, cfg, vol, http_status,
-                                page_comparison=page_comparison)
+                                page_comparison=page_comparison,
+                                failure_elements=failure_elements)
     # Absolute similarity cannot catch a rebind between near-identical siblings:
     # a T-shirt button scores high against a backpack baseline because they ARE
     # nearly identical. The relative question is the sharp one -- is some OTHER

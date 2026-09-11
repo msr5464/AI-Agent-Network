@@ -529,7 +529,8 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
         result = engine.heal(page, baseline, cfg, url, browser=browser,
                              storage_state=storage_state, replay=replay,
                              assertion_fields=assertion_used,
-                             page_comparison=comparison)
+                             page_comparison=comparison,
+                             failure_elements=_failure_fingerprints(issue))
     finally:
         page.close()
 

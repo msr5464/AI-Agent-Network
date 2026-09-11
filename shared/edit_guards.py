@@ -210,8 +210,26 @@ def no_selector_broadening(original: str, updated: str) -> tuple:
     return True, ""
 
 
+# A locator field used as a collection or by position: Playwright only demands a
+# single match from a locator that is acted on directly.
+_LIST_USE = re.compile(r"\b(\w+)\s*\.\s*(?:first|last|nth|all|count|allTextContents|"
+                       r"allInnerTexts|all_text_contents|all_inner_texts)\s*\(")
+_ASSIGNED = re.compile(r"(\w+)\s*=\s*[^=;]*\blocator\s*\(")
+
+
+def _acted_on_as_one(line: str, original: str) -> bool:
+    """Whether the locator this edited line assigns must resolve to one element."""
+    if "nth=" in line or ":nth-match(" in line:
+        return False                     # the selector narrows by position itself
+    field = _ASSIGNED.search(line)
+    # ponytail: usage is read from this file only; a field handed elsewhere and
+    # used as a list there is not seen — FORCE=true is the way past that.
+    return not (field and field.group(1) in {m.group(1) for m in _LIST_USE.finditer(original)})
+
+
 def validate_diagnosis_fit(original: str, updated: str, verdict: str,
-                           snapshot_soup=None, fingerprints=None) -> tuple:
+                           snapshot_soup=None, fingerprints=None,
+                           require_unique: bool = False) -> tuple:
     """Reject an edit that does not match what the diagnosis actually found.
 
     Returns (ok, reason). Runs before the test does, so a fix that could only
@@ -220,6 +238,10 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
     `fingerprints` is the sidecar captured beside the DOM snapshot. It is optional
     because callers without one must keep working unchanged, but supplying it is
     what makes rule 3 able to see visibility — the saved markup cannot.
+
+    `require_unique` says the test failed acting on this element (a click, a
+    fill), so a replacement matching more than one fails the same way. Off by
+    default: callers that cannot say keep the previous behaviour.
     """
     changed = [line for line in difflib.unified_diff(
         original.splitlines(), updated.splitlines(), lineterm="", n=0)
@@ -269,6 +291,21 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
             return False, ("the replacement selector matches only elements that "
                            "were not visible when the test failed, so the click "
                            "would time out exactly as the original did")
+        # 3b. The test failed acting on this element, and Playwright refuses to act
+        #     on a selector matching more than one: `#loginForm button:has-text('Login')`
+        #     also matched "Use OTP to Login" and failed the same way, 40 s later.
+        if require_unique:
+            for line in added:
+                if not _acted_on_as_one(line, original):
+                    continue
+                for candidate in _selectors_in(line):
+                    result = selector_visibility(candidate, snapshot_soup, prints)
+                    if result and result[0] > 1:
+                        return False, (f"the replacement selector {candidate!r} matches "
+                                       f"{result[0]} elements in the DOM captured at "
+                                       f"failure; the test acts on this element and "
+                                       f"Playwright refuses to act on more than one "
+                                       f"(strict mode violation)")
 
     # 4. A fix for an ambiguous locator has to be unambiguous. Playwright refuses
     #    to act on a selector that resolves to more than one element, so a

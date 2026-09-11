@@ -161,7 +161,7 @@ class TestCandidatesFromFingerprints:
 
     def test_the_right_element_ranks_first(self):
         top = self._build()["likely_matches"][0]
-        assert top["suggested_selector"] == '#summary img[alt="PencilSimple"]'
+        assert top["suggested_selector"] == "#summary img[alt='PencilSimple']"
 
     def test_hidden_elements_never_appear(self):
         out = self._build()
@@ -187,6 +187,48 @@ class TestCandidatesFromFingerprints:
         out = self._build(failed="img[alt='mukesh']")
         assert out["likely_matches"] and not out.get("error")
 
+    def test_a_vanished_scope_is_never_prefixed(self):
+        """`#random-text-locator` is the selector that broke, not a container:
+        prefixing it made every suggestion match nothing. Each element is scoped
+        by its own ancestor instead, which also keeps the twin icons apart."""
+        selectors = [e["suggested_selector"]
+                     for e in self._build(failed="#random-text-locator")["elements"]]
+        assert not any("random-text-locator" in s for s in selectors)
+        assert "#summary img[alt='PencilSimple']" in selectors
+        assert "#education img[alt='PencilSimple']" in selectors
+
+    def test_suggestions_quote_like_the_emitter(self):
+        """The model copies these into a Java string, where double quotes arrive
+        escaped. Single quotes, unless the value itself holds one."""
+        assert ds._fp_selector({"tag": "a", "text": "Don't know"}, []) == 'a:text-is("Don\'t know")'
+        assert ds.suggest_selector({"tag": "button", "text": "Login"}) == "button:has-text('Login')"
+
+    def test_short_text_is_matched_exactly(self):
+        """has-text is a substring match: 'Login' also hit 'Use OTP to Login'."""
+        assert ds._fp_selector({"tag": "button", "text": "Login"}, []) == "button:text-is('Login')"
+        long = "Craft a compelling narrative about your career so far"
+        assert ds._fp_selector({"tag": "p", "text": long}, []) == \
+            f"p:has-text('{long[:40].rstrip()}')"
+
+    def test_text_is_counts_exact_text_only(self):
+        bs4 = pytest.importorskip("bs4")
+        soup = bs4.BeautifulSoup('<form id="f"><button>Login</button>'
+                                 '<button>Use OTP to Login</button></form>', "html.parser")
+        assert ds.selector_visibility("#f button:has-text('Login')", soup, {})[0] == 2
+        assert ds.selector_visibility("#f button:text-is('Login')", soup, {})[0] == 1
+
+    def test_each_suggestion_says_how_many_it_matches(self):
+        bs4 = pytest.importorskip("bs4")
+        page = '<form id="loginForm"><button>Login</button><span>Login</span></form>'
+        prints = {"elements": [{"tag": "button", "text": "Login", "is_visible": True,
+                                "area_norm": 0.01, "ancestor_chain": [{"id": "loginForm"}]}]}
+        out = ds.candidates_from_fingerprints(prints, ["Login button"], "test-locator",
+                                              soup=bs4.BeautifulSoup(page, "html.parser"))
+        assert out["elements"][0]["matches"] == 1
+        text = ds.format_for_prompt({"source": "fingerprints", "likely_matches": [
+            {"tag": "button", "suggested_selector": "button[type='submit']", "matches": 2}]})
+        assert "NOT unique" in text and 'matches="2"' not in text
+
     @pytest.mark.parametrize("prints", [{}, {"elements": []},
                                         {"elements": [{"tag": "div", "is_visible": False}]}])
     def test_no_visible_capture_reports_an_error_not_a_crash(self, prints):
@@ -195,7 +237,7 @@ class TestCandidatesFromFingerprints:
     def test_prompt_rendering_says_the_candidates_were_visible(self):
         text = ds.format_for_prompt(self._build())
         assert "VISIBLE" in text
-        assert 'img[alt="PencilSimple"]' in text
+        assert "img[alt='PencilSimple']" in text
 
 
 class TestViewportParity:

@@ -126,6 +126,11 @@ def _step_has_error(data: Optional[Dict]) -> bool:
     # journey is a usable result, not a failed step.
     if data.get("status") in ("unsafe", "no_session", "unreachable"):
         return True
+    # 01-fix.json's counts can't tell a failed fix from a diagnosis-only run
+    # (both have failed > 0), so read the gate the step wrote. Without this, a
+    # fix that repaired nothing showed "done" (green).
+    if data.get("fix_gate") == "false":
+        return True
     return False
 
 

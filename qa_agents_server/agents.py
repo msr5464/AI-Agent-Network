@@ -133,6 +133,19 @@ def auto_push_default() -> bool:
     return os.environ.get("AUTO_PUSH", "false").strip().lower() == "true"
 
 
+def effective_auto_push(agent_env: Dict[str, str]) -> bool:
+    """What AUTO_PUSH will actually be inside the run.
+
+    Not `payload["auto_push"]`: _auto_push_env deliberately exports nothing when
+    the caller expressed no preference, and config/.env decides in that case. A
+    reader that checked the payload alone would call a run a dry run on a server
+    configured AUTO_PUSH=true — which now picks where the run executes, not just
+    whether a PR is raised.
+    """
+    raw = agent_env.get("AUTO_PUSH")
+    return auto_push_default() if raw is None else raw == "true"
+
+
 def adapt_apply_default() -> bool:
     """Same story as AUTO_PUSH, for the adaptation agent's apply/propose switch.
 

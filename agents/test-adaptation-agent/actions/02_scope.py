@@ -46,6 +46,10 @@ REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]
 WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", str(REPO_ROOT.parent))
 GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "")
 VERIFY_POLICY = os.environ.get("ADAPTATION_VERIFY_POLICY", "named_only")
+# Spelled as in this agent's own 05_ship.py, so one run cannot read the flag two
+# ways. False means the run works in the developer's checkout and leaves its
+# edits there uncommitted — which changes what the gates below are protecting.
+AUTO_PUSH = os.environ.get("AUTO_PUSH", "true").lower() != "false"
 
 
 def get_workspace():
@@ -131,21 +135,32 @@ def main():
     if behind:
         log(f"  note: this checkout is {behind} commit(s) behind {base_branch}")
 
-    clean, why = working_tree_is_clean(workspace)
-    if not clean:
-        write_skip(f"automation repo is not clean — {why}", infra=True)
-        return
+    # Both gates below protect a PR. With AUTO_PUSH=false there is no PR: the
+    # run is deliberately working on top of the developer's uncommitted changes
+    # and will leave its own edits beside them for review. Refusing on a dirty
+    # tree would then refuse the only thing the mode is for, and checking out
+    # the base would destroy what it was asked to build on.
+    if AUTO_PUSH:
+        clean, why = working_tree_is_clean(workspace)
+        if not clean:
+            write_skip(f"automation repo is not clean — {why}", infra=True)
+            return
 
-    # Now that the gate has proved there is nothing to lose, move onto the base.
-    # sync() refuses to reset precisely because it runs before this check; past
-    # it, resetting honours the same intent instead of violating it — and
-    # without this an "adapt against release/2.3" run would edit whatever HEAD
-    # happened to be and then open a PR against release/2.3.
-    moved = workspace_helper.checkout_base(
-        workspace, prepared["branch"], prepared["sha"], log=log)
-    if not moved["ok"]:
-        write_skip(f"could not check out the base branch — {moved['reason']}", infra=True)
-        return
+        # Now that the gate has proved there is nothing to lose, move onto the
+        # base. sync() refuses to reset precisely because it runs before this
+        # check; past it, resetting honours the same intent instead of violating
+        # it — and without this an "adapt against release/2.3" run would edit
+        # whatever HEAD happened to be and then open a PR against release/2.3.
+        moved = workspace_helper.checkout_base(
+            workspace, prepared["branch"], prepared["sha"], log=log)
+        if not moved["ok"]:
+            write_skip(f"could not check out the base branch — {moved['reason']}", infra=True)
+            return
+    else:
+        _, current, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace)
+        log(f"AUTO_PUSH=false — adapting your checkout on "
+            f"{current.strip() or 'HEAD'} as it stands, uncommitted changes included")
+        log(f"  review with: git -C {workspace} status")
 
     nouns = sorted({n for item in plan["items"] for n in (item.get("nouns") or [])})
     result = blast_radius.resolve(

@@ -150,10 +150,15 @@ def selector_visibility(selector: str, soup, fingerprints: Dict) -> Optional[tup
     from shared.page_identity import _unescape, normalize_selector as _normalize_selector
     selector = _unescape(selector)
 
-    text_clause = None
+    text_clause, exact = None, False
     match = _HAS_TEXT_RE.search(selector)
     if match:
-        text_clause = _norm_text(match.group(2)).lower()
+        # :text-is() is Playwright's exact, case-sensitive match; :has-text() and
+        # :text() match a substring. Counting all three as a substring made
+        # `button:text-is('Login')` two buttons ("Use OTP to Login") instead of one.
+        exact = "text-is" in match.group(0)
+        text_clause = (" ".join(match.group(2).split()) if exact
+                       else _norm_text(match.group(2)).lower())
         selector = _HAS_TEXT_RE.sub("", selector).strip()
         if not selector:
             return None
@@ -166,7 +171,10 @@ def selector_visibility(selector: str, soup, fingerprints: Dict) -> Optional[tup
     except Exception:
         return None
 
-    if text_clause is not None:
+    if text_clause is not None and exact:
+        # get_text() with no separator is textContent, which is what Playwright compares.
+        nodes = [n for n in nodes if " ".join(n.get_text().split()) == text_clause]
+    elif text_clause is not None:
         nodes = [n for n in nodes
                  if text_clause in _norm_text(n.get_text(" ", strip=True)).lower()]
     if not nodes:
@@ -203,6 +211,14 @@ def _in_scope(element: Dict, scopes: List[str]) -> bool:
     return element.get("id") in scopes or element.get("testid") in scopes
 
 
+def _css_value(value: str) -> str:
+    """Quote a CSS value as locator_emit._css does: single quotes unless the value
+    holds one. The model copies these suggestions into a Java string, where double
+    quotes would arrive escaped."""
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().code.quote_css_value(value)
+
+
 def _fp_selector(element: Dict, scopes: List[str]) -> str:
     """A selector for a captured element, scoped to a surviving container.
 
@@ -211,24 +227,34 @@ def _fp_selector(element: Dict, scopes: List[str]) -> str:
     """
     tag = element.get("tag") or "*"
     if element.get("testid"):
-        core = f'[data-testid="{element["testid"]}"]'
+        core = f'[data-testid={_css_value(element["testid"])}]'
     elif element.get("id"):
         core = f'#{element["id"]}'
     elif element.get("name"):
-        core = f'{tag}[name="{element["name"]}"]'
+        core = f'{tag}[name={_css_value(element["name"])}]'
     elif element.get("aria_label"):
-        core = f'{tag}[aria-label="{element["aria_label"]}"]'
+        core = f'{tag}[aria-label={_css_value(element["aria_label"])}]'
     elif element.get("alt"):
-        core = f'{tag}[alt="{element["alt"]}"]'
+        core = f'{tag}[alt={_css_value(element["alt"])}]'
     elif element.get("placeholder"):
-        core = f'{tag}[placeholder="{element["placeholder"]}"]'
+        core = f'{tag}[placeholder={_css_value(element["placeholder"])}]'
     elif element.get("text"):
-        core = f'{tag}:has-text("{_norm_text(element["text"])[:40]}")'
+        text = " ".join(element["text"].split())
+        # Exact text is what tells "Login" from "Use OTP to Login"; has-text is a
+        # substring match and picks up both. Too long to quote whole → a prefix.
+        core = (f'{tag}:text-is({_css_value(text)})' if len(text) <= 40
+                else f'{tag}:has-text({_css_value(text[:40].rstrip())})')
     else:
         core = tag
     if core.startswith("#") or core.startswith("[data-testid"):
         return core                      # already unique on its own
-    scope = next((s for s in scopes if _SAFE_ID.fullmatch(s)), "")
+    # Only a container this element actually sits in. The failing selector's
+    # own id is often the thing that vanished (`#random-text-locator`), and
+    # prefixing it made every candidate match nothing. Failing that, the
+    # element's nearest id'd ancestor: it exists, because it was captured.
+    chain = [a["id"] for a in element.get("ancestor_chain") or []
+             if a.get("id") and _SAFE_ID.fullmatch(a["id"])]
+    scope = next((s for s in scopes if s in chain), "") or next(iter(chain), "")
     return f"#{scope} {core}" if scope else core
 
 
@@ -239,7 +265,8 @@ _TARGET_TAG = re.compile(r"([a-zA-Z][\w-]*)\s*(?:\[[^\]]*\])*\s*$")
 
 
 def candidates_from_fingerprints(fingerprints: Dict, element_names: Optional[List[str]] = None,
-                                 failed_selector: str = "", max_elements: int = 30) -> Dict:
+                                 failed_selector: str = "", max_elements: int = 30,
+                                 soup=None) -> Dict:
     """Candidate elements taken from the capture rather than the saved markup.
 
     `distill()` reads the HTML, which cannot say what was visible and describes
@@ -307,6 +334,11 @@ def candidates_from_fingerprints(fingerprints: Dict, element_names: Optional[Lis
             out["text"] = _norm_text(element["text"])
         if _in_scope(element, scopes):
             out["in_failing_scope"] = True
+        # The same counter the guard uses, so the model sees up front which
+        # suggestions the guard would refuse for matching more than one element.
+        counted = selector_visibility(out["suggested_selector"], soup, fingerprints)
+        if counted:
+            out["matches"] = counted[0]
         return out
 
     in_scope = [e for e in ranked if _in_scope(e, scopes)]
@@ -330,18 +362,18 @@ def suggest_selector(element: Dict[str, str]) -> str:
     """Propose a selector for an element, following the project's priority order."""
     for attr in ("data-testid", "data-test", "data-cy"):
         if element.get(attr):
-            return f"[{attr}='{element[attr]}']"
+            return f"[{attr}={_css_value(element[attr])}]"
     if element.get("id"):
         return f"#{element['id']}" if re.fullmatch(r'[A-Za-z][\w-]*', element["id"]) \
-            else f"[id='{element['id']}']"
+            else f"[id={_css_value(element['id'])}]"
     if element.get("name"):
-        return f"[name='{element['name']}']"
+        return f"[name={_css_value(element['name'])}]"
     if element.get("aria-label"):
-        return f"[aria-label='{element['aria-label']}']"
+        return f"[aria-label={_css_value(element['aria-label'])}]"
     if element.get("placeholder"):
-        return f"[placeholder='{element['placeholder']}']"
+        return f"[placeholder={_css_value(element['placeholder'])}]"
     if element.get("text"):
-        return f"{element['tag']}:has-text(\"{element['text'][:40]}\")"
+        return f"{element['tag']}:has-text({_css_value(element['text'][:40])})"
     return element.get("tag", "")
 
 
@@ -459,12 +491,15 @@ def format_for_prompt(distilled: Dict, max_chars: int = 6000) -> str:
         attrs = " ".join(
             f'{k}="{html.escape(str(v), quote=False)}"'
             for k, v in element.items()
-            if k not in ("tag", "text", "suggested_selector")
+            if k not in ("tag", "text", "suggested_selector", "matches")
         )
         open_tag = f'<{element["tag"]} {attrs}>' if attrs else f'<{element["tag"]}>'
         text = f' — text: "{element["text"]}"' if element.get("text") else ""
+        matches = element.get("matches")
+        count = ("" if matches is None else "  (unique)" if matches == 1 else
+                 f"  (matches {matches} elements — NOT unique; Playwright will refuse it)")
         return (f'  {open_tag}{text}\n'
-                f'      suggested selector: {element["suggested_selector"]}')
+                f'      suggested selector: {element["suggested_selector"]}{count}')
 
     shown = set()
     if distilled.get("likely_matches"):

@@ -125,6 +125,14 @@ class TestStepProgressIsAlwaysTerminal:
             "a flow map that recorded most of a journey is a usable result, "
             "not a failed step")
 
+    def test_a_fix_that_repaired_nothing_is_failed(self):
+        """01-fix.json has no status key; its gate is the verdict."""
+        from qa_agents_server.audit_reader import _step_has_error
+        assert _step_has_error({"failed": 1, "fix_gate": "false"}) is True
+        assert _step_has_error({"failed": 1, "fix_gate": "skipped"}) is False, (
+            "a diagnosis-only run is an outcome, not a failure")
+        assert _step_has_error({"succeeded": 1, "fix_gate": "true"}) is False
+
 
 # ── The optional per-run base branch ──────────────────────────────────────────
 #

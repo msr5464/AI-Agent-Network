@@ -609,3 +609,48 @@ def test_cancelling_an_already_finished_run_is_a_noop():
     finally:
         runner._runs.clear()
         runner._active_runs.clear()
+
+
+# ── Baseline directory follows the worktree ───────────────────────────────────
+def test_out_of_tree_baseline_override_hides_a_new_baseline(tmp_path, monkeypatch):
+    """HEALING_BASELINE_DIR pinned to the main checkout loses every new baseline.
+
+    config/.env builds it as an absolute ${WORKSPACE_DIR}/${GITHUB_REPO_AUTOMATION}
+    path. Inherited into a worktree run, the Java framework writes fingerprints
+    into the developer's main checkout while ship reads repo_directory(worktree) —
+    which rejects the out-of-tree override and falls back inside the worktree. Ship
+    then sees only the baselines the checkout came with, logs "none changed", and
+    the PR carries a new page object with no baseline for it.
+    """
+    from shared import baseline
+
+    worktree = tmp_path / "worktree"
+    (worktree / baseline.REPO_SUBPATH).mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=worktree, capture_output=True)
+
+    fingerprint = '{"pageObject": "NaukriProfilePage", "locators": {}}'
+    (worktree / baseline.REPO_SUBPATH / "NaukriProfilePage.json").write_text(fingerprint)
+
+    # The override points at a different checkout entirely — exactly what a
+    # worktree run inherits today.
+    outside = tmp_path / "main-checkout" / "src" / "main" / "resources" / "baselines"
+    outside.mkdir(parents=True)
+    monkeypatch.setenv(baseline._DIR_ENV, str(outside))
+
+    # It must not win: an out-of-tree directory is not committable from here.
+    assert baseline.repo_directory(worktree) == worktree / baseline.REPO_SUBPATH
+
+    # And with it dropped — what runner.py now does — the new baseline is found
+    # and reported as differing from HEAD, so ship commits it.
+    monkeypatch.delenv(baseline._DIR_ENV)
+    assert "NaukriProfilePage.json" in " ".join(baseline.changed(worktree))
+
+
+def test_runner_drops_the_baseline_override_for_worktree_runs():
+    """The pop must sit with the FRAMEWORK_DIR redirect it belongs to."""
+    src = (REPO_ROOT / "qa_agents_server" / "runner.py").read_text()
+    block = re.search(r'env\["FRAMEWORK_DIR"\].*?\n\n', src, re.S)
+    assert block, "FRAMEWORK_DIR is no longer redirected for worktree runs"
+    assert 'env.pop("HEALING_BASELINE_DIR", None)' in block.group(0), (
+        "HEALING_BASELINE_DIR survives into the worktree run — baselines the run "
+        "records will be written outside the tree ship commits from")

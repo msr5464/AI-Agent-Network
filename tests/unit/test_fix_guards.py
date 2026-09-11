@@ -320,3 +320,24 @@ class TestReapParkedBrowser:
         fix._reap_parked_browser(self._session(tmp_path, browserPid=4242))
         out = capsys.readouterr().out
         assert "ignored SIGTERM" in out and "closed" not in out
+
+
+class TestLiveSelectorsMustBeUnique:
+    """The parked-browser run reported `button:has-text("Login")` as confirmed; it
+    also matches "Use OTP to Login". Its count is its own claim, so the failure
+    capture's counter decides before the model is told."""
+
+    PAGE = ('<form id="loginForm"><button>Login</button>'
+            '<button>Use OTP to Login</button></form>')
+
+    def test_ambiguous_live_selectors_are_dropped(self, fix):
+        from bs4 import BeautifulSoup
+        result = {"selectors": {"doLogin": 'button:has-text("Login")',
+                                "exact": "button:text-is('Login')"}}
+        fix._keep_unique(result, BeautifulSoup(self.PAGE, "html.parser"), {})
+        assert result["selectors"] == {"exact": "button:text-is('Login')"}
+
+    def test_without_a_capture_nothing_is_dropped(self, fix):
+        result = {"selectors": {"doLogin": 'button:has-text("Login")'}}
+        fix._keep_unique(result, None, {})
+        assert result["selectors"] == {"doLogin": 'button:has-text("Login")'}
