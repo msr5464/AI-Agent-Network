@@ -135,6 +135,35 @@ def test_an_unresolvable_argument_is_named_not_glossed(workspace):
     assert "otp" in entry["reason"] and "doLoginWithOtp" in entry["reason"]
 
 
+def test_credentials_fetched_through_the_helper_are_followed(workspace):
+    """SauceDemo loads a CSV row with getCredentials(...) and passes the Map on —
+    reading that as "never signs in" sent exploration off unauthenticated."""
+    _write(workspace, "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java", """
+    package automation.modules.saucedemo;
+    public class SauceDemoHelper {
+        public ProductsPage doLogin(Map<String, String> credentials) { return null; }
+    }
+    """)
+    _write(workspace, "src/test/java/automation/saucedemo/SauceDemoWebTest.java", """
+    package automation.saucedemo;
+    import automation.modules.saucedemo.SauceDemoHelper;
+    public class SauceDemoWebTest extends TestBase {
+        public void addProductToCart(Config config) {
+            SauceDemoHelper sauceDemo = new SauceDemoHelper(config);
+            Map<String, String> credentials = sauceDemo.getCredentials("add_to_cart");
+            ProductsPage products = sauceDemo.doLogin(credentials);
+        }
+    }
+    """)
+    entry = entry_path.extract(workspace,
+                               "automation.saucedemo.SauceDemoWebTest#addProductToCart")
+    assert entry["mode"] == "credential"
+    assert entry["helper"] == "automation.modules.saucedemo.SauceDemoHelper"
+    assert (entry["method"], entry["data_method"], entry["data_arg"]) == \
+        ("doLogin", "getCredentials", "add_to_cart")
+    assert 'SauceDemoHelper.doLogin(getCredentials("add_to_cart"))' in entry_path.describe(entry)
+
+
 def test_method_body_stops_at_the_matching_brace():
     source = """
     public void first(Config config) { if (x) { a(); } b(); }

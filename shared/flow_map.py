@@ -161,8 +161,12 @@ def count_in_inventory(selector: str, elements: List[Dict]) -> Optional[int]:
 
     tag = (match.group("tag") or "").lower()
     rest = match.group("rest") or ""
-    ids = re.findall(r"#([\w-]+)", rest)
-    classes = re.findall(r"\.([\w-]+)", rest)
+    # Ids and classes come from outside the [...] attribute parts only: SauceDemo's
+    # `[data-test='add-to-cart-test.allthethings()-t-shirt-(red)']` otherwise
+    # demanded a class "allthethings" and recounted a unique button as zero.
+    bare = re.sub(r"\[(?:\"[^\"]*\"|'[^']*'|[^\]])*\]", "", rest)
+    ids = re.findall(r"#([\w-]+)", bare)
+    classes = re.findall(r"\.([\w-]+)", bare)
     # finditer, not findall: findall reports a non-participating alternation
     # branch as "" rather than None, so `[data-cy='go']` came back with an empty
     # expected value and matched nothing. Group participation is the signal here.

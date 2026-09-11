@@ -147,18 +147,30 @@ def build_adapt_prompt(item: dict, plan: dict, scope: dict, flow: dict,
         if best:
             measured[best["path"]] = best
 
+    # A web change lands in page objects, so they outrank builders and API
+    # clients even unmeasured: sorted by path alone, three API files once pushed
+    # ProductsPage past the cut below.
+    web = plan.get("type") in ("web", "both")
     candidates = sorted(
         scope.get("edit_candidates") or [],
-        key=lambda c: (0 if c["path"] in measured else 1, c["path"]))
+        key=lambda c: (0 if c["path"] in measured else 1,
+                       0 if web and c.get("role") == "page_object" else 1, c["path"]))
+    # The tests under adaptation always go in: a step_insert edits the test body
+    # itself, and leaving the file out read to the model as "not editable".
+    tests = sorted({row["path"] for row in (scope.get("tiers") or {}).get("named", [])
+                    if row.get("path") and (not web or row.get("is_web", True))})
+    shown = candidates[:6] + [{"path": p, "role": "test"} for p in tests]
     files = "\n".join(
         f"\n### {workspace / c['path']}  ({c['role']})"
         + (f"  — **measured**: this is the page object for observed page "
            f"`{measured[c['path']]['name']}` "
            f"({measured[c['path']]['matched']}/{measured[c['path']]['evaluable']} "
            f"of its locators matched what the browser reported)"
-           if c["path"] in measured else "  — nominated by name similarity only")
+           if c["path"] in measured
+           else "  — a test under adaptation" if c["role"] == "test"
+           else "  — nominated by name similarity only")
         + f"\n```java\n{excerpt(workspace / c['path'])}\n```"
-        for c in candidates[:6])
+        for c in shown)
 
     steps = [s for s in flow.get("steps") or []]
     flow_table = flow_map.describe({"steps": steps, "status": "ok",

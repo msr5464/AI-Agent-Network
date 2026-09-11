@@ -114,6 +114,14 @@ class TestCountInInventory:
     def test_counts(self, selector, expected):
         assert fm.count_in_inventory(selector, self.ELEMENTS) == expected
 
+    def test_a_dot_inside_an_attribute_value_is_not_a_class(self):
+        """SauceDemo's T-shirt button recounted as zero — `.allthethings` read as a
+        class — and "Unique? NO" then made the adapt step decline the whole change."""
+        button = {"tag": "button", "attributes": {
+            "data-test": "add-to-cart-test.allthethings()-t-shirt-(red)"}}
+        assert fm.count_in_inventory(
+            "[data-test='add-to-cart-test.allthethings()-t-shirt-(red)']", [button]) == 1
+
 
 class TestDestructive:
     def test_refused_destructive_action_is_a_normal_outcome(self):

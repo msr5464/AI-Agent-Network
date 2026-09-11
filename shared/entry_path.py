@@ -43,6 +43,9 @@ _HELPER_NEW = re.compile(r"(\w+)\s+(\w+)\s*=\s*new\s+(\w+)\s*\(")
 # also bare `github.loginWithStoredSession();`
 _CALL = re.compile(r"(?:\w+\s+\w+\s*=\s*)?(\w+)\s*\.\s*(\w+)\s*\(([^)]*)\)\s*;")
 
+# `Map<String, String> credentials = sauceDemo.getCredentials("add_to_cart");`
+_DATA_READ = re.compile(r"(\w+)\s*=\s*(\w+)\s*\.\s*(\w+)\s*\(\s*\"([^\"]*)\"\s*\)\s*;")
+
 # `import automation.modules.naukari.NaukriProfileSummaryHelper;`
 _IMPORT = re.compile(r"^\s*import\s+(static\s+)?([\w.]+)\s*;", re.MULTILINE)
 
@@ -135,6 +138,9 @@ def extract(workspace, test_id: str) -> Dict:
     # variable -> property key, and variable -> helper type
     properties = dict(_PROPERTY_READ.findall(body))
     helpers = {var: cls for cls, var, ctor in _HELPER_NEW.findall(body) if cls == ctor}
+    # variable -> (receiver, method, literal): credentials fetched through the
+    # helper itself, as SauceDemo's CSV-backed getCredentials("add_to_cart") is.
+    data_reads = {var: (recv, meth, lit) for var, recv, meth, lit in _DATA_READ.findall(body)}
 
     for receiver, called, raw_args in _CALL.findall(body):
         if receiver not in helpers:
@@ -166,6 +172,14 @@ def extract(workspace, test_id: str) -> Dict:
                                   f"calls {called}(), which loads "
                                   f"{session['file_name']}"}
 
+        if len(args) == 1 and data_reads.get(args[0], ("",))[0] == receiver:
+            _, data_method, data_arg = data_reads[args[0]]
+            return {**result, "mode": "credential", "helper": fqcn,
+                    "method": called, "data_method": data_method,
+                    "data_arg": data_arg,
+                    "reason": f"the test calls {called}() with "
+                              f"{data_method}(\"{data_arg}\")"}
+
         if credential_args and len(credential_args) == len(args):
             return {**result, "mode": "credential", "helper": fqcn,
                     "method": called,
@@ -192,11 +206,18 @@ def extract(workspace, test_id: str) -> Dict:
     return result
 
 
+def call_args(entry: Dict) -> str:
+    """What the login call is handed: property keys, or the helper's data call."""
+    if entry.get("data_method"):
+        return f"{entry['data_method']}(\"{entry.get('data_arg', '')}\")"
+    return ", ".join(entry.get("arg_keys") or [])
+
+
 def describe(entry: Dict) -> str:
     mode = entry.get("mode")
     if mode == "stored_session":
         return f"stored session — {entry['session']['path']}"
     if mode == "credential":
         return (f"credential — {entry['helper'].rsplit('.', 1)[-1]}"
-                f".{entry['method']}({', '.join(entry['arg_keys'])})")
+                f".{entry['method']}({call_args(entry)})")
     return f"no login — {entry.get('reason', '')}"

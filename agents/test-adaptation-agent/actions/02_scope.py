@@ -223,8 +223,13 @@ def main():
     # reading it beats the repo-wide conventions exploration used to guess from —
     # the framework contradicts every one of them somewhere. Measured here, while
     # the tree is still untouched, alongside the frozen contracts.
-    entry = entry_path.extract(workspace, verify_rows[0]["test"]) if verify_rows \
-        else {"mode": "none", "reason": "no tests in scope"}
+    # The first test that signs in, not merely the first row: a module-wide scope
+    # can lead with an API test that never touches a login page.
+    entry = {"mode": "none", "reason": "no tests in scope"}
+    for row in verify_rows:
+        entry = entry_path.extract(workspace, row["test"])
+        if entry["mode"] != "none":
+            break
     log(f"Entry path: {entry_path.describe(entry)}")
 
     scope = {

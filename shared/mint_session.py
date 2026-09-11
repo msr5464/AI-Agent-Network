@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import urlparse
 
-from shared import browser_mode
+from shared import browser_mode, entry_path
 
 # The one line of SessionMinter's output that is contractual. Framework logging
 # emits plenty of other braces, so the marker is what makes this parseable.
@@ -136,18 +136,21 @@ def mint(workspace, module: str, entry: Dict, headless: Optional[bool] = None,
     staging = out_dir / f".{out_path.name}.minting"
 
     log(f"  running {entry['helper'].rsplit('.', 1)[-1]}.{entry['method']}"
-        f"({', '.join(entry['arg_keys'])}) — the same call the test makes")
-    log(f"  credentials resolve inside the JVM from property keys; no value "
-        f"crosses the command line")
+        f"({entry_path.call_args(entry)}) — the same call the test makes")
+    log(f"  credentials resolve inside the JVM; no value crosses the command line")
 
     command = [
         "mvn", "-q", "compile", "exec:java@mint",
         f"-Dheadless={'true' if headless else 'false'}",
         f"-Dmint.helper={entry['helper']}",
         f"-Dmint.method={entry['method']}",
-        f"-Dmint.argKeys={','.join(entry['arg_keys'])}",
+        f"-Dmint.argKeys={','.join(entry.get('arg_keys') or [])}",
         f"-Dmint.out={staging}",
     ]
+    if entry.get("data_method"):
+        # Only the test-data row's name crosses; SessionMinter fetches the row.
+        command += [f"-Dmint.dataMethod={entry['data_method']}",
+                    f"-Dmint.dataArg={entry.get('data_arg', '')}"]
     try:
         result = subprocess.run(command, capture_output=True, text=True,
                                 timeout=MINT_TIMEOUT_S, cwd=str(workspace))

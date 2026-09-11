@@ -124,7 +124,7 @@ def test_property_keys_are_passed_not_values(tmp_path, monkeypatch):
     assert outcome["path"].exists()
 
 
-def _mint_capturing_command(tmp_path, monkeypatch):
+def _mint_capturing_command(tmp_path, monkeypatch, entry=None):
     """Run a successful mint and hand back the maven command it built."""
     seen = {}
 
@@ -143,9 +143,18 @@ def _mint_capturing_command(tmp_path, monkeypatch):
     monkeypatch.setattr(mint_session.subprocess, "run", capture)
 
     mint_session.mint(tmp_path, "naukari",
-                      {"mode": "credential", "helper": "H", "method": "doLogin",
-                       "arg_keys": ["naukari.username"]})
+                      entry or {"mode": "credential", "helper": "H", "method": "doLogin",
+                                "arg_keys": ["naukari.username"]})
     return " ".join(seen["command"])
+
+
+def test_a_helper_data_call_is_passed_by_name_not_value(tmp_path, monkeypatch):
+    """SauceDemo's credentials come from a CSV row; only the row's name crosses."""
+    joined = _mint_capturing_command(tmp_path, monkeypatch, {
+        "mode": "credential", "helper": "H", "method": "doLogin", "arg_keys": [],
+        "data_method": "getCredentials", "data_arg": "add_to_cart"})
+    assert "-Dmint.dataMethod=getCredentials" in joined
+    assert "-Dmint.dataArg=add_to_cart" in joined
 
 
 def test_minting_follows_playwright_headless_when_the_caller_says_nothing(
