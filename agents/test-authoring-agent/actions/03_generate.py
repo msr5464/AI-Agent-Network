@@ -80,6 +80,8 @@ from shared.log import log as _log
 def log(msg: str) -> None: _log("03-generate", msg)
 
 from shared.claude import call_claude_ex as _call_claude_ex
+# The static half of every codegen prompt, written by main() before the first call.
+SYSTEM_PROMPT_FILE = AUDIT_DIR / "03-system-prompt.txt"
 def call_claude(prompt: str, label: str = "") -> str:
     """Run one codegen call, reporting *why* it produced nothing when it does.
 
@@ -111,6 +113,15 @@ def call_claude(prompt: str, label: str = "") -> str:
         # and tool-registry cost connecting Playwright and Google Drive on every
         # single batch. Passing strict without an mcp_config loads zero servers.
         strict_mcp_config=True,
+        # No built-in tools and no slash commands: codegen reads its whole context from
+        # the prompt, and every tool definition is system-prompt tokens paid per call.
+        tools="",
+        disable_slash_commands=True,
+        # Conventions, references and rules are identical for every call in this run,
+        # so main() writes them once and every batch and repair sends that file as the
+        # system prompt. Picked up here rather than passed in, so no call site — and no
+        # test fake of this function — has to know the file exists.
+        system_prompt_file=(str(SYSTEM_PROMPT_FILE) if SYSTEM_PROMPT_FILE.is_file() else None),
     )
     if not result.ok:
         log(f"ERROR: Claude call{label} {result.describe()}")
@@ -121,30 +132,20 @@ def call_claude(prompt: str, label: str = "") -> str:
     return result.stdout
 
 
-def extract_json(text: str):
-    m = re.search(r"```json\s*([\s\S]*?)\s*```", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    m = re.search(r"(\{[\s\S]*\})", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    return None
+# Shared: tolerates an unclosed ```json fence and braces in the prose before the object.
+from shared.json_extract import extract_json  # noqa: E402
 
 
 def read_reference_files() -> dict:
     """Read reference implementation files from Jarvis to show Claude the patterns."""
     ref_paths = [
-        "src/main/java/automation/modules/github/GitHubData.java",
-        "src/main/java/automation/modules/github/GitHubBuilder.java",
-        "src/main/java/automation/modules/github/GitHubHelper.java",
-        "src/main/java/automation/modules/github/api/GitHubApi.java",
+        # One module end to end: SauceDemo's helper serves both its API and its web
+        # tests, which is the shape a generated module needs. Its data classes keep
+        # the name of the entity they model (Post*), hence listed by name.
+        "src/main/java/automation/modules/saucedemo/PostData.java",
+        "src/main/java/automation/modules/saucedemo/PostBuilder.java",
         "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
+        "src/main/java/automation/modules/saucedemo/api/PostApi.java",
         # The only page object here, and it earns its place: without one, the model
         # has never seen a real `extends BasePage` import block and infers the
         # package from the directory it is writing into — modules/<f>/web/ became
@@ -153,9 +154,8 @@ def read_reference_files() -> dict:
         # object, which CLAUDE.md forbids outside test classes.
         "src/main/java/automation/modules/saucedemo/web/LoginPage.java",
         "src/main/java/automation/core/api/ApiHelper.java",
-        "src/test/java/automation/github/GitHubApiTest.java",
-        "src/test/java/automation/github/GitHubLoginTest.java",   # shows correct credential pattern
-        "src/test/java/automation/saucedemo/SauceDemoWebTest.java",
+        "src/test/java/automation/saucedemo/SauceDemoApiTest.java",
+        "src/test/java/automation/saucedemo/SauceDemoWebTest.java",   # shows the CSV credential pattern
     ]
     refs = {}
     for rel in ref_paths:
@@ -271,7 +271,7 @@ def write_file(rel_path: str, content: str) -> None:
 # CODE_ERROR failure, so the logic (and the file-location/key-naming rules it
 # encodes) exists in exactly one place.
 from shared.credential_properties import write_credential_property
-from shared.credential_extraction import credentials_from_plan  # noqa: E402
+from shared.credential_extraction import LABELS as _CREDENTIAL_LABELS, credentials_from_plan  # noqa: E402
 from shared.page_identity import is_dom_selector  # noqa: E402
 from shared.test_catalog import test_methods_in  # noqa: E402
 # URLs are the same story as credentials — one place decides the property file and
@@ -511,7 +511,8 @@ def _repair_hardcoded_urls(files_map: dict, url_props: dict, feature: str,
     STILL hardcoded afterwards, for the audit and for step 04 to see.
     """
     violations = {path: found for path, content in files_map.items()
-                  if content and (found := url_properties.hardcoded_urls(content))}
+                  if path.endswith(".java") and content
+                  and (found := url_properties.hardcoded_urls(content))}
     if not violations:
         return files_map, {}
 
@@ -933,6 +934,15 @@ def _build_api_hint(test_type: str, api_data: dict) -> str:
         if ep.get("error"):
             lines.append(f"  {ep['method']} {ep['path']}: call failed — {ep['error']}")
             continue
+        if ep.get("body_sent") is False:
+            # Sent with no body: the status says the route exists, not how it answers
+            # a real request. Advising it as the expected status is how a generated
+            # test ends up asserting a 400.
+            lines.append(
+                f"  {ep['method']} {ep['path']}: reachable (returned {ep['actual_status']} to a "
+                f"request with no body — NOT its real status; keep the plan's expected_status "
+                f"{ep.get('expected_status')})")
+            continue
         mark = "matched expected status" if ep.get("matched_expected") else "DID NOT match expected status"
         lines.append(
             f"  {ep['method']} {ep['path']}: real call returned {ep['actual_status']} "
@@ -1074,7 +1084,12 @@ def main() -> None:
     api_hint = _build_api_hint(test_type, api_data)
 
     refs = read_reference_files()
-    ref_section = "\n".join(
+    # The references predate rule 7's guardrails — SauceDemoApiTest builds request
+    # bodies and hardcodes data inside @Test — and a model copies an example over a
+    # rule, so the block says up front which one wins.
+    ref_section = ("Use these for imports, structure and framework calls only. Where one differs "
+                   "from the Rules below (building request bodies or hardcoding data inside @Test, "
+                   "for example), the Rules win.\n") + "\n".join(
         f"\n--- {path} ---\n{content}\n" for path, content in refs.items()
     )
 
@@ -1241,8 +1256,9 @@ def main() -> None:
     except Exception:
         _LOCATOR_SYNTAX_HINT = "match the syntax the surrounding page objects already use"
 
-    def build_prompt(batch_files: list, generated_context: str = "") -> str:
-        return f"""You are a Java test automation code generator for the Jarvis framework.
+    # Identical for every batch and repair in this run: written once and sent as the
+    # system prompt, so only the per-batch half in build_prompt changes between calls.
+    static_system_prompt = f"""You are a Java test automation code generator for the Jarvis framework.
 
 <framework_conventions>
 {claude_md}
@@ -1251,20 +1267,6 @@ def main() -> None:
 <reference_implementations>
 {ref_section}
 </reference_implementations>
-{csv_roles_hint}
-{existing_files_context}{generated_context}
-
-<generation_plan>
-{json.dumps(plan, indent=2)}
-</generation_plan>
-{selector_hint}{mechanism_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
-
-Generate the following Java files and return them as a single JSON object where
-keys are relative file paths (from Thanos-pw repo root) and values are the complete
-file contents as strings.
-
-Files to generate:
-{json.dumps(batch_files, indent=2)}
 
 Rules (MANDATORY — violations will cause compilation failures):
 1. Every file must compile standalone — include all necessary imports.
@@ -1273,6 +1275,15 @@ Rules (MANDATORY — violations will cause compilation failures):
 3. Builder: fluent with*() methods returning `this`. withDefaults() sets null fields.
    build() calls withDefaults() then constructs the POJO.
 4. API enum: implements ApiDetails. Include withPath(String param, String value) method.
+4b. CURL INTEGRATION — when an endpoint in generation_plan["api_endpoints"] has a "curl", it is the
+   author's exact request, so take the details from it:
+   - Query parameters (e.g. `?currencyCode=USD`) go into that enum constant's path exactly as written.
+   - The `-d`/`--data` JSON body decides the Data POJO: every key in it is a field, mapped with
+     @JsonProperty to that exact key.
+   - Non-secret custom headers (e.g. `-H "x-client: web"`) are sent from the Helper with
+     executeRaw(api, body, headers), followed by an explicit AssertHelper status assertion.
+   - NEVER copy an Authorization header, bearer token, cookie or API key from a curl into Java —
+     auth comes only from plan["api_auth"] (rule 5b) and properties. A token in code is a leaked secret.
 5. Helper: extends ApiHelper (import automation.core.api.ApiHelper). Pass customBaseUrl to super(config, BASE_URL).
    API methods call execute()/executeAndVerify()/executeRaw().
    Web methods only if they orchestrate 2+ page objects.
@@ -1315,8 +1326,25 @@ Rules (MANDATORY — violations will cause compilation failures):
    form submissions with no visible feedback").
    Note BrowserHelper.navigateTo waits AFTER navigating, not before — it does NOT
    remove the need for the wait on the line above it.
-7. Test classes: extend TestBase. Use @Test(dataProvider="getConfig", groups={{...}}).
+7. Test classes: extend TestBase, and import automation.core.Enums.* (QA, Country, ...).
+   Use @Test(description="...", dataProvider="getConfig", groups={{...}}) with the TestBase constants:
+     - web flow:    groups={{GROUP_REGRESSION, GROUP_WEB}}
+     - API flow:    groups={{GROUP_REGRESSION, GROUP_API}}
+     - hybrid flow: groups={{GROUP_REGRESSION, GROUP_WEB, GROUP_API}}
    Every @Test method has @TestVariables(automatedBy = QA.Mukesh).
+   STRICT GUARDRAILS for @Test methods:
+     - Declarative only: high-level calls to the Helper and page objects, then AssertHelper
+       assertions. No loops, Java Stream filtering or JSONPath extraction (see rule 14c).
+     - Hide API intricacies: never build a request body (new XBuilder()...) or chain dependent API
+       calls inside @Test — the Helper does it and returns the result.
+     - No data hardcoding: product ids, names and other test data come from the module's CSV
+       through a Helper method, or from a Builder. Group CSV data by business entity inside the
+       module's csvFiles/ folder (users.csv, products.csv), NOT by API vs web — API and web tests
+       that use the same entity share one sheet. A CSV listed under "Files to generate" is
+       OPTIONAL: return it only if a generated test reads from it. When extending an existing CSV,
+       return the whole file with every existing row unchanged and new rows appended. Never put
+       credentials in a CSV — they come from properties (see WEB LOGIN CREDENTIALS).
+     - State isolation: one user per test; never share an account between test methods.
    LOGGING — decided by the KIND of class, never by what you want to say:
      - test class  -> config.logStep("...")            NEVER Log.step / Log.comment
      - every other class (page objects, helpers, builders)
@@ -1358,8 +1386,9 @@ Rules (MANDATORY — violations will cause compilation failures):
       <existing_file_contents> and find how they load credentials. Copy that pattern exactly.
       Do NOT look at what methods are available on the helper — look at what the existing test
       METHODS actually call. Valid patterns (use whichever the existing methods already use):
-        • config.getRunTimeProperty("feature.username") / "feature.password" → github.doLogin(u, p)
-        • github.loginWithStoredSession()
+        • config.getRunTimeProperty("feature.username") / "feature.password" → helper.doLogin(u, p)
+        • sauceDemo.doLogin(sauceDemo.getCredentials("scenario"))   (a CSV row looked up by scenario)
+        • github.loginWithStoredSession()                          (a saved storage state)
       NEVER introduce a new credential mechanism (e.g. getCredentials(), CSV lookup, allocateUser())
       if the existing test methods don't already use it.
    b) For NEW modules where no prior test exists: use config.getRunTimeProperty("{feature.lower()}.username")
@@ -1391,10 +1420,20 @@ Rules (MANDATORY — violations will cause compilation failures):
     Only add new JavaDoc for newly added methods.
 13. When reading credentials from a CSV file, use ONLY role strings that exist in that file.
     Refer to the "Available roles" list above. Using an unlisted role will cause a runtime error.
-14. Helpers — do NOT add thin convenience wrapper methods that simply chain existing calls with no
-    additional logic. For example: a method that only calls getCredentials(role) then doLogin() adds
-    zero value — the test can call those two methods directly. Only add helper methods when they
-    genuinely orchestrate ≥2 distinct page objects or encapsulate non-trivial multi-step logic.
+14. Helpers and page objects — put cohesive work where it belongs, so the @Test method stays short:
+    a) PAGE OBJECTS: several small actions on the SAME page in a row (filling a form's five fields)
+       become ONE higher-level method on that page object — `fillCheckoutDetails(data)` — and the
+       test calls that once.
+    b) HELPERS (shared steps): steps that several tests repeat become one Helper method, called
+       from each test instead of copied into every one.
+    c) HELPERS (non-trivial logic): JSON extraction (`response.jsonPath().getList(...)`), Java
+       Stream filtering/mapping, loops and multi-step data preparation live in the Helper, which
+       returns what the test asserts on. Never do them inside the @Test method.
+    d) Do NOT add a thin wrapper around a SINGLE existing call, or one that only chains two calls
+       with no logic of its own (getCredentials(role) then doLogin()) — that adds nothing.
+       Grouping MULTIPLE steps or real logic is the point.
+    Rule 7b still applies: grouping never hides several PLAN steps behind one call — each plan
+    step keeps its own logStep in the test method.
 15. INTERLEAVED FLOWS — when generation_plan["flow_style"] == "interleaved", generate exactly ONE
     test method (do NOT split into separate Api/Web test classes) in the single test class listed
     under "Files to generate". Follow generation_plan["interleaved_steps"] IN ORDER: for each step,
@@ -1420,17 +1459,38 @@ Rules (MANDATORY — violations will cause compilation failures):
     config.getRunTimeProperty("{feature}.<page>.url") with a key named the same way and it will be
     added to the properties file. Pointing this module at another environment must never require
     editing Java.
+17. Code quality (strict): no System.out.println, no commented-out code, no unused imports, and no
+    intermediate variable whose value is never used.
+"""
+    SYSTEM_PROMPT_FILE.write_text(static_system_prompt)
+
+    def build_prompt(batch_files: list, generated_context: str = "") -> str:
+        return f"""{csv_roles_hint}
+{existing_files_context}{generated_context}
+
+<generation_plan>
+{json.dumps(plan, indent=2)}
+</generation_plan>
+{selector_hint}{mechanism_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
+
+Generate the following files (Java source, plus CSV test data where a test reads data) and return them as a single JSON object where
+keys are relative file paths (from Thanos-pw repo root) and values are the complete
+file contents as strings, following the Rules in your system prompt.
+
+Files to generate:
+{json.dumps(batch_files, indent=2)}
 
 Return ONLY a JSON object, no prose:
 {{
   "src/main/java/automation/modules/{feature}/{feature_class}Data.java": "...full file content...",
   "src/main/java/automation/modules/{feature}/api/{feature_class}Api.java": "...full file content...",
+  "src/test/resources/{feature}/csvFiles/{feature}-data.csv": "...full CSV content, only if a test reads it...",
   "src/test/java/automation/{feature}/{feature_class}ApiTest.java": "...full file content..."
 }}
 """
 
     batches = _batch_by_layer(files_to_generate, GENERATE_BATCH_SIZE)
-    log(f"Calling Claude to generate {len(files_to_generate)} Java files "
+    log(f"Calling Claude to generate {len(files_to_generate)} files "
         f"in {len(batches)} batch(es), {GENERATE_TIMEOUT}s budget each...")
 
     files_map: dict = {}
@@ -1465,7 +1525,8 @@ Return ONLY a JSON object, no prose:
         files_map.update(batch_map)
         log(f"  {tag} returned {len(batch_map)} file(s)")
 
-    missing = [f for f in files_to_generate if f not in files_map]
+    # CSVs are optional: a scenario that reads no test data rightly returns none.
+    missing = [f for f in files_to_generate if f not in files_map and not f.endswith(".csv")]
     if not files_map:
         log("ERROR: Claude did not return a valid files map")
         (AUDIT_DIR / "03-generate.json").write_text(json.dumps({
@@ -1574,6 +1635,12 @@ Return ONLY a JSON object, no prose:
             full_path.resolve().relative_to(AUTOMATION_FRAMEWORK_DIR.resolve())
         except ValueError:
             log(f"  BLOCKED: path escapes Thanos-pw root: {rel_path}")
+            continue
+        if rel_path.endswith(".csv") and _is_credential_csv(content.split("\n", 1)[0]):
+            # Credentials live in the properties file, which is never committed. A CSV
+            # holding them would ride into the PR with the rest of this run's files.
+            log(f"  BLOCKED: {rel_path} has a credential column — credentials belong in "
+                f"the properties file, not a committed CSV")
             continue
         for a_line, a_text, n_line, n_text in unsettled_navigations(content):
             log(f"  WARNING: {Path(rel_path).name}:{n_line} navigates while the "
@@ -1748,6 +1815,56 @@ def _find_existing_test_class(feature_lower: str, test_type: str) -> str:
     return ""  # "both"/parallel → caller handles api + web separately
 
 
+# A column that makes a CSV a credential sheet, matched on word boundaries so a
+# `footprint` column is not an `otp` one. Same vocabulary credential_extraction uses.
+_CREDENTIAL_COLUMN = re.compile(
+    r"(?<![a-z])(?:" + "|".join((_CREDENTIAL_LABELS["password"], _CREDENTIAL_LABELS["otp"],
+                                  _CREDENTIAL_LABELS["api_key"], "token", "secret"))
+    + r")(?![a-z])")
+
+
+def _is_credential_csv(header: str) -> bool:
+    """Whether a CSV header row has a credential column — password, otp, api key, token."""
+    columns = (re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column).strip().lower()
+               for column in (header or "").split(","))
+    return any(_CREDENTIAL_COLUMN.search(column) for column in columns)
+
+
+def _plan_csv_files(feature_lower: str) -> list:
+    """The module's test-data CSVs codegen may extend, or the one it may create.
+
+    Credential sheets are left out: a model regenerating one can mangle real
+    passwords, and 05_ship commits whatever step 03 wrote.
+    """
+    csv_dir = AUTOMATION_FRAMEWORK_DIR / "src" / "test" / "resources" / feature_lower / "csvFiles"
+    data = []
+    for path in sorted(csv_dir.glob("*.csv")):
+        try:
+            with path.open(encoding="utf-8", errors="ignore") as handle:
+                header = handle.readline()
+        except OSError:
+            continue
+        if not _is_credential_csv(header):
+            data.append(str(path.relative_to(AUTOMATION_FRAMEWORK_DIR)))
+    return data or [f"src/test/resources/{feature_lower}/csvFiles/{feature_lower}-data.csv"]
+
+
+def _find_existing_helper(feature_lower: str, feature_class: str) -> str:
+    """The module's existing Helper, so an existing module gains methods instead of a
+    second Helper named after one scenario (NaukriProfileSummaryHelper beside NaukriHelper).
+
+    `{feature_class}Helper.java` when it exists, otherwise the shortest `*Helper.java`
+    name — the module's own helper rather than a specialised one like CheckoutApiHelper.
+    "" when the module has none.
+    """
+    module_dir = (AUTOMATION_FRAMEWORK_DIR / "src" / "main" / "java" / "automation"
+                  / "modules" / feature_lower)
+    exact = module_dir / f"{feature_class}Helper.java"
+    candidates = sorted(module_dir.glob("*Helper.java"), key=lambda p: (len(p.stem), p.stem))
+    chosen = exact if exact.is_file() else (candidates[0] if candidates else None)
+    return str(chosen.relative_to(AUTOMATION_FRAMEWORK_DIR)) if chosen else ""
+
+
 def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, feature) -> list:
     """Build the list of files that need to be generated or updated."""
     files = []
@@ -1766,7 +1883,8 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
     else:
         # Existing module — update Helper + all page objects required by this scenario
         # (existing page objects are always included so Claude can ADD new methods to them)
-        files.append(f"src/main/java/automation/modules/{feature_lower}/{feature_class}Helper.java")
+        files.append(_find_existing_helper(feature_lower, feature_class)
+                     or f"src/main/java/automation/modules/{feature_lower}/{feature_class}Helper.java")
         if test_type in ("web", "both"):
             for page_def in plan.get("web_pages", []):
                 class_name = page_def["class_name"]
@@ -1783,7 +1901,7 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
             files.append(existing_flow)
         else:
             files.append(f"src/test/java/automation/{feature_lower}/{feature_class}FlowTest.java")
-        return files
+        return files + _plan_csv_files(feature_lower)
 
     if test_type in ("api", "both"):
         existing_api = _find_existing_test_class(feature_lower, "api") if existing else ""
@@ -1801,7 +1919,7 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
         else:
             files.append(f"src/test/java/automation/{feature_lower}/{feature_class}WebTest.java")
 
-    return files
+    return files + _plan_csv_files(feature_lower)
 
 
 def _infer_test_class(written: list, test_type: str) -> str:

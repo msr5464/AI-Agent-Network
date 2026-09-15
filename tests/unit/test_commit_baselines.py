@@ -141,6 +141,17 @@ def test_pending_fingerprints_are_never_committed(repo):
     assert baseline.changed(repo) == {}
 
 
+def test_a_module_scoped_baseline_is_committed(repo):
+    """The framework stores baselines as {module}/{PageObject}.json. A flat glob
+    never saw them, so ship would report "none changed" for every new page."""
+    scoped = repo / HEALING_BASELINE_DIR / "checkout" / "CartPage.json"
+    scoped.parent.mkdir()
+    scoped.write_text(json.dumps({"pageObject": "CartPage", "module": "checkout"}))
+    (repo / HEALING_BASELINE_DIR / "pending").mkdir()
+    (repo / HEALING_BASELINE_DIR / "pending" / "T.m__checkout__CartPage.json").write_text("{}")
+    assert list(baseline.changed(repo)) == [f"{HEALING_BASELINE_DIR}/checkout/CartPage.json"]
+
+
 def test_build_output_is_never_a_commit_target(tmp_path):
     """`directory()` also resolves to test-output/baselines. Staging that would
     commit build output into the repo."""

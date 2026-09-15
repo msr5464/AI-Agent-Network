@@ -51,7 +51,10 @@ TESTING_MODE="${TESTING_MODE:-false}"
 # restored session with no report to read, so the History detail view showed a
 # run that had apparently produced nothing — and TESTING_MODE is on in
 # config/.env, so that was every run on this machine.
-_cache_hit()     { [[ "$TESTING_MODE" == "true" ]] && [[ -f "$CACHE_DIR/$1" ]]; }
+# A hit also needs the note it was cached from to match INPUT_FILE byte for byte —
+# content, not mtime; see test-authoring-agent/run.sh for why.
+_cache_hit()     { [[ "$TESTING_MODE" == "true" ]] && [[ -f "$CACHE_DIR/$1" ]] \
+                     && [[ -f "$CACHE_DIR/$1.input" ]] && cmp -s "$CACHE_DIR/$1.input" "$INPUT_FILE"; }
 _cache_restore() {
   cp "$CACHE_DIR/$1" "$AUDIT_DIR/$1"
   local md="${1%.json}.md"
@@ -62,6 +65,7 @@ _cache_save() {
   [[ "$TESTING_MODE" == "true" ]] || return 0
   mkdir -p "$CACHE_DIR"
   [[ -f "$AUDIT_DIR/$1" ]] && cp "$AUDIT_DIR/$1" "$CACHE_DIR/$1"
+  if [[ -f "$INPUT_FILE" ]]; then cp "$INPUT_FILE" "$CACHE_DIR/$1.input"; else rm -f "$CACHE_DIR/$1.input"; fi
   local md="${1%.json}.md"
   [[ -f "$AUDIT_DIR/$md" ]] && cp "$AUDIT_DIR/$md" "$CACHE_DIR/$md"
   return 0

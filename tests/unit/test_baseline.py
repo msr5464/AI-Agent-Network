@@ -47,6 +47,26 @@ class TestLoad:
         assert loaded["available"] is True
         assert loaded["coverage"] == {"a": 1}
 
+    def test_reads_a_module_scoped_fingerprint(self, tmp_path, monkeypatch):
+        # Two modules each own a CartPage; the failing test's module picks its own.
+        for module, count in (("checkout", 1), ("saucedemo", 2)):
+            (tmp_path / module).mkdir()
+            (tmp_path / module / "CartPage.json").write_text(json.dumps({
+                "module": module, "pageObject": "CartPage",
+                "coverage": {"checkoutButton": count}}))
+        monkeypatch.setenv("HEALING_BASELINE_DIR", str(tmp_path))
+        module = baseline.module_of("automation.saucedemo.SauceDemoWebTest.checkout")
+        assert module == "saucedemo"
+        assert baseline.load("CartPage", module=module)["coverage"] == {"checkoutButton": 2}
+        assert baseline.load("CartPage")["available"] is True, (
+            "without a module the lookup still finds a module-scoped baseline")
+
+    def test_pending_is_never_read_as_a_baseline(self, tmp_path, monkeypatch):
+        (tmp_path / "pending").mkdir()
+        (tmp_path / "pending" / "CartPage.json").write_text('{"coverage": {"a": 1}}')
+        monkeypatch.setenv("HEALING_BASELINE_DIR", str(tmp_path))
+        assert baseline.load("CartPage")["available"] is False
+
     def test_absent_baseline_is_not_an_error(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HEALING_BASELINE_DIR", str(tmp_path))
         assert baseline.load("NeverSeen")["available"] is False

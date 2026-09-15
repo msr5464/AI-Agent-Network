@@ -189,8 +189,16 @@ def attach_baselines(issues: list, workspace: Path, audit_dir: Path, log=print) 
         preserved = audit_dir / "baselines"
         preserved.mkdir(parents=True, exist_ok=True)
         copied = 0
-        for record in source.glob("*.json"):
-            (preserved / record.name).write_text(
+        # Recursive, keeping the layout: the framework stores baselines per module
+        # ({module}/{PageObject}.json), and a flat glob preserved none of those.
+        # Never pending/ — fingerprints from a test that had not finished.
+        for record in source.rglob("*.json"):
+            relative = record.relative_to(source)
+            if "pending" in relative.parts:
+                continue
+            target = preserved / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
                 record.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
             copied += 1
         if copied:

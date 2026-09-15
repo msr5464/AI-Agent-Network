@@ -96,7 +96,7 @@ def _strength(callee: str) -> Tuple[int, int]:
     return -1, -1
 
 
-def _normalise_args(text: str) -> str:
+def _normalise_args(text: str) -> Tuple[str, str]:
     """Argument text with identifiers collapsed and the expected value preserved.
 
     Renaming a local variable must not read as a changed assertion; changing the
@@ -109,6 +109,9 @@ def _normalise_args(text: str) -> str:
     changed fingerprint, which the ladder check then reported as a *weakened
     assertion*. A guard that cries wolf over a copy edit is a guard people learn
     to override, which costs far more than it saves.
+
+    Returned as (skeleton, expected) so conserved() can tell "the same call with a
+    different expected value" apart from "a different call".
     """
     literals = _STRING.findall(text)
     expected = literals[:-1] if len(literals) > 1 else (
@@ -116,7 +119,16 @@ def _normalise_args(text: str) -> str:
     skeleton = _STRING.sub("@", text)
     skeleton = _IDENTIFIER.sub("_", skeleton)
     skeleton = re.sub(r"\s+", "", skeleton)
-    return skeleton + "|" + "|".join(expected)
+    return skeleton, "|".join(expected)
+
+
+def _canonical(literals: List[str]) -> List[str]:
+    """Expected values with whitespace and case ignored — formatting, not meaning.
+
+    `"$175.00"` and `"$ 175.00"` are one expectation rendered two ways; a fix that
+    turns one into the other has not changed what the test proves.
+    """
+    return [re.sub(r"\s+", "", s).lower() for s in literals]
 
 
 def _is_declaration(text: str, start: int) -> bool:
@@ -286,6 +298,7 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
     """
     result: Dict = {"asserts": {}, "unresolved": [], "log_steps": []}
     seen: Set[Tuple[str, str]] = set()
+    occurrences: Dict[str, int] = {}
 
     def walk(simple: str, member_name: str, depth: int):
         if depth > max_depth or (simple, member_name) in seen:
@@ -356,13 +369,21 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
             callee = match.group(1)
             args = _call_args(text, match.end() - 1)
             cond = _cond_path(text, match.start())
-            raw = f"{callee.split('.')[-1]}|{_normalise_args(args)}"
-            fp = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+            skeleton, expected = _normalise_args(args)
+            raw = f"{callee.split('.')[-1]}|{skeleton}|{expected}"
+            base = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+            # Two identical assertions — cart total and checkout total, both
+            # "$ 183.99" — hashed to one key, so the second overwrote the first and
+            # deleting either went unnoticed. The occurrence number keeps them
+            # apart; the walk is in source order, so the numbering is stable.
+            occurrences[base] = occurrences.get(base, 0) + 1
+            fp = f"{base}_{occurrences[base]}"
             result["asserts"][fp] = {
                 "callee": callee, "site": f"{simple}#{member_name}",
                 "depth": depth, "cond_path": list(cond),
                 "strength": _strength(callee.split(".")[-1]),
                 "literals": _STRING.findall(args),
+                "skeleton": skeleton,
             }
 
         for match in _CALL.finditer(text):
@@ -400,33 +421,82 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
 
 
 def conserved(before: Dict, after: Dict) -> Dict:
-    """Compare two fingerprint sets. Returns a verdict with named reasons."""
-    lost, weakened, conditionalised, moved = [], [], [], []
+    """Compare two fingerprint sets. Returns a verdict with named reasons.
+
+    Neither argument is modified: `before` is usually a frozen contract that the
+    caller reuses across change items and fix attempts.
+    """
+    lost, weakened, conditionalised, moved, changed = [], [], [], [], []
+    after_asserts = after["asserts"]
+    # Insertion-ordered, so every fallback below pairs in source order and the
+    # verdict cannot depend on the hash seed.
+    unmatched = dict.fromkeys(after_asserts)
+    pairs: Dict[str, str] = {}
+
+    def claim(fp: str, afp: Optional[str]) -> bool:
+        if afp is None:
+            return False
+        pairs[fp] = afp
+        del unmatched[afp]
+        return True
+
+    # 1. Same fingerprint. A contract frozen before occurrence suffixes existed
+    # stores the bare hash, which is exactly the base of `<hash>_1` now.
+    for fp, info in before["asserts"].items():
+        legacy = f"{fp}_1" if "skeleton" not in info else None
+        claim(fp, fp if fp in unmatched else (legacy if legacy in unmatched else None))
+
+    # 2. Same call, same place, different expected value. Allowed only when the
+    # values match with whitespace and case ignored: "$175.00" -> "$ 175.00" is the
+    # page's formatting, "$175.00" -> "$ 0.00" changes what the test proves. The
+    # last literal is the failure message and may change freely (see
+    # _normalise_args). Price, shipping and total are usually one call shape, so
+    # pairing prefers an equal value first and only then falls back to source
+    # order — taking any candidate paired price with total and reported a correct
+    # reformat as a changed amount.
+    for same_value in (True, False):
+        for fp, info in before["asserts"].items():
+            if fp in pairs or "skeleton" not in info:
+                continue
+            expected = _canonical(info["literals"][:-1])
+            afp = next((a for a in unmatched
+                        if after_asserts[a]["callee"] == info["callee"]
+                        and after_asserts[a]["site"] == info["site"]
+                        and after_asserts[a].get("skeleton") == info["skeleton"]
+                        and (not same_value
+                             or _canonical(after_asserts[a]["literals"][:-1]) == expected)),
+                       None)
+            if claim(fp, afp) and _canonical(after_asserts[afp]["literals"][:-1]) != expected:
+                changed.append(f"{info['callee']} at {info['site']}: "
+                               f"{', '.join(info['literals'][:-1])} -> "
+                               f"{', '.join(after_asserts[afp]['literals'][:-1])}")
 
     for fp, info in before["asserts"].items():
-        if fp in after["asserts"]:
-            now = after["asserts"][fp]
-            if len(now["cond_path"]) > len(info["cond_path"]):
-                conditionalised.append(
-                    f"{info['callee']} at {info['site']} is now guarded by "
-                    f"{'/'.join(now['cond_path'])} — it runs only when it would pass")
-            elif now["site"] != info["site"]:
-                moved.append(f"{info['callee']}: {info['site']} -> {now['site']}")
+        now = after_asserts.get(pairs.get(fp, ""))
+        if now is None:
             continue
-        # Not present by fingerprint. A same-family replacement lower on the
-        # ladder is a weakening; anything else is a loss.
+        if len(now["cond_path"]) > len(info["cond_path"]):
+            conditionalised.append(
+                f"{info['callee']} at {info['site']} is now guarded by "
+                f"{'/'.join(now['cond_path'])} — it runs only when it would pass")
+        elif now["site"] != info["site"]:
+            moved.append(f"{info['callee']}: {info['site']} -> {now['site']}")
+
+    # 3. Still unpaired. A same-family replacement lower on the ladder, at the same
+    # place, is a weakening; anything else is a loss.
+    for fp, info in before["asserts"].items():
+        if fp in pairs:
+            continue
         family, rung = info["strength"]
-        replacement = None
-        if family >= 0:
-            for other in after["asserts"].values():
-                fam2, rung2 = other["strength"]
-                if fam2 == family and rung2 > rung:
-                    replacement = other
-                    break
-        if replacement is not None:
+        replacement = next((a for a in unmatched
+                            if family >= 0
+                            and after_asserts[a]["strength"][0] == family
+                            and after_asserts[a]["strength"][1] > rung
+                            and after_asserts[a]["site"] == info["site"]), None)
+        if claim(fp, replacement):
             weakened.append(
                 f"{info['callee']} at {info['site']} replaced by "
-                f"{replacement['callee']} — same check, weaker guarantee")
+                f"{after_asserts[replacement]['callee']} — same check, weaker guarantee")
         else:
             lost.append(f"{info['callee']} at {info['site']}"
                         + (f" ({', '.join(info['literals'][:2])})" if info["literals"] else ""))
@@ -435,7 +505,7 @@ def conserved(before: Dict, after: Dict) -> Dict:
     holes_after = set(after.get("unresolved") or [])
     new_holes = sorted(holes_after - holes_before)
 
-    ok = not (lost or weakened or conditionalised)
+    ok = not (lost or weakened or conditionalised or changed)
     reasons = []
     if lost:
         reasons.append("assertion(s) removed: " + "; ".join(lost[:4]))
@@ -443,12 +513,14 @@ def conserved(before: Dict, after: Dict) -> Dict:
         reasons.append("assertion(s) weakened: " + "; ".join(weakened[:4]))
     if conditionalised:
         reasons.append("assertion(s) made conditional: " + "; ".join(conditionalised[:4]))
+    if changed:
+        reasons.append("expected value(s) changed: " + "; ".join(changed[:4]))
 
     return {
         "ok": ok,
         "verdict": "CONFIRMED" if (not ok or not new_holes) else "PLAUSIBLE",
         "reason": " | ".join(reasons),
-        "lost": lost, "weakened": weakened,
+        "lost": lost, "weakened": weakened, "changed": changed,
         "conditionalised": conditionalised, "moved": moved,
         "new_unresolved": new_holes,
         "counted": len(before["asserts"]),

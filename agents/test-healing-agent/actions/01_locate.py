@@ -467,7 +467,8 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
 
     captured_at = (issue.get("failure_context") or {}).get("captured_at", "") \
         if isinstance(issue.get("failure_context"), dict) else ""
-    stored = baseline_store.load(class_name, workspace, not_after=captured_at)
+    stored = baseline_store.load(class_name, workspace, not_after=captured_at,
+                                 module=baseline_store.module_of(issue.get("test_name", "")))
     if not stored.get("available"):
         record["verdict"] = "NO_BASELINE"
         record["reason"] = stored.get("rejected") or (

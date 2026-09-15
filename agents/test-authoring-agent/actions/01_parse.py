@@ -43,28 +43,15 @@ def log(msg: str) -> None: _log("01-parse", msg)
 
 from shared.claude import call_claude as _call_claude
 def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, MODEL, str(REPO_ROOT), timeout=600)
+    output = _call_claude(prompt, MODEL, str(REPO_ROOT), timeout=600, strict_mcp_config=True, log_dir=str(AUDIT_DIR))
     if not output:
         log("ERROR: Claude CLI returned empty response")
     return output
 
 
-def extract_json(text: str):
-    """Extract JSON from Claude response — tries ```json block first, then bare JSON."""
-    m = re.search(r"```json\s*([\s\S]*?)\s*```", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    # Bare JSON object
-    m = re.search(r"(\{[\s\S]*\})", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    return None
+# Shared, so every step reads a reply the same way: an unclosed ```json fence and
+# braces in the prose before the object both used to lose the whole plan.
+from shared.json_extract import extract_json  # noqa: E402
 
 
 
@@ -112,6 +99,11 @@ def resolve_check_provenance(plan: dict, raw_input: str) -> dict:
     for method in (plan.get("web_test_methods") or []) + (plan.get("api_test_methods") or []):
         method["steps"] = visit(method.get("steps"))
     plan["web_steps_for_validation"] = visit(plan.get("web_steps_for_validation"))
+    # Step 02 shows the browser these descriptions for interleaved flows, so their
+    # tags are stripped — and their checks judged — like every other step list.
+    for step in plan.get("interleaved_steps") or []:
+        if isinstance(step, dict) and step.get("description"):
+            step["description"] = visit([step["description"]])[0]
 
     plan["check_provenance"] = verdicts
     untraceable = sorted(s for s, v in verdicts.items() if v["droppable"])
@@ -256,7 +248,7 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
     {{"field": "currency", "default_value": "SGD"}}
   ],
   "api_endpoints": [
-    {{"enum_name": "CreatePayment", "method": "POST",   "path": "/v1/payments",       "expected_status": 201}},
+    {{"enum_name": "CreatePayment", "method": "POST",   "path": "/v1/payments",       "expected_status": 201, "curl": "curl -X POST https://api.staging.example.com/v1/payments ..."}},
     {{"enum_name": "GetPayment",    "method": "GET",    "path": "/v1/payments/{{id}}", "expected_status": 200, "path_params": ["id"]}}
   ],
   "api_test_methods": [
@@ -314,7 +306,9 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
   "flow_style": "parallel",
   "interleaved_steps": [],
   "interleaved_test_method_name": "",
-  "type_resolution": null
+  "type_resolution": null,
+  "actual_result": null,
+  "is_known_product_defect": false
 }}
 
 Rules:
@@ -323,13 +317,17 @@ Rules:
    names the package and directory on disk. Do NOT substitute a more descriptive name, correct its
    spelling, or derive one from the scenario. Set "package_main" to "automation.modules.{module_name}"
    and "package_test" to "automation.{module_name}" to match.
-   "feature_class" is separate and SHOULD describe the scenario (e.g. a "Module: naukari" input about
-   profile summaries gives feature_name "naukari" with feature_class "NaukriProfileSummary").
+   "feature_class" is the module name in CamelCase — "saucedemo" gives "SauceDemo", "checkout" gives
+   "Checkout" — and must NOT describe the scenario. It names the module's shared Helper, Data and
+   Builder classes, so a scenario-specific name (e.g. "NaukriProfileSummary") creates a second Helper
+   beside the one the module already has.
 2. "feature_enum" must be one of: CARD, BUDGET, CLAIM, DBS_SG, DBS_HK, CC_SG, CALASTONE_SG.
    Pick the closest match; if unsure use CARD.
 3. "response_only": true for fields set by the server (id, status, createdAt, updatedAt).
 4. Infer "web_steps_for_validation" from the plain English web steps for use in the
    Playwright validation script — list them as simple imperative sentences.
+   UI steps ONLY — clicks, fills, navigations, what is visible. Never put a curl command, an API
+   call or backend setup in this list; those belong in "api_endpoints" and "interleaved_steps".
 
 4b. DO NOT INVENT CHECKS. You may freely infer the MECHANICS a flow needs —
    navigations, waits, intermediate pages, reading a value before changing it.
@@ -371,6 +369,10 @@ Rules:
    real value only exists at test-run time — e.g. an id returned by an earlier create call in
    THIS SAME scenario — that case has nothing safe to substitute during parse-time validation
    and is correctly left for step 04's real test run to exercise instead.
+5c. If the input gives a `curl` command for an endpoint, copy it EXACTLY — flags, headers, body and
+   line continuations included — into that endpoint's "curl" property in "api_endpoints". Step
+   [02/05] Validate API runs it as written (POST/PUT/DELETE included), and step 03 takes the query
+   string and request body from it. Never write a curl the input did not give.
 6. "api_auth" — only relevant when test_type includes "api". This is the concrete recipe
    step [02/05] Validate API uses to actually authenticate against the real API before
    codegen, and what setAuthToken(token) in the generated Helper is ultimately wired to.
@@ -417,7 +419,13 @@ Rules:
         decision (e.g. "Declared: web. Resolved: both (interleaved) — steps 1 and 4 perform
         real API calls (POST /v1/payments, GET /v1/payments/{{id}})."). Otherwise leave
         "type_resolution" as null.
-8. Output ONLY valid JSON, no prose, no markdown wrapper.
+8. "actual_result" / "is_known_product_defect" — look for an "Actual Result" in the input. If the
+   input documents one AND it differs from the expected result (the author is recording a product
+   bug that exists today), copy it verbatim into "actual_result" and set "is_known_product_defect"
+   to true. Still plan the test for the EXPECTED result — that is what the regression test proves.
+   If there is no Actual Result, or it matches the expected result, set "actual_result" to null
+   and "is_known_product_defect" to false.
+9. Output ONLY valid JSON, no prose, no markdown wrapper.
 """
 
     log("Calling Claude to parse input...")
@@ -499,6 +507,22 @@ Rules:
         missing = [f for f in ("username", "password") if not creds.get(f)]
         log(f"WARNING: the input file names {', '.join(sorted(creds))} but no "
             f"{' or '.join(missing)} — a login step will fail validation in step 02")
+
+    # Rule 8 is the model's claim; the input text is the evidence. A "known defect"
+    # flag on an input with no Actual Result would make step 04 stop fixing a test
+    # that is merely broken, so the flag only survives with something to quote.
+    documented = bool(re.search(r"actual\s+result", raw_text, re.IGNORECASE))
+    plan["actual_result"] = (str(plan.get("actual_result") or "").strip() or None) if documented else None
+    plan["is_known_product_defect"] = bool(plan.get("is_known_product_defect") and plan["actual_result"])
+    if plan["is_known_product_defect"]:
+        log(f"Known product defect documented: {plan['actual_result'][:160]}")
+
+    if plan["flow_style"] == "interleaved" and plan["interleaved_steps"]:
+        # Only the web half belongs here. An API step or curl in this list sent the
+        # browser to an API URL, replacing the page every later step needed.
+        plan["web_steps_for_validation"] = [
+            s.get("description", "") for s in plan["interleaved_steps"]
+            if isinstance(s, dict) and s.get("interface") == "web" and s.get("description")]
 
     resolve_check_provenance(plan, raw_text)
 

@@ -249,20 +249,9 @@ def test_steps_from_source(scope: dict, workspace: Path) -> list:
     return steps
 
 
-def extract_json(response: str):
-    for candidate in (response.strip(),):
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
-    for pattern in (r"```json\s*([\s\S]*?)\s*```", r"(\{[\s\S]*\})"):
-        match = re.search(pattern, response)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                continue
-    return None
+# Shared with the authoring agent: tolerates an unclosed ```json fence and braces
+# in the prose before the object, both of which the greedy regex here lost.
+from shared.json_extract import extract_json  # noqa: E402
 
 
 def run_guards(item: dict, edits_by_file: dict, snapshots: dict, flow: dict,
@@ -499,7 +488,8 @@ def main():
         log(f"Item {item['index']} [{item['kind']}] — {item['text'][:70]}")
         prompt = build_adapt_prompt(item, plan, scope, flow, workspace, rules,
                                     retry_note)
-        response = _call_claude(prompt, MODEL, str(REPO_ROOT), timeout=900)
+        response = _call_claude(prompt, MODEL, str(REPO_ROOT), timeout=900,
+                                log_dir=str(AUDIT_DIR))
         payload = extract_json(response or "")
         record = {**item, "status": "failed", "guards": [], "reason": ""}
 

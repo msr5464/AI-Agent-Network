@@ -89,6 +89,8 @@ from shared.log import log as _log
 def log(msg: str) -> None: _log("04-run-and-fix", msg)
 
 from shared.claude import call_claude_ex as _call_claude_ex
+# The static half of the fix prompt, written by main() just before each fix call.
+SYSTEM_PROMPT_FILE = AUDIT_DIR / "04-system-prompt.txt"
 def call_claude(prompt: str) -> str:
     """Run the fix call, reporting *why* it produced nothing when it does.
 
@@ -117,6 +119,10 @@ def call_claude(prompt: str) -> str:
         # Generating a fix is pure text-in/text-out — no MCP server is needed, and
         # inheriting the user's global config just pays connection cost per attempt.
         strict_mcp_config=True,
+        # Conventions and rules travel as the system prompt file main() writes just
+        # before this call; only the failure evidence is in the prompt itself. Picked
+        # up here rather than passed in, so no call site or test fake has to know.
+        system_prompt_file=(str(SYSTEM_PROMPT_FILE) if SYSTEM_PROMPT_FILE.is_file() else None),
     )
     if not result.ok:
         log(f"ERROR: Claude fix call {result.describe()}")
@@ -172,20 +178,8 @@ def _record_build(cmd, elapsed_s: float, verdict: str) -> None:
         pass
 
 
-def extract_json(text: str):
-    m = re.search(r"```json\s*([\s\S]*?)\s*```", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    m = re.search(r"(\{[\s\S]*\})", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    return None
+# Shared: tolerates an unclosed ```json fence and braces in the prose before the object.
+from shared.json_extract import extract_json  # noqa: E402
 
 
 _TESTS_RUN = re.compile(r"Tests run:\s*(\d+)", re.I)
@@ -306,19 +300,23 @@ def read_generated_files(files_written: list) -> dict:
 
 
 def extract_fix_response(fix_map) -> tuple:
-    """Unpack into (root_cause, confidence, files_map, edits_map).
+    """Unpack into (root_cause, confidence, files_map, edits_map, defect_matched).
 
     Understands three shapes, most preferred first:
       {"root_cause", "confidence", "edits": [{file, old_string, new_string}]}
       {"root_cause", "confidence", "files": {path: full_content}}
       {path: full_content}                       (bare, no metadata)
 
-    Exactly one of files_map / edits_map is ever non-empty.
+    Exactly one of files_map / edits_map is ever non-empty. `defect_matched` is the
+    model saying the failure is the product defect the test input documented.
     """
     if not isinstance(fix_map, dict):
-        return "", "", {}
+        # Five values, like every other branch: a reply with no JSON in it used to
+        # return three into a four-name unpack and crash the attempt.
+        return "", "", {}, {}, False
     root  = str(fix_map.get("root_cause", ""))
     conf  = str(fix_map.get("confidence", ""))
+    defect = fix_map.get("is_known_product_defect_matched") is True
 
     # Preferred shape — targeted search/replace, the same contract the healing
     # agent uses. Grouped per file so each file is read, patched and guarded once.
@@ -330,14 +328,19 @@ def extract_fix_response(fix_map) -> tuple:
         if rel:
             edits_map.setdefault(rel, []).append(edit)
     if edits_map:
-        return root, conf, {}, edits_map
+        return root, conf, {}, edits_map, defect
 
     if "files" in fix_map and isinstance(fix_map["files"], dict):
-        return root, conf, fix_map["files"], {}
+        return root, conf, fix_map["files"], {}, defect
+    if "edits" in fix_map or "root_cause" in fix_map:
+        # `"edits": []` is the model saying it has no fix — an answer, not a file
+        # map. Falling through to the branch below wrote files named `root_cause`
+        # and `confidence` into the automation repo.
+        return root, conf, {}, {}, defect
     # Neither shape: treat the whole object as a flat {file: content} map. An LLM
     # does not always follow a structure change on the first try, and a fix that
     # still applies correctly should not be discarded over missing metadata.
-    return "", "", fix_map, {}
+    return "", "", fix_map, {}, defect
 
 
 def _fingerprint_test(test_class: str, test_method: str):
@@ -1570,25 +1573,28 @@ find a different one, or return "edits": [] and say what would actually be neede
     # an agent is allowed to edit a test.
     never_rules = "\n".join(f"  - {rule}" for rule in intent.NEVER)
 
-    prompt = f"""You are a Java test automation debugging agent for the Jarvis framework.
+    # The input documented how the product misbehaves today. A failure that is
+    # exactly that is the test doing its job, and "fixing" it hides the bug.
+    defect_rules = ""
+    if plan_data.get("is_known_product_defect") and plan_data.get("actual_result"):
+        defect_rules = f"""
+KNOWN PRODUCT DEFECT: the test input documents this Actual Result, which differs from what the
+test expects:
+  "{plan_data['actual_result']}"
+If the failure below IS that defect — the application misbehaves in exactly that way — do NOT fix
+or work around the test: return "edits": [], explain the match in root_cause, and set
+"is_known_product_defect_matched": true. Only for that defect: a compile error, a missing locator,
+a wrong URL or any other automation problem is yours to fix normally, with the flag left false.
+"""
+
+    static_system_prompt = f"""You are a Java test automation debugging agent for the Jarvis framework.
 
 <framework_conventions>
 {claude_md}
 </framework_conventions>
 
-<generated_files>
-{files_context}
-</generated_files>
-{structured_section}
-<test_failure>
-```
-{prev_output}
-```
-</test_failure>
-{retry_section}
-
-The test failed. Analyze the failure and return a JSON object with your diagnosis and
-fixed file contents. Only include files that need to change.
+The test failed — its files and output are in the message. Analyze the failure and return a
+JSON object with your diagnosis and fixed file contents. Only include files that need to change.
 
 Common failure causes:
 - Import statements missing or wrong package names
@@ -1597,7 +1603,7 @@ Common failure causes:
 - Compilation error — fix the Java syntax
 - User not allocated — check allocateUser() call matches feature enum
 - Auth not set — ensure setAuthToken(token) is called on the helper, or doLogin() for web tests
-
+{defect_rules}
 CRITICAL: Preserve ALL existing JavaDoc comments, inline comments, and annotations exactly as written.
 Only change the minimum code required to fix the failure. Do NOT remove, shorten, or reword any comments.
 
@@ -1608,13 +1614,27 @@ not. Specifically, you may never:
 A test that passes because it stopped checking is worse than a failing one: the failure was
 visible and this is not. This is enforced mechanically — every assertion reachable from
 {test_class}#{test_method} was fingerprinted before your fix, and one that is removed, moved
-down to a weaker call, or wrapped in a condition gets the WHOLE fix rejected and the attempt
-wasted, however good the rest of it was.
+down to a weaker call, wrapped in a condition, or given a different expected value gets the
+WHOLE fix rejected and the attempt wasted, however good the rest of it was.
 
 If the only way to make this test pass is to weaken what it checks, then it should not pass.
 Return "edits": [] and say so in root_cause — that the product does not do what the test
 asserts, or that the assertion was never right. That is a useful answer and a human will act
 on it. Turning the assertion into a warning, a log line, or an `if` is not.
+
+ALLOWED, and expected of you: an expected literal that differs from what the page actually
+renders ONLY in whitespace or letter case ("$ 8.99" vs "$8.99", a non-breaking space,
+"PENDING" vs "Pending") is a rendering difference, not a change to what the test proves.
+Update the expected string in the assertion to match what the page renders, keeping the same
+assertion call — the conservation check accepts it. Fix every assertion with the same
+formatting mismatch in one attempt, not one per attempt: the test stops at the first failure,
+so the others are already there waiting for you.
+
+The line is the VALUE, not its formatting. Anything beyond whitespace and case — different
+digits or words ("$183.99" vs "$173.99", "Pending" vs "Shipped", 3 items vs 4), an added
+thousands separator or trailing period — is a different expected value and gets the WHOLE fix
+rejected. A real difference is a finding about the product and NOT yours to rewrite. Return
+"edits": [] and say so in root_cause.
 
 CRITICAL: Never introduce a literal "http://" or "https://" URL — not in a test, a page object,
 a helper, or a `static final` constant. A fix that adds one is REJECTED outright and the attempt
@@ -1627,6 +1647,7 @@ Return ONLY a JSON object of this exact shape:
 {{
   "root_cause": "one or two sentences: what actually broke and why, not just what error appeared",
   "confidence": "high | medium | low",
+  "is_known_product_defect_matched": false,
   "edits": [
     {{
       "file": "src/main/java/automation/modules/{plan_data.get('feature_name', 'feature')}/web/SomePage.java",
@@ -1651,10 +1672,48 @@ If this is a framework-level issue you cannot fix from the files you can see, re
 "edits": [] and explain that clearly in root_cause rather than guessing at a workaround.
 Output ONLY valid JSON.
 """
+    SYSTEM_PROMPT_FILE.write_text(static_system_prompt)
+
+    # Per attempt: the evidence. Everything that holds for the whole run is in the
+    # system prompt file above.
+    prompt = f"""<generated_files>
+{files_context}
+</generated_files>
+{structured_section}
+<test_failure>
+```
+{prev_output}
+```
+</test_failure>
+{retry_section}
+"""
 
     fix_response = call_claude(prompt)
     fix_map = extract_json(fix_response)
-    root_cause, confidence, files_map, edits_map = extract_fix_response(fix_map)
+    root_cause, confidence, files_map, edits_map, defect_matched = extract_fix_response(fix_map)
+
+    # ── The failure is the product defect the input documented ──────────────
+    # Honoured only for a test that compiled: a compile error cannot be the
+    # application misbehaving, and stopping on one would ship code that does not
+    # build, labelled as a reproduced bug.
+    compile_failed = bool(re.search(r"compilation (error|failure)", prev_output, re.IGNORECASE))
+    if defect_matched and plan_data.get("is_known_product_defect") and not compile_failed:
+        log(f"Failure matches the documented product defect: {root_cause}")
+        log("  → Stopping the fix loop: the test is correctly catching a known bug.")
+        _write_gate("defect")
+        _write_result({
+            "attempt": FIX_ATTEMPT, "test_class": test_class, "test_method": test_method,
+            "passed": False, "known_product_defect": True,
+            "reason": f"failure matches the documented product defect: {root_cause}",
+            "root_cause": root_cause, "confidence": confidence,
+            "test_output": prev_output, "fixes_applied": [],
+            "fix_response_length": len(fix_response), "skipped_rerun": True,
+        }, files_written, FIX_ATTEMPT)
+        return
+    if defect_matched:
+        log("  The model called this the known product defect, but "
+            + ("the test did not compile" if compile_failed else "the input documented none")
+            + " — treating it as an ordinary failure")
 
     proposed = fix_history.fingerprint(files_map, edits_map)
 

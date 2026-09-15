@@ -188,7 +188,7 @@ Run over the combined diff of one change item, before anything compiles:
 | guard | rejects |
 |---|---|
 | `validate_fix` | oversized diffs, emptied files, lost methods |
-| `assertion_graph.conserved` | an assertion removed, weakened, or made conditional — **anywhere in the call graph** |
+| `assertion_graph.conserved` | an assertion removed, weakened, made conditional, or given a different expected value (whitespace/case-only reformatting is allowed) — **anywhere in the call graph** |
 | `no_new_swallowing` | empty catch, `Thread.sleep`, `@Ignore`, `enabled=false`, `assumeTrue`, `SkipException` |
 | `wrapper_compliance` | raw Selenium — `driver.findElement`, `.sendKeys()`, `new WebDriverWait` |
 | `logstep_present` | an interaction added to a test class with no `logStep` |
@@ -266,7 +266,8 @@ START_FROM_STEP=4 SESSION_ID=<sid> make run AGENT=test-adaptation-agent  # resum
 
 Resume matters more here than anywhere else in this repo: exploration is the
 expensive half, and a failed edit must never cost a second thirty-minute browser
-run. `TESTING_MODE=true` caches steps 01–03 under `cache/<module>/`.
+run. `TESTING_MODE=true` caches steps 01–03 under `cache/<user>/<module>/`; editing
+the change note's content invalidates that cache.
 
 ## Locator baselines are committed with the edits
 

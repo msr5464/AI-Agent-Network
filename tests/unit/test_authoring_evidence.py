@@ -192,7 +192,7 @@ class TestStepO3Scan:
 class TestFixResponseShapes:
     def test_targeted_edits_are_preferred_and_grouped_per_file(self, tmp_path, monkeypatch):
         mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
-        _, conf, files, edits = mod.extract_fix_response({
+        _, conf, files, edits, _ = mod.extract_fix_response({
             "root_cause": "ambiguous locator", "confidence": "high",
             "edits": [{"file": "A.java", "old_string": "x", "new_string": "y"},
                       {"file": "A.java", "old_string": "p", "new_string": "q"},
@@ -202,15 +202,147 @@ class TestFixResponseShapes:
 
     def test_whole_file_shape_still_understood(self, tmp_path, monkeypatch):
         mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
-        _, _, files, edits = mod.extract_fix_response(
+        _, _, files, edits, _ = mod.extract_fix_response(
             {"root_cause": "r", "files": {"A.java": "content"}})
         assert files == {"A.java": "content"} and edits == {}
 
     def test_bare_map_still_understood(self, tmp_path, monkeypatch):
         # An LLM does not always follow a structure change on the first try.
         mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
-        _, _, files, edits = mod.extract_fix_response({"A.java": "content"})
+        _, _, files, edits, _ = mod.extract_fix_response({"A.java": "content"})
         assert files == {"A.java": "content"} and edits == {}
+
+    def test_a_reply_with_no_json_unpacks_to_five(self, tmp_path, monkeypatch):
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        assert mod.extract_fix_response(None) == ("", "", {}, {}, False)
+
+    def test_an_empty_edit_list_is_not_a_file_map(self, tmp_path, monkeypatch):
+        # Read as a flat map, this reply wrote files named `root_cause` and
+        # `confidence` into the automation repo.
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        root, _, files, edits, defect = mod.extract_fix_response(
+            {"root_cause": "matches the documented defect", "confidence": "high",
+             "edits": [], "is_known_product_defect_matched": True})
+        assert (files, edits, defect) == ({}, {}, True) and root
+        _, _, files, _, _ = mod.extract_fix_response(
+            {"root_cause": "r", "edits": [], "files": {"A.java": "x"}})
+        assert files == {"A.java": "x"}, "a whole-file fallback beside an empty edit list still applies"
+
+    def test_unclosed_fence_after_prose_with_braces(self, tmp_path, monkeypatch):
+        # Observed reply: prose mentioning /cart/checkout/{uuid}, then ```json never closed.
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        reply = ('Lands on `/cart/checkout/{uuid}`.\n\n```json\n'
+                 '{"root_cause": "r", "confidence": "high", "edits": '
+                 '[{"file": "A.java", "old_string": "x", "new_string": "{y}"}]}')
+        _, conf, _, edits, _ = mod.extract_fix_response(mod.extract_json(reply))
+        assert conf == "high" and list(edits) == ["A.java"]
+        # The same reply with no fence at all falls through to the brace scan.
+        _, _, _, edits, _ = mod.extract_fix_response(mod.extract_json(reply.replace("```json", "")))
+        assert list(edits) == ["A.java"]
+
+
+class TestValidateApiCallsEveryEndpoint:
+    def test_curl_runs_as_argv_and_a_bodyless_call_is_reachability_only(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_api.py", tmp_path, monkeypatch)
+        ran, requested = [], []
+
+        class Done:
+            returncode, stdout, stderr = 0, '{"id": 7}\n201', ""
+
+        class Resp:
+            status_code = 400
+
+            def json(self):
+                return {"error": "body required"}
+
+        def fake_run(argv, **kwargs):
+            ran.append((argv, kwargs))
+            return Done()
+
+        def fake_request(method, url, **kwargs):
+            requested.append(method)
+            return Resp(), None
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(mod, "_request_with_retry", fake_request)
+        checked, skipped = mod.check_safe_endpoints("https://api.x.io", [
+            {"enum_name": "Create", "method": "POST", "path": "/pay", "expected_status": 201,
+             "curl": "curl -X POST https://api.x.io/pay -d '{\"a\": 1}'; rm -rf /"},
+            {"enum_name": "Order", "method": "POST", "path": "/order", "expected_status": 201},
+            {"enum_name": "Clear", "method": "DELETE", "path": "/cart", "expected_status": 204},
+        ], {}, None)
+
+        argv, kwargs = ran[0]
+        assert isinstance(argv, list) and argv[0] == "curl" and not kwargs.get("shell")
+        assert "rm" in argv, "a ; inside the curl is a literal argument, never a second command"
+        assert checked[0]["actual_status"] == 201 and checked[0]["response_keys"] == ["id"]
+        assert checked[0]["body_sent"] is True and checked[0]["via"] == "curl"
+        assert requested == ["POST", "DELETE"], "mutating calls without a curl are still made"
+        assert [e["body_sent"] for e in checked[1:]] == [False, False]
+        assert checked[1]["matched_expected"] is False and checked[1]["via"] == "requests"
+        assert skipped == []
+
+    def test_a_bodyless_status_is_not_advised_as_the_real_one(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        hint = mod._build_api_hint("api", {"auth": {}, "endpoints_checked": [
+            {"method": "POST", "path": "/pay", "expected_status": 201, "actual_status": 400,
+             "matched_expected": False, "response_keys": [], "error": None,
+             "body_sent": False}]})
+        assert "prefer the real observed status" not in hint
+        assert "NOT its real status" in hint
+
+
+class TestExistingHelperIsReused:
+    def test_the_modules_own_helper_is_chosen(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        module = mod.AUTOMATION_FRAMEWORK_DIR / "src/main/java/automation/modules/naukari"
+        module.mkdir(parents=True)
+        # What the scenario-named feature_class left behind in the real framework.
+        for name in ("NaukriProfileSummaryHelper", "NaukriHelper"):
+            (module / f"{name}.java").write_text("class X {}")
+        assert mod._find_existing_helper("naukari", "Naukari").endswith("/NaukriHelper.java")
+        (module / "NaukariHelper.java").write_text("class X {}")
+        assert mod._find_existing_helper("naukari", "Naukari").endswith("/NaukariHelper.java")
+        assert mod._find_existing_helper("nomodule", "Nomodule") == ""
+
+
+class TestCsvTestData:
+    def test_credential_sheets_are_never_planned_for_codegen(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        csv_dir = mod.AUTOMATION_FRAMEWORK_DIR / "src/test/resources/saucedemo/csvFiles"
+        csv_dir.mkdir(parents=True)
+        # The two sheets the real framework has: one credential sheet, one data sheet.
+        (csv_dir / "saucedemo-testdata.csv").write_text("scenario,environment,username,password,role\n")
+        (csv_dir / "saucedemo-posts.csv").write_text("scenario,title,body,userId\n")
+        assert mod._plan_csv_files("saucedemo") == [
+            "src/test/resources/saucedemo/csvFiles/saucedemo-posts.csv"]
+        assert mod._plan_csv_files("newmodule") == [
+            "src/test/resources/newmodule/csvFiles/newmodule-data.csv"]
+
+    @pytest.mark.parametrize("header,credential", [
+        ("role,environment,username,password,description", True),
+        ("user_key,apiKey,country", True),
+        ("scenario,access_token", True),
+        ("scenario,title,body,userId", False),
+        ("product_key,footprint,notPresent", False),
+    ])
+    def test_credential_columns_are_recognised(self, tmp_path, monkeypatch, header, credential):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        assert mod._is_credential_csv(header) is credential
+
+
+class TestInterleavedStepLabels:
+    def test_api_steps_are_kept_out_of_element_evidence(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        passed, failed, unverified = mod.parse_step_results(
+            "STEP_PASSED: [WEB] Verify the cart badge shows 1\n"
+            "STEP_PASSED: [API] Verify POST /cart returns 201\n"
+            "STEP_UNVERIFIED: [API] Verify the order total is 42.00\n"
+            "STEP_FAILED: [API] Create the order via POST /orders\n"
+            "STEP_PASSED: Log in with the test credentials\n")
+        assert passed == ["Verify the cart badge shows 1", "Log in with the test credentials"]
+        assert unverified == [], "an API check can never produce a SELECTOR_FOUND"
+        assert failed == ["Create the order via POST /orders"]
 
 
 class TestThirdPartyNoise:

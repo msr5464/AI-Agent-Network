@@ -97,6 +97,15 @@ class TestMaskingParity:
         assert "***MASKED***" in mask_credential_lines(line)
         assert extract_credentials(line).get("password") == "hunter2"
 
+    def test_every_secret_in_a_one_line_curl_is_masked(self):
+        # Queue files now carry curl snippets, and the PR body shows the input.
+        curl = ('curl -X POST https://api.x.io/pay -H "Authorization: Bearer abc123" '
+                '-H "x-api-key: k-999" -d \'{"password": "hunter2"}\'')
+        masked = mask_credential_lines(curl)
+        for secret in ("abc123", "k-999", "hunter2"):
+            assert secret not in masked, f"{secret} survived masking: {masked}"
+        assert "https://api.x.io/pay" in masked, "the request itself must stay readable"
+
 
 class TestCredentialsFromPlan:
     """Every step that needs credentials reads them through this, so a plan that

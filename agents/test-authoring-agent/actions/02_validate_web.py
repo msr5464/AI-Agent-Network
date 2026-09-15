@@ -193,12 +193,21 @@ def parse_step_results(output: str) -> tuple:
     passed, failed, unverified = [], [], []
     for line in output.splitlines():
         line = line.strip()
-        if line.startswith("STEP_PASSED:"):
-            passed.append(line[len("STEP_PASSED:"):].strip())
-        elif line.startswith("STEP_FAILED:"):
-            failed.append(line[len("STEP_FAILED:"):].strip())
-        elif line.startswith("STEP_UNVERIFIED:"):
-            unverified.append(line[len("STEP_UNVERIFIED:"):].strip())
+        for marker, bucket in (("STEP_PASSED:", passed), ("STEP_FAILED:", failed),
+                               ("STEP_UNVERIFIED:", unverified)):
+            if not line.startswith(marker):
+                continue
+            step = line[len(marker):].strip()
+            # Interleaved flows label each step. An [API] step's proof is a response,
+            # never an element, so it must not reach the element-evidence check or
+            # step 03's drop decision — only its failure is kept, because a UI step
+            # that depended on it is otherwise unexplained. The label itself never
+            # survives: its word would skew the check-provenance vocabulary.
+            api = step.startswith("[API]")
+            step = re.sub(r"^\[(?:API|WEB)\]\s*", "", step)
+            if not api or bucket is failed:
+                bucket.append(step)
+            break
     return passed, failed, unverified
 
 
@@ -458,6 +467,12 @@ def main() -> None:
     base_url   = plan.get("web_base_url", "")
     web_steps  = plan.get("web_steps_for_validation", [])
     web_pages  = plan.get("web_pages", [])
+    if plan.get("flow_style") == "interleaved" and plan.get("interleaved_steps"):
+        # In order and labelled: a UI step can depend on state an API step created,
+        # so the browser performs both — the API ones through fetch() (fetch_guard).
+        web_steps = [f"[{str(s.get('interface', 'web')).upper()}] {s.get('description', '')}"
+                     for s in plan["interleaved_steps"]
+                     if isinstance(s, dict) and s.get("description")]
 
     if not web_steps:
         log("No web steps found in plan — writing empty selector map")
@@ -537,6 +552,14 @@ CREDENTIALS (use exactly these — do NOT use any other values):
         if all_locators else ""
     )
 
+    fetch_guard = (
+        "\n[API] STEPS: never browser_navigate to an API endpoint — loading it replaces the "
+        "application page every later step needs. Perform the request with browser_evaluate "
+        "and fetch() from the current page, so it shares the session, then carry on. Report an "
+        "[API] step as STEP_PASSED or STEP_FAILED from the response status; it needs no "
+        "SELECTOR_FOUND."
+        if any(s.startswith("[API] ") for s in web_steps) else "")
+
     def build_prompt(attempt_notes: str = "") -> str:
         return f"""You are a QA automation agent. Use the Playwright browser MCP tools to validate a web user flow.
 
@@ -546,6 +569,7 @@ STEPS TO EXECUTE:
 {steps_numbered}
 {creds_section}
 {locators_hint}
+{fetch_guard}
 {attempt_notes}
 
 ══════════════════════════════════════════════════════════════

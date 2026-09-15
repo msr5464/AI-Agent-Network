@@ -153,6 +153,38 @@ class TestConservation:
             "an assertion that only runs when it would pass is a deleted "
             "assertion wearing a disguise")
 
+    def test_duplicate_assertions_are_counted_separately(self, tmp_path, tmp_path_factory):
+        # Cart total and checkout total, both "42.00": one fingerprint used to hold
+        # both, so deleting either of them was invisible.
+        twice = '''\
+    public void verifyTotal() {
+        AssertHelper.assertEquals(testConfig, "Order total", total, "42.00");
+        AssertHelper.assertEquals(testConfig, "Order total", total, "42.00");
+    }
+'''
+        before = ag.fingerprints("CheckoutTest", "placeOrder",
+                                 _repo(tmp_path, page_body=twice))
+        after_root = tmp_path_factory.mktemp("once")
+        after = ag.fingerprints("CheckoutTest", "placeOrder", _repo(after_root))
+        report = ag.conserved(before, after)
+        assert len(before["asserts"]) == len(after["asserts"]) + 1
+        assert report["ok"] is False
+        assert report["lost"], "deleting one of two identical assertions must be caught"
+
+    def test_a_contract_frozen_before_occurrence_suffixes_still_conserves(self, tmp_path):
+        # A session frozen by the previous release stores bare hashes and no
+        # skeleton. Resuming it must not read every assertion as removed.
+        fps = ag.fingerprints("CheckoutTest", "placeOrder", _repo(tmp_path))
+        legacy = {"asserts": {fp.rsplit("_", 1)[0]: {k: v for k, v in info.items()
+                                                     if k != "skeleton"}
+                              for fp, info in fps["asserts"].items()},
+                  "unresolved": fps["unresolved"], "log_steps": []}
+        report = ag.conserved(legacy, fps)
+        assert report["ok"] is True, ag.describe(report)
+        assert all("_matched" not in info for info in legacy["asserts"].values()), (
+            "the frozen contract is reused across items and attempts; comparing "
+            "against it must not write into it")
+
 
 class TestHoles:
     def test_unresolvable_receiver_is_reported_not_dropped(self, tmp_path):
@@ -193,9 +225,17 @@ class TestMessageVersusExpectedValue:
             '"Order total should be 42.00");\n'
             '    }\n')
 
-    def _report(self, tmp_path, factory, mutated):
+    # The checkout run's real shape: several amounts asserted side by side, all
+    # the same call shape, and the page renders each as `$ 175.00`, not `$175.00`.
+    MONEY = ('    public void verifyTotal() {\n'
+             '        AssertHelper.assertEquals(testConfig, price, "$175.00", "Price");\n'
+             '        AssertHelper.assertEquals(testConfig, shipping, "$8.99", "Shipping");\n'
+             '        AssertHelper.assertEquals(testConfig, total, "$183.99", "Total");\n'
+             '    }\n')
+
+    def _report(self, tmp_path, factory, mutated, page=None):
         before = ag.fingerprints("CheckoutTest", "placeOrder",
-                                 _repo(tmp_path, page_body=self.PAGE))
+                                 _repo(tmp_path, page_body=page or self.PAGE))
         after_root = factory.mktemp("after")
         after = ag.fingerprints("CheckoutTest", "placeOrder",
                                 _repo(after_root, page_body=mutated))
@@ -212,6 +252,23 @@ class TestMessageVersusExpectedValue:
         assert report["ok"] is False, (
             "the expected value is the whole point of the assertion; only the "
             "message is cosmetic")
+
+    def test_reformatting_the_expected_value_is_allowed(self, tmp_path, tmp_path_factory):
+        spaced = self.MONEY.replace('"$', '"$ ')
+        report = self._report(tmp_path, tmp_path_factory, spaced, self.MONEY)
+        assert report["ok"] is True, (
+            "$175.00 -> $ 175.00 is the page's formatting, not a new expectation; "
+            "pairing price with total because they share a call shape is a false "
+            "rejection of the fix that was actually right")
+
+    def test_a_different_amount_is_blocked_and_named(self, tmp_path, tmp_path_factory):
+        zeroed = self.MONEY.replace('"$', '"$ ').replace('"$ 175.00"', '"$ 0.00"')
+        report = self._report(tmp_path, tmp_path_factory, zeroed, self.MONEY)
+        assert report["ok"] is False, (
+            "same call, same place, same shape — only the amount differs, and "
+            "the amount is what a checkout test exists to prove")
+        assert '"$175.00" -> "$ 0.00"' in report["reason"], (
+            "the reviewer has to see which value became which, not a mispairing")
 
 
 class TestWhatCountsAsAHole:

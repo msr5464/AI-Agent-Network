@@ -18,16 +18,20 @@ from shared.credential_extraction import LABELS
 # are never extracted but must never be printed either.
 #
 # Bare "user" is in neither list: it would false-positive on "Admin user".
-_EXTRA_SECRET_LABELS = r"token|secret"
+_EXTRA_SECRET_LABELS = r"token|secret|authorization"
+# Every `label: value` pair, not one per line: a one-line curl carries several
+# (`-H "Authorization: Bearer …" -H "x-api-key: …" -d '{"password": "…"}'`), and
+# the line-anchored form masked only the last. The optional quote handles JSON
+# keys, and a Bearer/Basic scheme word is skipped so the token itself is masked.
 _CREDENTIAL_LINE_RE = re.compile(
-    r"(?im)^(.*\b(?:"
+    r"(?i)(\b(?:"
     + "|".join(list(LABELS.values()) + [_EXTRA_SECRET_LABELS])
-    + r")\b\s*[:=]\s*)(\S+)"
+    + r")\b[\"']?\s*[:=]\s*[\"']?(?:(?:bearer|basic)\s+)?)(\S+)"
 )
 
 
 def mask_credential_lines(text: str) -> str:
-    """Pattern-based redaction — catches common credential-line shapes
+    """Pattern-based redaction — catches every `label: value` credential shape
     without needing to already know the actual credential values.
 
     This is the ONLY layer available before 01_parse.py has run (before

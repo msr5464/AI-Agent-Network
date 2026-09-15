@@ -240,6 +240,7 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
     test_passed = (fix_attempts_data[-1].get("passed", False)
                    if fix_attempts_data else False)
     test_status = ("tests pass" if test_passed
+                   else "tests reproduce a known product defect" if fix_gate == "defect"
                    else "tests not run" if fix_gate == "skipped"
                    else "tests need review")
 
@@ -406,6 +407,13 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
     # Test result section
     if test_passed:
         test_section = "✅ Generated test was run and passed before this PR was created."
+    elif fix_data.get("known_product_defect"):
+        test_section = (
+            "⚠️ The test reproduces the known product defect documented in the test input "
+            f"({(fix_data.get('reason') or '').strip() or 'see root_cause'}). The fix loop "
+            "stopped rather than work around it: merge this as the regression test, and "
+            "expect it to pass once the product is fixed."
+        )
     elif fix_data.get("stuck"):
         # Distinct from the infra-skip case below: this test genuinely failed rather
         # than never getting a fair shot. The loop stopped short of its budget because
@@ -554,6 +562,12 @@ def build_slack_message(gen_data: dict, fix_data: dict, pr_url: Optional[str], f
         what    = "push to GitHub" if ship_status == "push_failed" else "PR creation"
         status  = (f"generated and tests {'pass' if test_passed else 'ran'}, but {what} FAILED — "
                    "code is stuck on a local branch, needs manual intervention")
+    elif fix_gate == "defect":
+        # A failing test, so the alert channel — but a finding about the product,
+        # not about the generated code.
+        channel = SLACK_ALERT_CHANNEL or SLACK_NOTIFY_CHANNEL
+        icon    = ":warning:"
+        status  = "generated — test reproduces the known product defect, needs review"
     elif fix_gate == "stuck":
         # This is a genuine, reproducible failure — must go to the alert channel
         # like any other failure, not the "generated (test not run)" notify-only
@@ -681,6 +695,8 @@ def main() -> None:
     if weakening_rejected:
         log(f"NEEDS-REVIEW: {len(weakening_rejected)} fix attempt(s) were rejected "
             f"for weakening an assertion.")
+    if fix_gate == "defect":
+        log("NEEDS-REVIEW: the test reproduces the known product defect the input documented.")
     if fix_gate == "skipped":
         log("NEEDS-REVIEW: no test ever ran (infrastructure) — nothing was verified.")
     (AUDIT_DIR / ".verdict").write_text(verdict)
@@ -722,7 +738,7 @@ def main() -> None:
         f"| Branch | `{branch_name or 'N/A'}` |",
         f"| Commit | `{commit_sha or 'N/A'}` |",
         f"| PR | {pr_url or 'Not created'} |",
-        f"| Test result | {'✅ Passed' if test_passed else '⚠️ Not run' if fix_gate == 'skipped' else '❌ Failed'} |",
+        f"| Test result | {'✅ Passed' if test_passed else '⚠️ Known defect reproduced' if fix_gate == 'defect' else '⚠️ Not run' if fix_gate == 'skipped' else '❌ Failed'} |",
         f"| Ship status | {ship_status} |",
         f"| Slack | {'Sent' if slack_sent else 'Skipped'} |",
     ]

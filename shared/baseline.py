@@ -94,8 +94,39 @@ def directory(workspace=None, results_dirname: str = "test-output",
     return Path(workspace) / results_dirname / _DEFAULT_DIRNAME
 
 
+def module_of(test_name: str) -> str:
+    """`automation.checkout.CheckoutWebTest.placeOrder` → "checkout".
+
+    A test's package names the module its page objects live in
+    (`automation.modules.checkout.web`), which is the subdirectory the framework
+    stores their baselines under. "" when the name is too short to say.
+    """
+    parts = [part for part in (test_name or "").split(".") if part]
+    return parts[1].lower() if len(parts) > 2 else ""
+
+
+def path_for(page_object: str, workspace=None, preserved: Optional[str] = None,
+             module: str = "") -> Optional[Path]:
+    """Where one page object's baseline is on disk, or None.
+
+    The framework stores `{module}/{PageObject}.json`, because two modules can
+    each own a `LoginPage`. The caller's module is tried first, then the flat
+    layout every older baseline uses, then any module that has one — a test can
+    reach a page object that belongs to another module. Never `pending/`.
+    """
+    folder = directory(workspace, preserved=preserved)
+    if not folder or not page_object:
+        return None
+    name = f"{page_object}.json"
+    for candidate in ([folder / module / name] if module else []) + [folder / name]:
+        if candidate.is_file():
+            return candidate
+    return next((p for p in sorted(folder.glob(f"*/{name}"))
+                 if p.parent.name != "pending"), None)
+
+
 def load(page_object: str, workspace=None, preserved: Optional[str] = None,
-         not_after: str = "") -> Dict:
+         not_after: str = "", module: str = "") -> Dict:
     """The recorded fingerprint for one page object, if there is one.
 
     `not_after` is the moment the failure was captured. A baseline stamped at or
@@ -103,17 +134,17 @@ def load(page_object: str, workspace=None, preserved: Optional[str] = None,
     re-running it minutes later — and records the broken page under the name of
     the last good one. Every rule that compares against it then confirms the
     breakage instead of contradicting it.
+
+    `module` (see module_of) picks the right file when two modules share a
+    page-object name; without it the lookup falls back as path_for describes.
     """
     result: Dict = {"available": False, "page_object": page_object,
                     "url_shape": "", "title": "", "body_class": "", "coverage": {},
                     "fingerprints": {}, "landmarks": [], "rejected": ""}
     if not page_object:
         return result
-    folder = directory(workspace, preserved=preserved)
-    if not folder:
-        return result
-    path = folder / f"{page_object}.json"
-    if not path.exists():
+    path = path_for(page_object, workspace, preserved, module)
+    if path is None:
         return result
     try:
         data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
@@ -333,16 +364,18 @@ def repo_directory(workspace) -> Optional[Path]:
 def promoted(workspace) -> List[Path]:
     """Baselines a successful page load promoted, newest state on disk.
 
-    Deliberately not recursive: `pending/` under this directory is the Java side's
-    scratch space, holding fingerprints recorded by a test that has not finished.
-    promote() moves them up here and discard() deletes them, so anything still
+    Recursive, because the framework stores them per module
+    (`{module}/{PageObject}.json`) — but never under `pending/`, the Java side's
+    scratch space holding fingerprints recorded by a test that has not finished.
+    promote() moves them into place and discard() deletes them, so anything still
     sitting there is an interrupted run — named by test key rather than by page
     object, and never a record of a page working.
     """
     folder = repo_directory(workspace)
     if folder is None or not folder.is_dir():
         return []
-    return sorted(folder.glob("*.json"))
+    return sorted(p for p in folder.rglob("*.json")
+                  if "pending" not in p.relative_to(folder).parts)
 
 
 def _committed(workspace, relative: str) -> str:

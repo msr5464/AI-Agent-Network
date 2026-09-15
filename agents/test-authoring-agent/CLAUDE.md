@@ -33,7 +33,7 @@ run.sh (orchestrator)
 | Step | Owns | Does NOT do |
 |------|------|-------------|
 | **01 Parse** | Read plain text, call Claude, produce plan JSON | No file writes to Thanos-pw |
-| **02 Validate API** | Real HTTP auth + safe-endpoint calls against `api_base_url`, no LLM | Never call unsafe (POST/PUT/DELETE or path-param) endpoints |
+| **02 Validate API** | Real HTTP auth + a real call to every endpoint against `api_base_url` — the input's `curl` where it gave one (run without a shell), no LLM | Never call a path-param endpoint whose value is unknown and has no curl; never treat a body-less POST/PUT/DELETE status as the endpoint's real one |
 | **02 Validate Web** | Drive the browser via Playwright MCP, collect confirmed selectors | No Java codegen |
 | **03 Generate** | Write all Java files to Thanos-pw | No test running |
 | **04 Run & Fix** | Run mvn test, call Claude to fix failures, retry | No git push |
@@ -121,8 +121,16 @@ proves. Every assertion reachable from the test method is fingerprinted **before
 first run** into `.assertions-frozen.json`, and each attempt is compared against that
 frozen copy with `shared/assertion_graph.conserved()` — so attempt 3 cannot launder a
 weakening introduced by attempt 2. An assertion removed, moved down a strength ladder
-(`assertEquals` → `assertNotNull`), or wrapped in a condition rejects the **whole**
-fix and rolls every file back. `FORCE=true` overrides it, matching test-healing-agent.
+(`assertEquals` → `assertNotNull`), wrapped in a condition, or given a different
+expected value rejects the **whole** fix and rolls every file back. `FORCE=true`
+overrides it, matching test-healing-agent.
+
+An expected value may differ only in whitespace or letter case: `"$175.00"` →
+`"$ 175.00"` is the page's formatting, `"$175.00"` → `"$ 0.00"` is a new expectation.
+Before this, any changed literal read as a *removed* assertion, so the correct
+formatting fix was rejected along with the bug-hiding one. Identical assertions in one
+method are fingerprinted separately (`<hash>_1`, `<hash>_2`), so deleting one of a
+pair is caught too.
 
 This exists because none of the six per-file guards could see it: deleting an
 assertion is a one-line diff that loses no method, adds no `Thread.sleep`, and is
@@ -222,6 +230,7 @@ Web Steps:
 - `false`   — test failed after all fix attempts → ship with NEEDS-REVIEW verdict
 - `skipped` — no test could be run (infra issue) → clean exit
 - `stuck`   — the test ran and failed, and a further attempt provably could not differ (see "When step 04 stops retrying") → ship with NEEDS-REVIEW
+- `defect`  — the test ran and failed exactly as the input's documented `Actual Result` says the product misbehaves today; the loop stops instead of working around a real bug → ship with NEEDS-REVIEW. Only when step 01 found an Actual Result in the input text, and never on a compile failure
 
 **.verdict**
 - `APPROVED`      — test passed, nothing the input asked for went unverified, no fix was rejected for weakening an assertion
@@ -240,6 +249,7 @@ Web Steps:
 | `02-validate-api.json` + `.md` | Validate API | Auth status, confirmed endpoint response shapes |
 | `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms` |
 | `claude-*.log` | Validate Web | Raw `claude -p` stream, for diagnosing empty runs |
+| `03-system-prompt.txt`, `04-system-prompt.txt` | Generate, Run & Fix | The static half of each prompt — conventions, references, rules — sent once as `--system-prompt-file` instead of inside every batch or attempt |
 | `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators` |
 | `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes |
 | `.assertions-frozen.json` | Run & Fix | What the generated test proved before any fix — the conservation baseline |

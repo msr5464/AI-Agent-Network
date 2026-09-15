@@ -341,7 +341,8 @@ def collect(issue: Dict, workspace=None, page_objects: Optional[List[Dict]] = No
     expected_name = evidence["expected_page_object"]
     evidence["baseline"] = baseline.load(expected_name, workspace,
                                          issue.get("healing_baseline_dir"),
-                                         not_after=header.get("capturedAt", ""))
+                                         not_after=header.get("capturedAt", ""),
+                                         module=baseline.module_of(issue.get("test_name", "")))
     if evidence["baseline"].get("rejected"):
         evidence["notes"].append(
             "ignored a baseline that is not older than the failure — "

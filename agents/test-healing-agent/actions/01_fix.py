@@ -1366,10 +1366,12 @@ def _refresh_baseline_after_heal(ctx: dict, workspace: Path) -> None:
     if not located or not located.get("page_object"):
         return
     try:
-        directory = baseline.directory(workspace)
-        if not directory:
+        # path_for, not a flat join: baselines live under {module}/, and
+        # update_baseline silently does nothing for a path that does not exist.
+        path = baseline.path_for(located["page_object"], workspace,
+                                 module=baseline.module_of(ctx.get("test_name", "")))
+        if not path:
             return
-        path = Path(directory) / f"{located['page_object']}.json"
         locator_patch.update_baseline(
             path, located["field"], located.get("new_locator", ""),
             fingerprint={}, score=located.get("score", 0.0),
@@ -1663,24 +1665,10 @@ Work independently on this test case only.
 """
 
 
-def extract_fix_json(response: str) -> dict | None:
-    try:
-        return json.loads(response.strip())
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"```json\s*([\s\S]*?)\s*```", response)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    m = re.search(r"(\{[\s\S]*\})", response)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    return None
+# Shared with the authoring and adaptation agents: tolerates an unclosed ```json
+# fence and braces in the prose before the object, both of which the greedy regex
+# here lost. Kept under its own name for the callers in this file.
+from shared.json_extract import extract_json as extract_fix_json  # noqa: E402
 
 # ── Attempt history ───────────────────────────────────────────────────────────
 

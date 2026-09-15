@@ -36,6 +36,7 @@ def log(msg): _log("parse-change", msg)
 from shared.claude import call_claude as _call_claude
 from shared.credential_masking import mask_credential_lines
 from shared.flow_map import destructive_token
+from shared.json_extract import extract_json
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
@@ -200,12 +201,10 @@ def main():
     try:
         response = _call_claude(classify_prompt(headers.get("module", MODULE),
                                                 items, note),
-                                MODEL, str(REPO_ROOT), timeout=600)
-        payload = response.strip()
-        match = re.search(r"\{[\s\S]*\}", payload)
-        if match:
-            for row in (json.loads(match.group(0)).get("items") or []):
-                classified[int(row.get("index", 0))] = row
+                                MODEL, str(REPO_ROOT), timeout=600,
+                                log_dir=str(AUDIT_DIR))
+        for row in ((extract_json(response) or {}).get("items") or []):
+            classified[int(row.get("index", 0))] = row
     except Exception as exc:
         log(f"Classification call failed ({exc}) — every item will be escalated")
 

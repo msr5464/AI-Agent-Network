@@ -45,7 +45,8 @@ def read_file(path: Path) -> str:
 
 from shared.claude import call_claude as _call_claude
 def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, TRIAGING_REVIEWER_MODEL, str(REPO_ROOT))
+    output = _call_claude(prompt, TRIAGING_REVIEWER_MODEL, str(REPO_ROOT),
+                          log_dir=str(AUDIT_DIR))
     if not output:
         log("Claude CLI returned empty response")
     return output

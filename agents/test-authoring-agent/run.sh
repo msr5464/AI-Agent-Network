@@ -42,6 +42,7 @@ source "$REPO_ROOT/shared/session.sh"
 # When TESTING_MODE=true, step-01 and step-02 outputs are cached under
 # agents/test-authoring-agent/cache/<module>/ so they are reused on every
 # subsequent run of the same input file — saving ~3 minutes per iteration.
+# "Same" means same content: editing the file's steps invalidates the cache.
 # Clear the cache manually to force a fresh run:
 #   rm -rf agents/test-authoring-agent/cache/<module>/
 TESTING_MODE="${TESTING_MODE:-false}"
@@ -52,9 +53,14 @@ USER_ID="${USER_ID:-${USER:-cli}}"
 # cross-user content leakage, plus torn reads from a concurrent cp.
 CACHE_DIR="$AGENT_DIR/cache/$USER_ID/$MODULE"
 
-# _cache_hit <filename>  → returns 0 if cache exists and TESTING_MODE=true
+# _cache_hit <filename>  → returns 0 if TESTING_MODE=true, the file is cached, and it
+# was cached from an input byte-identical to INPUT_FILE. Content, not mtime: the
+# server rewrites a queue file on every save and every run moves it to processed/,
+# so an mtime check would miss on every UI run. Snapshotted per file, so a run that
+# crashed after re-caching step 01 can never validate step 02's older output.
 _cache_hit() {
-  [[ "$TESTING_MODE" == "true" ]] && [[ -f "$CACHE_DIR/$1" ]]
+  [[ "$TESTING_MODE" == "true" ]] && [[ -f "$CACHE_DIR/$1" ]] \
+    && [[ -f "$CACHE_DIR/$1.input" ]] && cmp -s "$CACHE_DIR/$1.input" "$INPUT_FILE"
 }
 # _cache_restore <filename>  → copies file from cache into current AUDIT_DIR
 _cache_restore() {
@@ -66,6 +72,7 @@ _cache_save() {
   if [[ "$TESTING_MODE" == "true" ]] && [[ -f "$AUDIT_DIR/$1" ]]; then
     mkdir -p "$CACHE_DIR"
     cp "$AUDIT_DIR/$1" "$CACHE_DIR/$1"
+    if [[ -f "$INPUT_FILE" ]]; then cp "$INPUT_FILE" "$CACHE_DIR/$1.input"; else rm -f "$CACHE_DIR/$1.input"; fi
     log "TESTING_MODE: cached $1 → $CACHE_DIR"
   fi
 }
@@ -428,7 +435,8 @@ else
 
   FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
 
-  if [[ "$FIX_RESULT" != "true" && "$FIX_RESULT" != "skipped" && "$FIX_RESULT" != "stuck" ]]; then
+  if [[ "$FIX_RESULT" != "true" && "$FIX_RESULT" != "skipped" && "$FIX_RESULT" != "stuck" \
+        && "$FIX_RESULT" != "defect" ]]; then
     FIX_ATTEMPT=1
     while true; do
       export STEP_ATTEMPT="$FIX_ATTEMPT"
@@ -439,8 +447,11 @@ else
 
       # "stuck" (not just "skipped") also stops the loop early — 04_run_and_fix.py
       # sets it when a fix attempt had no effect on the failure's exact location,
-      # meaning further attempts are unlikely to converge either.
-      if [[ "$FIX_RESULT" == "true" || "$FIX_RESULT" == "skipped" || "$FIX_RESULT" == "stuck" ]]; then
+      # meaning further attempts are unlikely to converge either. "defect" means the
+      # failure is the product bug the input documented — another attempt could only
+      # work around it.
+      if [[ "$FIX_RESULT" == "true" || "$FIX_RESULT" == "skipped" || "$FIX_RESULT" == "stuck" \
+            || "$FIX_RESULT" == "defect" ]]; then
         break
       fi
 

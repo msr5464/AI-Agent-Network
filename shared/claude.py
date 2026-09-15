@@ -309,7 +309,7 @@ def call_claude_ex(
     add_dir: str = None,
     stream_json: bool = False,
     mcp_config=None,
-    strict_mcp_config: bool = False,
+    strict_mcp_config: bool = True,
     tools=None,
     disable_slash_commands: bool = False,
 ) -> ClaudeResult:
@@ -326,7 +326,11 @@ def call_claude_ex(
                           --mcp-config.
       strict_mcp_config — ignore user/global MCP configuration and use only the
                           servers in mcp_config. Without mcp_config this loads NO
-                          servers at all, so the two are passed together.
+                          servers at all, so the two are passed together. On by
+                          default: this repo's own .mcp.json starts a Playwright
+                          server, and a text-only call that inherits it pays for a
+                          browser it never uses. A caller that wants MCP names the
+                          servers in mcp_config.
       tools             — which BUILT-IN tools to load, as --tools. "" loads none.
                           Distinct from allowed_tools, which only gates permission:
                           a tool excluded by allowed_tools is still *defined*, so it
@@ -587,7 +591,7 @@ def call_claude(
     add_dir: str = None,
     stream_json: bool = False,
     mcp_config=None,
-    strict_mcp_config: bool = False,
+    strict_mcp_config: bool = True,
     tools=None,
     disable_slash_commands: bool = False,
     partial_on_timeout: bool = False,
@@ -597,7 +601,7 @@ def call_claude(
     Returns stdout on success, empty string on error.
     cwd should be the repo root so relative paths in prompts resolve correctly.
 
-    Optional args (all default to None/False for full backward compatibility):
+    Optional args (default to None/False, except strict_mcp_config — see call_claude_ex):
       on_output(label, line)  — called for each streamed output line
       system_prompt_file      — path passed as --system-prompt-file to claude CLI
       log_dir                 — directory to write a timestamped claude-*.log file
