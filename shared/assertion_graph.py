@@ -35,6 +35,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from shared.code_analyzer import (read_source, split_class_members,
                                   without_comments)
+from shared.logstep_narration import log_steps
 
 # Anything that asserts. Deliberately broad: a project-specific wrapper that
 # nobody told us about still matters, and a false positive here only costs a
@@ -42,15 +43,6 @@ from shared.code_analyzer import (read_source, split_class_members,
 ASSERT_CALL = re.compile(
     r"\b(AssertHelper\.\w+|assertPageLoaded|assert[A-Z]\w*|verify[A-Z]\w*"
     r"|compare[A-Z]\w*|shouldBe[A-Z]\w*)\s*\(")
-
-# Steps a test logs. CONVENTIONS.md requires these to state the action and the
-# expected outcome in plain English, which makes them the best available source
-# for a derived intent contract.
-# Both call shapes in the wild: `logStep(testConfig, "…")` as CONVENTIONS.md
-# writes it, and `config.logStep("…")` as the Playwright framework actually does.
-# Only matching the first found no steps at all in a real repo.
-LOG_STEP = re.compile(
-    r"\blogStep\s*\(\s*(?:\w+\s*,\s*)?(\"(?:\\.|[^\"\\])*\")")
 
 # Strength order within a family, weakest last. An edit that moves an assertion
 # down one of these ladders has weakened it even though a call still exists.
@@ -360,8 +352,10 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
         # plumbing, not gaps in what the test proves.
         opaque_base = not _ancestry(klass, index)[1]
 
-        for match in LOG_STEP.finditer(text):
-            result["log_steps"].append(match.group(1).strip('"'))
+        # Steps a test logs. CONVENTIONS.md requires these to state the action and
+        # the expected outcome in plain English, which makes them the best available
+        # source for a derived intent contract.
+        result["log_steps"].extend(log_steps(text))
 
         for match in ASSERT_CALL.finditer(text):
             if _is_declaration(text, match.start()):

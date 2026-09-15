@@ -36,9 +36,9 @@ from shared.code_analyzer import split_class_members, without_comments
 _TEST_ANNOTATION = re.compile(r"@Test\b")
 
 # Both call shapes the repos use: `logStep(testConfig, "…")` as CONVENTIONS.md
-# writes it, and `config.logStep("…")` as the Playwright framework does.
-LOG_STEP = re.compile(
-    r"\blogStep\s*\(\s*(?:\w+\s*,\s*)?\"((?:\\.|[^\"\\])*)\"")
+# writes it, and `config.logStep("…")` as the Playwright framework does. Matches up
+# to the step's opening quote; _step_text reads the rest of the argument.
+LOG_STEP = re.compile(r"\blogStep\s*\(\s*(?:\w+\s*,\s*)?(?=\")")
 
 # Any logging call. A log line is narration *about* work, never the work itself,
 # so it must not count towards the acting statements that justify narration.
@@ -127,9 +127,56 @@ def test_bodies(source: str) -> Dict[str, str]:
     return bodies
 
 
+def _literal_end(text: str, start: int) -> int:
+    """Index just past the string or char literal that opens at `start`."""
+    quote, i = text[start], start + 1
+    while i < len(text) and text[i] != quote:
+        i += 2 if text[i] == "\\" else 1
+    return min(i + 1, len(text))
+
+
+def _step_text(text: str, start: int) -> str:
+    """One logStep argument, from its opening quote to the call's closing paren.
+
+    `"Login and add " + product.get("slug") + " to cart"` is one sentence, so the
+    value stays in it as `{product.get("slug")}`. Stopping at the first closing
+    quote left "Login and add " as the whole step once test data moved into CSVs.
+    """
+    parts: List[str] = []
+    expr, depth, i = "", 0, start
+    while i < len(text):
+        ch = text[i]
+        if ch in "\"'":
+            end = _literal_end(text, i)
+            if ch == '"' and depth == 0 and not expr.strip():
+                parts.append(text[i + 1:end - 1])
+                expr = ""
+            else:
+                expr += text[i:end]
+            i = end
+            continue
+        if ch == ")" and depth == 0:
+            break
+        if ch == "+" and depth == 0:
+            if expr.strip():
+                parts.append("{" + expr.strip() + "}")
+            expr = ""
+        else:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            expr += ch
+        i += 1
+    if expr.strip():
+        parts.append("{" + expr.strip() + "}")
+    return "".join(parts)
+
+
 def log_steps(body: str) -> List[str]:
     """The logStep narration in a method body, in call order."""
-    return LOG_STEP.findall(body or "")
+    text = body or ""
+    return [_step_text(text, match.end()) for match in LOG_STEP.finditer(text)]
 
 
 def acting_statements(body: str) -> List[str]:

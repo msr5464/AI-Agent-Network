@@ -43,7 +43,7 @@ _HELPER_NEW = re.compile(r"(\w+)\s+(\w+)\s*=\s*new\s+(\w+)\s*\(")
 # also bare `github.loginWithStoredSession();`
 _CALL = re.compile(r"(?:\w+\s+\w+\s*=\s*)?(\w+)\s*\.\s*(\w+)\s*\(([^)]*)\)\s*;")
 
-# `Map<String, String> credentials = sauceDemo.getCredentials("add_to_cart");`
+# `Map<String, String> user = sauceDemo.getUser("standard");`
 _DATA_READ = re.compile(r"(\w+)\s*=\s*(\w+)\s*\.\s*(\w+)\s*\(\s*\"([^\"]*)\"\s*\)\s*;")
 
 # `import automation.modules.naukari.NaukriProfileSummaryHelper;`
@@ -139,7 +139,7 @@ def extract(workspace, test_id: str) -> Dict:
     properties = dict(_PROPERTY_READ.findall(body))
     helpers = {var: cls for cls, var, ctor in _HELPER_NEW.findall(body) if cls == ctor}
     # variable -> (receiver, method, literal): credentials fetched through the
-    # helper itself, as SauceDemo's CSV-backed getCredentials("add_to_cart") is.
+    # helper itself, as SauceDemo's CSV-backed getUser("standard") is.
     data_reads = {var: (recv, meth, lit) for var, recv, meth, lit in _DATA_READ.findall(body)}
 
     for receiver, called, raw_args in _CALL.findall(body):

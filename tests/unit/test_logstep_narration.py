@@ -177,3 +177,17 @@ class TestAudit:
         }
         '''
         assert ln.audit(source, {}) == {}
+
+
+class TestLogSteps:
+
+    def test_values_joined_into_a_step_stay_in_its_text(self):
+        """Test data moved into CSVs, so steps are built from it. Stopping at the first
+        closing quote reported "Login, add " as the whole step."""
+        body = ('config.logStep("Login, add " + product.get("slug") + " to cart, and navigate to cart");\n'
+                'logStep(testConfig, "Fetch a post ID that does not exist (" + postId + ")");\n'
+                'config.logStep("Verify cart badge shows 1 item");\n')
+        assert ln.log_steps(body) == [
+            'Login, add {product.get("slug")} to cart, and navigate to cart',
+            'Fetch a post ID that does not exist ({postId})',
+            'Verify cart badge shows 1 item']

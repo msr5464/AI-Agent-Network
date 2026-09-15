@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -140,12 +141,11 @@ def read_reference_files() -> dict:
     """Read reference implementation files from Jarvis to show Claude the patterns."""
     ref_paths = [
         # One module end to end: SauceDemo's helper serves both its API and its web
-        # tests, which is the shape a generated module needs. Its data classes keep
-        # the name of the entity they model (Post*), hence listed by name.
-        "src/main/java/automation/modules/saucedemo/PostData.java",
-        "src/main/java/automation/modules/saucedemo/PostBuilder.java",
+        # tests, which is the shape a generated module needs.
+        "src/main/java/automation/modules/saucedemo/SauceDemoData.java",
+        "src/main/java/automation/modules/saucedemo/SauceDemoBuilder.java",
         "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
-        "src/main/java/automation/modules/saucedemo/api/PostApi.java",
+        "src/main/java/automation/modules/saucedemo/api/SauceDemoApi.java",
         # The only page object here, and it earns its place: without one, the model
         # has never seen a real `extends BasePage` import block and infers the
         # package from the directory it is writing into — modules/<f>/web/ became
@@ -1387,7 +1387,7 @@ Rules (MANDATORY — violations will cause compilation failures):
       Do NOT look at what methods are available on the helper — look at what the existing test
       METHODS actually call. Valid patterns (use whichever the existing methods already use):
         • config.getRunTimeProperty("feature.username") / "feature.password" → helper.doLogin(u, p)
-        • sauceDemo.doLogin(sauceDemo.getCredentials("scenario"))   (a CSV row looked up by scenario)
+        • user = sauceDemo.getUser("standard") → sauceDemo.doLogin(user)   (a CSV row looked up by key)
         • github.loginWithStoredSession()                          (a saved storage state)
       NEVER introduce a new credential mechanism (e.g. getCredentials(), CSV lookup, allocateUser())
       if the existing test methods don't already use it.
@@ -1642,6 +1642,15 @@ Return ONLY a JSON object, no prose:
             log(f"  BLOCKED: {rel_path} has a credential column — credentials belong in "
                 f"the properties file, not a committed CSV")
             continue
+        if rel_path.endswith(".csv"):
+            lost_rows = _lost_csv_rows(read_existing_file(rel_path), content)
+            if lost_rows:
+                # Other tests look these rows up by key, and step 04 runs only the
+                # generated test, so a dropped or edited row would ship unnoticed.
+                log(f"  BLOCKED: {rel_path} would drop or change {len(lost_rows)} existing "
+                    f"row(s) other tests read, e.g. {lost_rows[0][:80]!r} — keep every "
+                    f"existing row as it is and append new ones")
+                continue
         for a_line, a_text, n_line, n_text in unsettled_navigations(content):
             log(f"  WARNING: {Path(rel_path).name}:{n_line} navigates while the "
                 f"action on line {a_line} may still be navigating — Playwright will "
@@ -1828,6 +1837,22 @@ def _is_credential_csv(header: str) -> bool:
     columns = (re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column).strip().lower()
                for column in (header or "").split(","))
     return any(_CREDENTIAL_COLUMN.search(column) for column in columns)
+
+
+def _lost_csv_rows(existing: str, updated: str) -> list:
+    """Rows of an existing CSV that the regenerated file no longer contains.
+
+    The prompt asks for every existing row back unchanged; this checks it. Where a
+    new row lands is free, so rows are matched as a multiset, not by position.
+    """
+    remaining = Counter(line.strip() for line in updated.splitlines() if line.strip())
+    lost = []
+    for line in (row.strip() for row in existing.splitlines() if row.strip()):
+        if remaining[line]:
+            remaining[line] -= 1
+        else:
+            lost.append(line)
+    return lost
 
 
 def _plan_csv_files(feature_lower: str) -> list:

@@ -311,11 +311,13 @@ class TestCsvTestData:
         mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
         csv_dir = mod.AUTOMATION_FRAMEWORK_DIR / "src/test/resources/saucedemo/csvFiles"
         csv_dir.mkdir(parents=True)
-        # The two sheets the real framework has: one credential sheet, one data sheet.
-        (csv_dir / "saucedemo-testdata.csv").write_text("scenario,environment,username,password,role\n")
-        (csv_dir / "saucedemo-posts.csv").write_text("scenario,title,body,userId\n")
+        # The sheets the real framework has: one credential sheet, two data sheets.
+        (csv_dir / "users.csv").write_text("user_key,environment,username,password,role\n")
+        (csv_dir / "products.csv").write_text("product_key,environment,slug,title\n")
+        (csv_dir / "posts.csv").write_text("post_key,environment,postId,userId,title,body,limit\n")
         assert mod._plan_csv_files("saucedemo") == [
-            "src/test/resources/saucedemo/csvFiles/saucedemo-posts.csv"]
+            "src/test/resources/saucedemo/csvFiles/posts.csv",
+            "src/test/resources/saucedemo/csvFiles/products.csv"]
         assert mod._plan_csv_files("newmodule") == [
             "src/test/resources/newmodule/csvFiles/newmodule-data.csv"]
 
@@ -329,6 +331,23 @@ class TestCsvTestData:
     def test_credential_columns_are_recognised(self, tmp_path, monkeypatch, header, credential):
         mod = _load_action("03_generate.py", tmp_path, monkeypatch)
         assert mod._is_credential_csv(header) is credential
+
+    def test_a_rewrite_may_add_rows_but_never_lose_one(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        existing = ("product_key,environment,slug\n"
+                    "backpack,staging,sauce-labs-backpack\n"
+                    "bike_light,staging,sauce-labs-bike-light\n")
+        # Appended, or inserted beside its siblings: every row other tests read survives.
+        assert mod._lost_csv_rows(existing, existing + "onesie,staging,sauce-labs-onesie\n") == []
+        assert mod._lost_csv_rows(existing, existing.replace(
+            "backpack,", "onesie,staging,sauce-labs-onesie\nbackpack,")) == []
+        # Dropped or edited: named, so the write is refused.
+        assert mod._lost_csv_rows(existing, existing.replace(
+            "bike_light,staging,sauce-labs-bike-light\n", "")) == [
+            "bike_light,staging,sauce-labs-bike-light"]
+        assert mod._lost_csv_rows(existing, existing.replace("-bike-light", "-light")) == [
+            "bike_light,staging,sauce-labs-bike-light"]
+        assert mod._lost_csv_rows("", "product_key\nonesie\n") == []
 
 
 class TestInterleavedStepLabels:
