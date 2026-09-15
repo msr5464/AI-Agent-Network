@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -46,10 +47,12 @@ from qa_agents_server.paths import (
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+from qa_agents_server import metrics_reader
 from qa_agents_server.agents import (
     AgentConfigError,
     AgentSpec,
     DEFAULT_AGENT,
+    effective_auto_push,
     get_agent,
 )
 
@@ -58,11 +61,10 @@ from qa_agents_server.agents import (
 AGENT = DEFAULT_AGENT
 MAX_BUFFERED_EVENTS = 10_000
 AUDIT_POLL_INTERVAL = 0.5  # seconds
-CANCEL_GRACE_SECONDS = 5
 # Whole-pipeline (run.sh, all 5 steps) kill timeout — not just one step's budget.
 # Worst case with current per-step defaults: step02 alone can now take up to
 # VALIDATE_WEB_TIMEOUT_S x (1+VALIDATE_WEB_RETRY_ATTEMPTS) = 1800x2 = 3600s;
-# step04's fix loop can take MAX_FIX_ATTEMPTS x ~600s = ~1800s; steps 01/03/05
+# step04's fix loop can take AUTHORING_FIX_RETRY_COUNT x ~600s = ~1200s; steps 01/03/05
 # add roughly another 1500s combined — so a 1800s default was already shorter
 # than step02 alone could legitimately take even before its retry loop existed.
 DEFAULT_RUN_TIMEOUT = 7200  # 2h
@@ -109,19 +111,44 @@ class RunState:
     events: Deque[Event] = field(default_factory=lambda: deque(maxlen=MAX_BUFFERED_EVENTS))
     seq_counter: int = 0
     step_progress: Dict[str, str] = field(default_factory=dict)  # key -> 'running'|'done'
+    # Parallel to step_progress rather than folded into it: step_progress is the
+    # state machine (six string comparisons across two threads depend on its
+    # shape), and timing has no business inside that.
+    step_metrics: Dict[str, dict] = field(default_factory=dict)  # key -> {started_at,...}
     proc: Optional[subprocess.Popen] = None
     cond: threading.Condition = field(default_factory=threading.Condition)
     start_from_step: int = 1  # >1 means this run resumed an existing session
     agent: str = DEFAULT_AGENT
+    # The base this run was asked for, or "" when it took whatever config/.env
+    # says. Empty is meaningful and not a synonym for "main": it is the only
+    # thing that distinguishes a deliberate override from the org default.
+    # Down here rather than beside auto_push because the fields above it have
+    # no defaults, and a dataclass will not take a defaulted field before them.
+    base_branch: str = ""
     payload: Dict = field(default_factory=dict)
+    user_id: str = "default"
+    # Stored, not recomputed from QA_WORKTREE_TEMP_DIR at teardown time: the
+    # admin Agent Settings page can change that variable while runs are in
+    # flight, and cleanup would then look for a path that never existed and
+    # silently leak both the directory and its .git/worktrees admin entry.
+    worktree_path: str = ""
+    # Where the run actually executed. In an isolated run this is the worktree;
+    # in a local-checkout run it is the developer's own clone, which must never
+    # be handed to worktree_path above — that field is what teardown deletes.
+    work_dir: str = ""
+    # AUTO_PUSH=false: the run works in the developer's checkout, on top of their
+    # uncommitted changes, and leaves its edits there uncommitted for review.
+    local_mode: bool = False
 
     def snapshot(self) -> Dict:
         """Persistable snapshot (no Popen, no threading primitives)."""
         return {
             "session_id": self.session_id,
+            "user_id": self.user_id,
             "agent": self.agent,
             "module": self.module,
             "auto_push": self.auto_push,
+            "base_branch": self.base_branch,
             "audit_dir": str(self.audit_dir),
             "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -129,16 +156,99 @@ class RunState:
             "exit_code": self.exit_code,
             "pid": self.pid,
             "start_from_step": self.start_from_step,
+            # Totals only — the per-stage detail stays in the session's
+            # metrics.json rather than bloating every registry entry.
+            "metrics": self.metrics_totals,
         }
+
+    @property
+    def metrics_totals(self) -> Dict:
+        try:
+            from qa_agents_server import metrics_reader
+            return metrics_reader.summary_fields(
+                metrics_reader.read_session_metrics(self.audit_dir))
+        except Exception:
+            return {}
 
 
 # ── Module state ──────────────────────────────────────────────────────────────
 _runs: Dict[str, RunState] = {}
-_active_session_id: Optional[str] = None
+_active_runs: Dict[str, RunState] = {}
+# Session ids that have passed the capacity gate but do not yet have a RunState:
+# preparing a run means cloning and creating a git worktree, which can take
+# minutes, and that used to happen while _registry_lock was held — blocking
+# GET /run/active and every other registry reader for the duration. The slot is
+# reserved here instead, so capacity stays correct while the git work runs
+# unlocked. Guarded by _registry_lock.
+_starting: set = set()
+# Session ids of local-checkout runs between the capacity gate and the registry
+# insert. Without it two dry runs fired together both see an empty _active_runs
+# and start in the same working tree.
+_starting_local: set = set()
 _registry_lock = threading.Lock()
 
+
+def _local_slot_busy() -> bool:
+    """Is the developer's checkout already in use? Caller holds _registry_lock.
+
+    One working tree cannot host two runs: they would read each other's edits
+    and each other's test output. Isolated worktree runs stay parallel — only
+    local-vs-local contends.
+    """
+    return bool(_starting_local) or any(r.local_mode for r in _active_runs.values())
+
+
+def max_concurrent_runs() -> int:
+    try:
+        return int(os.environ.get("QA_MAX_CONCURRENT_RUNS", "4"))
+    except ValueError:
+        return 4
+
+
+DEFAULT_WORKTREE_TEMP_DIR = "/tmp/qa-runs"
+# Paths a worktree root must never be. reconcile_on_boot deletes directories
+# under this root, so an admin typing "/" or "$HOME" into the Agent Settings box
+# would otherwise turn the next boot into a recursive delete of their home.
+# Compared as RESOLVED paths: on macOS /tmp is a symlink to /private/tmp, so a
+# literal string set silently missed the likeliest typo of the lot.
+_FORBIDDEN_WORKTREE_ROOTS = {"/", "/home", "/Users", "/tmp", "/var", "/etc", "/usr",
+                             "/private/tmp", "/private/var", "/private/etc"}
+
+
+def _worktree_temp_dir() -> str:
+    """The worktree root, or the default when the configured value is unsafe.
+
+    Validated on every read rather than at save time, because the value can also
+    arrive from the environment and from config/.env, neither of which goes
+    through the settings validator.
+    """
+    raw = (os.environ.get("QA_WORKTREE_TEMP_DIR") or "").strip()
+    if not raw:
+        return DEFAULT_WORKTREE_TEMP_DIR
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return DEFAULT_WORKTREE_TEMP_DIR
+    forbidden = set()
+    for candidate in _FORBIDDEN_WORKTREE_ROOTS:
+        forbidden.add(candidate)
+        try:
+            forbidden.add(str(Path(candidate).resolve()))
+        except (OSError, RuntimeError):
+            pass
+    if not resolved.is_absolute() or str(resolved) in forbidden:
+        print(f"[runner] refusing unsafe QA_WORKTREE_TEMP_DIR {raw!r}; "
+              f"using {DEFAULT_WORKTREE_TEMP_DIR}")
+        return DEFAULT_WORKTREE_TEMP_DIR
+    home = Path.home().resolve()
+    if resolved == home or resolved == home.parent:
+        print(f"[runner] refusing unsafe QA_WORKTREE_TEMP_DIR {raw!r}; "
+              f"using {DEFAULT_WORKTREE_TEMP_DIR}")
+        return DEFAULT_WORKTREE_TEMP_DIR
+    return str(resolved)
+
 # ── Pending queue ─────────────────────────────────────────────────────────────
-# Each entry: {"agent": str, "payload": dict, "module": str, "auto_push": bool}
+# Each entry: {"agent": str, "payload": dict, "module": str, "auto_push": bool, "user_id": str}
 _pending_queue: List[Dict] = []
 # Set once shutdown begins. Killing the active run makes its reaper try to start
 # the next queued item, which would spawn fresh work while the server is on its
@@ -163,18 +273,65 @@ class _QueuedNotification(Exception):
 
 
 def _start_next_from_queue() -> None:
-    """Pick the first pending item and start it. Runs in the reap thread."""
-    with _queue_lock:
-        if _shutting_down.is_set() or not _pending_queue:
+    """Pick the next pending item and start it. Runs in the reap thread.
+
+    Lock order is REGISTRY BEFORE QUEUE, everywhere, without exception — see
+    _unique_session_id, which depends on both being held in that order. This
+    function used to take them the other way round (queue, then registry) while
+    start_run took them registry-then-queue, which is a textbook ABBA deadlock:
+    a run finishing at the same moment as a run starting would wedge the entire
+    run subsystem, permanently, along with every endpoint that touches either
+    lock. Snapshotting the active counts under _registry_lock and RELEASING it
+    before taking _queue_lock is what keeps the order honest here.
+    """
+    while True:
+        if _shutting_down.is_set():
             return
-        next_item = _pending_queue.pop(0)
-    try:
-        start_run(next_item.get("payload", {}),
-                  agent=next_item.get("agent", DEFAULT_AGENT),
-                  session_id=next_item.get("session_id"),
-                  start_from_step=next_item.get("start_from_step", 1))
-    except Exception as e:
-        print(f"[runner] failed to start queued run for {next_item.get('module')!r}: {e}")
+
+        with _registry_lock:
+            active_counts: Dict[str, int] = {}
+            for r in _active_runs.values():
+                active_counts[r.user_id] = active_counts.get(r.user_id, 0) + 1
+            local_busy = _local_slot_busy()
+
+        with _queue_lock:
+            if _shutting_down.is_set() or not _pending_queue:
+                return
+            # A local-checkout run whose checkout is still occupied is skipped
+            # rather than started-and-requeued: start_run would push it back and
+            # this function would return, stranding every isolated run queued
+            # behind it until something else finished.
+            eligible = [i for i in range(len(_pending_queue))
+                        if not (local_busy and _pending_queue[i].get("local_mode"))]
+            if not eligible:
+                return
+            # Fewest active runs wins; min() breaks ties by queue position, so
+            # one user firing ten runs cannot starve everyone queued behind them.
+            best_idx = min(
+                eligible,
+                key=lambda i: active_counts.get(
+                    _pending_queue[i].get("user_id", "default"), 0),
+            )
+            next_item = _pending_queue.pop(best_idx)
+
+        try:
+            start_run(next_item.get("payload", {}),
+                      agent=next_item.get("agent", DEFAULT_AGENT),
+                      session_id=next_item.get("session_id"),
+                      start_from_step=next_item.get("start_from_step", 1),
+                      user_id=next_item.get("user_id", "default"))
+            return
+        except _QueuedNotification:
+            # The pool refilled between our snapshot and the call, so start_run
+            # put it back. Whoever frees the next slot will pick it up.
+            return
+        except Exception as e:
+            print(f"[runner] failed to start queued run for {next_item.get('module')!r} "
+                  f"(session {next_item.get('session_id')}): {e}")
+            # Keep draining. Dropping the item AND returning would strand the
+            # rest of the queue forever whenever this was the last active run,
+            # because nothing else would ever call us again.
+            continue
 
 
 def _unique_session_id(spec, payload: dict) -> str:
@@ -194,7 +351,8 @@ def _unique_session_id(spec, payload: dict) -> str:
     against the existing registry-then-queue ordering.
     """
     base = spec.make_session_id(payload)
-    taken = {item.get("session_id") for item in _pending_queue} | set(_runs.keys())
+    taken = ({item.get("session_id") for item in _pending_queue}
+             | set(_runs.keys()) | set(_starting))
 
     candidate = base
     suffix = 2
@@ -204,42 +362,56 @@ def _unique_session_id(spec, payload: dict) -> str:
     return candidate
 
 
-def get_queue(agent: Optional[str] = None) -> List[Dict]:
+def get_queue(agent: Optional[str] = None,
+              user_id: Optional[str] = None) -> List[Dict]:
     """
     Return a snapshot of pending queue items.
 
-    The queue itself is global — the run slot is shared, because every agent
-    drives the same automation-repo checkout. But a caller asking on behalf of
-    one agent wants only its own rows, so `agent` filters them. Each row keeps
+    The queue is global — the worker pool is shared across agents and users —
+    but a caller asking on behalf of one agent wants only its own rows, so
+    `agent` filters them, and `user_id` filters to one person's. Each row keeps
     `index`, its position in the GLOBAL queue, which is what remove_from_queue
     takes; `position` is only the 1-based rank within the filtered view and is
     not a valid index once filtering is in play.
+
+    `mine` lets a UI show every row (so the wait is explicable) while marking
+    which ones the viewer may cancel.
     """
     with _queue_lock:
         rows = [{"agent": item.get("agent", DEFAULT_AGENT),
                  "module": item.get("module"), "auto_push": item.get("auto_push"),
+                 "base_branch": item.get("base_branch", ""),
                  "session_id": item.get("session_id"),
                  "start_from_step": item.get("start_from_step", 1),
+                 "user_id": item.get("user_id", "default"),
                  "index": i}
                 for i, item in enumerate(_pending_queue)]
     if agent:
         rows = [r for r in rows if r["agent"] == agent]
+    if user_id:
+        rows = [r for r in rows if r["user_id"] == user_id]
     for rank, row in enumerate(rows):
         row["position"] = rank + 1
+        row["mine"] = (user_id is not None and row["user_id"] == user_id)
     return rows
 
 
-def remove_from_queue(index: int, agent: Optional[str] = None) -> bool:
+def remove_from_queue(index: int, agent: Optional[str] = None,
+                      user_id: Optional[str] = None) -> bool:
     """
     Remove the item at 0-based GLOBAL index. Returns True if removed.
 
     `agent`, when given, must match the item's own agent — one panel must not
-    be able to delete another agent's queued run by index collision.
+    be able to delete another agent's queued run by index collision. `user_id`
+    is the same argument applied to people: None means "no ownership check"
+    (an admin), otherwise the row must belong to that user.
     """
     with _queue_lock:
         if not (0 <= index < len(_pending_queue)):
             return False
         if agent and _pending_queue[index].get("agent", DEFAULT_AGENT) != agent:
+            return False
+        if user_id is not None and _pending_queue[index].get("user_id", "default") != user_id:
             return False
         _pending_queue.pop(index)
         return True
@@ -305,6 +477,36 @@ def _kill_group(pid: int, label: str = "") -> bool:
     return True
 
 
+def _preserve_worktree_artefacts(run: "RunState") -> None:
+    """Copy a run's artefacts out of its worktree before the worktree is removed.
+
+    Screenshots, DOM snapshots and traces are written inside the ephemeral
+    worktree, which _wait_and_reap deletes as soon as the process exits — while
+    the audit record keeps pointing at those now-deleted paths. Copying
+    test-output/ into the session's audit directory (already an artefact root)
+    is what makes those links resolve after the run ends.
+
+    Best-effort by design: a run that produced nothing, or a partial copy, must
+    never turn a finished run into a failed one.
+    """
+    # work_dir, not worktree_path: a local-checkout run has no worktree, and
+    # reading the field that names one would skip artefact preservation for
+    # every dry run — the runs whose output a human is most likely to open.
+    work_dir = (run.work_dir or run.worktree_path or "").strip()
+    if not work_dir:
+        return
+    source = Path(work_dir) / "test-output"
+    if not source.is_dir():
+        return
+    destination = run.audit_dir / "test-output"
+    try:
+        if destination.exists():
+            return          # a resumed session already preserved this
+        shutil.copytree(source, destination, symlinks=False, dirs_exist_ok=True)
+    except Exception as e:
+        print(f"[runner] could not preserve artefacts for {run.session_id}: {e}")
+
+
 def _mark_interrupted(audit_dir: Path) -> None:
     """Leave a marker the status derivation can read.
 
@@ -345,6 +547,36 @@ def reconcile_on_boot() -> None:
                 _mark_interrupted(Path(entry["audit_dir"]))
 
     interrupted = storage.mark_all_running_as_interrupted()
+    
+    # Prune worktrees left behind by an interrupted or crashed server process.
+    #
+    # This used to rmtree EVERY subdirectory unconditionally, despite a comment
+    # claiming it checked whether they were still valid worktrees — so a second
+    # server instance (or a create_app() in a test) wiped the first instance's
+    # live runs, and a typo in the admin Settings box became recursive deletion
+    # of whatever was typed. It also pruned BEFORE removing, so the prune saw
+    # the directories still present, removed nothing, and left the
+    # .git/worktrees admin entries orphaned to collide with a later add.
+    try:
+        worktree_temp_dir = _worktree_temp_dir()
+        if worktree_temp_dir and Path(worktree_temp_dir).is_dir():
+            from shared import workspace as _workspace
+            main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""),
+                                            os.environ.get("GITHUB_REPO_AUTOMATION", ""))
+            if main_repo and main_repo.exists():
+                # A worktree whose session is still marked running belongs to
+                # another live server process — never touch it.
+                live = {r.get("session_id") for r in storage.load_all()
+                        if r.get("status") == "running"}
+                for wt_dir in Path(worktree_temp_dir).iterdir():
+                    if not wt_dir.is_dir() or wt_dir.name in live:
+                        continue
+                    _workspace.cleanup_worktree(str(main_repo), str(wt_dir))
+                # Prune AFTER removal, so the stale admin entries actually go.
+                _workspace._git(["worktree", "prune"], cwd=str(main_repo), timeout=120)
+    except Exception as e:
+        print(f"[runner] failed to prune orphaned worktrees: {e}")
+
     if killed:
         print(f"[runner] killed {len(killed)} orphaned run(s) left by a previous "
               f"server process: {', '.join(killed)}")
@@ -389,17 +621,75 @@ def shutdown_all() -> None:
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
-def get_active_session_id() -> Optional[str]:
-    return _active_session_id
+def get_active_session_id(user_id: str = "default") -> Optional[str]:
+    """One of this user's active runs. Prefer get_active_runs().
 
+    Returns the FIRST match, which is dict-ordering-dependent and therefore
+    arbitrary once a user has more than one run in flight — the reason a second
+    concurrent run was invisible in the UI. Kept because callers that genuinely
+    want a single session still use it.
+    """
+    with _registry_lock:
+        for run in _active_runs.values():
+            if run.user_id == user_id:
+                return run.session_id
+    return None
+
+
+def get_active_runs(user_id: str = "default",
+                    agent: Optional[str] = None) -> List[RunState]:
+    """Every run this user has in flight, oldest first.
+
+    Oldest first so the list is stable as runs come and go: a UI that renders
+    one tab per run must not have them reorder underneath the person using it.
+    """
+    with _registry_lock:
+        runs = [r for r in _active_runs.values() if r.user_id == user_id]
+    if agent:
+        runs = [r for r in runs if r.agent == agent]
+    return sorted(runs, key=lambda r: r.started_at)
+
+
+def capacity(user_id: Optional[str] = None) -> Dict:
+    """Worker-pool occupancy, for the UI's capacity indicator.
+
+    The server reported only a boolean `busy`, which cannot render "2 of 4
+    workers busy" — so the numerator and denominator were missing on the server
+    side as well as unused on the client side.
+    """
+    with _registry_lock:
+        active = len(_active_runs)
+        mine_active = sum(1 for r in _active_runs.values() if r.user_id == user_id) \
+            if user_id else 0
+    with _queue_lock:
+        queued = len(_pending_queue)
+        mine_queued = sum(1 for item in _pending_queue
+                          if item.get("user_id", "default") == user_id) if user_id else 0
+    maximum = max_concurrent_runs()
+    return {
+        "active": active,
+        "max": maximum,
+        "queued": queued,
+        "busy": active >= maximum,
+        "mine_active": mine_active,
+        "mine_queued": mine_queued,
+    }
 
 def get_run(session_id: str) -> Optional[RunState]:
     return _runs.get(session_id)
 
 
+def remove_history(session_ids: List[str]) -> None:
+    """Remove inactive runs from the in-memory registry."""
+    with _registry_lock:
+        for sid in session_ids:
+            if sid in _runs and sid not in _active_runs:
+                del _runs[sid]
+
+
 def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
               session_id: Optional[str] = None, start_from_step: int = 1,
-              **legacy) -> RunState:
+              user_id: str = "default", **legacy) -> RunState:
     """Spawn an agent's run.sh. Raises RunnerError on validation.
 
     payload is the request body; each AgentSpec turns it into environment
@@ -416,8 +706,6 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
 
     **legacy accepts the pre-multi-agent keyword form start_run(module=..., auto_push=...).
     """
-    global _active_session_id
-
     payload = dict(payload or {})
     if "module" in legacy or "auto_push" in legacy:
         payload.setdefault("module", legacy.get("module"))
@@ -446,14 +734,17 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
                 )
             payload["module"] = recovered
         payload["start_from_step"] = start_from_step
-    elif spec.name == DEFAULT_AGENT:
-        # Authoring only: the module file must already exist in the queue.
+    elif spec.queue_kind == "txt":
+        # Any agent fed by a human-authored queue file: it must already exist.
+        # Keyed on queue_kind rather than the agent name so a second .txt-queue
+        # agent gets the same 404 instead of dying inside run.sh with a bare
+        # non-zero exit and no API-level error.
         module = payload.get("module")
         if not module:
             raise RunnerError("module is required")
-        if feature_exists(module) is None:
+        if feature_exists(module, spec.name, user_id=user_id) is None:
             raise RunnerError(
-                f"module file not found: {module}.txt — create it first via "
+                f"queue file not found: {module}.txt — create it first via "
                 f"POST /agents/{spec.name}/queue",
                 status=404,
             )
@@ -471,35 +762,107 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
     if not spec.run_sh.exists():
         raise RunnerError(f"agent run.sh not found at {spec.run_sh}", status=500)
 
+    # Capacity gate and slot reservation. Everything slow — clone, fetch,
+    # worktree creation, spawn — happens AFTER this block releases the lock:
+    # holding _registry_lock across a git clone (300s timeout) blocked every
+    # registry reader, GET /run/active included, for as long as it took.
+    # AUTO_PUSH decides WHERE the run executes, not just whether a PR is raised:
+    # false means the developer's own checkout, uncommitted changes and all.
+    local_mode = not effective_auto_push(agent_env)
+
     with _registry_lock:
-        if _active_session_id is not None:
-            active = _runs.get(_active_session_id)
-            if active and active.status == "running":
-                # Queue instead of rejecting. The slot is deliberately global
-                # across agents: they all mutate the same automation-repo
-                # checkout, so overlapping runs would corrupt the working tree.
-                with _queue_lock:
-                    queued_session_id = (session_id if resuming
-                                         else _unique_session_id(spec, payload))
-                    _pending_queue.append({
-                        "agent": spec.name, "payload": payload,
-                        "module": label, "auto_push": bool(payload.get("auto_push")),
-                        "session_id": queued_session_id,
-                        "start_from_step": start_from_step,
-                    })
-                    position = len(_pending_queue)
-                raise _QueuedNotification(position, queued_session_id)
+        if (len(_active_runs) + len(_starting) >= max_concurrent_runs()
+                or (local_mode and _local_slot_busy())):
+            # Queue instead of rejecting.
+            with _queue_lock:
+                queued_session_id = (session_id if resuming
+                                     else _unique_session_id(spec, payload))
+                _pending_queue.append({
+                    "agent": spec.name, "payload": payload,
+                    "module": label, "auto_push": bool(payload.get("auto_push")),
+                    "base_branch": (payload.get("base_branch") or "").strip(),
+                    "local_mode": local_mode,
+                    "session_id": queued_session_id,
+                    "start_from_step": start_from_step,
+                    "user_id": user_id,
+                })
+                position = len(_pending_queue)
+            raise _QueuedNotification(position, queued_session_id)
 
         if not session_id:
             with _queue_lock:
                 session_id = _unique_session_id(spec, payload)
+        _starting.add(session_id)
+        if local_mode:
+            _starting_local.add(session_id)
+
+    try:
         audit_dir = spec.audit_dir / session_id
         audit_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create isolated git worktree for parallel execution
+        worktree_path = Path(_worktree_temp_dir()) / session_id
+
+        from shared import workspace as _workspace
+
+        main_repo = _workspace.ensure(
+            os.environ.get("WORKSPACE_DIR", ""),
+            os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+            org=os.environ.get("GITHUB_ORG", ""),
+            token=os.environ.get("GITHUB_TOKEN", ""),
+            branch=payload.get("base_branch") or os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
+        )
+        if not main_repo:
+            raise RunnerError("Automation repo not found and could not be cloned.", status=500)
+
+        if local_mode:
+            # AUTO_PUSH=false. Run where the developer is working: a worktree cut
+            # from origin/<base> cannot see the locator they broke on purpose or
+            # the credentials they refuse to commit, and the edits every agent
+            # promises to "leave uncommitted for review" would be deleted with
+            # the worktree seconds later.
+            #
+            # worktree_path stays EMPTY on the run record below. Teardown deletes
+            # whatever that field names, and it must never name this directory.
+            work_dir = main_repo
+        else:
+            work_dir = worktree_path
+            base_branch = payload.get("base_branch") or os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
+            wt_result = _workspace.prepare_worktree(
+                str(main_repo), str(worktree_path), base_branch
+            )
+            if not wt_result.get("ok"):
+                raise RunnerError(f"Failed to create isolated git worktree: {wt_result.get('reason')}", status=500)
 
         env = os.environ.copy()
         env.update(agent_env)
         env["SESSION_ID"] = session_id
         env["AUDIT_DIR"] = str(audit_dir)
+        env["USER_ID"] = user_id
+        env["FRAMEWORK_DIR"] = str(work_dir)
+        if local_mode:
+            # Tells shared/workspace.checkout_base to refuse: every agent has its
+            # own idea of when moving the checkout is safe, and none of them are
+            # right about a checkout the developer is standing in.
+            #
+            # HEALING_BASELINE_DIR is deliberately NOT dropped here. It is an
+            # absolute ${WORKSPACE_DIR}/${GITHUB_REPO_AUTOMATION}/... path, which
+            # in a local run already points inside the checkout being used.
+            env[_workspace.LOCAL_RUN_ENV] = "1"
+        else:
+            env["QA_ISOLATED_WORKTREE_READY"] = "1"
+            # Every other path pinned to the old checkout has to follow
+            # FRAMEWORK_DIR, and HEALING_BASELINE_DIR is one: inherited into a
+            # worktree run it splits the two halves — the Java framework writes
+            # its fingerprints into the developer's main checkout while ship reads
+            # baseline.repo_directory(worktree), which rejects an out-of-tree
+            # override and falls back inside the worktree. Ship then finds only
+            # the baselines the checkout came with, logs "none changed", and the
+            # PR carries a new page object with no baseline for it while the real
+            # one sits untracked in the main checkout forever. Dropping it makes
+            # both halves resolve the framework's own worktree-relative
+            # `baselineDir` instead.
+            env.pop("HEALING_BASELINE_DIR", None)
 
         # Captured BEFORE Popen() (not after) — _audit_watcher uses this as the
         # cutoff for "did THIS run's own subprocess actually write this file,
@@ -524,6 +887,7 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
             session_id=session_id,
             module=label,
             auto_push=bool(payload.get("auto_push")),
+            base_branch=agent_env.get("GITHUB_DEFAULT_BRANCH", ""),
             agent=spec.name,
             payload=payload,
             audit_dir=audit_dir,
@@ -531,9 +895,24 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
             proc=proc,
             pid=proc.pid,
             start_from_step=start_from_step,
+            user_id=user_id,
+            worktree_path="" if local_mode else str(worktree_path),
+            work_dir=str(work_dir),
+            local_mode=local_mode,
         )
+    except BaseException:
+        # The slot must not stay reserved after a failed start, or the pool
+        # leaks capacity until restart.
+        with _registry_lock:
+            _starting.discard(session_id)
+            _starting_local.discard(session_id)
+        raise
+
+    with _registry_lock:
+        _starting.discard(session_id)
+        _starting_local.discard(session_id)
         _runs[session_id] = run
-        _active_session_id = session_id
+        _active_runs[session_id] = run
 
     # Emit initial status event
     _append_event(run, "status", {
@@ -541,6 +920,7 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
         "agent": run.agent,
         "module": run.module,
         "auto_push": run.auto_push,
+        "base_branch": run.base_branch,
         "status": "running",
         "started_at": run.started_at,
         "start_from_step": start_from_step,
@@ -575,33 +955,35 @@ def cancel_run(session_id: str) -> bool:
 
     _append_event(run, "status", {"status": "cancelling"})
 
-    # Send SIGTERM to the entire process group (run.sh spawns python3 / mvn / claude).
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.terminate()
-        except OSError:
-            pass
+    # Set BEFORE signalling, so _wait_and_reap — which is already blocked in
+    # proc.wait() and wakes the instant the process dies — sees "cancelled"
+    # when it derives the final status. Without this the run reports "failed"
+    # (a non-zero exit from SIGTERM is indistinguishable from a real failure),
+    # the .cancelled marker never gets written, and shared/session.sh
+    # mis-reports the analytics row to match.
+    run.status = "cancelled"
 
-    # Give it a grace period, then SIGKILL if still alive.
-    def _escalate():
-        time.sleep(CANCEL_GRACE_SECONDS)
-        if proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+    # Escalate SIGTERM -> SIGKILL on the whole process group, in a thread so the
+    # HTTP request does not block for the grace period. run.sh itself does
+    # little; its children (claude, mvn, the JVM surefire forks) are what burn
+    # time and tokens, and a child that ignores SIGTERM would otherwise hold its
+    # slot until the 2h run timeout.
+    #
+    # Worktree teardown deliberately does NOT happen here: it is _wait_and_reap's
+    # job, once proc.wait() has actually returned. Removing it here raced the
+    # dying process, rm -rf-ing the directory out from under a still-running
+    # mvn/JVM that had it as cwd.
+    threading.Thread(
+        target=_kill_group,
+        args=(proc.pid, f"cancelled run {session_id} (pid {proc.pid})"),
+        daemon=True,
+        name=f"cancel-{session_id}",
+    ).start()
 
-    threading.Thread(target=_escalate, daemon=True).start()
-    run.status = "cancelled"  # _wait_and_reap will confirm once proc exits
     return True
 
 
-def subscribe_stream(session_id: str, offset: int) -> Generator[Event, None, None]:
+def subscribe_stream(session_id: str, offset: int = 0) -> Generator[Event, None, None]:
     """Generator yielding events from `offset` onward until the run terminates.
 
     Safe to call from a Flask SSE endpoint — does not hold any lock while
@@ -685,6 +1067,62 @@ def _step_file_is_fresh(run: RunState, idx: int, file_path: Path) -> bool:
         return False
 
 
+def _mark_step_running(run: RunState, key: str) -> dict:
+    """Stamp a step's start and return the payload extras for its event."""
+    slot = run.step_metrics.setdefault(key, {})
+    slot.setdefault("started_at", time.time())
+    return {"started_at": slot["started_at"]}
+
+
+def _mark_step_done(run: RunState, key: str) -> dict:
+    """Close a step's timing and fold in whatever the agent recorded for it.
+
+    The poller only knows "the moment I noticed the file", which is up to one
+    poll interval late and meaningless for the first step. Where the agent wrote
+    an exact duration into stages.jsonl, that wins.
+    """
+    slot = run.step_metrics.setdefault(key, {})
+    slot["ended_at"] = time.time()
+    if slot.get("started_at"):
+        slot["duration_s"] = round(slot["ended_at"] - slot["started_at"], 3)
+
+    try:
+        session = metrics_reader.read_session_metrics(run.audit_dir)
+        exact = metrics_reader.step_metrics(session, key)
+        if exact:
+            slot.update(exact)          # agent-side duration_s overrides the estimate
+    except Exception:
+        pass
+    # Underscore-prefixed keys are our own bookkeeping, not part of the contract.
+    return {k: v for k, v in slot.items() if not k.startswith("_")}
+
+
+def _recorded_attempts(run: RunState, key: str) -> int:
+    """How many attempts the agent has recorded for this stage so far."""
+    try:
+        session = metrics_reader.read_session_metrics(run.audit_dir)
+        return int((metrics_reader.step_metrics(session, key) or {}).get("attempts") or 1)
+    except Exception:
+        return 1
+
+
+def _run_metrics(run: RunState) -> dict:
+    """Run-level totals plus the stage breakdown, for the terminal event.
+
+    Rebuilds from the JSONL streams when the agent never wrote metrics.json,
+    so a killed run still reports what it spent.
+    """
+    try:
+        session = metrics_reader.read_session_metrics(run.audit_dir)
+        if not session:
+            return {}
+        data = metrics_reader.totals(session)
+        data["stages"] = metrics_reader.stage_list(session)
+        return data
+    except Exception:
+        return {}
+
+
 def _audit_watcher(run: RunState) -> None:
     """Poll the audit dir and emit step events as JSON files appear.
 
@@ -710,14 +1148,49 @@ def _audit_watcher(run: RunState) -> None:
             run.step_progress[first_key] = "running"
             _append_event(run, "step", {
                 "key": first_key, "display": first_display, "status": "running",
+                **_mark_step_running(run, first_key),
             })
+
+    stages_path = run.audit_dir / "metrics" / "stages.jsonl"
+    last_stages_mtime = [0.0]
 
     while True:
         if run.proc is None:
             return
         # Scan for new step files
+        # A retried stage rewrites its own JSON file and appends another line to
+        # stages.jsonl. Watching that file's mtime costs one stat() per poll and
+        # is what lets a retry be noticed at all — without it the live stream
+        # keeps reporting attempt 1's time and cost while the replayed stream
+        # shows the summed total, so the same run reads differently before and
+        # after a page reload.
+        try:
+            stages_mtime = stages_path.stat().st_mtime
+        except OSError:
+            stages_mtime = 0.0
+        stages_changed = stages_mtime > last_stages_mtime[0]
+        if stages_changed:
+            last_stages_mtime[0] = stages_mtime
+
         for idx, (key, fname, display) in enumerate(steps):
-            if run.step_progress.get(key) in ("done", "failed"):
+            prior = run.step_progress.get(key)
+            if prior in ("done", "failed"):
+                if not stages_changed:
+                    continue
+                attempts = _recorded_attempts(run, key)
+                slot = run.step_metrics.setdefault(key, {})
+                if attempts <= int(slot.get("_emitted_attempts") or 1):
+                    continue
+                slot["_emitted_attempts"] = attempts
+                # The retry rewrote the step's file: judge that outcome, not the
+                # previous attempt's, or a fix that passed on attempt 2 stays red.
+                status = "failed" if _step_has_error(
+                    _safe_load_json(run.audit_dir / fname)) else "done"
+                run.step_progress[key] = status
+                _append_event(run, "step", {
+                    "key": key, "display": display, "status": status,
+                    **_mark_step_done(run, key),
+                })
                 continue
             file_path = run.audit_dir / fname
             if file_path.exists() and _step_file_is_fresh(run, idx, file_path):
@@ -729,8 +1202,12 @@ def _audit_watcher(run: RunState) -> None:
                 # vocabulary to tell the two apart.
                 step_status = "failed" if _step_has_error(_safe_load_json(file_path)) else "done"
                 run.step_progress[key] = step_status
+                payload = _mark_step_done(run, key)
+                run.step_metrics.setdefault(key, {})["_emitted_attempts"] = \
+                    int(payload.get("attempts") or 1)
                 _append_event(run, "step", {
                     "key": key, "display": display, "status": step_status,
+                    **payload,
                 })
                 # Mark the next step as running (if any, and regardless of
                 # whether THIS step failed — the pipeline still runs the next
@@ -742,6 +1219,7 @@ def _audit_watcher(run: RunState) -> None:
                         run.step_progress[next_key] = "running"
                         _append_event(run, "step", {
                             "key": next_key, "display": next_display, "status": "running",
+                            **_mark_step_running(run, next_key),
                         })
         if run.proc.poll() is not None:
             # Nothing left to do here — _wait_and_reap runs its own
@@ -755,8 +1233,6 @@ def _audit_watcher(run: RunState) -> None:
 
 def _wait_and_reap(run: RunState) -> None:
     """Wait for the subprocess to exit, determine final status, emit done."""
-    global _active_session_id
-
     proc = run.proc
     if proc is None:
         return
@@ -801,6 +1277,27 @@ def _wait_and_reap(run: RunState) -> None:
         final_status = "failed"
     run.status = final_status
 
+    # Preserve anything the run left in the worktree before tearing it down.
+    # /tmp/qa-runs is an artefact root (see routes._artefact_roots), but the
+    # worktree is removed here, BEFORE the terminal "done" event — so every
+    # artefact link pointing into it was a guaranteed 404 by the time the UI
+    # could follow it.
+    _preserve_worktree_artefacts(run)
+
+    # Cleanup worktree on completion. run.worktree_path is what this run was
+    # actually given; re-deriving it from QA_WORKTREE_TEMP_DIR meant a settings
+    # change mid-flight leaked the directory and its .git admin entry forever.
+    try:
+        worktree_path = run.worktree_path
+        if worktree_path:
+            from shared import workspace as _workspace
+            main_repo = _workspace.expected(os.environ.get("WORKSPACE_DIR", ""),
+                                            os.environ.get("GITHUB_REPO_AUTOMATION", ""))
+            if main_repo and Path(worktree_path).exists():
+                _workspace.cleanup_worktree(str(main_repo), str(worktree_path))
+    except Exception as e:
+        print(f"[runner] failed to cleanup worktree for {run.session_id}: {e}")
+
     # Authoritative final sweep — _audit_watcher polls on its own schedule
     # (every AUDIT_POLL_INTERVAL) and can lose the race against THIS thread for
     # a fast-finishing run: proc.wait() above returns the instant the process
@@ -824,10 +1321,27 @@ def _wait_and_reap(run: RunState) -> None:
             run.step_progress[_key] = _step_status
             _append_event(run, "step", {
                 "key": _key, "display": _display, "status": _step_status,
+                **_mark_step_done(run, _key),
+            })
+        elif run.step_progress.get(_key) == "running":
+            # _audit_watcher marks the NEXT step "running" as soon as the previous
+            # one lands, which is right while a run is in flight and wrong once it
+            # has ended: a run that stops early — EXPLORE_ONLY, an escalation, a
+            # skip — leaves that optimistic chip spinning forever in the live UI.
+            # The replayed stream never had this problem because it only reports
+            # steps that actually produced a file, so the two views disagreed about
+            # the same run. The process has already exited here, so a step with no
+            # output did not run.
+            run.step_progress[_key] = "skipped"
+            _append_event(run, "step", {
+                "key": _key, "display": _display, "status": "skipped",
             })
 
-    # Load ship data for the terminal event payload
-    ship_path = run.audit_dir / "05-ship.json"
+    # Load ship data for the terminal event payload. The filename comes from the
+    # agent's own step model: this was hardcoded to authoring's "05-ship.json",
+    # so a healing run (whose ship step is 02-ship.json) never carried pr_url on
+    # the live stream — only the replay path through audit_reader compensated.
+    ship_path = run.audit_dir / get_agent(run.agent).steps[-1][1]
     pr_url = None
     verdict = None
     test_passed = None
@@ -858,15 +1372,34 @@ def _wait_and_reap(run: RunState) -> None:
         "ship_detail": ship_detail,
         "ended_at": run.ended_at,
         "duration": run.ended_at - run.started_at,
+        "metrics": _run_metrics(run),
     })
+
+    # The agent writes its own analytics row at the end of run.sh, which is what
+    # covers plain `make run` invocations the server never sees. This second call
+    # is the fallback for a run whose run.sh was SIGKILLed and never got there.
+    # Duplicate session ids are resolved newest-wins at read time.
+    try:
+        from qa_agents_server import analytics
+        # user_id was the one field never passed, though it sits right here on
+        # the run. Every row was therefore written as "default", which query()
+        # rewrites to the hardcoded admin id — so ALL cost was attributed to the
+        # admin and every member's analytics dashboard was empty.
+        analytics.append_from_session(run.audit_dir, agent=run.agent,
+                                      status=final_status, exit_code=exit_code,
+                                      module=run.module, started_at=run.started_at,
+                                      ended_at=run.ended_at, auto_push=run.auto_push,
+                                      user_id=run.user_id)
+    except Exception:
+        pass
 
     # Persist final snapshot
     storage.upsert(run.snapshot())
 
     # Clear active run marker
     with _registry_lock:
-        if _active_session_id == run.session_id:
-            _active_session_id = None
+        if run.session_id in _active_runs:
+            del _active_runs[run.session_id]
 
     # Kick off the next queued run, if any
     _start_next_from_queue()

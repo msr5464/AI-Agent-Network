@@ -33,11 +33,142 @@ run.sh (orchestrator)
 | Step | Owns | Does NOT do |
 |------|------|-------------|
 | **01 Parse** | Read plain text, call Claude, produce plan JSON | No file writes to Thanos-pw |
-| **02 Validate API** | Real HTTP auth + safe-endpoint calls against `api_base_url`, no LLM | Never call unsafe (POST/PUT/DELETE or path-param) endpoints |
+| **02 Validate API** | Real HTTP auth + a real call to every endpoint against `api_base_url` — the input's `curl` where it gave one (run without a shell), no LLM | Never call a path-param endpoint whose value is unknown and has no curl; never treat a body-less POST/PUT/DELETE status as the endpoint's real one |
 | **02 Validate Web** | Drive the browser via Playwright MCP, collect confirmed selectors | No Java codegen |
 | **03 Generate** | Write all Java files to Thanos-pw | No test running |
 | **04 Run & Fix** | Run mvn test, call Claude to fix failures, retry | No git push |
 | **05 Ship** | Branch + commit + push + PR creation | No AI calls |
+
+### What "confirmed" means in step 02
+
+Every locator in `02-validate-web.json` — both the `selectors` map and the
+`interaction_hints` list, since step 03 generates from both — has been measured in
+the live browser at **exactly one matching element**. Anything else is dropped
+before the file is written:
+
+| Case | Outcome |
+|------|---------|
+| `SELECTOR_FOUND` with `count=1` and `visible=1` | kept |
+| `SELECTOR_FOUND` with `count != 1` | dropped — would be a runtime strict mode violation |
+| `SELECTOR_FOUND` with `visible != 1` | dropped — a locator nobody can see makes a test fail for an invisible reason |
+| `SELECTOR_FOUND` with no `count` at all | dropped — never measured, so not confirmed |
+| `SELECTOR_FOUND` with no `visible` at all | kept, recorded as visibility-unmeasured (a pre-protocol cached run must not empty the map) |
+| `INTERACTION_HINT` whose name has a confirmed selector | kept, with the hint's selector **replaced by the confirmed one** |
+| `INTERACTION_HINT` with no confirmed selector and no `count: 1` | dropped |
+
+The hint rules exist because a hint records an element the model *interacted with*,
+including ones an interaction then failed on — an observed run hinted a profile edit
+icon as `img[alt='PencilSimple']`, found clicking it did nothing, and confirmed the
+parent `span` instead, leaving a hint pointing at the element that does not work.
+
+A run that confirms nothing is retried once; if it still confirms nothing, step 03
+aborts rather than generating from guesses (override with `ALLOW_MISSING_SELECTORS`).
+
+Every dropped selector is recorded in `rejected_selectors` with its reason, so
+"why is there no locator for the toast?" has an answer in the audit trail rather
+than in a console line that has scrolled away.
+
+### What a step outcome means
+
+A step has three outcomes, not two. The third exists because "I did the action but
+could not observe what it claims" used to collapse into a pass — which is how a run
+reported `STEP_PASSED: Verify a success confirmation toast appears` for a toast that
+never rendered, reasoning from the save API returning 200.
+
+| Marker | Meaning |
+|--------|---------|
+| `STEP_PASSED` | the step's claim was observed. For a claim about a UI element that means **seeing the element**; a network response is never proof one rendered |
+| `STEP_UNVERIFIED` | the action completed, the claimed outcome was never observed |
+| `STEP_FAILED` | the step could not be performed |
+
+This is enforced, not requested: a verification step reported as passed with no
+`SELECTOR_FOUND` for the element it claims to have seen is downgraded to unverified
+in Python (`enforce_verification_evidence`). Step outcomes were the last self-report
+in this step that nothing checked.
+
+### Assertions vs mechanisms
+
+The two halves of a test are treated very differently, following the rule
+`shared/intent.py` already states — *the mechanism becomes mutable and the proof
+does not*.
+
+**A verification names the proof, and it is fixed.** What happens to one step 02
+could not observe depends on who asked for it (`shared/check_provenance.py` decides,
+by measuring the check's vocabulary against the author's own words — never by
+trusting the model's claim about itself):
+
+| Check | Outcome |
+|-------|---------|
+| the input asked for it | **kept at full strength.** The test fails on purpose, the PR says why, and the verdict is NEEDS-REVIEW. The product does not do what was asked — that is a finding |
+| the pipeline invented it | **dropped entirely** — locator, accessor and assertion. A failing check nobody asked for is exactly what gets "fixed" by deleting it |
+
+Dropping is the irreversible direction, so it needs the harder test: a check is only
+dropped when *nothing* in it traces back to the input. A partly-traceable check is
+kept and the test goes red, because a wrongly-kept check is visible and a wrongly-
+dropped one is silent.
+
+**An action names an outcome, and the mechanism is ours to find.** "Save the profile"
+does not mean "there is a Save button" — Naukri's profile summary autosaves about a
+second after the last keystroke. When an action's named control is not visible, step
+02 discovers how the outcome actually happens (rule 2e) and reports
+`MECHANISM_FOUND: <action>|<kind>|<trigger>|<settles when>`, which step 03 generates
+from. An action step never becomes an unverified check.
+
+### What step 04 may not do
+
+A fix may change how the test reaches its result; it may not change the result it
+proves. Every assertion reachable from the test method is fingerprinted **before the
+first run** into `.assertions-frozen.json`, and each attempt is compared against that
+frozen copy with `shared/assertion_graph.conserved()` — so attempt 3 cannot launder a
+weakening introduced by attempt 2. An assertion removed, moved down a strength ladder
+(`assertEquals` → `assertNotNull`), wrapped in a condition, or given a different
+expected value rejects the **whole** fix and rolls every file back. `FORCE=true`
+overrides it, matching test-healing-agent.
+
+An expected value may differ only in whitespace or letter case: `"$175.00"` →
+`"$ 175.00"` is the page's formatting, `"$175.00"` → `"$ 0.00"` is a new expectation.
+Before this, any changed literal read as a *removed* assertion, so the correct
+formatting fix was rejected along with the bug-hiding one. Identical assertions in one
+method are fingerprinted separately (`<hash>_1`, `<hash>_2`), so deleting one of a
+pair is caught too.
+
+This exists because none of the six per-file guards could see it: deleting an
+assertion is a one-line diff that loses no method, adds no `Thread.sleep`, and is
+invisible to `no_selector_broadening`, which only inspects `page.locator(...)` calls.
+
+### When step 04 stops retrying
+
+`AUTHORING_FIX_RETRY_COUNT` is a **ceiling, not a target**. A budget bounds the worst
+case; it cannot tell a real attempt from a repeat of one. So the loop also stops the
+moment it can prove the next attempt would not differ, which is the whole reason the
+budget could come down from 4 to 2.
+
+Three proofs, all in `shared/fix_history.py`:
+
+| Stop | Why another attempt cannot help |
+|------|--------------------------------|
+| the model returned `edits: []` | It reports it cannot fix this from the files it can see. That is an answer. Nothing on disk has changed since the failing run, so re-running maven reproduces a known result |
+| the same guard rejected everything **twice running** | The first rejection earns a retry, because the model had not yet been told why. The second was made *with* that reason in the prompt |
+| the proposed edits repeat an earlier attempt's | Matched on exact content hashes. Identical edits, identical result |
+
+All three write the `stuck` gate, not `false` — the test genuinely ran and genuinely
+failed, which is not an infra `skipped` where it never got a fair shot. The stored
+`reason` is what the PR body and the Slack alert quote.
+
+**Every attempt is recorded in `.fix-history.json`, appended and never overwritten**,
+and rendered into the next prompt. This is what makes attempt N differ from attempt N-1:
+
+- `04-run-and-fix.json` is overwritten each attempt, so on its own it gave attempt 3 no
+  way to know what attempt 1 tried — and attempt 3 was free to re-propose it.
+- Guard rejections used to reach disk and the ship verdict but never a prompt. The model
+  was told "try something different" without being told what it had done wrong, and the
+  run burned its budget re-triggering the same guard.
+
+An attempt whose fixes were all rejected also **carries the previous attempt's failure
+context forward** rather than writing a result without it. Dropping it blanked the next
+prompt's `<structured_failure_report>`, made the `stuck` check unreachable, and — via
+`run_started_at=0.0` — silently disabled `gather_runtime_evidence`'s freshness gate, so
+the next attempt was shown a DOM captured in a different session.
 
 ---
 
@@ -98,10 +229,12 @@ Web Steps:
 - `true`    — generated test ran and passed → proceed to ship
 - `false`   — test failed after all fix attempts → ship with NEEDS-REVIEW verdict
 - `skipped` — no test could be run (infra issue) → clean exit
+- `stuck`   — the test ran and failed, and a further attempt provably could not differ (see "When step 04 stops retrying") → ship with NEEDS-REVIEW
+- `defect`  — the test ran and failed exactly as the input's documented `Actual Result` says the product misbehaves today; the loop stops instead of working around a real bug → ship with NEEDS-REVIEW. Only when step 01 found an Actual Result in the input text, and never on a compile failure
 
 **.verdict**
-- `APPROVED`      — test passed, PR created
-- `NEEDS-REVIEW`  — test still failing, PR created with warning
+- `APPROVED`      — test passed, nothing the input asked for went unverified, no fix was rejected for weakening an assertion
+- `NEEDS-REVIEW`  — test failing, OR a requested check could not be observed, OR a fix was rejected for weakening a test, OR no test ran at all
 
 ---
 
@@ -114,10 +247,13 @@ Web Steps:
 | `00-session-init.md` | run.sh | Session metadata, env snapshot |
 | `01-parse.json` + `.md` | Parse | Generation plan |
 | `02-validate-api.json` + `.md` | Validate API | Auth status, confirmed endpoint response shapes |
-| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results |
+| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms` |
 | `claude-*.log` | Validate Web | Raw `claude -p` stream, for diagnosing empty runs |
-| `03-generate.json` + `.md` | Generate | List of files written |
+| `03-system-prompt.txt`, `04-system-prompt.txt` | Generate, Run & Fix | The static half of each prompt — conventions, references, rules — sent once as `--system-prompt-file` instead of inside every batch or attempt |
+| `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators` |
 | `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes |
+| `.assertions-frozen.json` | Run & Fix | What the generated test proved before any fix — the conservation baseline |
+| `.fix-history.json` | Run & Fix | Every fix attempt, appended: diagnosis, edits proposed, guards that rejected them. Feeds the next prompt and the stop rule |
 | `.fix-passed` | Run & Fix | Gate: true / false / skipped |
 | `05-ship.json` + `.md` | Ship | PR URL, Slack status |
 | `.verdict` | Ship | APPROVED / NEEDS-REVIEW |
@@ -129,27 +265,33 @@ Web Steps:
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary | `claude` |
-| `AUTOCREATE_MODEL` | Claude model for all AI steps | `claude-opus-4-6` |
+| `AUTHORING_MODEL` | Claude model for all AI steps | `claude-opus-4-6` |
 | `WORKSPACE_DIR` | Parent directory containing Jarvis | required |
+| `FRAMEWORK_DIR` | Absolute path to the checkout, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION` | optional |
 | `GITHUB_TOKEN` | GitHub auth token for PR creation | required |
 | `GITHUB_ORG` | GitHub org/user owning the repo | required |
 | `GITHUB_REPO_AUTOMATION` | Name of the Jarvis repo dir | `Jarvis` |
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs | `main` |
 | `GITHUB_PR_REVIEWERS` | Comma-separated reviewer handles | optional |
-| `AUTOCREATE_BRANCH_PREFIX` | Branch name prefix | `feat/qa-autocreate` |
-| `MAX_FIX_ATTEMPTS` | Max retry cycles for failing tests | `3` |
+| `AUTHORING_BRANCH_PREFIX` | Branch name prefix | `authoring` |
+| `AUTHORING_FIX_RETRY_COUNT` | Max retry cycles for failing tests. A ceiling — the loop stops early once an attempt can bring nothing new | `2` |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) | `true` |
-| `AUTOCREATE_ENVIRONMENT` | Maven `-Denvironment=` value | `staging` |
-| `AUTOCREATE_COUNTRY` | Maven `-Dcountry=` value | `SG` |
+| `AUTHORING_ENVIRONMENT` | Maven `-Denvironment=` value | `staging` |
+| `AUTHORING_COUNTRY` | Maven `-Dcountry=` value | `SG` |
 | `MAVEN_TEST_TIMEOUT_S` | Timeout (s) for a single `mvn test` run in step 04 | `300` |
 | `TEST_RESULTS_DIR_NAME` | Java framework's report/screenshot output dir name | `test-output` |
-| `PLAYWRIGHT_TIMEOUT_MS` | Timeout (ms) for each individual browser action | `30000` |
+| `AUTHORING_BROWSER_TIMEOUT_MS` | Timeout (ms) for each individual browser action | `30000` |
 | `VALIDATE_WEB_TIMEOUT_S` | Wall-clock budget (s) for the whole step-02 run | `1800` |
 | `VALIDATE_WEB_RETRY_ATTEMPTS` | Extra full re-runs step 02 attempts on recoverable failures | `1` |
-| `PLAYWRIGHT_HEADLESS` | Set `false` to watch the browser during step 02 | `true` |
+| `HEADLESS_BROWSER` | Set `false` to watch every browser this agent starts — step 02's validation and step 04's `mvn test` run | `true` |
+| `PLAYWRIGHT_MCP_VERSION` | `@playwright/mcp` version the browser steps launch (pinned, not `latest`) | `0.0.79` |
 | `VALIDATE_API_REQUEST_TIMEOUT_S` | Timeout (s) for each real HTTP call in Validate API | `15` |
 | `VALIDATE_API_RETRY_ON_ERROR` | Set `false` to disable the one connection-error retry in Validate API | `true` |
 | `ALLOW_MISSING_SELECTORS` | Let step 03 generate when step 02 confirmed nothing | `false` |
+| `GENERATE_COMPILE_CHECK` | Set `false` to skip step 03's `mvn test-compile` gate (a non-Maven framework plugin) | `true` |
+| `GENERATE_COMPILE_TIMEOUT_S` | Timeout (s) for that compile | `180` |
+| `COMPILE_REPAIR_MAX_DIFF_LINES` | Diff budget for the compile repair pass | `60` |
+| `FORCE` | Let a step 04 fix through even when it weakens an assertion. For a human who has read the diff — never for the loop | `false` |
 | `SLACK_BOT_TOKEN` | Slack bot token | optional |
 | `SLACK_NOTIFY_CHANNEL` | Slack channel for success notifications | optional |
 | `SLACK_ALERT_CHANNEL` | Slack channel for failure alerts | optional |
@@ -232,6 +374,140 @@ src/test/java/automation/{feature}/
 All patterns (Data POJO, Builder, API Enum, Helper, Page Object, Test classes, DO/DON'T rules)
 are defined in `Jarvis/CLAUDE.md` and injected into every Claude prompt at runtime.
 Refer to [Jarvis/CLAUDE.md](../../../Jarvis/CLAUDE.md) for the authoritative reference.
+
+---
+
+### URLs Are Properties, Never Java Literals
+
+A URL welded into a test, page object or helper pins the module to one environment —
+`Jarvis/CLAUDE.md` has always said so ("Hardcoded URL in test/page → put in properties
+file"), but until this guardrail nothing enforced it, and generated modules shipped with
+`private static final String LOGIN_URL = "https://..."` and no matching property.
+
+The rule is enforced at four points, all reading `shared/url_properties.py`:
+
+| Where | What happens |
+|-------|--------------|
+| **03 Generate**, before codegen | `collect_urls()` harvests every URL from the plan (`web_base_url`, `api_base_url`, validation steps) and from `02-validate-web.json` — `urls_visited` first, then `steps_passed`. It names a key for each and writes them to `parameters/{environment}-{country}.properties`. The key table goes into the codegen prompt. |
+| **03 Generate**, after codegen | A key the generated code reads that the properties file does not define is **recovered from `urls_visited` or the run aborts** — see "A URL property is not a warning" below. |
+| **03 Generate**, after codegen | Any file still holding a literal URL gets one targeted repair pass, guarded by `validate_fix`. What survives is logged and recorded in `03-generate.json` → `hardcoded_urls`. |
+| **04 Run & Fix** | `ensure_url_properties()` rewrites the keys before the first run (`git checkout -f` in run.sh discards them). `no_hardcoded_url` is a fix guard: a fix that adds a literal URL is rejected before it reaches disk. |
+| **05 Ship** | The URL keys are committed — added to HEAD's copy of the properties file, never the working copy, so the run's real credentials in that same file are not committed with them. |
+
+### `urls_visited` — why the step text was not enough
+
+`collect_urls()` used to read URLs only out of step 02's step *summaries*, which are prose
+the model chooses to write. A run that navigated to `https://www.naukri.com/mnjuser/profile`
+reported it as `STEP_PASSED: Navigate to the profile page` — no URL in the string — so no
+key was minted, the generated test read `naukari.profile.url` from a file that never
+defined it, and Playwright died on `url: expected string, got undefined`.
+
+So step 02 now records the URL of every `browser_navigate` call the model made, straight
+off the tool stream (`shared/claude.py` collects `navigated_urls`; `02-validate-web.json`
+carries them as `urls_visited`). It is the only URL source that cannot be silent: a step
+summary is what the model chose to say, this is the argument it actually passed.
+
+### A URL property is not a warning
+
+Reading a key nobody wrote is unrunnable code, and step 03 already knew it — it computed
+the list, logged `WARNING`, and wrote the files anyway. Step 04 then spent a maven run, a
+browser launch and a fix attempt rediscovering it. Now the same block:
+
+1. recovers the key from `urls_visited` when a page step 02 opened supplies it — not a
+   guess, an address the browser loaded;
+2. `sys.exit(1)` on anything left, with `"error": "missing_url_properties"` in the audit.
+
+A key that survives (1) means the browser never visited that page, so the test navigates
+somewhere step 02 never validated — which is the one thing this pipeline does not do.
+`BrowserHelper.navigateTo` also rejects a null URL by name now, so the same mistake made
+by hand reads as a missing property rather than a Playwright protocol error.
+
+---
+
+## The compile gate — step 03 builds what it wrote
+
+Every other guard in step 03 reads the generated code. None of them ran a compiler, so
+`import automation.core.web.BasePage` — a package that has never existed — reached step 04
+intact and cost the initial run, the no-change flakiness re-run, and one of only two fix
+attempts. The framework's own CLAUDE.md has always made `mvn compile` step 1 of its
+mandatory self-test; this is the agent finally doing it.
+
+| Where | What happens |
+|-------|--------------|
+| **03 Generate**, after the write loop | `mvn -q test-compile` in the framework checkout. `test-compile`, not `compile`, so the generated *test* class is covered too. |
+| on failure | `compile_errors()` parses javac's `[ERROR] path:[line,col] msg` lines. One targeted repair pass over only the generated files named, handed the real `automation.core` class list so an invented package has somewhere to land. Guarded by `validate_fix` under `COMPILE_REPAIR_MAX_DIFF_LINES`, accepted per file. |
+| still failing | `sys.exit(1)` with `"error": "compile_failed"` and the javac errors in `03-generate.json`. |
+| errors only in files this run did not write | abort too, saying so — the checkout does not build on its own, which is not something a repair pass can fix. |
+| maven missing, timed out, or no `pom.xml` | skipped, not failed. That is infra, and failing the run on it blames the wrong thing. |
+
+Safe to place in step 03 because there is no `git checkout -f` between steps 03 and 04 in
+the isolated worktree — what step 03 compiles is what step 04 runs.
+
+Key naming: the host alone is `{feature}.url` (matching the existing `saucedemo.url`), the
+API base is `{feature}.api.url`, and anything with a path is named for its last meaningful
+segment — `/nlogin/login` → `{feature}.login.url`. Id-like segments are skipped.
+
+Credentials use the same properties file through `shared/credential_properties.py` but are
+the opposite case: never committed. Both share `shared/properties_file.py` so the file
+location and the "never overwrite a human's value" rule exist in one place.
+
+---
+
+## Locator baselines reach the PR
+
+The framework writes an element fingerprint per page object on every successful page
+load — `src/main/resources/baselines/NaukriLoginPage.json` — and that file is the only
+record of what a locator matched while it worked. A generated page object shipped
+without one leaves the next diagnosis of that page with nothing to compare against.
+
+Until this was fixed the authoring PR never carried them, for a reason that is easy to
+miss: 05_ship's branch creation is a `checkout -f -B`, so the untracked baseline the
+green run had just written was wiped off disk *before* there was a branch to commit it
+onto. So the ship step now reads the baselines **before** it touches the branch, and
+commits them last, once the code and any fixes are in:
+
+| Where | What happens |
+|-------|--------------|
+| **05 Ship**, before branching | `baseline.promoted()` reads every fingerprint the run left in `src/main/resources/baselines/` — never `pending/`, which holds records from a test that did not finish. |
+| **05 Ship**, after the fix commits | `baseline.changed()` keeps only the ones whose substance differs from HEAD, and they land in their own commit, listed in the PR body. |
+
+Comparison ignores `recordedAt`: the framework rewrites it on every load, so comparing
+raw bytes would put an empty baseline diff in every PR. The timestamp itself has to stay
+in the file — `baseline.load()`'s staleness guard uses it to reject a record written by
+the failing run itself.
+
+The same rule now holds in the other two agents that raise PRs — `01_fix.py` in the
+healing agent (where the heal is exactly what makes the old fingerprint stale) and
+`05_ship.py` in the adaptation agent — all through `shared/baseline.py`, which
+`scripts/commit_baselines.py` also uses after a green CI suite.
+
+---
+
+## Step narration — one `logStep` per step
+
+The run report prints one line per `logStep`. A test that opens with a single run-on
+summary — *"Login to Naukri, toggle the trailing dot in Profile Summary, save the change,
+and verify it persists after page reload"* — passes every check that existed before
+(`logStep` present, in a test class, plain English) and still produces a one-line report
+for a four-step scenario: when it fails, the report cannot say which step broke. The
+derived intent contract is built from the same strings, so one sentence collapses four
+checkable claims into one blob.
+
+Presence was already checked (`logstep_present` in `shared/edit_guards.py`); granularity
+is what this adds, in two places:
+
+| Where | What happens |
+|-------|--------------|
+| **03 Generate**, in the prompt | Rule 7b: one `logStep` per plan step, immediately before the call(s) that carry it out; setup lines get none; a helper may encapsulate one step, never the whole scenario. Shown with a wrong/right pair. |
+| **03 Generate**, after codegen | `_repair_step_narration()` audits each generated test class with `shared/logstep_narration.py` and runs one targeted repair pass over the ones that fall short, guarded by `validate_fix` and rejected unless it actually adds narration. What survives is recorded in `03-generate.json` → `under_narrated_tests`. |
+
+The expectation is deliberately the *smaller* of two bounds: the plan's own step count for
+that method (setup steps dropped), and the number of statements in the method that
+actually drive or check the app. A method cannot narrate more groups than it has work to
+narrate, so capping by the second is what keeps the guard from firing on correct code —
+and it is why a test whose whole scenario hides behind one helper call is asked for two
+steps rather than five. The repair is given the helper and page objects generated
+alongside it as read-only context and may only call methods that already exist there.
 
 ---
 

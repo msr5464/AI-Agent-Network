@@ -26,12 +26,13 @@ a baseline of what the page looked like when the test last passed.
 
 | Verdict | Meaning | What the agent may do |
 |---|---|---|
-| `LOCATOR_STALE` | Right page, element renamed or moved | **edit the selector — the only verdict that authorises a change** |
+| `LOCATOR_STALE` | Right page, element renamed or moved | **edit the selector** |
+| `AMBIGUOUS_LOCATOR` | The selector matches several elements, so Playwright refuses to act | **narrow the selector to the one element meant** |
 | `WRONG_PAGE` | None of the page object's own locators are here | stop |
 | `PRIOR_STEP_FAILED` | An earlier interaction happened and the page never moved | stop |
 | `NOT_READY` | Page still rendering when the wait expired | stop — suggests a readiness wait |
 | `TOO_SLOW` | Element arrived after the budget ran out | stop — suggests raising `ObjectWaitTime` deliberately |
-| `BLOCKED` | Present but covered or off-screen | stop — suggests dismissing the obstruction |
+| `BLOCKED` | Present, and still hidden after the wait spent its budget | stop — suggests revealing it rather than reselecting |
 | `ERROR_STATE` / `ENV_UNREACHABLE` | The application or its host failed | stop |
 | `DATA_PRECONDITION` | A fixture the test loads is stale or missing | stop |
 | `ELEMENT_GONE` | Right page, and absent on the last passing run too | stop |
@@ -181,7 +182,7 @@ never touches the queue that triaging feeds.
 
 ## Driving it from the GUI
 
-`qa_agents_server` (`bash scripts/run-server.sh`, port 8765) exposes this agent at
+`qa_agents_server` (`bash scripts/run-server.sh`, port 6001) exposes this agent at
 `/agents/test-healing-agent/*`, alongside the authoring agent. AI-Test-Studio
 proxies those paths under `/api/agents/*` and renders the **Auto-Heal Tests**
 panel against them.
@@ -195,9 +196,12 @@ GET  /agents/test-healing-agent/queue                # handoffs waiting from tri
 GET  /agents/test-healing-agent/sessions             # history
 ```
 
-The run slot is **global across agents**, not per agent: both drive the same
-automation-repo checkout, and repair mode binds a fixed CDP port, so a second
-request is queued rather than run concurrently. Steps stream as
+Runs execute in parallel, up to `QA_MAX_CONCURRENT_RUNS` (default 4). Each gets
+its own detached git worktree under `/tmp/qa-runs/<session>`, so agents no longer
+share one automation-repo checkout, and each derives its own CDP port from the
+session id — so repair mode works in several runs at once. Beyond the limit,
+requests queue, drained fewest-active-runs-first so one user cannot starve
+another. Steps stream as
 Reproduce → Fix → Ship; Reproduce only appears in standalone mode.
 
 ## Fixing by defect, not by test
@@ -212,7 +216,7 @@ is usually a handful of defects, so the agent works in phases:
    one unit of work. The selector recorded in the trace is the strongest key;
    element names and the triage grouping are fallbacks. The same element name in
    two different page objects is never merged.
-3. **`AUTO_FIX_MAX_FIXES_PER_RUN` caps distinct fixes, not tests.** Clusters are
+3. **`HEALING_MAX_FIXES_PER_RUN` caps distinct fixes, not tests.** Clusters are
    attempted largest-first, so a capped run unblocks the most tests it can.
    Deferred clusters are reported as such, not silently dropped.
 4. **One investigation, one edit, per cluster.** The member with the best
@@ -221,6 +225,16 @@ is usually a handful of defects, so the agent works in phases:
 5. **Every affected test must still prove it.** All members are re-run. A fix is
    credited only for the ones that actually pass; members that still fail keep
    their own failure record so the next attempt re-investigates them separately.
+6. **A test that now fails on a *different* element is progress, not failure.**
+   The edit is kept, and the next attempt is handed the NEW failure — refreshed
+   from the artifacts the verification run just wrote. Only a test that still
+   fails on the *same* element condemns the edit, and only then is it reverted.
+
+Rule 6 is what lets one run walk a chain of broken locators. Without it the gate
+was whole-test pass/fail: a fix that repaired the login button, got the flow onto
+a page it had never reached, and then met a second broken locator scored as a
+failure and was reverted — so the next attempt started over on the locator that
+was already fixed, and the run could never get past the first one.
 
 Without this, the first test's fix lands and the other four arrive to find the
 file already corrected — their edit fails to apply, and they get reported as
@@ -251,11 +265,15 @@ agents/test-healing-agent/queue/<build_tag>.json   ← written by test-triaging-
 queue/processed/<build_tag>.json   ← moved after completion
 ```
 
-**Retry loop (in run.sh):** If `.fix-passed=false`, re-runs `01_fix.py` up to `MAX_FIX_ATTEMPTS`.
+**Retry loop (in run.sh):** If `.fix-passed=false`, re-runs `01_fix.py` up to `HEALING_RETRY_COUNT`
+(default 4 — each attempt either fixes an element or proves it cannot, so the loop walks a
+chain of broken locators rather than re-guessing at one).
 A retry re-attempts **only the tests that actually failed** — fixes already applied and
 committed by an earlier attempt are carried forward into the report rather than redone.
 On retry, `01_fix.py` injects the previous test failure output into the Claude prompt so it
-tries a different locator strategy.
+tries a different locator strategy. Where the previous attempt's edit *worked* and merely
+uncovered the next broken locator, the retry gets that new failure instead: new selector,
+new DOM snapshot, new diagnosis (`next_issue` in `01-fix.json`).
 
 If `01_fix.py` crashes, run.sh's ERR trap posts to `SLACK_ALERT_CHANNEL` and leaves the
 handoff queued — a crash is never silent.
@@ -302,6 +320,21 @@ hook). The healing agent then falls back to tier 2.
 
 ---
 
+## Locator baselines are committed with the fix
+
+`src/main/resources/baselines/<PageObject>.json` is the framework's record of what each
+locator matched while the test worked, and a heal is exactly what makes the committed
+one stale: the locator that broke has just been replaced, so the fingerprint in the repo
+describes an element the page no longer uses. `_refresh_baseline_after_heal()` already
+rewrote the file on disk; what was missing was committing it, because the fix commit
+stages only `fix["target_file"]`.
+
+`_commit_baselines()` now runs straight after a successful fix commit and adds a second,
+path-scoped commit for the fingerprints that actually changed — measured with
+`recordedAt` excluded, through `shared/baseline.py`, so two runs that differ only in
+their timestamp commit nothing. Never `git add -A`: this step holds a write token.
+
+
 ## Fix Gate Values (.fix-passed)
 
 - `true`    — every attempted fix was applied, and passed wherever a runner existed → PR created
@@ -341,32 +374,33 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | Variable | Purpose |
 |---|---|
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary (default: claude) |
-| `AUTOFIX_MODEL` | Claude model for fix generation (default: `claude-opus-5`) |
-| `AUTOFIX_INSPECT_DOM` | Read the failing page in a real browser before fixing (default: true) |
-| `AUTOFIX_BASE_URL` | Page URL for DOM inspection, overriding whatever is recovered from the execution log |
+| `HEALING_MODEL` | Claude model for fix generation (default: `claude-opus-5`) |
+| `HEALING_INSPECT_DOM` | Read the failing page in a real browser before fixing (default: true) |
+| `HEALING_BASE_URL` | Page URL for DOM inspection, overriding whatever is recovered from the execution log |
 | `AUTOFIX_DOM_TIMEOUT_S` | Wall-clock budget for one browser inspection (default: 600) |
-| `PLAYWRIGHT_HEADLESS` | Set `false` to watch the browser during inspection |
+| `HEADLESS_BROWSER` | Set `false` to watch every browser this agent starts: DOM inspection, the locate replay, session minting, and the reproduce / verification / probe runs (as `-Dheadless`) |
 | `AUTOFIX_LOGIN_USERNAME`, `AUTOFIX_LOGIN_PASSWORD` | Credentials override. Normally unnecessary — a saved session or `parameters/*.properties` is used first |
 | `AUTOFIX_ENVIRONMENT`, `AUTOFIX_COUNTRY` | Which `parameters/{environment}-{country}.properties` to read (default: `staging` / `SG`) |
 | `AUTOFIX_REPAIR_SESSION` | Explicit path to a `.repair-session.json`. Unset → looked for under the workspace's `test-output/` |
 | `AUTOFIX_MAX_DIFF_LINES` | Reject a fix whose diff exceeds this many lines (default: 40) |
 | `DIAGNOSIS_PROBE` | `false` to skip confirmation probes (default: on). A probe costs one test run and buys a measured verdict instead of an assumed one |
-| `BASELINE_DIR` | Where page baselines are read from. Unset → `<workspace>/test-output/baselines`. Point CI at a path that survives between builds, or baselines are discarded with every report directory |
+| `HEALING_BASELINE_DIR` | Where page baselines are read from. Unset → `<workspace>/test-output/baselines`. Point CI at a path that survives between builds, or baselines are discarded with every report directory |
 | `DIAGNOSIS_MODE` | `shadow` (default) — diagnose and log, but let the old behaviour decide. `enforce` — a stop verdict skips the work before any model call. Shadow exists so the verdicts can be measured against real outcomes before they refuse work the agent used to do |
 | `AUTOFIX_PAGE_OBJECT_CHARS` | Budget per page object shown to Claude (default: 8000). Declarations are always kept in full |
 | `PAGE_OBJECT_DIRS` | Comma-separated page-object search dirs. Unset → derived from the repo layout |
-| `AUTOFIX_TEST_TIMEOUT_S` | Timeout for one verification test run (default: 300) |
+| `HEALING_TEST_TIMEOUT_S` | Timeout for one verification test run (default: 300) |
 | `WORKSPACE_DIR` | Parent directory for the automation repo. Must be outside QA-Agent-Network. If the repo is not present, test-healing-agent clones it automatically using `GITHUB_TOKEN` + `GITHUB_ORG` + `GITHUB_REPO_AUTOMATION`. |
-| `GITHUB_REPO_AUTOMATION` | Name of the automation repo dir under `WORKSPACE_DIR` |
+| `GITHUB_REPO_AUTOMATION` | Name of the automation repo — the dir under `WORKSPACE_DIR` and the repo name on GitHub |
+| `FRAMEWORK_DIR` | Absolute path to the checkout, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION`. Unset → the derived path |
 | `GITHUB_TOKEN` | GitHub authentication for PR creation |
 | `GITHUB_ORG` | GitHub org owning the automation repo |
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs (default: main) |
-| `AUTOFIX_BRANCH_PREFIX` | Prefix for fix branches (default: `chore/qa-autofix`). Full name: `<prefix>/<build-tag>` |
+| `HEALING_BRANCH_PREFIX` | Prefix for fix branches (default: `healing`). Full name: `<prefix>/<build-tag>` |
 | `GITHUB_PR_REVIEWERS` | Comma-separated list of PR reviewers |
 | `REPO_CONTEXT_FILE` | Path to conventions file in the automation repo (relative to repo root or absolute). If unset or not found, falls back to `agents/test-healing-agent/CONVENTIONS.md` bundled in this agent. |
 | `TEST_RUNNER_CMD` | Override test runner — use `{class}`, `{class_simple}`, `{method}` placeholders. Without it, runners are auto-detected at the repo root and one level down; if none is found, fixes are reported `unverified` |
-| `AUTO_FIX_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
-| `MAX_FIX_ATTEMPTS` | Max retry cycles if tests fail (default: 2) |
+| `HEALING_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
+| `HEALING_RETRY_COUNT` | Max retry cycles if tests fail (default: 4) |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) |
 | `SLACK_BOT_TOKEN`, `SLACK_NOTIFY_CHANNEL` | Slack notifications on success |
 | `SLACK_ALERT_CHANNEL` | Slack channel for failures/partial fixes |
@@ -401,7 +435,9 @@ make audit AGENT=test-healing-agent SESSION=20260328-143022-fix-ProdSanity-All-T
 
 1. **Diagnose before editing.** `shared/diagnosis.py` decides *why* the element was
    missing — a stale locator is one answer among several, and only `LOCATOR_STALE`
-   authorises a selector edit. Stop verdicts exit without a model call. Abstention
+   and `AMBIGUOUS_LOCATOR` authorise a selector edit (the two defects that live in
+   the selector itself: one no longer matches its element, the other matches more
+   than one). Stop verdicts exit without a model call. Abstention
    (`INSUFFICIENT_EVIDENCE`) falls through to the pre-existing behaviour, so a weak
    signal never blocks a genuine fix
 2. **Every fix must pass the test before it is committed** — restore original on failure

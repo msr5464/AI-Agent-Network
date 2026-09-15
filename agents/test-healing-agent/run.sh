@@ -11,7 +11,7 @@ set -Eeuo pipefail
 #   make run AGENT=test-healing-agent BUILD_TAG=ProdSanity-541  # direct: specific handoff
 #   AUTO_PUSH=false make run AGENT=test-healing-agent           # dry-run: no PR
 #
-# Retry loop: if tests fail after fix, re-runs 01_fix.py up to MAX_FIX_ATTEMPTS.
+# Retry loop: if tests fail after fix, re-runs 01_fix.py up to HEALING_RETRY_COUNT.
 # ─────────────────────────────────────────────────────────────────────────────
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,13 +69,33 @@ elif [[ -n "$BUILD_TAG" ]]; then
   MODE="direct"
 
 else
-  # Queue mode — pick the oldest .json file in queue/
-  HANDOFF_FILE=$(ls -t "$QUEUE_DIR"/*.json 2>/dev/null | tail -1 || true)
+  # Queue mode — claim the oldest .json file in queue/.
+  #
+  # Claiming, not just picking: `ls | tail -1` gave two concurrent healing runs
+  # the same handoff, so both fixed the same test, raced on the same files, and
+  # both then tried to move one handoff to processed. `mv` within a filesystem
+  # is atomic and fails for the loser, which makes it the claim.
+  CLAIM_DIR="$QUEUE_DIR/.claimed/$$"
+  mkdir -p "$CLAIM_DIR"
+  HANDOFF_FILE=""
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    if mv "$candidate" "$CLAIM_DIR/" 2>/dev/null; then
+      HANDOFF_FILE="$CLAIM_DIR/$(basename "$candidate")"
+      break
+    fi
+    log "Handoff $(basename "$candidate") was claimed by another run — trying the next"
+  done < <(ls -tr "$QUEUE_DIR"/*.json 2>/dev/null || true)
+
   if [[ -z "$HANDOFF_FILE" ]]; then
+    rmdir "$CLAIM_DIR" 2>/dev/null || true
     log "Queue is empty — nothing to fix."
     log "Run test-triaging-agent first to populate the queue."
     exit 0
   fi
+  # Whatever happens next, this run must not strand its claim in .claimed/.
+  # shellcheck disable=SC2064
+  trap "[[ -f \"$HANDOFF_FILE\" ]] && mv \"$HANDOFF_FILE\" \"$QUEUE_DIR/\" 2>/dev/null; rmdir \"$CLAIM_DIR\" 2>/dev/null; true" EXIT
   BUILD_TAG=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['build_tag'])" "$HANDOFF_FILE")
   SAFE_TAG="${BUILD_TAG//\//-}"
   MODE="queue"
@@ -111,7 +131,7 @@ Handoff File: $HANDOFF_FILE
 Started: $(date +%Y-%m-%dT%H:%M:%S)
 
 ## Env Snapshot (keys only)
-$(env | grep -E '^(GITHUB_|SLACK_|MAX_|AUTO_|AUTOFIX_|CLAUDE_|WORKSPACE_|REPO_CONTEXT_|TEST_RUNNER_)' | sed 's/=.*/=<set>/' | sort)
+$(env | grep -E '^(GITHUB_|SLACK_|MAX_|AUTO_|AUTOFIX_|CLAUDE_|WORKSPACE_|REPO_CONTEXT_|TEST_RUNNER_|PLAYWRIGHT_|LOCATE_)' | sed 's/=.*/=<set>/' | sort)
 EOF
 
 declare -a STEP_NAMES=()
@@ -119,7 +139,7 @@ declare -a STEP_DURATIONS=()
 
 # ── Step 00 — Reproduce (standalone mode only) ────────────────────────────────
 if [[ "$MODE" == "local" ]]; then
-  run_step "[00/02] Reproduce" "python3 '$AGENT_DIR/actions/00_reproduce.py'"
+  run_step "[00/03] Reproduce" "python3 '$AGENT_DIR/actions/00_reproduce.py'" reproduce
 
   if [[ ! -f "$AUDIT_DIR/00-handoff.json" ]]; then
     # A passing test or a non-locator failure. Both are legitimate outcomes, and
@@ -176,13 +196,27 @@ PYALERT
 }
 trap 'on_error $LINENO' ERR
 
-# ── Step 01 — Fix (with retry loop) ──────────────────────────────────────────
-MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-2}"
+# ── Step 01 — Locate ─────────────────────────────────────────────────────────
+# Work out which element each broken locator meant, deterministically, before any
+# model call. Never edits a file — 01_fix decides what to do with the result — so
+# the worst case here is a model call the run would have made anyway.
+run_step "[01/03] Locate" "python3 '$AGENT_DIR/actions/01_locate.py'" locate
+
+# ── Step 02 — Fix (with retry loop) ──────────────────────────────────────────
+# Each attempt now either fixes an element or proves it cannot, and an attempt
+# that repairs one locator and uncovers the next keeps its edit — so the loop
+# walks a chain of broken locators instead of re-guessing at one. Two was enough
+# for a single locator; a chain needs room to finish.
+HEALING_RETRY_COUNT="${HEALING_RETRY_COUNT:-4}"
+if [[ -n "${MAX_FIX_ATTEMPTS:-}" ]]; then
+  log "NOTE: MAX_FIX_ATTEMPTS is set but no longer read — use HEALING_RETRY_COUNT (currently $HEALING_RETRY_COUNT)"
+fi
 FIX_ATTEMPT=1
 
 while true; do
-  run_step "[01/02] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
-    "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_fix.py'"
+  export STEP_ATTEMPT="$FIX_ATTEMPT"
+  run_step "[02/03] Fix (attempt $FIX_ATTEMPT/$HEALING_RETRY_COUNT)" \
+    "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_fix.py'" fix
 
   FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
 
@@ -190,7 +224,7 @@ while true; do
     break
   fi
 
-  if [[ "$FIX_ATTEMPT" -ge "$MAX_FIX_ATTEMPTS" ]]; then
+  if [[ "$FIX_ATTEMPT" -ge "$HEALING_RETRY_COUNT" ]]; then
     log "Fixes still failing after $FIX_ATTEMPT attempt(s) — proceeding to ship (will escalate)"
     break
   fi
@@ -200,7 +234,7 @@ while true; do
 done
 
 # ── Step 02 — Ship (PR + Slack) ───────────────────────────────────────────────
-run_step "[02/02] Ship" "python3 '$AGENT_DIR/actions/02_ship.py'"
+run_step "[03/03] Ship" "python3 '$AGENT_DIR/actions/02_ship.py'" ship
 
 # ── Mark handoff as processed ─────────────────────────────────────────────────
 # An infra skip (no GitHub token, workspace missing) means nothing was attempted.
@@ -215,6 +249,11 @@ fi
 if [[ "$MODE" == "local" ]]; then
   log "Standalone run — handoff kept with the session: $HANDOFF_FILE"
 elif [[ "$SKIP_REASON" == "infra" ]]; then
+  # Return the claim to the queue so another run (or a retry) picks it up.
+  if [[ -n "${CLAIM_DIR:-}" && -f "$HANDOFF_FILE" ]]; then
+    mv "$HANDOFF_FILE" "$QUEUE_DIR/" 2>/dev/null || true
+    HANDOFF_FILE="$QUEUE_DIR/$(basename "$HANDOFF_FILE")"
+  fi
   log "Infra skip — leaving handoff queued for retry: $HANDOFF_FILE"
 else
   mv "$HANDOFF_FILE" "$PROCESSED_DIR/$(basename "$HANDOFF_FILE")"
@@ -230,6 +269,12 @@ echo ""
 for i in "${!STEP_NAMES[@]}"; do
   printf "  %-50s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
 done
+
+# Roll up now so the spend is on screen with the timings rather than only in
+# metrics.json. The EXIT trap re-runs this; a rollup is idempotent.
+_METRICS=$(cd "${REPO_ROOT:-.}" && python3 -m shared.metrics 2>/dev/null || true)
+[[ -n "$_METRICS" ]] && log "Spend: $_METRICS"
+
 
 # What each attempt actually changed. The step logs interleave this with the
 # build output, so by the end you would have to scroll through several minutes

@@ -133,17 +133,17 @@ obstructed elements — both fixable — because they landed in `TIMEOUT`.
 
 | Variable | Purpose |
 |---|---|
-| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | MySQL database |
-| `INPUT_DIR` | Directory containing test report HTML |
-| `OUTPUT_DIR` | Where to save generated HTML reports |
+| `TRIAGING_DB_HOST`, `TRIAGING_DB_PORT`, `TRIAGING_DB_USER`, `TRIAGING_DB_PASSWORD`, `TRIAGING_DB_NAME` | MySQL database |
+| `TRIAGING_INPUT_DIR` | Directory containing test report HTML |
+| `TRIAGING_OUTPUT_DIR` | Where to save generated HTML reports |
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary (default: claude) |
-| `CLASSIFIER_MODEL` | Claude model for classification (default: claude-opus-4-6) |
-| `REVIEWER_MODEL` | Claude model for review (default: claude-sonnet-4-6) |
-| `MAX_REVIEW_ROUNDS` | Max reviewer/classifier debate rounds (default: 2) |
-| `SCOUT_LOOKBACK_DAYS` | Days to look back for build tags (default: 7) |
+| `TRIAGING_CLASSIFIER_MODEL` | Claude model for classification (default: claude-opus-4-6) |
+| `TRIAGING_REVIEWER_MODEL` | Claude model for review (default: claude-sonnet-4-6) |
+| `TRIAGING_MAX_REVIEW_ROUNDS` | Max reviewer/classifier debate rounds (default: 2) |
+| `TRIAGING_SCOUT_LOOKBACK_DAYS` | Days to look back for build tags (default: 7) |
 | `BUILD_TAG` | Direct mode override — skip scout |
 | `STOP_AFTER` | Stop after step: `scout`, `collect`, `classify`, `review` |
-| `AUTOFIX_QUEUE_DIR` | Path to test-healing-agent queue dir (default: `agents/test-healing-agent/queue` inside repo) |
+| `TRIAGING_AUTOFIX_QUEUE_DIR` | Path to test-healing-agent queue dir (default: `agents/test-healing-agent/queue` inside repo) |
 | `SLACK_BOT_TOKEN`, `SLACK_NOTIFY_CHANNEL` | Slack notifications |
 | `SESSION_ID`, `AUDIT_DIR` | Set by run.sh — do not set manually |
 

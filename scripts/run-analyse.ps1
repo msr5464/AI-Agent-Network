@@ -26,8 +26,8 @@ $ProjectRoot = Split-Path -Parent $ScriptDir
 Set-Location $ProjectRoot
 
 if ($BuildTag)  { $env:BUILD_TAG   = $BuildTag  }
-if ($InputDir)  { $env:INPUT_DIR   = $InputDir  }
-if ($OutputDir) { $env:OUTPUT_DIR  = $OutputDir }
+if ($InputDir)  { $env:TRIAGING_INPUT_DIR   = $InputDir  }
+if ($OutputDir) { $env:TRIAGING_OUTPUT_DIR  = $OutputDir }
 
 make run AGENT=qa-auto-analyse BUILD_TAG="$BuildTag"
 exit $LASTEXITCODE

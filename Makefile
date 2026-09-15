@@ -10,6 +10,17 @@
 #   make setup                                                   # install deps
 #   make test                                                    # run unit tests
 
+# The interpreter every Python target runs through. An activated virtualenv wins,
+# then a .venv/ in the repo, then whatever python3 is on PATH. Without this,
+# `make test` runs the bare `pytest` on PATH — which on a machine that keeps its
+# dependencies in .venv is a different interpreter than the one they are
+# installed into, and the suite fails with import errors that look like missing
+# packages rather than the wrong python. Override with `make test PY=...`.
+PY ?= $(shell if [ -n "$$VIRTUAL_ENV" ] && [ -x "$$VIRTUAL_ENV/bin/python" ]; then \
+                  echo "$$VIRTUAL_ENV/bin/python"; \
+              elif [ -x .venv/bin/python ]; then echo .venv/bin/python; \
+              else echo python3; fi)
+
 AGENT     ?= test-triaging-agent
 BUILD_TAG ?=
 MODULE    ?=
@@ -19,7 +30,7 @@ AGENTS_DIR = agents
 # ── Run ────────────────────────────────────────────────────────────────────────
 .PHONY: run
 run:
-	@if [ -z "$(AGENT)" ]; then echo "Usage: make run AGENT=test-triaging-agent  OR  make run AGENT=test-healing-agent"; exit 1; fi
+	@if [ -z "$(AGENT)" ]; then echo "Usage: make run AGENT=<test-authoring-agent|test-triaging-agent|test-healing-agent|test-adaptation-agent>"; exit 1; fi
 	@if [ ! -f "$(AGENTS_DIR)/$(AGENT)/run.sh" ]; then echo "Agent not found: $(AGENTS_DIR)/$(AGENT)/run.sh"; exit 1; fi
 	@BUILD_TAG="$(BUILD_TAG)" MODULE="$(MODULE)" TEST="$(TEST)" bash "$(AGENTS_DIR)/$(AGENT)/run.sh" "$(BUILD_TAG)"
 
@@ -63,7 +74,7 @@ audit:
 .PHONY: setup
 setup:
 	@echo "Installing Python dependencies..."
-	pip install -r requirements.txt
+	$(PY) -m pip install -r requirements.txt
 	@echo ""
 	@echo "Setup complete."
 	@echo "Next: copy config/.env.example to config/.env and fill in your credentials."
@@ -77,16 +88,16 @@ setup-mcp: ## Configure MCP tools (GitHub, Slack) in ~/.claude.json
 PORT ?= 8888
 .PHONY: dashboard
 dashboard: ## Browse audit trails in web UI (PORT=8888)
-	python3 scripts/audit_viewer.py --agents-dir agents --port $(PORT)
+	$(PY) scripts/audit_viewer.py --agents-dir agents --port $(PORT)
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
 .PHONY: test
 test:
-	pytest tests/unit/ -v
+	$(PY) -m pytest tests/unit/ -v
 
 .PHONY: test-cov
 test-cov:
-	pytest tests/unit/ --cov=agents/test-triaging-agent/lib --cov-report=term-missing
+	$(PY) -m pytest tests/unit/ --cov=agents/test-triaging-agent/lib --cov-report=term-missing
 
 # ── Feedback ───────────────────────────────────────────────────────────────────
 .PHONY: feedback
@@ -142,5 +153,6 @@ help:
 	@echo ""
 	@echo "Environment (test-healing-agent):"
 	@echo "  AUTO_PUSH=false                                    Dry-run (no PR)"
-	@echo "  MAX_FIX_ATTEMPTS=2                                 Max retry cycles"
+	@echo "  AUTHORING_FIX_RETRY_COUNT=2                        Max retry cycles (authoring)"
+	@echo "  HEALING_RETRY_COUNT=4                              Max retry cycles (healing)"
 	@echo ""

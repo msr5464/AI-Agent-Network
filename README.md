@@ -151,7 +151,9 @@ Edit `config/.env` and fill in the required values (see Configuration Reference 
 Generates Java test code from a plain English input file and raises a PR on the Jarvis automation repo.
 
 ```bash
-# Create an input file describing what to test
+# Create an input file describing what to test.
+# queue/ is the agent's local inbox — git-ignored, consumed on each run.
+# See docs/examples/queue/ for worked examples of every input format.
 cat > agents/test-authoring-agent/queue/payments.txt << 'EOF'
 Module: payments
 Type: web
@@ -178,7 +180,7 @@ TESTING_MODE=true make run AGENT=test-authoring-agent MODULE=payments
 
 Outputs:
 - Java files written to the Jarvis automation repo
-- GitHub PR on the Jarvis repo (`feat/qa-autocreate/<module>-<timestamp>`)
+- GitHub PR on the Jarvis repo (`authoring/<module>-<timestamp>`)
 - Slack notification to `SLACK_NOTIFY_CHANNEL`
 
 ![Agent 1 run](docs/authoring-run.png)
@@ -200,7 +202,7 @@ STOP_AFTER=classify ./scripts/run-analyse.sh          # stop early for inspectio
 ```
 
 Outputs:
-- HTML report → `OUTPUT_DIR/`
+- HTML report → `TRIAGING_OUTPUT_DIR/`
 - Handoff file → `agents/test-healing-agent/queue/<build_tag>.json` (if fixable issues found)
 - Slack notification → `SLACK_NOTIFY_CHANNEL` or `SLACK_ALERT_CHANNEL`
 
@@ -225,10 +227,58 @@ AUTO_PUSH=false ./scripts/run-autofix.sh              # dry-run: fix + test loca
 ```
 
 Outputs:
-- GitHub PR with all passing fixes on the Jarvis repo (`chore/qa-autofix/<build-tag>`)
+- GitHub PR with all passing fixes on the Jarvis repo (`healing/<build-tag>`)
 - Slack notification with per-test breakdown
 
 ![Agent 3 run](docs/healing-run.png)
+
+---
+
+### Agent 4 — Test Adaptation
+
+Updates tests when the **product** changes — a step is inserted, a wizard's pages merge,
+a `<select>` becomes a combobox, a form gains a required field. Driven by a plain-English
+change note, so it runs **before** the tests go red.
+
+Healing asks "why did this fail?". This asks "the product changed — what should the tests
+do now?". They are different jobs: once an edit may add or remove steps, "the test passes"
+stops being evidence, because a test that asserts nothing passes fastest of all. What
+replaces it is an **intent contract** — the assertions a repair must preserve, measured
+before any edit and compared against that frozen copy afterwards.
+
+```bash
+make run AGENT=test-adaptation-agent MODULE=checkout
+EXPLORE_ONLY=true  make run AGENT=test-adaptation-agent MODULE=checkout   # flow map only
+ADAPTATION_APPLY=false  make run AGENT=test-adaptation-agent MODULE=checkout   # propose only
+START_FROM_STEP=4 SESSION_ID=<sid> make run AGENT=test-adaptation-agent   # resume
+```
+
+Change note (`agents/test-adaptation-agent/queue/<module>.txt` — git-ignored inbox; see [`docs/examples/queue/`](docs/examples/queue/)):
+
+```
+Module: checkout
+Type: web
+Affects: automation.checkout.*
+
+What changed:
+1. After login a "Choose workspace" screen now appears before the dashboard.
+2. The 3-step checkout wizard is now 2 steps.
+
+Expected outcome unchanged: an order is placed and a confirmation number is shown.
+```
+
+Outputs:
+- A blast radius: the named tests, the tests that pass today but share the changed surface,
+  and what was excluded as framework infrastructure — with the cost of verifying them
+- An ordered flow map of what a browser actually observed, with every selector re-counted
+  in Python rather than taken on the model's word
+- A PR that is **always NEEDS-REVIEW**, carrying each edit against the observed step that
+  justified it
+
+It refuses rather than guessing when the change note does not account for what it saw, when
+the expected *outcome* changed (the spec moved, not the test), when there is no valid saved
+login session, or when the flow ends in something that cannot be undone. See
+[agents/test-adaptation-agent/CLAUDE.md](agents/test-adaptation-agent/CLAUDE.md).
 
 ---
 
@@ -241,60 +291,62 @@ Outputs:
 | `CLAUDE_CLI_PATH` | `claude` | Path to Claude CLI binary |
 | `GITHUB_TOKEN` | | GitHub personal access token (repo scope) |
 | `GITHUB_ORG` | | GitHub org or username owning the automation repo |
-| `GITHUB_REPO_AUTOMATION` | `Jarvis` | Name of the automation repo directory under `WORKSPACE_DIR` |
-| `GITHUB_DEFAULT_BRANCH` | `main` | Base branch for PRs |
+| `GITHUB_REPO_AUTOMATION` | `Jarvis` | Name of the automation repo — the directory under `WORKSPACE_DIR`, and the repo name on GitHub. Required even when `FRAMEWORK_DIR` is set. |
+| `GITHUB_DEFAULT_BRANCH` | `main` | Default base branch: checked out before a run and used as the PR base. Overridable per run from the GUI. |
 | `GITHUB_PR_REVIEWERS` | | Comma-separated list of PR reviewer handles |
 | `WORKSPACE_DIR` | | Absolute path to the parent directory containing the automation repo. If the repo is absent it is cloned automatically using `GITHUB_TOKEN`. |
+| `FRAMEWORK_DIR` | | Absolute path to the automation repo checkout itself, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION`. Set it when the checkout is named differently or lives elsewhere; every agent and the parity test read this one setting. |
 | `SLACK_BOT_TOKEN` | | Slack Bot OAuth token (`xoxb-...`) |
 | `SLACK_NOTIFY_CHANNEL` | `#qa-reports` | Channel for normal results and successful fixes |
 | `SLACK_ALERT_CHANNEL` | `#qa-critical` | Channel for failures needing human attention |
 | `AUTO_PUSH` | `true` | Set `false` to skip PR creation (dry-run mode) |
+| `QA_LOG_COLOR` | `auto` | Log severity colouring: `ERROR`/`FATAL`/`FAILED`/`BLOCKED:` lines print red and `WARNING` lines yellow when the run is attached to a terminal. `always` forces colour (e.g. into a pager that renders it), `never` disables it; `NO_COLOR` is honoured too. Under the server, stdout is a pipe, so nothing is emitted and the Studio console colours by prefix. |
 
 ### Agent 1 — test-authoring-agent
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AUTOCREATE_MODEL` | `claude-opus-4-6` | Claude model for all AI steps (parse, validate, generate, fix) |
-| `AUTOCREATE_BRANCH_PREFIX` | `feat/qa-autocreate` | Branch prefix. Full name: `<prefix>/<module>-<timestamp>` |
-| `AUTOCREATE_ENVIRONMENT` | `staging` | Maven `-Denvironment=` value when running generated tests |
-| `AUTOCREATE_COUNTRY` | `SG` | Maven `-Dcountry=` value |
-| `MAX_FIX_ATTEMPTS` | `3` | Max retry cycles if the generated test fails |
+| `AUTHORING_MODEL` | `claude-opus-4-6` | Claude model for all AI steps (parse, validate, generate, fix) |
+| `AUTHORING_BRANCH_PREFIX` | `authoring` | Branch prefix. Full name: `<prefix>/<module>-<timestamp>` |
+| `AUTHORING_ENVIRONMENT` | `staging` | Maven `-Denvironment=` value when running generated tests |
+| `AUTHORING_COUNTRY` | `SG` | Maven `-Dcountry=` value |
+| `AUTHORING_FIX_RETRY_COUNT` | `2` | Max retry cycles if the generated test fails. The loop also stops early on its own |
 | `TESTING_MODE` | `false` | Set `true` to cache step-01 and step-02 outputs and skip them on reruns |
-| `PLAYWRIGHT_TIMEOUT_MS` | `30000` | Timeout per step in the headless web validation script |
-| `PLAYWRIGHT_HEADLESS` | `true` | Set `false` to run validation browser in headed mode (useful for debugging selectors) |
-| `NODE_PATH` | `node` | Path to Node.js binary |
+| `AUTHORING_BROWSER_TIMEOUT_MS` | `30000` | Timeout per step in the headless web validation script |
+| `HEADLESS_BROWSER` | `true` | Set `false` to run **every** browser in every agent headed — validation, DOM inspection, exploration, session minting, and the Maven test runs (as `-Dheadless`). Unset, each browser keeps its own default and Maven follows the framework's `config.properties` |
+| `AUTHORING_NODE_PATH` | `node` | Path to Node.js binary |
 
 ### Agent 2 — test-triaging-agent
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `DB_HOST` | `localhost` | MySQL host |
-| `DB_PORT` | `3306` | MySQL port |
-| `DB_USER` | `root` | MySQL user |
-| `DB_PASSWORD` | | MySQL password |
-| `DB_NAME` | `qa_results` | MySQL database name |
-| `CLASSIFIER_MODEL` | `claude-sonnet-4-6` | Claude model for failure classification |
-| `REVIEWER_MODEL` | `claude-sonnet-4-6` | Claude model for adversarial review |
-| `CLASSIFIER_EFFORT` | `medium` | Effort level for classifier (`low` `medium` `high`) |
-| `REVIEWER_EFFORT` | `medium` | Effort level for reviewer |
+| `TRIAGING_DB_HOST` | `localhost` | MySQL host |
+| `TRIAGING_DB_PORT` | `3306` | MySQL port |
+| `TRIAGING_DB_USER` | `root` | MySQL user |
+| `TRIAGING_DB_PASSWORD` | | MySQL password |
+| `TRIAGING_DB_NAME` | `qa_results` | MySQL database name |
+| `TRIAGING_CLASSIFIER_MODEL` | `claude-sonnet-4-6` | Claude model for failure classification |
+| `TRIAGING_REVIEWER_MODEL` | `claude-sonnet-4-6` | Claude model for adversarial review |
+| `TRIAGING_CLASSIFIER_EFFORT` | `medium` | Effort level for classifier (`low` `medium` `high`) |
+| `TRIAGING_REVIEWER_EFFORT` | `medium` | Effort level for reviewer |
 | `BUILD_TAG` | | Skip scout and analyse this build directly |
 | `STOP_AFTER` | | Stop pipeline after: `scout` `collect` `classify` `review` |
-| `SCOUT_LOOKBACK_DAYS` | `7` | How far back scout looks for unanalyzed builds |
-| `MAX_REVIEW_ROUNDS` | `2` | Max classifier ↔ reviewer debate rounds |
-| `FLAKY_TESTS_LAST_RUNS` | `10` | Window for flaky test detection |
-| `FLAKY_TESTS_MIN_FAILURES` | `5` | Min failures in window to be flagged as flaky |
-| `INPUT_DIR` | `testdata` | Directory containing HTML test reports |
-| `OUTPUT_DIR` | `reports` | Directory for generated HTML triage reports |
-| `AUTOFIX_QUEUE_DIR` | `agents/test-healing-agent/queue` | Where to write handoff files for Agent 3 |
+| `TRIAGING_SCOUT_LOOKBACK_DAYS` | `7` | How far back scout looks for unanalyzed builds |
+| `TRIAGING_MAX_REVIEW_ROUNDS` | `2` | Max classifier ↔ reviewer debate rounds |
+| `TRIAGING_FLAKY_TESTS_LAST_RUNS` | `10` | Window for flaky test detection |
+| `TRIAGING_FLAKY_TESTS_MIN_FAILURES` | `5` | Min failures in window to be flagged as flaky |
+| `TRIAGING_INPUT_DIR` | `testdata` | Directory containing HTML test reports |
+| `TRIAGING_OUTPUT_DIR` | `reports` | Directory for generated HTML triage reports |
+| `TRIAGING_AUTOFIX_QUEUE_DIR` | `agents/test-healing-agent/queue` | Where to write handoff files for Agent 3 |
 
 ### Agent 3 — test-healing-agent
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AUTOFIX_MODEL` | `claude-opus-4-6` | Claude model for fix generation |
-| `AUTOFIX_BRANCH_PREFIX` | `chore/qa-autofix` | Branch prefix. Full name: `<prefix>/<build-tag>` |
-| `MAX_FIX_ATTEMPTS` | `2` | Retry cycles if tests still fail after fix |
-| `AUTO_FIX_MAX_FIXES_PER_RUN` | `5` | Max tests to fix per session |
+| `HEALING_MODEL` | `claude-opus-4-6` | Claude model for fix generation |
+| `HEALING_BRANCH_PREFIX` | `healing` | Branch prefix. Full name: `<prefix>/<build-tag>` |
+| `HEALING_RETRY_COUNT` | `4` | Retry cycles if tests still fail after fix — enough to walk a chain of broken locators |
+| `HEALING_MAX_FIXES_PER_RUN` | `5` | Max tests to fix per session |
 | `TEST_RUNNER_CMD` | auto-detect | Override test runner. Placeholders: `{class}` `{class_simple}` `{method}` |
 | `REPO_CONTEXT_FILE` | `CONVENTIONS.md` | Path to conventions file (relative to automation repo root, or absolute). Falls back to the bundled `agents/test-healing-agent/CONVENTIONS.md`. |
 
@@ -353,7 +405,8 @@ QA-Agent-Network/
 │   │       ├── 04_review.py       # Adversarial review + .verdict gate
 │   │       └── 05_ship.py         # HTML report + handoff JSON + Slack
 │   │
-│   └── test-healing-agent/        # Agent 3 — fix broken locators, raise PR
+│   ├── test-healing-agent/        # Agent 3 — fix broken locators, raise PR
+│   └── test-adaptation-agent/     # Agent 4 — update tests when the product changes
 │       ├── run.sh                 # Orchestrator (queue / direct / file-path mode)
 │       ├── CLAUDE.md              # Full agent spec
 │       ├── CONVENTIONS.md         # Fallback conventions file for Claude
@@ -401,8 +454,23 @@ The repo ships a thin HTTP + SSE server (`qa_agents_server/`) used by the AI Tes
 
 ```bash
 bash scripts/run-server.sh
-# Listens on http://0.0.0.0:8765 by default
+# Listens on http://0.0.0.0:6001 by default
 ```
+
+On its first boot in a checkout the server copies
+[`docs/examples/queue/<agent>/`](docs/examples/queue/) into each agent's queue,
+so the UI's queue view has something in it rather than being empty. Each signed-in
+user then gets their own copy the first time they open the queue, because a
+per-user queue starts as empty as a fresh checkout does. It seeds once per queue
+and never overwrites: a file already queued is left alone, a name already in
+`processed/` is not re-created, and a queue carrying the `.examples-seeded`
+marker is skipped — so an example you delete stays deleted. Set
+`QA_SEED_EXAMPLES=false` to turn it off, or delete a queue directory (the
+agent's, or one user's) to get its examples back.
+
+Note that seeded items are ordinary queue items: `make run AGENT=<agent>` with no
+`MODULE`/`BUILD_TAG` picks the oldest one and runs it. Pass an explicit target, or
+delete the examples, if that is not what you want.
 
 Key endpoints (scoped to `test-authoring-agent` for v1):
 
@@ -425,8 +493,9 @@ Environment overrides:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `QA_AGENT_SERVER_HOST` | `0.0.0.0` | Bind host |
-| `QA_AGENT_SERVER_PORT` | `8765` | Bind port |
+| `QA_AGENT_SERVER_PORT` | `6001` | Bind port |
 | `AI_TEST_STUDIO_URL` | `http://localhost:5001` | CORS allowlist |
+| `QA_SEED_EXAMPLES` | `true` | Seed each agent's queue from `docs/examples/queue/` on first boot |
 | `QA_AGENT_RUN_TIMEOUT_SECONDS` | `7200` | SIGKILL after this many seconds |
 | `QA_AGENT_STALE_AFTER_SECONDS` | `900` | Untouched for this long ⇒ treated as abandoned, not running |
 

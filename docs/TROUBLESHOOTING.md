@@ -115,9 +115,12 @@ Claude wrote tests that don't compile or fail at runtime. Options:
    TESTING_MODE=true make run AGENT=test-authoring-agent MODULE=payments
    ```
 
-2. **Increase `MAX_FIX_ATTEMPTS`** — the agent will retry the fix loop more times:
+2. **Increase `AUTHORING_FIX_RETRY_COUNT`** — the agent will retry the fix loop more times.
+   Note the loop stops early regardless once an attempt can bring nothing new (the model
+   returns no edits, the same guard rejects twice running, or an edit set repeats), so
+   raising this only helps when attempts are genuinely still exploring:
    ```bash
-   MAX_FIX_ATTEMPTS=5 make run AGENT=test-authoring-agent MODULE=payments
+   AUTHORING_FIX_RETRY_COUNT=5 make run AGENT=test-authoring-agent MODULE=payments
    ```
 
 3. **Read the Claude prompt** — open `agents/test-authoring-agent/audit/<session>/04-run-and-fix.md` to see exactly what Claude was asked and what it responded.
@@ -128,12 +131,12 @@ Agent 1 launches a headless browser to validate selectors. If selectors aren't f
 
 ```bash
 # Run in headed (visible) mode to watch what happens
-PLAYWRIGHT_HEADLESS=false make run AGENT=test-authoring-agent MODULE=payments
+HEADLESS_BROWSER=false make run AGENT=test-authoring-agent MODULE=payments
 ```
 
 Increase timeout if the page is slow:
 ```bash
-PLAYWRIGHT_TIMEOUT_MS=60000 make run AGENT=test-authoring-agent MODULE=payments
+AUTHORING_BROWSER_TIMEOUT_MS=60000 make run AGENT=test-authoring-agent MODULE=payments
 ```
 
 ---
@@ -144,7 +147,7 @@ PLAYWRIGHT_TIMEOUT_MS=60000 make run AGENT=test-authoring-agent MODULE=payments
 
 Agent 2 reads from MySQL. Ensure:
 1. The test runner inserts results before Agent 2 runs
-2. DB credentials in `config/.env` are correct (`DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`)
+2. DB credentials in `config/.env` are correct (`TRIAGING_DB_HOST`, `TRIAGING_DB_USER`, `TRIAGING_DB_PASSWORD`, `TRIAGING_DB_NAME`)
 3. The `buildTag` in MySQL matches the tag you're passing
 
 ```bash
@@ -156,7 +159,7 @@ python3 -c "import mysql.connector; c = mysql.connector.connect(host='localhost'
 
 All builds in the DB have already been analysed. Either:
 - Pass a specific build tag: `make run AGENT=test-triaging-agent BUILD_TAG=MyBuild-123`
-- Check if `SCOUT_LOOKBACK_DAYS` is too short (default: 7 days)
+- Check if `TRIAGING_SCOUT_LOOKBACK_DAYS` is too short (default: 7 days)
 
 ### Classification confidence is LOW
 
@@ -166,7 +169,7 @@ Claude isn't confident about a failure. Check the classifier prompt in the audit
 
 ### Verdict is NEEDS-HUMAN
 
-The reviewer disagreed with the classifier after `MAX_REVIEW_ROUNDS` rounds. This is intentional — it means the failure is genuinely ambiguous. Check:
+The reviewer disagreed with the classifier after `TRIAGING_MAX_REVIEW_ROUNDS` rounds. This is intentional — it means the failure is genuinely ambiguous. Check:
 ```bash
 make audit AGENT=test-triaging-agent SESSION=<id>
 # Then open the .verdict file and 04-review.json in the session folder
@@ -206,7 +209,7 @@ The `.json` file for this build tag doesn't exist in the queue. Either Agent 2 h
 
 ### Fix applied but test still failing
 
-Claude generated a locator fix but the test still fails after applying it. The agent will retry up to `MAX_FIX_ATTEMPTS` times. On each retry, it injects the previous failure output into the prompt so Claude can try a different strategy.
+Claude generated a locator fix but the test still fails after applying it. The agent will retry up to `HEALING_RETRY_COUNT` times. On each retry, it injects the previous failure output into the prompt so Claude can try a different strategy.
 
 To debug manually:
 1. Open `agents/test-healing-agent/audit/<session>/01-fix.md` — read the Claude prompt and response

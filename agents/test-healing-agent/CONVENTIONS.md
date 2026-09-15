@@ -291,6 +291,27 @@ testConfig.logException("context message", exception);
 
 `logStep` descriptions must be in plain English explaining the full action AND expected outcome so anyone can follow the test flow without reading the code.
 
+**One `logStep` per step.** The report prints one line per `logStep`, so a scenario
+narrated in a single summary line fails with a report that cannot say which step
+broke. Put each `logStep` immediately before the call(s) it describes, and never let
+one describe several steps:
+
+```java
+// WRONG — four steps in one line, and a helper call that hides all of them
+logStep(testConfig, "Login, toggle the trailing dot in the summary, save, and verify it persists");
+String[] result = helper.toggleProfileSummaryDot(username, password);
+
+// RIGHT — one line per step
+logStep(testConfig, "Login to Naukri and open the profile page");
+ProfilePage profile = helper.loginAndOpenProfile(username, password);
+
+logStep(testConfig, "Toggle the trailing dot in Profile Summary and save the change");
+String saved = profile.toggleTrailingDotAndSave();
+```
+
+Setup lines — reading properties or credentials, constructing a helper — get no
+`logStep`.
+
 ---
 
 ## 11. Page object scope and navigation chaining

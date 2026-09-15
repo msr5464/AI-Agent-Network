@@ -1,7 +1,0 @@
-Feature: demo
-Type: web
-URL: https://example.com
-
-Steps:
-1. Visit the home page
-2. Verify the page title contains Example

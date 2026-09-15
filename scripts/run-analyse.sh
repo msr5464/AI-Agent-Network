@@ -5,7 +5,7 @@ set -euo pipefail
 # Run the test-triaging-agent agent.
 #
 # Usage:
-#   ./scripts/run-analyse.sh [BUILD_TAG] [INPUT_DIR] [OUTPUT_DIR]
+#   ./scripts/run-analyse.sh [BUILD_TAG] [TRIAGING_INPUT_DIR] [TRIAGING_OUTPUT_DIR]
 #
 # Examples:
 #   ./scripts/run-analyse.sh                                     # scout mode, dirs from .env
@@ -19,11 +19,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 BUILD_TAG="${1:-${BUILD_TAG:-}}"
-INPUT_DIR="${2:-${INPUT_DIR:-}}"
-OUTPUT_DIR="${3:-${OUTPUT_DIR:-}}"
+TRIAGING_INPUT_DIR="${2:-${TRIAGING_INPUT_DIR:-}}"
+TRIAGING_OUTPUT_DIR="${3:-${TRIAGING_OUTPUT_DIR:-}}"
 
 export BUILD_TAG
-[[ -n "$INPUT_DIR" ]]  && export INPUT_DIR
-[[ -n "$OUTPUT_DIR" ]] && export OUTPUT_DIR
+[[ -n "$TRIAGING_INPUT_DIR" ]]  && export TRIAGING_INPUT_DIR
+[[ -n "$TRIAGING_OUTPUT_DIR" ]] && export TRIAGING_OUTPUT_DIR
 
 make run AGENT=test-triaging-agent BUILD_TAG="$BUILD_TAG"

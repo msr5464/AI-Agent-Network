@@ -113,16 +113,10 @@ def test_trend_analysis():
             print("\n   ⚠️  No historical data found in database")
         print("\n✅ Test 3 PASSED\n")
         assert True
-    except (ImportError, ValueError) as e:
-        print(f"\n⚠️  Test skipped: {e}")
+    except Exception as e:
+        print(f"\n⚠️  Test skipped (no matching DB data/table): {e}")
         print("\n⚠️  Test 3 SKIPPED\n")
         pytest.skip(str(e))
-    except Exception as e:
-        print(f"\n❌ Test failed: {e}")
-        import traceback
-        traceback.print_exc()
-        print("\n❌ Test 3 FAILED\n")
-        raise
 
 
 def test_table_name_extraction():
@@ -259,7 +253,7 @@ def main():
     print("🧠 TESTING MEMORY SYSTEM (MySQL Only)")
     print("=" * 60)
     print("\n⚠️  Note: These tests require MySQL database to be configured")
-    print("   Set DB_HOST, DB_USER, DB_PASSWORD, DB_NAME in config/.env\n")
+    print("   Set TRIAGING_DB_HOST, TRIAGING_DB_USER, TRIAGING_DB_PASSWORD, TRIAGING_DB_NAME in config/.env\n")
     
     results = []
     

@@ -86,7 +86,7 @@ class ReportGenerator:
         test_results: Optional[List[TestResult]] = None,
         test_html_links: Optional[Dict[str, str]] = None,
         environment: Optional[str] = None,
-        output_dir: Optional[str] = None,
+        triaging_output_dir: Optional[str] = None,
     ) -> tuple[str, Dict[str, List[str]]]:
         """
         Generate HTML report content.
@@ -100,7 +100,7 @@ class ReportGenerator:
             trend: Trend indicator
             report_dir: Path to report directory for HTML links
             test_results: List of test results for descriptions
-            output_dir: Directory where the report will be saved; when set, screenshot
+            triaging_output_dir: Directory where the report will be saved; when set, screenshot
                 URLs are relative so opening the report from disk loads images locally.
 
         Returns:
@@ -108,7 +108,7 @@ class ReportGenerator:
         """
         html_content, test_api_map = self._generate_html(
             summary, classifications, report_name, ai_summary, recurring_failures, trend,
-            report_dir, test_results, test_html_links, environment, output_dir
+            report_dir, test_results, test_html_links, environment, triaging_output_dir
         )
         return html_content, test_api_map
     
@@ -232,7 +232,7 @@ class ReportGenerator:
                                 # ReportUrlBuilder.build_dashboard_url handles ProdSanity special case (no job name in path)
                                 
                                 return ReportUrlBuilder.build_dashboard_url(
-                                    Config.DASHBOARD_BASE_URL, 
+                                    Config.TRIAGING_DASHBOARD_BASE_URL, 
                                     report_name, 
                                     f"html/{suite_file}",
                                     project_name=project_name
@@ -250,7 +250,7 @@ class ReportGenerator:
                 from ..settings import Config
                 project_name = ReportUrlBuilder.extract_project_name(report_name)
                 return ReportUrlBuilder.build_dashboard_url(
-                    Config.DASHBOARD_BASE_URL, 
+                    Config.TRIAGING_DASHBOARD_BASE_URL, 
                     report_name, 
                     "html/overview.html", 
                     project_name=project_name
@@ -1839,29 +1839,29 @@ class ReportGenerator:
         report_name: str,
         project_name: Optional[str],
         job_name: Optional[str],
-        output_dir: Optional[str] = None,
+        triaging_output_dir: Optional[str] = None,
     ) -> Optional[str]:
         """
         Build the URL to use for a screenshot in the report.
-        - When output_dir is provided: use a path relative to the report file so that opening
+        - When triaging_output_dir is provided: use a path relative to the report file so that opening
           the report from disk (file://) loads screenshots from the local testdata/.../Screenshots.
-        - Otherwise: use dashboard absolute URL (requires DASHBOARD_BASE_URL and correct project/job
+        - Otherwise: use dashboard absolute URL (requires TRIAGING_DASHBOARD_BASE_URL and correct project/job
           matching how the dashboard serves artifacts; may 404 if dashboard path structure differs).
         """
         if not screenshot_rel or not report_dir:
             return None
-        if output_dir:
+        if triaging_output_dir:
             try:
                 report_dir_path = Path(report_dir)
                 screenshot_abs = (report_dir_path / screenshot_rel).resolve()
-                output_dir_path = Path(output_dir).resolve()
+                output_dir_path = Path(triaging_output_dir).resolve()
                 rel = os.path.relpath(str(screenshot_abs), str(output_dir_path))
                 return rel.replace("\\", "/")
             except (ValueError, OSError):
                 pass
-        if report_name and getattr(Config, "DASHBOARD_BASE_URL", None):
+        if report_name and getattr(Config, "TRIAGING_DASHBOARD_BASE_URL", None):
             return ReportUrlBuilder.build_dashboard_url(
-                Config.DASHBOARD_BASE_URL,
+                Config.TRIAGING_DASHBOARD_BASE_URL,
                 report_name,
                 screenshot_rel,
                 project_name,
@@ -2198,9 +2198,9 @@ class ReportGenerator:
         test_results: Optional[List[TestResult]] = None,
         test_html_links: Optional[Dict[str, str]] = None,
         environment: Optional[str] = None,
-        output_dir: Optional[str] = None,
+        triaging_output_dir: Optional[str] = None,
     ) -> str:
-        """Generate modern HTML report content. output_dir is used to build relative screenshot URLs for local viewing."""
+        """Generate modern HTML report content. triaging_output_dir is used to build relative screenshot URLs for local viewing."""
         
         # Initialize TestDataCache for efficient data access
         # This eliminates redundant execution log fetching
@@ -2284,10 +2284,10 @@ class ReportGenerator:
         project_name_for_js = project_name_from_path if project_name_from_path else ReportUrlBuilder.extract_project_name(report_name)
         job_name_for_url = job_name_from_path if job_name_from_path else Config.DASHBOARD_JOB_NAME
         js_scripts = get_html_scripts(
-            Config.DASHBOARD_BASE_URL,
+            Config.TRIAGING_DASHBOARD_BASE_URL,
             project_name_for_js,
             job_name_for_url,
-            jira_base_url=Config.JIRA_BASE_URL or ''
+            triaging_jira_base_url=Config.TRIAGING_JIRA_BASE_URL or ''
         )
         
         # Build HTML - use f-string for most content, but concatenate JavaScript separately
@@ -2315,7 +2315,7 @@ class ReportGenerator:
                     <h1 class="report-title">AI-Generated Automation Report</h1>
                     <div class="report-meta" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
                         <strong>{report_name}</strong>
-                        {'<a href="' + ReportUrlBuilder.build_dashboard_url(Config.DASHBOARD_BASE_URL, report_name, "html/index.html", project_name_from_path, job_name_for_url) + '" target="_blank" style="color: #ffffff; opacity: 0.9; text-decoration: none; display: inline-flex; align-items: center; line-height: 1;"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1-2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></a>' if report_name else ''}
+                        {'<a href="' + ReportUrlBuilder.build_dashboard_url(Config.TRIAGING_DASHBOARD_BASE_URL, report_name, "html/index.html", project_name_from_path, job_name_for_url) + '" target="_blank" style="color: #ffffff; opacity: 0.9; text-decoration: none; display: inline-flex; align-items: center; line-height: 1;"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1-2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></a>' if report_name else ''}
                     </div>
                     {self._build_meta_line(automation_group, automation_branch, environment or automation_environment)}
                 </div>
@@ -2555,7 +2555,7 @@ class ReportGenerator:
                         report_name,
                         project_name_from_path,
                         job_name_for_url,
-                        output_dir=output_dir,
+                        triaging_output_dir=triaging_output_dir,
                     )
                     condensed_content = self._format_condensed_details(
                         root_cause, recommended_action, execution_log, category=category, screenshot_url=screenshot_url
@@ -2738,7 +2738,7 @@ class ReportGenerator:
         html += f"""
             <div class="section" id="flaky-tests">
             <h2 class="section-title" style="border-color: #6c757d">⚠️ All Flaky Tests ({flaky_count} tests)</h2>
-            <p class="root-cause-subtitle">Tests that atleast failed {Config.FLAKY_TESTS_MIN_FAILURES} times in the last {Config.FLAKY_TESTS_LAST_RUNS} executions. Click on execution history dots to view detailed failure information for each run.</p>
+            <p class="root-cause-subtitle">Tests that atleast failed {Config.TRIAGING_FLAKY_TESTS_MIN_FAILURES} times in the last {Config.TRIAGING_FLAKY_TESTS_LAST_RUNS} executions. Click on execution history dots to view detailed failure information for each run.</p>
         """
         if recurring_failures:
             # Sort filtered data:
@@ -2780,7 +2780,7 @@ class ReportGenerator:
                         <thead>
                             <tr>
                                     <th>Testcase Name</th>
-                                    <th>Last {Config.FLAKY_TESTS_LAST_RUNS} Executions</th>
+                                    <th>Last {Config.TRIAGING_FLAKY_TESTS_LAST_RUNS} Executions</th>
                                     <th>Failure Pattern</th>
                             </tr>
                         </thead>
@@ -2829,7 +2829,7 @@ class ReportGenerator:
                     exec_url = ""
                     if exec_build:
                         exec_url = ReportUrlBuilder.build_dashboard_url(
-                            Config.DASHBOARD_BASE_URL,
+                            Config.TRIAGING_DASHBOARD_BASE_URL,
                             exec_build,
                             "html/index.html",
                             project_name_from_path,
@@ -2947,7 +2947,7 @@ class ReportGenerator:
             html += f"""
                 <div class="section-content">
                     <p style="color: #6c757d; padding: 20px; text-align: center; font-style: italic;">
-                        ✅ No flaky tests detected in the last {Config.FLAKY_TESTS_LAST_RUNS} runs.
+                        ✅ No flaky tests detected in the last {Config.TRIAGING_FLAKY_TESTS_LAST_RUNS} runs.
                         <br>
                         <small style="color: #999;">This means tests are either passing consistently or failures are isolated incidents.</small>
                     </p>
@@ -2979,7 +2979,7 @@ class ReportGenerator:
         
         if known_failures:
             # Build Jira URL helper
-            jira_base_url = Config.JIRA_BASE_URL.rstrip('/')
+            triaging_jira_base_url = Config.TRIAGING_JIRA_BASE_URL.rstrip('/')
             
             # Fetch execution history for known failure tests
             from lib.agent.memory import AgentMemory
@@ -2988,7 +2988,7 @@ class ReportGenerator:
             known_failure_history = memory._get_test_execution_history_from_db(
                 report_name=report_name,
                 test_names=known_failure_test_names,
-                limit_per_test=Config.FLAKY_TESTS_LAST_RUNS,
+                limit_per_test=Config.TRIAGING_FLAKY_TESTS_LAST_RUNS,
                 table_name=None  # Will be auto-detected
             )
             
@@ -2998,7 +2998,7 @@ class ReportGenerator:
                         <thead>
                             <tr>
                                 <th>Testcase Name</th>
-                                <th>Last {Config.FLAKY_TESTS_LAST_RUNS} Executions</th>
+                                <th>Last {Config.TRIAGING_FLAKY_TESTS_LAST_RUNS} Executions</th>
                                 <th>Jira Ticket</th>
                             </tr>
                         </thead>
@@ -3023,7 +3023,7 @@ class ReportGenerator:
                 
                 # Build Jira URL
                 jira_ticket_id = test_result.known_failure.strip()
-                jira_url = f"{jira_base_url}/browse/{jira_ticket_id}"
+                jira_url = f"{triaging_jira_base_url}/browse/{jira_ticket_id}"
                 jira_ticket_escaped = html_escape.escape(jira_ticket_id)
                 jira_url_escaped = html_escape.escape(jira_url)
                 
@@ -3038,7 +3038,7 @@ class ReportGenerator:
                 
                 # Reverse execution records to match Flaky Tests ordering (oldest to newest)
                 # DB query returns newest first (id DESC), but we want oldest first for consistent display
-                reversed_execution_records = list(reversed(execution_records[:Config.FLAKY_TESTS_LAST_RUNS]))
+                reversed_execution_records = list(reversed(execution_records[:Config.TRIAGING_FLAKY_TESTS_LAST_RUNS]))
                 
                 # Process execution records to build history (oldest to newest)
                 for idx, exec_record in enumerate(reversed_execution_records):
@@ -3075,8 +3075,8 @@ class ReportGenerator:
                         'knownFailure': exec_known_failure
                     })
                 
-                # Pad history to FLAKY_TESTS_LAST_RUNS if needed
-                while len(history) < Config.FLAKY_TESTS_LAST_RUNS:
+                # Pad history to TRIAGING_FLAKY_TESTS_LAST_RUNS if needed
+                while len(history) < Config.TRIAGING_FLAKY_TESTS_LAST_RUNS:
                     history.insert(0, None)  # None = padded
                     execution_details.insert(0, {'padded': True})
                 
@@ -3107,7 +3107,7 @@ class ReportGenerator:
                     exec_url = ""
                     if exec_build:
                         exec_url = ReportUrlBuilder.build_dashboard_url(
-                            Config.DASHBOARD_BASE_URL,
+                            Config.TRIAGING_DASHBOARD_BASE_URL,
                             exec_build,
                             "html/index.html",
                             project_name_from_path,
@@ -3235,7 +3235,7 @@ class ReportGenerator:
 
         # Build the full logs URL
         # Build the full logs URL
-        full_logs_url = ReportUrlBuilder.build_dashboard_url(Config.DASHBOARD_BASE_URL, report_name, "html/index.html", project_name_from_path, job_name_from_path)
+        full_logs_url = ReportUrlBuilder.build_dashboard_url(Config.TRIAGING_DASHBOARD_BASE_URL, report_name, "html/index.html", project_name_from_path, job_name_from_path)
         
         html += f"""
                 <div class="footer">

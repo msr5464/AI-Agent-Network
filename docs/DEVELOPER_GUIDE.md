@@ -182,7 +182,9 @@ Tests cover Agent 2's library (database queries, HTML parser, report generator, 
 
 ## Adding a New Input File (Agent 1)
 
-Input files live in `agents/test-authoring-agent/queue/`. Claude is flexible about exact formatting — the minimum required fields are:
+Input files live in `agents/test-authoring-agent/queue/`. That directory is the agent's live inbox and is **git-ignored** — items are consumed and moved out by `run.sh`, so nothing there is meant to be committed. Worked examples of each input format are kept in [`docs/examples/queue/`](examples/queue/).
+
+Claude is flexible about exact formatting — the minimum required fields are:
 
 ```
 Module: <name>
@@ -239,8 +241,8 @@ The most commonly tweaked variables during development:
 | `AUTO_PUSH` | Skip GitHub PR creation | `false` |
 | `TESTING_MODE` | Cache Agent 1 steps 01+02 | `true` |
 | `STOP_AFTER` | Stop Agent 2 at a specific step | `collect` or `classify` |
-| `MAX_FIX_ATTEMPTS` | Retry budget for Agent 1+3 | `1` (faster feedback) |
-| `PLAYWRIGHT_HEADLESS` | Show browser during Agent 1 web validation | `false` |
+| `AUTHORING_FIX_RETRY_COUNT` / `HEALING_RETRY_COUNT` | Retry budget, per agent | `1` (faster feedback) |
+| `HEADLESS_BROWSER` | Show every browser any agent starts (validation, DOM inspection, exploration, minting, test runs) | `false` |
 | `CLAUDE_CLI_PATH` | Full path to claude binary | _(set if not on PATH)_ |
 
 Full variable reference: `config/.env.example`.

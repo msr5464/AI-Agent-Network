@@ -70,3 +70,50 @@ class TestFailureClassification:
             root_cause_category="OTHER",
         )
         assert "🔧" in repr(fc) and "AUTOMATION_ISSUE" in repr(fc)
+
+
+class TestExtractElementNames:
+    """Reading the element out of a failure the framework actually writes.
+
+    Only the page-load assertion says "in DashboardPage". Interaction failures —
+    the majority — name the element and its selector and nothing else, and used
+    to match no pattern here at all: the fix step then logged "no page object
+    matched" and Claude was asked to repair a locator it had never seen.
+    """
+
+    CLICK = ("Failed to click on element 'Edit Profile Summary button' with locator: "
+             "Locator@#profile-section-profile-summary img[alt='mukesh']: Error {\n"
+             "  message='Timeout 30000ms exceeded.")
+    ENTER = ("Failed to enter data in element 'Profile Summary Text Area' with "
+             "locator: Locator@textarea[placeholder='Craft a compelling summary']: Error {")
+
+    def _names(self, text, category="ELEMENT_NOT_FOUND"):
+        from shared.code_analyzer import CodeAnalyzer
+        return CodeAnalyzer().extract_element_names(root_cause=text, category=category)
+
+    def test_a_click_failure_yields_the_element_and_its_selector(self):
+        names = self._names(self.CLICK)
+        assert "Edit Profile Summary button" in names
+        assert "#profile-section-profile-summary img[alt='mukesh']" in names
+
+    def test_a_data_entry_failure_too(self):
+        names = self._names(self.ENTER)
+        assert "Profile Summary Text Area" in names
+        assert "textarea[placeholder='Craft a compelling summary']" in names
+
+    def test_the_selector_stops_before_the_exception_body(self):
+        # "Locator@<selector>: Error {" — the trailing ": Error {" is not part of
+        # the selector, and a selector with a colon in it would swallow the rest.
+        assert not any("Error" in name for name in self._names(self.CLICK))
+
+    def test_extraction_does_not_depend_on_the_classification(self):
+        # It used to return nothing unless the failure was already classified
+        # ELEMENT_NOT_FOUND or TIMEOUT, which made the evidence conditional on
+        # the conclusion it feeds: a WRONG_PAGE verdict switched off the lookup
+        # that would have shown it was a stale locator.
+        assert self._names(self.CLICK, category="WRONG_PAGE")
+        assert self._names(self.CLICK, category="")
+
+    def test_the_page_load_wording_still_works(self):
+        names = self._names("Failed to load Element Locator@.heading in ProductsPage")
+        assert ".heading" in names

@@ -107,6 +107,18 @@ class TestElementGone:
         assert verdict["verdict"] == "LOCATOR_STALE"
         assert verdict["actionable"] is True
 
+    def test_a_baseline_that_never_measured_the_element_will_not_guess(self, tmp_path):
+        # The rule used to fire when `vanished` was merely absent — and it is
+        # absent whenever no per-locator counts could be compared, which is the
+        # common case. "Absent on the last good run too" has to be read off that
+        # run, not inferred from the silence.
+        verdict, _ = _setup(
+            tmp_path, fx.DASHBOARD_RENAMED, _page_objects(),
+            context=fx.context(coverage=self.RIGHT_PAGE),
+            baseline=fx.baseline_record(coverage={"userMenu": 1}))
+        assert verdict["verdict"] == "LOCATOR_STALE"
+        assert verdict["actionable"] is True
+
     def test_without_a_baseline_it_will_not_guess(self, tmp_path):
         # From one run, "removed" and "the selector was always wrong" are the same
         # picture. Claiming either would be inventing evidence.

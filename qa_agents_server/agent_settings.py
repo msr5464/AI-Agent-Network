@@ -60,6 +60,83 @@ _EFFORT_OPTIONS = [
 ]
 
 SETTINGS_SCHEMA: List[Dict[str, Any]] = [
+    {
+        "key": "automation_framework",
+        "env_var": "AUTOMATION_FRAMEWORK",
+        "label": "Automation Framework",
+        "description": "Select the automation framework used in your target repository.",
+        "type": "select",
+        "options": [
+            {"label": "Playwright", "value": "playwright"},
+            {"label": "Selenium", "value": "selenium"}
+        ],
+        "category": "common",
+        "default": "playwright",
+        "sensitive": False,
+    },
+    # ── test-adaptation-agent ────────────────────────────────────────────────
+    {"key": "adaptation_model", "env_var": "ADAPTATION_MODEL", "label": "Adaptation model",
+     "description": "Claude model used to classify the change note and write edits.",
+     "type": "text", "category": "adaptation", "default": "claude-opus-5", "sensitive": False},
+    {"key": "adaptation_apply", "env_var": "ADAPTATION_APPLY", "label": "Apply edits",
+     "description": "Off = propose-only: full diffs and guard results are recorded "
+                    "but nothing is written. Turn on once the proposals are being "
+                    "accepted verbatim.",
+     "type": "boolean", "category": "adaptation", "default": False, "sensitive": False},
+    {"key": "adaptation_verify_policy", "env_var": "ADAPTATION_VERIFY_POLICY",
+     "label": "Verification scope",
+     "description": "named_only re-runs the tests the change note named; tiered adds "
+                    "the shared surface. The verify set holds the single global run "
+                    "slot, so 'all' can make the platform single-tasked for an hour.",
+     "type": "select", "category": "adaptation", "default": "named_only",
+     "options": [
+         {"value": "named_only", "label": "named_only"},
+         {"value": "tiered", "label": "tiered"},
+         {"value": "all", "label": "all"}
+     ], "sensitive": False},
+    {"key": "adaptation_explore_timeout_s", "env_var": "ADAPTATION_EXPLORE_TIMEOUT_S",
+     "label": "Exploration budget (s)",
+     "description": "Wall-clock limit for one browser exploration.",
+     "type": "number", "category": "adaptation", "default": 1800, "min": 60, "max": 7200, "sensitive": False},
+    {"key": "adaptation_explore_attempts", "env_var": "ADAPTATION_EXPLORE_ATTEMPTS",
+     "label": "Extra exploration attempts",
+     "description": "Full re-runs on a recoverable failure. Each one restarts the "
+                    "flow in a fresh browser — there is no mid-flow resume.",
+     "type": "number", "category": "adaptation", "default": 1, "min": 0, "max": 3, "sensitive": False},
+    {"key": "adaptation_retry_count", "env_var": "ADAPTATION_RETRY_COUNT",
+     "label": "Adapt retry count",
+     "description": "Re-runs of the adapt step when verification fails. Each attempt is "
+                    "handed the previous one's unapplied items, so a second failure on the "
+                    "same item is evidence the approach is wrong.",
+     "type": "number", "category": "adaptation", "default": 2, "min": 1, "max": 10, "sensitive": False},
+    {"key": "adaptation_max_files", "env_var": "ADAPTATION_MAX_FILES_PER_RUN",
+     "label": "Max files per run",
+     "description": "Exceeding this flips the run to propose-only rather than "
+                    "truncating the work.",
+     "type": "number", "category": "adaptation", "default": 6, "min": 1, "max": 20, "sensitive": False},
+    {"key": "adaptation_max_total_diff", "env_var": "ADAPTATION_MAX_TOTAL_DIFF_LINES",
+     "label": "Max changed lines per run",
+     "description": "Total across all files. A reviewer has to read this.",
+     "type": "number", "category": "adaptation", "default": 200, "min": 20, "max": 1000, "sensitive": False},
+    {"key": "adaptation_blast_max_tests", "env_var": "ADAPTATION_BLAST_MAX_TESTS",
+     "label": "Max tests in scope",
+     "description": "Above this the change is bigger than one agent run and escalates.",
+     "type": "number", "category": "adaptation", "default": 40, "min": 1, "max": 500, "sensitive": False},
+    {"key": "adaptation_hub_threshold", "env_var": "ADAPTATION_HUB_THRESHOLD",
+     "label": "Hub threshold",
+     "description": "A class referenced by more files than this is shared "
+                    "infrastructure and does not propagate the blast radius.",
+     "type": "number", "category": "adaptation", "default": 8, "min": 2, "max": 100, "sensitive": False},
+    {"key": "adaptation_branch_prefix", "env_var": "ADAPTATION_BRANCH_PREFIX",
+     "label": "Branch prefix",
+     "description": "Branch name is <prefix>/<module>-<timestamp>.",
+     "type": "text", "category": "adaptation", "default": "adaptation", "sensitive": False},
+    {"key": "adaptation_sandbox", "env_var": "ADAPTATION_SANDBOX", "label": "Sandbox environment",
+     "description": "Assert the target environment is disposable, allowing "
+                    "exploration to walk a destructive final step. Requires "
+                    "ADAPTATION_SANDBOX_NOTE, which is reproduced in the PR body.",
+     "type": "boolean", "category": "adaptation", "default": False, "sensitive": False},
+
     # ── Common ───────────────────────────────────────────────────────────────
     {
         "key": "workspace_dir",
@@ -67,6 +144,18 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "label": "Workspace Directory",
         "description": "Parent directory that contains the automation repo. Must be an "
                        "absolute path OUTSIDE of QA-Agent-Network.",
+        "type": "text",
+        "category": "common",
+        "default": "",
+        "sensitive": False,
+    },
+    {
+        "key": "framework_dir",
+        "env_var": "FRAMEWORK_DIR",
+        "label": "Automation Repo Path",
+        "description": "Absolute path to the automation repo checkout, overriding "
+                       "<workspace>/<automation repo>. Leave blank unless the checkout "
+                       "is named differently or lives elsewhere.",
         "type": "text",
         "category": "common",
         "default": "",
@@ -86,7 +175,7 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "key": "github_repo_automation",
         "env_var": "GITHUB_REPO_AUTOMATION",
         "label": "Automation Repo",
-        "description": "Name of the automation repo directory under the workspace directory",
+        "description": "Name of the automation repo — the directory under the workspace directory, and the repo name on GitHub. Required even when Automation Repo Path is set.",
         "type": "text",
         "category": "common",
         "default": "Jarvis",
@@ -96,7 +185,9 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "key": "github_default_branch",
         "env_var": "GITHUB_DEFAULT_BRANCH",
         "label": "Default Branch",
-        "description": "Base branch for all pull requests raised by the agents",
+        "description": ("Default base branch: agents check the automation repo "
+                        "out on it and raise their PRs against it. A run can "
+                        "override it from the run panel's branch field."),
         "type": "text",
         "category": "common",
         "default": "main",
@@ -163,19 +254,6 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "max_fix_attempts",
-        "env_var": "MAX_FIX_ATTEMPTS",
-        "label": "Max Fix Attempts",
-        "description": "Maximum fix-and-retry cycles before shipping with a NEEDS-REVIEW "
-                       "verdict. The healing agent defaults to 2 when this is unset.",
-        "type": "number",
-        "category": "common",
-        "default": 3,
-        "sensitive": False,
-        "min": 1,
-        "max": 10,
-    },
-    {
         "key": "auto_push",
         "env_var": "AUTO_PUSH",
         "label": "Auto Push & Create PR",
@@ -184,6 +262,18 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "type": "boolean",
         "category": "common",
         "default": False,
+        "sensitive": False,
+    },
+    {
+        "key": "headless_browser",
+        "env_var": "HEADLESS_BROWSER",
+        "label": "Headless Browser",
+        "description": "Turn off to watch every browser any agent starts — selector "
+                       "validation, DOM inspection, exploration, session login, and the "
+                       "test runs themselves. Useful for debugging; keep on for CI runs.",
+        "type": "boolean",
+        "category": "common",
+        "default": True,
         "sensitive": False,
     },
     {
@@ -199,8 +289,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
     },
     # ── Test Authoring ───────────────────────────────────────────────────────
     {
-        "key": "autocreate_model",
-        "env_var": "AUTOCREATE_MODEL",
+        "key": "authoring_model",
+        "env_var": "AUTHORING_MODEL",
         "label": "Claude Model",
         "description": "Model used for all AI steps: parse, validate, generate, fix",
         "type": "text",
@@ -209,18 +299,18 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "autocreate_branch_prefix",
-        "env_var": "AUTOCREATE_BRANCH_PREFIX",
+        "key": "authoring_branch_prefix",
+        "env_var": "AUTHORING_BRANCH_PREFIX",
         "label": "Branch Prefix",
         "description": "Full branch name becomes <prefix>/<feature>-<timestamp>",
         "type": "text",
         "category": "authoring",
-        "default": "feat/qa-autocreate",
+        "default": "authoring",
         "sensitive": False,
     },
     {
-        "key": "autocreate_environment",
-        "env_var": "AUTOCREATE_ENVIRONMENT",
+        "key": "authoring_environment",
+        "env_var": "AUTHORING_ENVIRONMENT",
         "label": "Environment",
         "description": "Passed as -Denvironment when verifying generated tests",
         "type": "text",
@@ -229,8 +319,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "autocreate_country",
-        "env_var": "AUTOCREATE_COUNTRY",
+        "key": "authoring_country",
+        "env_var": "AUTHORING_COUNTRY",
         "label": "Country",
         "description": "Passed as -Dcountry when verifying generated tests",
         "type": "text",
@@ -239,10 +329,25 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "playwright_timeout_ms",
-        "env_var": "PLAYWRIGHT_TIMEOUT_MS",
-        "label": "Playwright Step Timeout (ms)",
-        "description": "Timeout for each Playwright step during selector validation",
+        "key": "authoring_fix_retry_count",
+        "env_var": "AUTHORING_FIX_RETRY_COUNT",
+        "label": "Fix Retry Count",
+        "description": "Fix-and-retry cycles for a failing generated test before shipping "
+                       "with a NEEDS-REVIEW verdict. The initial run is not counted. The "
+                       "loop also stops early on its own once an attempt can bring nothing "
+                       "new \u2014 so this is a ceiling, not a target.",
+        "type": "number",
+        "category": "authoring",
+        "default": 2,
+        "sensitive": False,
+        "min": 1,
+        "max": 10,
+    },
+    {
+        "key": "authoring_browser_timeout_ms",
+        "env_var": "AUTHORING_BROWSER_TIMEOUT_MS",
+        "label": "Browser Step Timeout (ms)",
+        "description": "Timeout for each browser step during selector validation",
         "type": "number",
         "category": "authoring",
         "default": 30000,
@@ -250,21 +355,10 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "min": 1000,
         "max": 600000,
     },
-    {
-        "key": "playwright_headless",
-        "env_var": "PLAYWRIGHT_HEADLESS",
-        "label": "Headless Browser",
-        "description": "Turn off to run the browser in headed (visible) mode during selector "
-                       "validation. Useful for debugging; keep on for CI runs.",
-        "type": "boolean",
-        "category": "authoring",
-        "default": True,
-        "sensitive": False,
-    },
     # ── Test Healing ─────────────────────────────────────────────────────────
     {
-        "key": "autofix_model",
-        "env_var": "AUTOFIX_MODEL",
+        "key": "healing_model",
+        "env_var": "HEALING_MODEL",
         "label": "Claude Model",
         "description": "Model used to generate locator fixes",
         "type": "text",
@@ -273,8 +367,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "auto_fix_max_fixes_per_run",
-        "env_var": "AUTO_FIX_MAX_FIXES_PER_RUN",
+        "key": "healing_max_fixes_per_run",
+        "env_var": "HEALING_MAX_FIXES_PER_RUN",
         "label": "Max Fixes Per Run",
         "description": "Maximum number of DISTINCT LOCATOR FIXES per session — not tests. "
                        "One fix can green several tests, so 30 failures caused by 6 broken "
@@ -288,18 +382,33 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "max": 50,
     },
     {
-        "key": "autofix_branch_prefix",
-        "env_var": "AUTOFIX_BRANCH_PREFIX",
+        "key": "healing_retry_count",
+        "env_var": "HEALING_RETRY_COUNT",
+        "label": "Fix Retry Count",
+        "description": "Retry cycles when a locator fix fails verification. An attempt that "
+                       "repairs one locator and uncovers the next keeps its edit, so the loop "
+                       "walks a chain of broken locators rather than re-guessing at one \u2014 "
+                       "which is why this is higher than the authoring agent's.",
+        "type": "number",
+        "category": "healing",
+        "default": 4,
+        "sensitive": False,
+        "min": 1,
+        "max": 10,
+    },
+    {
+        "key": "healing_branch_prefix",
+        "env_var": "HEALING_BRANCH_PREFIX",
         "label": "Branch Prefix",
         "description": "Full branch name becomes <prefix>/<build-tag>",
         "type": "text",
         "category": "healing",
-        "default": "chore/qa-autofix",
+        "default": "healing",
         "sensitive": False,
     },
     {
-        "key": "autofix_inspect_dom",
-        "env_var": "AUTOFIX_INSPECT_DOM",
+        "key": "healing_inspect_dom",
+        "env_var": "HEALING_INSPECT_DOM",
         "label": "Live DOM Inspection",
         "description": "Before asking for a fix, open the failing page in a real browser and "
                        "read the element's actual selector. Only used when the handoff carries "
@@ -311,8 +420,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "autofix_base_url",
-        "env_var": "AUTOFIX_BASE_URL",
+        "key": "healing_base_url",
+        "env_var": "HEALING_BASE_URL",
         "label": "Page URL Override",
         "description": "Explicit page URL for DOM inspection, overriding whatever is recovered "
                        "from the failure log. Leave blank to auto-recover.",
@@ -322,8 +431,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "autofix_test_timeout_s",
-        "env_var": "AUTOFIX_TEST_TIMEOUT_S",
+        "key": "healing_test_timeout_s",
+        "env_var": "HEALING_TEST_TIMEOUT_S",
         "label": "Verification Timeout (s)",
         "description": "Timeout for a single verification test run",
         "type": "number",
@@ -347,8 +456,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
     },
     # ── Test Triaging ────────────────────────────────────────────────────────
     {
-        "key": "db_host",
-        "env_var": "DB_HOST",
+        "key": "triaging_db_host",
+        "env_var": "TRIAGING_DB_HOST",
         "label": "DB Host",
         "description": "Hostname of the test-results database",
         "type": "text",
@@ -357,8 +466,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "db_port",
-        "env_var": "DB_PORT",
+        "key": "triaging_db_port",
+        "env_var": "TRIAGING_DB_PORT",
         "label": "DB Port",
         "description": "Port of the test-results database",
         "type": "number",
@@ -369,8 +478,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "max": 65535,
     },
     {
-        "key": "db_user",
-        "env_var": "DB_USER",
+        "key": "triaging_db_user",
+        "env_var": "TRIAGING_DB_USER",
         "label": "DB User",
         "description": "Username for the test-results database",
         "type": "text",
@@ -379,8 +488,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "db_password",
-        "env_var": "DB_PASSWORD",
+        "key": "triaging_db_password",
+        "env_var": "TRIAGING_DB_PASSWORD",
         "label": "DB Password",
         "description": "Password for the test-results database",
         "type": "password",
@@ -389,8 +498,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": True,
     },
     {
-        "key": "db_name",
-        "env_var": "DB_NAME",
+        "key": "triaging_db_name",
+        "env_var": "TRIAGING_DB_NAME",
         "label": "DB Name",
         "description": "Name of the test-results database",
         "type": "text",
@@ -399,8 +508,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "classifier_model",
-        "env_var": "CLASSIFIER_MODEL",
+        "key": "triaging_classifier_model",
+        "env_var": "TRIAGING_CLASSIFIER_MODEL",
         "label": "Classifier Model",
         "description": "Model used to classify each failure's root cause",
         "type": "text",
@@ -409,8 +518,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "classifier_effort",
-        "env_var": "CLASSIFIER_EFFORT",
+        "key": "triaging_classifier_effort",
+        "env_var": "TRIAGING_CLASSIFIER_EFFORT",
         "label": "Classifier Effort",
         "description": "Reasoning effort for the classification pass",
         "type": "select",
@@ -420,8 +529,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "options": _EFFORT_OPTIONS,
     },
     {
-        "key": "reviewer_model",
-        "env_var": "REVIEWER_MODEL",
+        "key": "triaging_reviewer_model",
+        "env_var": "TRIAGING_REVIEWER_MODEL",
         "label": "Reviewer Model",
         "description": "Model used to review and challenge the classifier's verdicts",
         "type": "text",
@@ -430,8 +539,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "reviewer_effort",
-        "env_var": "REVIEWER_EFFORT",
+        "key": "triaging_reviewer_effort",
+        "env_var": "TRIAGING_REVIEWER_EFFORT",
         "label": "Reviewer Effort",
         "description": "Reasoning effort for the review pass",
         "type": "select",
@@ -441,8 +550,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "options": _EFFORT_OPTIONS,
     },
     {
-        "key": "scout_lookback_days",
-        "env_var": "SCOUT_LOOKBACK_DAYS",
+        "key": "triaging_scout_lookback_days",
+        "env_var": "TRIAGING_SCOUT_LOOKBACK_DAYS",
         "label": "Scout Lookback (days)",
         "description": "How far back to look for test runs when no build tag is given",
         "type": "number",
@@ -453,8 +562,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "max": 365,
     },
     {
-        "key": "max_review_rounds",
-        "env_var": "MAX_REVIEW_ROUNDS",
+        "key": "triaging_max_review_rounds",
+        "env_var": "TRIAGING_MAX_REVIEW_ROUNDS",
         "label": "Max Review Rounds",
         "description": "How many classify/review rounds to run before accepting the verdict",
         "type": "number",
@@ -465,8 +574,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "max": 10,
     },
     {
-        "key": "flaky_tests_last_runs",
-        "env_var": "FLAKY_TESTS_LAST_RUNS",
+        "key": "triaging_flaky_tests_last_runs",
+        "env_var": "TRIAGING_FLAKY_TESTS_LAST_RUNS",
         "label": "Flaky Window (runs)",
         "description": "How many recent runs to inspect when deciding whether a test is flaky",
         "type": "number",
@@ -477,8 +586,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "max": 200,
     },
     {
-        "key": "flaky_tests_min_failures",
-        "env_var": "FLAKY_TESTS_MIN_FAILURES",
+        "key": "triaging_flaky_tests_min_failures",
+        "env_var": "TRIAGING_FLAKY_TESTS_MIN_FAILURES",
         "label": "Flaky Threshold (failures)",
         "description": "Failures within that window before a test is labelled flaky",
         "type": "number",
@@ -489,8 +598,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "max": 200,
     },
     {
-        "key": "dashboard_base_url",
-        "env_var": "DASHBOARD_BASE_URL",
+        "key": "triaging_dashboard_base_url",
+        "env_var": "TRIAGING_DASHBOARD_BASE_URL",
         "label": "Dashboard Base URL",
         "description": "Used to build links back to the QA dashboard in reports",
         "type": "text",
@@ -499,8 +608,8 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
-        "key": "jira_base_url",
-        "env_var": "JIRA_BASE_URL",
+        "key": "triaging_jira_base_url",
+        "env_var": "TRIAGING_JIRA_BASE_URL",
         "label": "Jira Base URL",
         "description": "Used to build issue links in reports",
         "type": "text",
@@ -515,7 +624,7 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "label": "Run Timeout (s)",
         "description": "Wall-clock budget for a single agent run before it is killed",
         "type": "number",
-        "category": "server",
+        "category": "common",
         "default": 7200,
         "sensitive": False,
         "min": 60,
@@ -527,17 +636,40 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "label": "Stale After (s)",
         "description": "How long a run may go without progress before the UI marks it stale",
         "type": "number",
-        "category": "server",
+        "category": "common",
         "default": 900,
         "sensitive": False,
         "min": 30,
         "max": 86400,
     },
+    {
+        "key": "qa_max_concurrent_runs",
+        "env_var": "QA_MAX_CONCURRENT_RUNS",
+        "label": "Max Concurrent Runs",
+        "description": "Maximum number of agent runs allowed to execute in parallel across all users",
+        "type": "number",
+        "category": "common",
+        "default": 4,
+        "sensitive": False,
+        "min": 1,
+        "max": 32,
+    },
+    {
+        "key": "qa_worktree_temp_dir",
+        "env_var": "QA_WORKTREE_TEMP_DIR",
+        "label": "Git Worktree Temp Dir",
+        "description": "Directory where ephemeral git worktrees are created for isolated runs",
+        "type": "text",
+        "category": "common",
+        "default": "/tmp/qa-runs",
+        "sensitive": False,
+    },
 ]
 
 _SCHEMA_BY_KEY: Dict[str, Dict[str, Any]] = {s["key"]: s for s in SETTINGS_SCHEMA}
 
-CATEGORIES: List[str] = ["common", "authoring", "healing", "triaging", "server"]
+CATEGORIES: List[str] = ["common", "authoring", "healing", "adaptation",
+                         "triaging"]
 
 
 class SettingsValidationError(Exception):
