@@ -1,0 +1,11 @@
+Module: saucedemo
+Type: web
+Affects: automation.saucedemo.SauceDemoWebTest#simulateWebLifecycle
+
+What changed:
+1. Clicking "Remove" on a cart row no longer deletes the item. It moves the
+   item into a new "Saved for later" list at the bottom of the cart page, so
+   the cart line count drops but the product name is still shown on the page.
+
+Expected outcome changed: after removing a product from the cart, it is still
+listed on the cart page under "Saved for later", not gone from the page.

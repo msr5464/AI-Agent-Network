@@ -24,6 +24,10 @@ The mechanism is yours to change: locators, waits, the order of steps, which pag
 are visited. The proof is not. Every assertion the test currently performs must
 still be performed, on the same subject, unconditionally.
 
+A `coverage_added` item is the one case where nothing in the product changed: the
+job is to add the steps and assertions the note asks for, on top of every existing
+one. Adding an assertion is always allowed; losing one never is.
+
 This is checked mechanically after you answer, across the whole helper call graph
 and not just the file you edited. An assertion that is deleted, replaced with a
 weaker one, or wrapped in an `if` that makes it run only when it would have passed,
@@ -44,8 +48,8 @@ A flow-map step whose selector could not be verified unique justifies nothing.
 
 You may: change a locator; change the wrapper call when the control type changed
 (a `<select>` that became a combobox needs different handling, not just a different
-selector); add or remove a step; add a page object for a genuinely new page; add a
-field to a data builder.
+selector); add or remove a step; add an assertion; add a page object for a genuinely
+new page; add a field to a data builder.
 
 You may not: weaken or remove an assertion; add `Thread.sleep`; add a `try/catch`
 that swallows a failure; add `@Ignore` or `enabled = false`; use raw Selenium

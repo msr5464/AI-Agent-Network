@@ -70,12 +70,15 @@ DIFF_BUDGETS = {
     "locator": 6, "interaction": 20, "route": 10, "step_insert": 40,
     "step_merge": 40, "field_added": 60, "api_contract": 30, "test_data": 30,
     "page_object_new": 300,
+    # Extra steps and checks usually mean new locators and accessors in a page
+    # object plus the calls and assertions in the test — field_added's shape.
+    "coverage_added": 60,
 }
 DEFAULT_BUDGET = 40
 # A step_insert may legitimately touch a call site and a page object; the
 # per-file budget alone would let it do that in six files and stay inside every
-# individual limit.
-CLUSTER_BUDGETS = {"step_insert": 80}
+# individual limit. coverage_added touches the same two, at field_added's size.
+CLUSTER_BUDGETS = {"step_insert": 80, "coverage_added": 120}
 
 # A URL belongs in the properties file the tests already read, never inline.
 # Which framework wrapper a control type implies. An `interaction` change is only

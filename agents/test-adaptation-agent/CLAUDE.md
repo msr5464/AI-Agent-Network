@@ -61,6 +61,7 @@ writing it down has already answered it.
 | `step_insert` | a new step in the flow | 40/file |
 | `step_merge` | steps merged or removed | 40/file |
 | `field_added` | something the page object does not model at all — a new required field, or a control with no locator yet | 60 across ≤3 files |
+| `coverage_added` | no product change — extra steps and checks on an existing test; every existing assertion stays | 60/file, 120 per item |
 | `api_contract` | request/response shape, status, header | 30 |
 | `test_data` | a fixture or default | 30 |
 | `page_object_new` | a whole new page object | 300 (the one whole-file case) |

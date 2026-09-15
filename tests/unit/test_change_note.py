@@ -130,3 +130,11 @@ class TestKinds:
 
     def test_every_escalate_only_kind_is_a_real_kind(self):
         assert set(pc.ESCALATE_ONLY) <= set(pc.KINDS)
+
+    def test_added_coverage_is_applied_not_escalated(self):
+        assert "coverage_added" in pc.KINDS and "coverage_added" not in pc.ESCALATE_ONLY, (
+            "a note that only adds steps or checks changes nothing in the product; "
+            "with no kind for it, the classifier reached for outcome_changed and the "
+            "agent escalated an edit it was allowed to make")
+        prompt = pc.classify_prompt("saucedemo", [{"index": 1, "text": "also verify the price"}], "")
+        assert "is `coverage_added`, not this" in prompt

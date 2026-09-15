@@ -49,7 +49,7 @@ MODEL = os.environ.get("ADAPTATION_MODEL", "claude-opus-5")
 # something permissive.
 KINDS = ("locator", "interaction", "route", "step_insert", "step_merge",
          "field_added", "api_contract", "test_data", "page_object_new",
-         "content_changed", "outcome_changed")
+         "coverage_added", "content_changed", "outcome_changed")
 
 # Kinds no agent may apply. `outcome_changed` means the spec moved, not the test;
 # `content_changed` is where a real product bug hides most comfortably.
@@ -114,8 +114,9 @@ def looks_destructive(text: str) -> str:
 def classify_prompt(module: str, items: list, note: str) -> str:
     kinds = "\n".join(f"  - {k}" for k in KINDS)
     listed = "\n".join(f"{i['index']}. {i['text']}" for i in items)
-    return f"""You are classifying how a product changed, so a QA agent knows how much
-authority it has to edit the automation tests. Module: {module}.
+    return f"""You are classifying how a product changed — or what more a team wants an
+existing test to cover — so a QA agent knows how much authority it has to edit
+the automation tests. Module: {module}.
 
 The full change note:
 ---
@@ -142,6 +143,9 @@ What the kinds mean:
 - api_contract     — a request/response shape, status code or header changed.
 - test_data        — a fixture, default or seeded record changed.
 - page_object_new  — a genuinely new page exists that has no page object yet.
+- coverage_added   — nothing in the product changed: the team wants an existing test
+                     to do more — extra steps, extra checks — while every check it
+                     already makes stays exactly as it is.
 - content_changed  — only visible copy/label/expected text changed.
 - outcome_changed  — what the feature DOES changed, so what the test should prove
                      has changed too.
@@ -149,7 +153,8 @@ What the kinds mean:
 Two of these stop the agent rather than directing it, so do not reach for them
 loosely and do not avoid them when they fit:
 - `outcome_changed` means the specification moved. No edit to the test is correct,
-  because the test is not what is broken.
+  because the test is not what is broken. A note that only ADDS steps or checks,
+  and keeps every existing one, is `coverage_added`, not this.
 - `content_changed` is where a genuine product bug hides most comfortably — a
   changed expected string looks identical whether it was intended or is a defect.
 
