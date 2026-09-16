@@ -131,6 +131,13 @@ def _step_has_error(data: Optional[Dict]) -> bool:
     # fix that repaired nothing showed "done" (green).
     if data.get("fix_gate") == "false":
         return True
+    # 04-adapt.json has no "status" key at all — its vocabulary is per item.
+    # A step that wrote a valid file in which every item failed showed "done"
+    # (green) in the UI, the same way Run & Fix used to. `escalated` and
+    # `declined` are deliberate outcomes and deliberately not counted here.
+    if any(isinstance(item, dict) and item.get("status") == "failed"
+           for item in (data.get("items") or [])):
+        return True
     return False
 
 
@@ -202,39 +209,46 @@ def list_sessions(limit: int = 50, offset: int = 0,
     return all_sessions[offset : offset + limit]
 
 
+def _authoring_summary(spec, session_dir: Path) -> Dict:
+    """One session row for the authoring agent.
+
+    Extracted so the detail view can build on the same derivation the history
+    rows use — the shape healing and adaptation already have. It used to be a
+    literal inlined in the list function plus a second, shorter literal in the
+    detail function, which is why a detail payload carried no `pr_url`,
+    `duration_s`, `timestamp` or cost fields even though the row beside it did.
+    """
+    ship = _safe_load_json(session_dir / "05-ship.json")
+    parsed = _parse_session_id(session_dir.name)
+    verdict = _read_text(session_dir / ".verdict")
+    fix_gate = _read_text(session_dir / ".fix-passed")
+    return {
+        "session_id": session_dir.name,
+        "module": (ship or {}).get("feature") or parsed["module"],
+        "feature_class": (ship or {}).get("feature_class"),
+        "started_at": parsed["timestamp"],
+        "status": _derive_status(session_dir, ship, spec.steps),
+        "verdict": (verdict or "").strip() or None,
+        "fix_gate": (fix_gate or "").strip() or None,
+        "diagnosis": _diagnosis_outcome(session_dir, fix_gate),
+        "test_passed": (ship or {}).get("test_passed"),
+        "pr_url": (ship or {}).get("pr_url"),
+        "files_count": (ship or {}).get("files_count"),
+        "timestamp": (ship or {}).get("timestamp"),
+        "duration_s": _duration_with_fallback(session_dir, session_dir.name, ship),
+        # Flat cost/token fields so the history table renders without an
+        # N+1 fetch per row.
+        **metrics_reader.summary_fields(
+            metrics_reader.read_session_metrics(session_dir)),
+    }
+
+
 def _list_authoring_sessions(spec, limit: int, offset: int) -> List[Dict]:
     if not spec.audit_dir.exists():
         return []
 
-    sessions: List[Dict] = []
-    for entry in spec.audit_dir.iterdir():
-        if not entry.is_dir():
-            continue
-        ship = _safe_load_json(entry / "05-ship.json")
-        parsed = _parse_session_id(entry.name)
-        verdict = _read_text(entry / ".verdict")
-        fix_gate = _read_text(entry / ".fix-passed")
-        status = _derive_status(entry, ship, spec.steps)
-        sessions.append({
-            "session_id": entry.name,
-            "module": (ship or {}).get("feature") or parsed["module"],
-            "feature_class": (ship or {}).get("feature_class"),
-            "started_at": parsed["timestamp"],
-            "status": status,
-            "verdict": (verdict or "").strip() or None,
-            "fix_gate": (fix_gate or "").strip() or None,
-            "diagnosis": _diagnosis_outcome(entry, fix_gate),
-            "test_passed": (ship or {}).get("test_passed"),
-            "pr_url": (ship or {}).get("pr_url"),
-            "files_count": (ship or {}).get("files_count"),
-            "timestamp": (ship or {}).get("timestamp"),
-            "duration_s": _duration_with_fallback(entry, entry.name, ship),
-            # Flat cost/token fields so the history table renders without an
-            # N+1 fetch per row.
-            **metrics_reader.summary_fields(
-                metrics_reader.read_session_metrics(entry)),
-        })
-
+    sessions = [_authoring_summary(spec, entry)
+                for entry in spec.audit_dir.iterdir() if entry.is_dir()]
     sessions.sort(key=lambda s: s.get("session_id") or "", reverse=True)
     return sessions[offset : offset + limit]
 
@@ -252,43 +266,39 @@ def get_session(session_id: str, agent: str = DEFAULT_AGENT) -> Optional[Dict]:
     return session
 
 
+def _steps_and_reports(spec, session_dir: Path) -> Dict[str, Dict]:
+    """The `steps` (parsed JSON) and `reports` (markdown) dicts, by step key.
+
+    Derived from the spec rather than hand-written per agent, which is what the
+    three copies of this used to be. Those copies drifted exactly as you would
+    expect: authoring never grew a `reports` dict at all even though its agent
+    writes the markdown; healing's `steps` omitted `locate` while its `reports`
+    included it; and the two keyed reports differently (`<name>_md` vs the step
+    key), so one payload could not be rendered by the other's view.
+
+    Both dicts always share a key set here, so a renderer can walk one and index
+    the other. A missing file is None, not an error — any run that died
+    mid-pipeline lacks its later artefacts, and so does authoring's
+    02-validate-web.md on an API-only run.
+    """
+    artifacts = spec.detail_artifacts()
+    return {
+        "steps": {key: _safe_load_json(session_dir / filename)
+                  for key, filename, _label in artifacts},
+        "reports": {key: _read_text(session_dir / filename.replace(".json", ".md"))
+                    for key, filename, _label in artifacts},
+    }
+
+
 def _get_authoring_session(spec, session_id: str) -> Optional[Dict]:
     session_dir = spec.audit_dir / session_id
-    if not session_dir.exists() or not session_dir.is_dir():
+    if not session_dir.is_dir():
         return None
 
-    parsed = _parse_session_id(session_id)
-    init_md = _read_text(session_dir / "00-session-init.md")
-    parse = _safe_load_json(session_dir / "01-parse.json")
-    validate = _safe_load_json(session_dir / "02-validate-web.json")
-    validate_api = _safe_load_json(session_dir / "02-validate-api.json")
-    generate = _safe_load_json(session_dir / "03-generate.json")
-    run_and_fix = _safe_load_json(session_dir / "04-run-and-fix.json")
-    ship = _safe_load_json(session_dir / "05-ship.json")
-    verdict = (_read_text(session_dir / ".verdict") or "").strip() or None
-    fix_gate = (_read_text(session_dir / ".fix-passed") or "").strip() or None
-
-    return {
-        "session_id": session_id,
-        "module": (ship or {}).get("feature") or parsed["module"],
-        "started_at": parsed["timestamp"],
-        "status": _derive_status(session_dir, ship, spec.steps),
-        "verdict": verdict,
-        "fix_gate": fix_gate,
-        "diagnosis": _diagnosis_outcome(session_dir, fix_gate),
-        "init_md": init_md,
-        "steps": {
-            "parse": parse,
-            "validate_web": validate,
-            # Runs alongside validate_web in the SAME numbered step-2 slot (see
-            # run.sh) — not in STEPS (progress-bar polling stays on the 5-step
-            # model), but exposed here so the History detail view can show it.
-            "validate_api": validate_api,
-            "generate": generate,
-            "run_and_fix": run_and_fix,
-            "ship": ship,
-        },
-    }
+    summary = _authoring_summary(spec, session_dir)
+    summary["init_md"] = _read_text(session_dir / "00-session-init.md")
+    summary.update(_steps_and_reports(spec, session_dir))
+    return summary
 
 
 def replay_events(session_id: str,
@@ -731,22 +741,12 @@ def _get_healing_session(spec, session_id: str) -> Optional[Dict]:
 
     summary = _healing_summary(spec, session_dir)
     summary["init_md"] = _read_text(session_dir / "00-session-init.md")
-    summary["steps"] = {
-        "reproduce": _safe_load_json(session_dir / "00-reproduce.json"),
-        "fix": _safe_load_json(session_dir / "01-fix.json"),
-        "ship": _safe_load_json(session_dir / "02-ship.json"),
-    }
     # Markdown reports are what a human actually wants to read in the detail view.
     # The raw console is deliberately NOT included: it is served incrementally by
     # /run/<sid>/stream into the Live Run card, so shipping a second copy here
     # made every row click pay for the whole log — and a real run's maven output
     # is the largest thing in the session by far.
-    summary["reports"] = {
-        "reproduce_md": _read_text(session_dir / "00-reproduce.md"),
-        "locate_md": _read_text(session_dir / "01-locate.md"),
-        "fix_md": _read_text(session_dir / "01-fix.md"),
-        "ship_md": _read_text(session_dir / "02-ship.md"),
-    }
+    summary.update(_steps_and_reports(spec, session_dir))
     return summary
 
 
@@ -855,14 +855,7 @@ def _get_adaptation_session(spec, session_id: str) -> Optional[Dict]:
         return None
     summary = _adaptation_summary(spec, session_dir)
     summary["init_md"] = _read_text(session_dir / "00-session-init.md")
-    summary["steps"] = {
-        key: _safe_load_json(session_dir / filename)
-        for key, filename, _ in spec.steps
-    }
-    summary["reports"] = {
-        key: _read_text(session_dir / filename.replace(".json", ".md"))
-        for key, filename, _ in spec.steps
-    }
+    summary.update(_steps_and_reports(spec, session_dir))
     return summary
 
 

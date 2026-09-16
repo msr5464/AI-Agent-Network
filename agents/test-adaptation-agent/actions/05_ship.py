@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shared.log import log as _log
+from shared import workspace as workspace_helper
 from shared.log import blocked
 def log(msg): _log("ship", msg)
 
@@ -61,7 +62,29 @@ SLACK_NOTIFY = os.environ.get("SLACK_NOTIFY_CHANNEL", "")
 SLACK_ALERT = os.environ.get("SLACK_ALERT_CHANNEL", "") or SLACK_NOTIFY
 
 # Skip reasons that mean a person has to look at this, not that nothing happened.
-ESCALATING = ("escalate", "unsafe", "no-session", "unreachable")
+ESCALATING = ("escalate", "unsafe", "no-session", "unreachable", "stuck")
+
+
+def needs_a_human(skip_reason: str, escalations: list, items: list,
+                  applied: list) -> tuple:
+    """Does this run belong in the alert channel, and what should it say?
+
+    Work that did not land needs a person as much as an explicit escalation does.
+    A run whose every item was rejected by a guard posted "0 change item(s)
+    applied, 0 test(s) verified" to the *success* channel, which reads as a quiet
+    success — the same shape as a failed step showing green in the UI.
+    """
+    stalled = [i for i in (items or [])
+               if i.get("status") in ("rejected", "failed", "rolled_back")]
+    if not (skip_reason in ESCALATING or escalations or (stalled and not applied)):
+        return False, ""
+    detail = "\n".join(f"• {e['what']}: {e['why'][:160]}"
+                       for e in (escalations or [])[:4])
+    if not detail and stalled:
+        detail = (f"{len(stalled)} change item(s) could not be adapted: "
+                  + "; ".join((i.get("reason") or i.get("status", ""))[:80]
+                              for i in stalled[:3]))
+    return True, detail or skip_reason
 
 
 def load(name: str) -> dict:
@@ -274,7 +297,7 @@ def main():
         result["ship_detail"] = f"no PR — {reason}"
         log(result["ship_detail"])
     else:
-        workspace = Path(scope["workspace"])
+        workspace = workspace_helper.resume_workspace(scope["workspace"], log=log)
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
         branch = f"{BRANCH_PREFIX}/{MODULE}-{stamp}"
         # Branch from the SHA step 02 recorded, and do NOT re-fetch first.
@@ -377,14 +400,14 @@ def main():
     (AUDIT_DIR / ".verdict").write_text(result["verdict"])
 
     if SLACK_TOKEN:
-        escalating = skip_reason in ESCALATING or bool(result["escalations"])
+        escalating, escalation_detail = needs_a_human(
+            skip_reason, result["escalations"], adapt.get("items") or [], applied)
         channel = SLACK_ALERT if (escalating or result["ship_status"] in
                                   ("push_failed", "pr_failed")) else SLACK_NOTIFY
         if escalating:
             headline = (f":raised_hand: *QA Adaptation needs a human* — `{MODULE}`\n"
                         f"The agent stopped rather than guessing.")
-            detail = "\n".join(f"• {e['what']}: {e['why'][:160]}"
-                               for e in result["escalations"][:4]) or skip_reason
+            detail = escalation_detail
         else:
             headline = (f":arrows_counterclockwise: *QA Adaptation — NEEDS REVIEW* "
                         f"— `{MODULE}`")

@@ -1,6 +1,6 @@
-Module: saucedemo
+Module: SauceDemo
 Type: web
-Affects: automation.saucedemo.SauceDemoWebTest#simulateWebLifecycle
+Tests: automation.saucedemo.SauceDemoWebTest#simulateWebLifecycle
 
 What changed:
 1. Clicking "Remove" on a cart row no longer deletes the item. It moves the

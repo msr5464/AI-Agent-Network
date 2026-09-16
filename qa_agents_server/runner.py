@@ -155,6 +155,12 @@ class RunState:
             "status": self.status,
             "exit_code": self.exit_code,
             "pid": self.pid,
+            # Which server owns this run. Boot-time reconciliation reaps a run
+            # only when its owner is gone: without this, starting a second server
+            # while the first is working killed the first one's live runs, then
+            # exited on the port conflict — so the surviving server kept serving
+            # and the run it was in the middle of was simply dead.
+            "server_pid": os.getpid(),
             "start_from_step": self.start_from_step,
             # Totals only — the per-stage detail stays in the session's
             # metrics.json rather than bloating every registry entry.
@@ -436,6 +442,19 @@ def _describe_pid(pid: int) -> str:
         return ""
 
 
+def _pid_alive(pid: int) -> bool:
+    """Is this process still around? Signal 0 checks without delivering anything."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True         # exists, owned by somebody else
+    except OSError:
+        return False
+    return True
+
+
 def _is_our_agent_process(pid: int) -> bool:
     """Guard against PID reuse before signalling a pid we only know from disk.
 
@@ -538,6 +557,13 @@ def reconcile_on_boot() -> None:
         pid = entry.get("pid")
         sid = entry.get("session_id") or "?"
         if not pid:
+            continue
+        owner = entry.get("server_pid")
+        if owner and int(owner) != os.getpid() and _pid_alive(int(owner)):
+            # Another server process is still running and this is its run, not a
+            # leftover of a dead one. Reaping it is how a second `run-server.sh`
+            # came to kill the work of the server that was already up.
+            print(f"[runner] leaving run {sid} alone — server {owner} still owns it")
             continue
         if not _is_our_agent_process(int(pid)):
             continue        # already gone, or the pid now belongs to something else
@@ -687,6 +713,20 @@ def remove_history(session_ids: List[str]) -> None:
                 del _runs[sid]
 
 
+def _recover_module(spec, session_id: str) -> Optional[str]:
+    """The queue file a retried run must re-read, from the session's own audit dir.
+
+    Two things this gets wrong if written the obvious way. The lookup has to name
+    THIS agent's audit dir — defaulting to the authoring agent's meant every
+    adaptation retry failed with "could not determine module", since the session
+    simply is not in that directory. And for a change note the queue file is
+    `note`: the session's `module` is the product module from the note's own
+    `Module:` header (`SauceDemo`), which resolves to no file at all.
+    """
+    existing = _get_session(session_id, agent=spec.name) or {}
+    return existing.get("note") or existing.get("module")
+
+
 def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
               session_id: Optional[str] = None, start_from_step: int = 1,
               user_id: str = "default", **legacy) -> RunState:
@@ -726,8 +766,7 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
         if not (spec.audit_dir / session_id).exists():
             raise RunnerError(f"session not found: {session_id}", status=404)
         if not payload.get("module"):
-            existing = _get_session(session_id)
-            recovered = existing.get("module") if existing else None
+            recovered = _recover_module(spec, session_id)
             if not recovered:
                 raise RunnerError(
                     f"could not determine module for session {session_id}", status=500

@@ -69,6 +69,13 @@ def main():
         "violations": web_flow.get("violations") or [],
         "outcomes": web_flow.get("outcomes") or [],
         "notes": web_flow.get("notes") or [],
+        # Carried through rather than dropped. Every consumer of the combined flow
+        # that wants to recount a selector, recognise a page, or build a negative
+        # document keys off this — and the adapt step reads the combined file, not
+        # the web half. Leaving it out is why `matches_negative` still passed
+        # everything after being given a real source of negatives: it was handed
+        # an empty list, exactly as it had been in every other agent.
+        "_inventories": web_flow.get("_inventories") or {},
     }
 
     # Only halves that actually ran get a vote. A web-only change note leaves the

@@ -379,9 +379,38 @@ def format_summary(data: Optional[Dict[str, Any]]) -> str:
             f"({turns} turns) · {out_tokens:,} output tokens")
 
 
+def format_stage(data: Optional[Dict[str, Any]], key: str) -> str:
+    """One stage's spend, for the `✓ Stage` line run.sh prints as it ends.
+
+    Cost belongs on that line rather than on a second one the GUI appends when
+    its own metrics arrive: two ✓ lines for one stage, separated by later stages'
+    output, read as the run having gone backwards.
+    """
+    for stage in (data or {}).get("stages") or []:
+        if stage.get("key") != key:
+            continue
+        bits = []
+        cost = float(stage.get("cost_usd") or 0.0)
+        calls = int(stage.get("llm_calls") or 0)
+        out_tokens = int(stage.get("output_tokens") or 0)
+        if cost:
+            bits.append(f"${cost:.4f}")
+        if calls:
+            bits.append(f"{calls} call{'' if calls == 1 else 's'}")
+        if out_tokens:
+            bits.append(f"{out_tokens:,} out")
+        return " · ".join(bits)
+    return ""
+
+
 if __name__ == "__main__":
     # `python3 -m shared.metrics` — roll up and print the summary. Used by run.sh.
+    # `--stage <key>` prints just that stage's spend, for its own ✓ line.
+    import sys as _sys
     _data = rollup()
-    _line = format_summary(_data)
+    if len(_sys.argv) > 2 and _sys.argv[1] == "--stage":
+        _line = format_stage(_data, _sys.argv[2])
+    else:
+        _line = format_summary(_data)
     if _line:
         print(_line)

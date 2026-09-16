@@ -114,6 +114,40 @@ class TestFrameworkDir:
         assert isinstance(resolved, Path) and not resolved.exists()
 
 
+class TestResumeWorkspace:
+    """A retried run does not inherit the checkout the run it continues used.
+
+    The first run's isolated worktree is removed the moment that run ends, and a
+    retry with AUTO_PUSH=false runs in the developer's own checkout with no
+    worktree at all. The path step 02 recorded then names a directory that no
+    longer exists, and Explore died on it — "could not run maven: No such file or
+    directory" — with a perfectly good workspace sitting in FRAMEWORK_DIR.
+    """
+
+    def test_a_recorded_workspace_that_still_exists_is_kept(self, tmp_path, monkeypatch):
+        recorded = tmp_path / "worktree"
+        recorded.mkdir()
+        monkeypatch.setenv("FRAMEWORK_DIR", str(tmp_path / "checkout"))
+        assert workspace.resume_workspace(str(recorded)) == recorded
+
+    def test_a_removed_worktree_falls_back_to_this_runs_checkout(self, tmp_path, monkeypatch):
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        monkeypatch.setenv("FRAMEWORK_DIR", str(checkout))
+        said = []
+        result = workspace.resume_workspace(str(tmp_path / "qa-runs" / "gone"),
+                                            log=said.append)
+        assert result == checkout
+        assert said, "switching checkout silently is worse than the crash it replaces"
+
+    def test_with_nothing_to_fall_back_to_the_recorded_path_is_returned(self, tmp_path,
+                                                                        monkeypatch):
+        # Unchanged behaviour: the caller already knows how to report this path.
+        monkeypatch.delenv("FRAMEWORK_DIR", raising=False)
+        gone = tmp_path / "gone"
+        assert workspace.resume_workspace(str(gone)) == gone
+
+
 class TestLoadRepoEnv:
     """Reading config/.env must answer one question, not reconfigure the process."""
 

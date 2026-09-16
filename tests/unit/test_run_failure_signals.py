@@ -1,0 +1,97 @@
+"""Telling "the run failed" apart from "the run finished" — twice over.
+
+Both signals were found by one real adaptation run. The CLI answered a usage cap
+with prose on stdout and exit code 0, so the adapt step reported "could not parse
+the model's response as JSON" for every change item; and the step wrote a valid
+04-adapt.json in which every item had failed, which the server read as a healthy
+step and the UI drew green.
+"""
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import pytest                                                    # noqa: E402
+
+from shared.claude import ClaudeResult, usage_limit              # noqa: E402
+from qa_agents_server.audit_reader import _step_has_error        # noqa: E402
+
+
+class TestUsageLimit:
+    @pytest.mark.parametrize("text", [
+        "You've hit your session limit · resets 11:50am (Asia/Calcutta)",
+        "You have hit your usage limit, resets at 4pm",
+    ])
+    def test_a_cap_is_recognised(self, text):
+        assert usage_limit(text) == text.strip()
+
+    @pytest.mark.parametrize("text", [
+        '{"adaptable": true, "edits": []}',
+        "",
+        "   ",
+    ])
+    def test_an_answer_is_not_a_cap(self, text):
+        assert usage_limit(text) == ""
+
+    @pytest.mark.parametrize("text", [
+        '{"adaptable": false, "unadaptable_reason": "the rate limit resets hourly"}',
+        '[{"limit": "resets at noon"}]',
+    ])
+    def test_a_json_answer_is_never_a_cap(self, text):
+        # Short, and inside both word tests — but it is the model answering.
+        assert usage_limit(text) == ""
+
+    def test_a_multi_line_answer_is_never_a_cap(self):
+        assert usage_limit("The limit resets hourly.\nSo the test should retry.") == ""
+
+    def test_a_long_answer_that_discusses_limits_is_not_a_cap(self):
+        # The guard is length-bounded precisely so a test about rate limiting
+        # does not read as the account being out of budget.
+        prose = ("The endpoint has a rate limit of 50 requests per second which "
+                 "resets every second, so the test asserts the retry backs off. ") * 4
+        assert usage_limit(prose) == ""
+
+
+class TestResultStatus:
+    """Callers read the status, never the text. The text wrapper returns "" for
+    every non-ok status, so a capped call looked exactly like a model that
+    answered with something unparseable."""
+
+    def _result(self, status, stdout=""):
+        return ClaudeResult(stdout=stdout, stderr="", returncode=0, status=status,
+                            timed_out=False, duration_s=0.6)
+
+    def test_a_cap_describes_itself_as_a_cap(self):
+        capped = self._result(
+            "usage_limit", "You've hit your session limit · resets 1:40pm (Asia/Calcutta)")
+        described = capped.describe()
+        assert "usage cap" in described and "1:40pm" in described
+
+    def test_a_cap_is_not_ok(self):
+        assert self._result("usage_limit", "hit your limit, resets 1pm").status != "ok"
+
+
+class TestStepHasError:
+    def test_an_adapt_step_whose_items_all_failed_is_a_failure(self):
+        data = {"attempt": 1, "applied_mode": False, "items": [
+            {"index": 1, "kind": "field_added", "status": "failed",
+             "reason": "could not parse the model's response as JSON"},
+            {"index": 2, "kind": "coverage_added", "status": "failed"},
+        ]}
+        assert _step_has_error(data) is True
+
+    def test_a_deliberate_escalation_is_not_a_failure(self):
+        # Escalating is the design working — it must stay distinguishable from
+        # the step falling over.
+        data = {"items": [{"index": 1, "status": "escalated", "reason": "outcome_changed"},
+                          {"index": 2, "status": "declined"}]}
+        assert _step_has_error(data) is False
+
+    def test_a_change_notes_items_are_not_step_results(self):
+        # 01-parse-change.json also has an "items" list, with no status at all.
+        data = {"module": "SauceDemo", "items": [
+            {"index": 1, "kind": "coverage_added", "escalate_only": False}]}
+        assert _step_has_error(data) is False

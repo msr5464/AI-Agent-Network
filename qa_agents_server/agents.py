@@ -63,6 +63,23 @@ ADAPTATION_STEPS: List[Tuple[str, str, str]] = [
 ]
 
 
+# Step files a run writes that are deliberately NOT in the step list above.
+# They are real artefacts a human wants to read in the session detail view, but
+# they must not become progress-bar steps: authoring's validate_api shares
+# step 02's slot, and adaptation's explore halves both feed the combined
+# 03-explore.json the chip is keyed on. Kept out of *_STEPS so the progress
+# model stays N-step, and surfaced through AgentSpec.extra_artifacts so the
+# session payload can still carry them.
+AUTHORING_EXTRA: List[Tuple[str, str, str]] = [
+    ("validate_api", "02-validate-api.json", "Validate API"),
+]
+
+ADAPTATION_EXTRA: List[Tuple[str, str, str]] = [
+    ("explore_web", "03-explore-web.json", "Explore — Web"),
+    ("explore_api", "03-explore-api.json", "Explore — API"),
+]
+
+
 class AgentConfigError(Exception):
     """A request that cannot be turned into a valid run."""
 
@@ -104,6 +121,14 @@ class AgentSpec:
     queue_kind: str = "json"
     # Whether GET /agents/<a>/tests should enumerate the automation repo.
     uses_test_catalog: bool = False
+    # Extra (key, filename, label) triples the session detail view should read
+    # alongside `steps` — see AUTHORING_EXTRA / ADAPTATION_EXTRA above. Not part
+    # of the progress model, so nothing polls these to decide a step is done.
+    extra_artifacts: Tuple[Tuple[str, str, str], ...] = ()
+
+    def detail_artifacts(self) -> List[Tuple[str, str, str]]:
+        """Everything the session detail view reads: steps, then the extras."""
+        return list(self.steps) + list(self.extra_artifacts)
 
     def make_session_id(self, payload: dict) -> str:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -234,6 +259,7 @@ AGENTS: Dict[str, AgentSpec] = {
         audit_dir=AGENTS_DIR / "test-authoring-agent" / "audit",
         queue_dir=AGENTS_DIR / "test-authoring-agent" / "queue",
         steps=AUTHORING_STEPS,
+        extra_artifacts=tuple(AUTHORING_EXTRA),
         summary_kind="authoring",
         queue_kind="txt",
         session_prefix="create",
@@ -282,6 +308,7 @@ AGENTS["test-adaptation-agent"] = AgentSpec(
     audit_dir=AGENTS_DIR / "test-adaptation-agent" / "audit",
     queue_dir=AGENTS_DIR / "test-adaptation-agent" / "queue",
     steps=ADAPTATION_STEPS,
+    extra_artifacts=tuple(ADAPTATION_EXTRA),
     summary_kind="adaptation",
     session_prefix="adapt",
     build_env=_adaptation_env,

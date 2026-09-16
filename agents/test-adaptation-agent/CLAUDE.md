@@ -194,10 +194,20 @@ Run over the combined diff of one change item, before anything compiles:
 | `wrapper_compliance` | raw Selenium — `driver.findElement`, `.sendKeys()`, `new WebDriverWait` |
 | `logstep_present` | an interaction added to a test class with no `logStep` |
 | `steps_justified` | an interaction matching nothing exploration observed |
-| `matches_negative` | an anchor that also matches the logged-out or error page |
+| `matches_negative` | an anchor that also matches the logged-out or error page — the negatives are the flow map's own inventories for pages whose identity reads as login/error, so this guard finally has data to compare against |
 
 The last one is the anti-tautology check: a selector that matches the logged-out
 page is not proof of a successful login.
+
+**Propose-only is verified too.** `ADAPTATION_APPLY=false` is the default, and it
+used to end at the guards above — so the diff a human was asked to trust had never
+been compiled and never been measured against the frozen contracts. It now writes
+the edit, compiles it, runs assertion conservation, and rolls every file back
+whatever the answer was. "Nothing is written" still holds at the end of the step;
+what changed is that a proposal which does not build, or which drops an assertion,
+is rejected before anyone reads it. Test verification stays apply-only: running the
+suite to judge an edit nobody is keeping costs minutes for an answer the compiler
+and the contracts already gave.
 
 ## The change-item transaction
 
@@ -309,6 +319,7 @@ drift.
 | `04-adapt.json` + `.md` | per-item diffs, guard results, conservation reports |
 | `05-ship.json` + `.md` | PR URL, verdict, escalations |
 | `.snapshots.json` | transient; the ERR trap's rollback source |
+| `.fix-history.json` | every attempt: proposed-edit hashes, guard rejections, outcome. Feeds the next attempt's prompt and the stop rule. Cleared when a resume re-runs Adapt, or an explicitly requested retry would refuse to start |
 
 ## Key Rules
 
@@ -324,3 +335,12 @@ drift.
 6. **Compile before verifying**, so our own broken edit is never misread as infra.
 7. **All-or-nothing per change item**, including on crash.
 8. **The PR is always NEEDS-REVIEW.**
+9. **Every attempt is recorded, and the loop stops when it can prove nothing new
+   is coming.** `.fix-history.json` holds each attempt's proposed-edit hashes and
+   guard rejections (`shared/fix_history.py`, shared with the authoring agent).
+   `04-adapt.json` is overwritten per attempt, so reading that back showed attempt
+   three only what attempt two did and left it free to re-propose what attempt one
+   had already had rejected. Three stops: the model returned no edits, the same
+   guard rejected everything twice running, or this attempt proposed only edits an
+   earlier one already made. All three write `.skip-reason=stuck`, which ships for
+   review and alerts a human rather than burning the remaining budget.

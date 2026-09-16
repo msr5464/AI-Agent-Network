@@ -37,11 +37,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shared.log import log as _log
+from shared import workspace as workspace_helper
 def log(msg): _log("adapt", msg)
 
-from shared import (assertion_graph, code_analyzer, edit_guards, flow_map,
-                    intent, url_properties, verdict_feedback)
-from shared.claude import call_claude as _call_claude
+from shared import (assertion_graph, code_analyzer, edit_guards, fix_history,
+                    flow_map, intent, url_properties, verdict_feedback)
+from shared.claude import call_claude_ex as _call_claude_ex
 from shared.code_analyzer import invalidate_file, read_source
 from shared.test_runner import run_test
 
@@ -301,6 +302,13 @@ def run_guards(item: dict, edits_by_file: dict, snapshots: dict, flow: dict,
                 snapshots[path], updated, "LOCATOR_STALE", None)
             add(f"diagnosis_fit[{Path(path).name}]", ok, reason)
 
+    # The anti-tautology check: an anchor that also resolves on the logged-out or
+    # error page would pass there too, so it proves nothing about this flow.
+    negatives = negative_documents(flow)
+    if negatives and added.strip():
+        add("matches_negative",
+            *edit_guards.matches_negative(edit_guards._selectors_in(added), negatives))
+
     if kind == "route":
         # Same detector authoring generates against, so "no literal URLs" means
         # one thing across the network rather than one per agent.
@@ -375,6 +383,69 @@ def check_conservation(scope: dict, workspace: Path) -> list:
     return reports
 
 
+# Pages an adapted test must never be sitting on at the end of a step.
+_NEGATIVE_PAGE_HINTS = ("login", "signin", "sign-in", "logged-out", "error",
+                        "denied", "expired")
+
+
+def negative_documents(flow: dict) -> list:
+    """The pages this flow must NOT be on, as DOM the anti-tautology guard can query.
+
+    `matches_negative` has been in the guard table since the start and has never
+    had anything to compare against — the healing agent passes it an empty list —
+    while the flow map has been carrying the logged-out page's own inventory the
+    whole time. A selector that also matches the login page is not proof the flow
+    got past it.
+    """
+    inventories = flow.get("_inventories") or {}
+    pages = flow.get("pages") or {}
+    docs = []
+    for page_id, elements in inventories.items():
+        page = pages.get(page_id) or {}
+        identity = " ".join(str(v) for v in (page_id, page.get("url", ""),
+                                             page.get("title", ""))).lower()
+        if elements and any(hint in identity for hint in _NEGATIVE_PAGE_HINTS):
+            try:
+                docs.append(flow_map.document_from_inventory(elements))
+            except Exception:
+                continue
+    return docs
+
+
+def verify_proposal(txn, scope: dict, workspace: Path, record: dict) -> tuple:
+    """Compile a proposal and re-measure its assertions. Returns (ok, why).
+
+    Propose-only used to stop at the diff-shaped guards, so the diff handed to a
+    human as the agent's recommendation had never been compiled and had never been
+    checked against the frozen contracts — the one promise this agent makes. Both
+    need the edit on disk, so the caller applies first and rolls back afterwards
+    whatever the answer is.
+
+    A compiler that cannot run at all is infra, not a bad proposal: recorded and
+    passed, the same way the apply path treats it.
+    """
+    ok, output = txn.compile(workspace, COMPILE_CMD)
+    if ok:
+        record["compile_status"] = "compiles"
+    elif output.startswith("could not run the compiler"):
+        record["compile_status"] = f"not compiled — {output}"
+        log(f"    (compiler unavailable: {output})")
+    else:
+        record["compile_output"] = output
+        return False, "the proposal does not compile"
+
+    conservation = check_conservation(scope, workspace)
+    record["conservation"] = conservation
+    for report in conservation:
+        log(f"    conservation {report.get('test','')}: "
+            f"{assertion_graph.describe(report)}")
+    broken = [c for c in conservation if not c["ok"]]
+    if broken:
+        return False, ("assertion conservation failed: "
+                       + "; ".join(b.get("reason", "") for b in broken[:2]))
+    return True, ""
+
+
 def compile_ok(workspace: Path) -> tuple:
     """Compile before running anything. Returns (ok, output)."""
     try:
@@ -402,7 +473,7 @@ def main():
         finish(result, "skipped", "no-work")
         return
 
-    workspace = Path(scope["workspace"])
+    workspace = workspace_helper.resume_workspace(scope["workspace"], log=log)
 
     # Hard gates, before any model call.
     if explore.get("unexplained_failures"):
@@ -453,19 +524,25 @@ def main():
 
     rules = load_adapt_rules()
     index_before = {}
+    # Every attempt, not just the last one. 04-adapt.json is overwritten per
+    # attempt, so reading it back showed attempt 3 only what attempt 2 did — and
+    # left it free to re-propose the edit attempt 1 had already had rejected.
+    history = fix_history.load(AUDIT_DIR)
     retry_note = ""
-    if ATTEMPT > 1:
-        previous = AUDIT_DIR / "04-adapt.json"
-        if previous.exists():
-            prior = json.loads(previous.read_text())
-            failures = [i.get("reason", "") for i in prior.get("items", [])
-                        if i.get("status") not in ("applied", "verified")]
-            retry_note = ("\n## ⚠️ Previous attempt\n"
-                          + "\n".join(f"- {f}" for f in failures[:6])
-                          + "\nTwo failures on the same item is evidence the "
-                            "approach is wrong, not a reason to try a wider edit. "
-                            "If you cannot justify an edit from the flow map, "
-                            "return adaptable: false.\n")
+    if history:
+        stop, why = fix_history.exhausted(history)
+        if stop:
+            log(f"Not attempting again — {why}")
+            result["escalations"].append(
+                {"what": "further attempts cannot differ", "why": why})
+            finish(result, "skipped", "stuck")
+            return
+        retry_note = ("\n## ⚠️ What earlier attempts already tried\n"
+                      + fix_history.render(history)
+                      + "\nTwo failures on the same item is evidence the "
+                        "approach is wrong, not a reason to try a wider edit. "
+                        "If you cannot justify an edit from the flow map, "
+                        "return adaptable: false.\n")
 
     actionable = [i for i in plan["items"] if not i.get("escalate_only")]
     for item in plan["items"]:
@@ -491,14 +568,29 @@ def main():
         log(f"Item {item['index']} [{item['kind']}] — {item['text'][:70]}")
         prompt = build_adapt_prompt(item, plan, scope, flow, workspace, rules,
                                     retry_note)
-        response = _call_claude(prompt, MODEL, str(REPO_ROOT), timeout=900,
-                                log_dir=str(AUDIT_DIR))
-        payload = extract_json(response or "")
+        call = _call_claude_ex(prompt=prompt, model=MODEL, cwd=str(REPO_ROOT),
+                               timeout=900, log_dir=str(AUDIT_DIR))
+        if call.status != "ok":
+            # The call did not happen: a usage cap, an API error, a timeout. None
+            # of those are the change note's fault, so stop as infra and leave it
+            # queued rather than consuming it and reporting its items as failures.
+            # Status, not text: the text wrapper returns "" for every one of these,
+            # which is how a 429 came to be reported to a human as "could not parse
+            # the model's response as JSON".
+            why = call.describe()
+            log(f"ERROR: the model call {why}")
+            result["escalations"].append(
+                {"what": "the model call did not complete",
+                 "why": f"{why} — nothing was attempted; re-run when it clears"})
+            finish(result, "skipped", "infra")
+            return
+
+        payload = extract_json(call.stdout or "")
         record = {**item, "status": "failed", "guards": [], "reason": ""}
 
         if not payload:
             record["reason"] = "could not parse the model's response as JSON"
-            result["items"].append(record); log(f"  {record['reason']}"); continue
+            result["items"].append(record); log(f"  ERROR: {record['reason']}"); continue
         if not payload.get("adaptable", False):
             record.update({"status": "declined",
                            "reason": payload.get("unadaptable_reason")
@@ -510,6 +602,15 @@ def main():
             continue
 
         edits = payload.get("edits") or []
+        if not edits:
+            # An answer rather than a failure — the model reports it cannot do this
+            # from the files it can see. Staging an empty edit list would otherwise
+            # produce an empty diff that passes every guard and reads as a proposal.
+            record.update({"status": "failed", "no_edits": True,
+                           "reason": "the model proposed no edits"})
+            result["items"].append(record)
+            log("  no edits proposed")
+            continue
         record["summary"] = payload.get("summary", "")
         record["justification"] = [
             {"file": Path(e.get("file", "")).name, "step": e.get("justified_by")}
@@ -524,6 +625,9 @@ def main():
 
         record["diff"] = txn.diff()
         record["files"] = sorted(txn.staged)
+        # Content hashes, so a later attempt can tell "the same edit again" from
+        # "a different idea" without storing whole files in the audit trail.
+        record["fingerprint"] = fix_history.fingerprint(txn.staged, None)
 
         guards = run_guards(item, txn.staged, txn.snapshots, flow, scope, workspace,
                             index_before)
@@ -539,6 +643,25 @@ def main():
             continue
 
         if not APPLY:
+            # Measured, then put back. "Nothing is written" is still true at the
+            # end of this block — but a proposal that does not compile, or that
+            # quietly drops an assertion, is now caught here rather than by the
+            # human who trusted the diff.
+            # try/finally, not two statements: a propose-only run is often working
+            # in the developer's own checkout, and anything raising between the
+            # write and the restore would leave our edit sitting in it.
+            txn.apply()
+            try:
+                sound, why = verify_proposal(txn, scope, workspace, record)
+            except Exception as exc:                       # noqa: BLE001 — see above
+                sound, why = False, f"could not verify the proposal: {exc}"
+            finally:
+                txn.rollback("propose-only — nothing is kept")
+            if not sound:
+                record.update({"status": "rejected", "reason": why})
+                result["items"].append(record)
+                log(f"  REJECT {why}")
+                continue
             record["status"] = "proposed"
             result["proposed"].append({"item": item["index"], "diff": record["diff"],
                                        "summary": record["summary"]})
@@ -607,6 +730,30 @@ def main():
         result["items"].append(record)
 
     statuses = {i["status"] for i in result["items"]}
+    # What this attempt tried, for the next one to read and for the stop rule at
+    # the top to prove that another attempt could bring nothing new.
+    if {"applied", "partial", "proposed"} & statuses:
+        outcome = fix_history.PASSED
+    elif statuses and statuses <= {"rejected"}:
+        outcome = fix_history.ALL_REJECTED
+    elif any(i.get("no_edits") for i in result["items"]):
+        # Only when the model actually answered "no edits" — a response that could
+        # not be parsed is a failure, and calling it "no edits" would stop the loop
+        # on the strength of something the model never said.
+        outcome = fix_history.NO_EDITS
+    else:
+        outcome = fix_history.FAILED
+    fix_history.append(AUDIT_DIR, fix_history.record(
+        attempt=ATTEMPT,
+        proposed=[fp for i in result["items"] for fp in (i.get("fingerprint") or [])],
+        applied=sorted({Path(f).name for i in result["items"]
+                        if i.get("status") in ("applied", "partial")
+                        for f in (i.get("files") or [])}),
+        rejections=[{"guard": g.get("guard", ""), "reason": g.get("reason", "")}
+                    for i in result["items"] for g in (i.get("guards") or [])
+                    if not g.get("ok")],
+        outcome=outcome))
+
     if not APPLY:
         gate = "skipped" if "proposed" not in statuses else "true"
         finish(result, gate, "" if "proposed" in statuses else "no-work")

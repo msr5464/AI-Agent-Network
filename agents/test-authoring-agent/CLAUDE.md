@@ -336,6 +336,11 @@ START_FROM_STEP=4 SESSION_ID=20260330-143022-create-payments \
   make run AGENT=test-authoring-agent
 ```
 
+A resume never takes a `TESTING_MODE` cache hit. Retrying a step means running it
+again, and the cached artefact is the output of the run being retried — restoring
+it made the retry a no-op that reported the step done in 0s and gated every step
+after it on a result the retry existed to replace.
+
 `MODULE` is recovered automatically from the session's own `00-session-init.md` if not
 given — the original queue `.txt` file may already have moved to `processed/` by the run
 being resumed, so it isn't required to still exist. Resuming fails fast with a clear error

@@ -90,10 +90,18 @@ make run AGENT=test-adaptation-agent MODULE=saucedemo
 ADAPTATION_APPLY=false make run AGENT=test-adaptation-agent MODULE=saucedemo
 ```
 
-Each note names, in `Affects:`, the existing `SauceDemoWebTest` / `SauceDemoApiTest`
-methods it touches. The web notes carry no `URL:` — web exploration starts from
-the module's own entry point (`saucedemo.url`). The API note keeps `API URL:`,
-because step 03 probes no endpoint without it.
+Each note names, in `Tests:`, the exact `SauceDemoWebTest` / `SauceDemoApiTest`
+methods it touches, fully qualified as `<class>#<method>` and spelled as the test
+catalogue spells them — which is also what the GUI's change-note form reads, so
+opening one of these fills in its module, class and tests instead of leaving you
+to pick them. `Affects:` is the wider form: a glob, matched the same way, that
+also ticks *Also check tests that share this code*. A note may carry either or
+both; with neither, scope falls back to `Module:` alone, and step 01 reports that
+as the weaker claim it is.
+
+The web notes carry no `URL:` — web exploration starts from the module's own entry
+point (`saucedemo.url`). The API note keeps `API URL:`, because step 03 probes no
+endpoint without it.
 
 `saucedemo_cart_details.txt` matches the live site — every element it names exists
 today. The other two are staged: SauceDemo and JSONPlaceholder do not actually

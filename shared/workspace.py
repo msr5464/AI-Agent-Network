@@ -114,6 +114,31 @@ def configured() -> Optional[Path]:
     return Path(value).expanduser() if value else None
 
 
+def resume_workspace(recorded: str, log=lambda m: None) -> Path:
+    """The checkout a later step should work in, given what an earlier one recorded.
+
+    A resumed run is not handed the same checkout as the run it continues. The
+    first run may have worked in an isolated worktree, which is removed the moment
+    that run ends, while a retry with AUTO_PUSH=false runs in the developer's own
+    checkout and creates no worktree at all. The path recorded in 02-scope.json
+    then names a directory that no longer exists, and every step reading it died
+    on ENOENT — "could not run maven: No such file or directory" — while the
+    workspace this run was actually given sat in FRAMEWORK_DIR all along.
+    """
+    recorded_path = Path(recorded) if recorded else None
+    if recorded_path and recorded_path.is_dir():
+        return recorded_path
+    current = configured()
+    if current and current.is_dir():
+        if recorded_path:
+            log(f"recorded workspace {recorded_path} is gone — using this run's "
+                f"own checkout {current}")
+        return current
+    # Nothing better to offer: hand back what was recorded, so the caller reports
+    # the missing path the way it already knows how to.
+    return recorded_path or Path("")
+
+
 def expected(workspace_dir, repo_name: str = "") -> Optional[Path]:
     """Where the checkout belongs, whether or not it is there yet.
 

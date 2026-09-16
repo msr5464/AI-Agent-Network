@@ -47,6 +47,12 @@ DESTRUCTIVE: Tuple[str, ...] = (
     "unsubscribe", "disable", "wipe", "destroy",
 )
 
+# Verbs that only read the page. A destructive *name* under one of these is not a
+# destructive *act*: verifying that a Checkout button is on the cart page changes
+# nothing, and treating it as a performed action escalated whole runs whose notes
+# only asked for an extra assertion.
+READ_ONLY_VERBS: Tuple[str, ...] = ("observe", "assert", "wait")
+
 # Exploration outcomes. `destructive_refused` is the one addition to the
 # authoring agent's closed set — refusing is a normal result, not a failure.
 CATEGORIES = ("selector_not_found", "login_failed", "timeout", "overlay_blocking",
@@ -335,6 +341,10 @@ def detect_refusals(flow: Dict) -> Dict:
         if not token:
             continue
         step.setdefault("result", {})["destructive_token"] = token
+        # The token is still recorded above, so a read-only look at a dangerous
+        # control stays visible in the flow map — it just is not a violation.
+        if ((step.get("action") or {}).get("verb") or "").strip().lower() in READ_ONLY_VERBS:
+            continue
         if (step["result"].get("outcome") or "") == "ok":
             violations.append({"index": step.get("index"), "token": token,
                                "target": ((step.get("action") or {})
@@ -388,6 +398,20 @@ def diff_against_test(flow: Dict, test_steps: List[Dict]) -> Dict:
     return {"added": added, "removed": removed, "changed": changed}
 
 
+def pages_without_inventory(flow: Dict) -> List[str]:
+    """Pages the run walked but never described.
+
+    A page with no `PAGE_STATE` cannot have its selectors recounted and cannot be
+    matched to a page object, so everything downstream treats it as unverifiable.
+    An observed run emitted `PAGE_ENTER` for three pages, an inventory for none of
+    them, and still reported `ok`: no page object matched anything, every selector
+    stayed `unique: unverified`, and the adapt step was told the repo had no page
+    object for pages it has had for months.
+    """
+    inventories = flow.get("_inventories") or {}
+    return sorted(p for p in (flow.get("pages") or {}) if not inventories.get(p))
+
+
 def score(flow: Dict, status: str) -> tuple:
     """Rank one exploration attempt against another. Higher is better.
 
@@ -398,7 +422,10 @@ def score(flow: Dict, status: str) -> tuple:
     steps = flow.get("steps") or []
     failed = [s for s in steps if (s.get("result") or {}).get("outcome") == "failed"]
     unique = [s for s in steps if (s.get("selector_check") or {}).get("unique")]
-    return (1 if status == "ok" else 0, len(steps), -len(failed), len(unique))
+    # Ranked above step count on purpose: more steps across pages nobody described
+    # is less usable than fewer steps that can actually be verified.
+    return (1 if status == "ok" else 0, -len(pages_without_inventory(flow)),
+            len(steps), -len(failed), len(unique))
 
 
 def validate(flow: Dict) -> tuple:
@@ -418,6 +445,12 @@ def validate(flow: Dict) -> tuple:
     if flow.get("violations"):
         problems.append(f"{len(flow['violations'])} destructive action(s) were "
                         f"performed rather than refused")
+    uninventoried = pages_without_inventory(flow)
+    if uninventoried:
+        problems.append(f"{len(uninventoried)} page(s) were walked without a "
+                        f"PAGE_STATE inventory ({', '.join(uninventoried[:4])}) — "
+                        f"their selectors cannot be recounted and no page object "
+                        f"can be matched to them")
     return (not problems), problems
 
 

@@ -39,7 +39,21 @@ def mask_credential_lines(text: str) -> str:
     before step 01 even starts). See mask_credential_values for a stronger,
     value-based pass once demo_credentials is available.
     """
-    return _CREDENTIAL_LINE_RE.sub(r"\1***MASKED***", text)
+    return _CREDENTIAL_LINE_RE.sub(_mask_match, text)
+
+
+# A bare number under a user-id label is a record id in a request body
+# (`"userId": 1,`), not a login. Only that label gets the exemption: a numeric OTP,
+# PIN-style password or key is still a secret.
+_USERNAME_LABEL = re.compile(rf"(?i)\b(?:{LABELS['username']})\b")
+_BARE_NUMBER = re.compile(r"\d+[,;}\])\"']*")
+
+
+def _mask_match(match: re.Match) -> str:
+    label, value = match.group(1), match.group(2)
+    if _BARE_NUMBER.fullmatch(value) and _USERNAME_LABEL.match(label):
+        return match.group(0)
+    return label + "***MASKED***"
 
 
 def mask_credential_values(text: str, demo_creds: dict) -> str:

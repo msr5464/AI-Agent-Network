@@ -1,7 +1,7 @@
-Module: saucedemo
+Module: SauceDemo
 Type: api
 API URL: https://jsonplaceholder.typicode.com
-Affects: automation.saucedemo.SauceDemoApiTest#getPostById, automation.saucedemo.SauceDemoApiTest#createPost, automation.saucedemo.SauceDemoApiTest#updatePost
+Tests: automation.saucedemo.SauceDemoApiTest#getPostById, automation.saucedemo.SauceDemoApiTest#createPost, automation.saucedemo.SauceDemoApiTest#updatePost
 
 Auth: none. JSONPlaceholder is a public mock API — no token or API key.
 

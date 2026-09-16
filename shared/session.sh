@@ -138,7 +138,14 @@ run_step() {
   record_stage "$step_key" "$label" "${#STEP_NAMES[@]}" \
                "$step_start" "$(date +%s)" 0 false
   unset STEP_KEY STEP_LABEL STEP_ATTEMPT
-  log "✓ $label — $(fmt_duration $dur)"
+  # Spend goes on this line, as the stage ends and in stream order. The GUI used
+  # to append its own "✓ <stage> — <time> · <cost>" when the step event's metrics
+  # arrived, which landed after later stages had already logged output and read
+  # as the run looping back to a stage that had long finished.
+  local spend=""
+  [[ -n "$step_key" ]] && spend=$(cd "${REPO_ROOT:-.}" &&
+    python3 -m shared.metrics --stage "$step_key" 2>/dev/null || true)
+  log "✓ $label — $(fmt_duration $dur)${spend:+ · $spend}"
 }
 
 # ── Metrics rollup ────────────────────────────────────────────────────────────

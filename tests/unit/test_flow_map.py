@@ -143,6 +143,54 @@ class TestDestructive:
         assert flow["status"] == "unsafe"
         assert "cannot be treated as side-effect free" in fm.describe(flow)
 
+    def test_looking_at_a_destructive_control_is_not_performing_it(self):
+        # A change note asking the explorer to verify a Checkout button exists
+        # escalated the whole run: the step's target matched "checkout", it
+        # succeeded, and that counted as a destructive action performed.
+        stdout = (f"PAGE_ENTER: p|https://x/|T\nPAGE_STATE: p|https://x/|{INVENTORY}\n"
+                  + "FLOW_STEP: " + _step(0, "p", verb="observe", name="Checkout",
+                                          outcome="ok") + "\n")
+        flow = fm.build(stdout)
+        assert flow["violations"] == []
+        assert flow["status"] == "ok"
+        assert flow["steps"][0]["result"]["destructive_token"] == "checkout", (
+            "the token still belongs in the flow map — it just is not a violation")
+
+
+class TestUninventoriedPages:
+    """A page walked without a PAGE_STATE is unusable downstream.
+
+    An observed run entered three pages, inventoried none, and still reported
+    `ok`: no page object matched anything, every selector stayed unverified, and
+    the adapt step was told the repo had no page object for pages it has had for
+    months.
+    """
+
+    WALKED = {"pages": {"login": {}, "cart": {}},
+              "_inventories": {"login": [{"tag": "input", "id": "user-name"}]},
+              "steps": []}
+
+    def test_a_page_with_no_inventory_is_named(self):
+        assert fm.pages_without_inventory(self.WALKED) == ["cart"]
+
+    def test_a_fully_inventoried_flow_names_nothing(self):
+        flow = {"pages": {"login": {}}, "_inventories": {"login": [{"tag": "input"}]}}
+        assert fm.pages_without_inventory(flow) == []
+
+    def test_validate_reports_it(self):
+        ok, problems = fm.validate(self.WALKED)
+        assert ok is False
+        assert any("PAGE_STATE" in p for p in problems)
+
+    def test_an_inventoried_attempt_outranks_a_longer_blind_one(self):
+        blind = {"pages": {"a": {}, "b": {}}, "_inventories": {},
+                 "steps": [{"result": {"outcome": "ok"}} for _ in range(9)]}
+        seeing = {"pages": {"a": {}}, "_inventories": {"a": [{"tag": "div"}]},
+                  "steps": [{"result": {"outcome": "ok"}} for _ in range(3)]}
+        assert fm.score(seeing, "ok") > fm.score(blind, "ok"), (
+            "more steps across pages nobody described is less usable than fewer "
+            "steps that can actually be verified")
+
 
 class TestScoreAndValidate:
     def test_clean_run_beats_a_crash_with_fewer_failures(self):

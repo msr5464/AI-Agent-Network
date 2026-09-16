@@ -176,6 +176,18 @@ from shared.edit_guards import (            # noqa: F401
 )
 
 
+def _progress(_label: str, line: str) -> None:
+    """Surface what the model is doing while a long call is in flight.
+
+    A DOM inspection drives a browser for minutes and printed nothing until it
+    returned, which is indistinguishable from a hang. The decoder already emits
+    these lines; the authoring and adaptation agents surface the same three.
+    """
+    text = (line or "").strip()
+    if text.startswith(("→ ", "MCP server", "API retry")):
+        log(f"    {text[:110]}")
+
+
 def call_claude(prompt: str, cwd: Path, use_system_prompt: bool = True,
                 artifact_dir: str = "", allowed_tools: list | None = None,
                 add_dir: str = "", **kwargs) -> str:
@@ -200,6 +212,10 @@ def call_claude(prompt: str, cwd: Path, use_system_prompt: bool = True,
         # prompt, so Read is not new reach — but it is not the confinement an
         # earlier comment here claimed.
         tools.append("Read")
+    # Only where the stream carries decodable events: with --output-format json
+    # the callback would be handed one enormous blob line instead.
+    if kwargs.get("stream_json"):
+        kwargs.setdefault("on_output", _progress)
     output = _call_claude(prompt, HEALING_MODEL, str(cwd),
                           system_prompt_file=system_prompt,
                           allowed_tools=(tools or None),

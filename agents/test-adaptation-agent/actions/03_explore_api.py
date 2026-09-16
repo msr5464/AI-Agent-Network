@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shared.log import log as _log
+from shared import workspace as workspace_helper
 def log(msg): _log("explore-api", msg)
 
 from shared.baseline import url_shape
@@ -201,7 +202,7 @@ def main():
     elif scope.get("skipped"):
         result["reason"] = "scope was skipped"
     else:
-        workspace = Path(scope.get("workspace", ""))
+        workspace = workspace_helper.resume_workspace(scope.get("workspace", ""), log=log)
         endpoints = endpoints_from_repo(workspace, scope.get("edit_candidates") or [])
         log(f"{len(endpoints)} endpoint(s) declared in the repo's Api enums")
         base = plan.get("api_base_url", "")

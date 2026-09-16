@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shared.log import log as _log
+from shared import workspace as workspace_helper
 def log(msg): _log("explore-web", msg)
 
 from shared import browser_mode, entry_path, flow_map, mint_session, session_state
@@ -125,6 +126,14 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
             log(f"    step {seen['steps']}")
         elif text.startswith(("REFUSED:", "UNREACHABLE_STATE:")):
             log(f"    {text[:110]}")
+        # What the browser is actually doing, whether its server ever came up, and
+        # whether the API is making us wait. Without these, half an hour of
+        # exploration prints a handful of step lines and is indistinguishable from
+        # a hang — which is why the authoring agent already surfaces them
+        # (03_generate.py, 02_validate_web.py). The decoder emits them; only this
+        # filter was dropping them.
+        elif text.startswith(("→ ", "MCP server", "API retry")):
+            log(f"    {text[:110]}")
 
     log("  Sending to Claude for exploration...")
     result = call_claude_ex(
@@ -170,7 +179,7 @@ def main():
         result["reason"] = "scope was skipped"
         write(result); return
 
-    workspace = Path(scope.get("workspace", ""))
+    workspace = workspace_helper.resume_workspace(scope.get("workspace", ""), log=log)
     module = plan.get("module", "")
 
     # What the test under adaptation does to sign itself in, measured in step 02.
@@ -254,8 +263,23 @@ def main():
     for attempt in range(1, max(1, ATTEMPTS + 1) + 0 or 1):
         log(f"Exploration attempt {attempt}/{ATTEMPTS + 1} (budget {TIMEOUT_S}s)")
         flow, status, raw = run_attempt(plan, rules, notes, mcp_path, stop_before)
+        if status == "usage_limit":
+            # An empty flow map here would be read as "the flow could not be
+            # walked", which is a finding about the product. This is a finding
+            # about the account, so stop and leave the note queued.
+            log("ERROR: Claude usage limit reached — exploration did not run")
+            result.update({"ran": False, "status": "skipped", "attempts": attempt,
+                           "reason": "Claude usage limit reached — re-run once it resets"})
+            write(result)
+            (AUDIT_DIR / ".skip-reason").write_text("infra")
+            sys.exit(1)
         score = flow_map.score(flow, status)
         log(f"  → {len(flow['steps'])} step(s), status {flow['status']}")
+        uninventoried = flow_map.pages_without_inventory(flow)
+        if uninventoried:
+            log(f"  WARNING: no PAGE_STATE for {', '.join(uninventoried)} — "
+                f"selectors there cannot be recounted and no page object can be "
+                f"matched to them")
         if best is None or score > best_score:
             best, best_score = flow, score
             # Persist after every attempt: a cancel during attempt 2 must not
@@ -270,15 +294,31 @@ def main():
         if attempt > ATTEMPTS:
             break
         if categories and categories <= {"login_failed", "skipped",
-                                          "destructive_refused"}:
+                                          "destructive_refused"} and not uninventoried:
             log("  not retrying — every failure was a login or a refusal, and a "
                 "retry would reproduce both exactly")
             break
-        notes = ("\n## Previous attempt\nThese steps failed; try a different "
-                 "approach for them:\n"
-                 + "\n".join(f"- {s['action']['target'].get('name')}: "
-                             f"{(s.get('result') or {}).get('category')}"
-                             for s in failures[:8]) + "\n")
+        if not failures and not uninventoried:
+            break
+        notes = ""
+        if failures:
+            notes += ("\n## Previous attempt\nThese steps failed; try a different "
+                      "approach for them:\n"
+                      + "\n".join(f"- {s['action']['target'].get('name')}: "
+                                  f"{(s.get('result') or {}).get('category')}"
+                                  for s in failures[:8]) + "\n")
+        if uninventoried:
+            # Worth a whole attempt: without an inventory nothing downstream can
+            # verify a selector or recognise the page, so the walk is unusable
+            # however complete it looked.
+            notes += ("\n## You skipped the inventory\nYou emitted PAGE_ENTER for "
+                      + ", ".join(uninventoried)
+                      + " but no PAGE_STATE. Emit a PAGE_STATE for every page you "
+                        "enter, before the first FLOW_STEP on it, with the full "
+                        "element list — including each element's id and class, and "
+                        "the containers, header and title that identify the page. "
+                        "Without it the selectors you report cannot be verified and "
+                        "the page cannot be matched to its page object.\n")
 
     # Guess -> measure -> edit. Step 02 nominated page objects by name
     # similarity; now that the pages have actually been looked at, measure which

@@ -1,10 +1,10 @@
-Module: saucedemo
+Module: SauceDemo
 Type: web
-Affects: automation.saucedemo.SauceDemoWebTest#verifyProductAppearsInCart
+Tests: automation.saucedemo.SauceDemoWebTest#verifyProductAppearsInCart
 
 What to add:
 1. After the cart opens, verify the "Sauce Labs Bike Light" row shows quantity "1"
    and price "$9.99". CartPage has no locators for a row's quantity or price.
-2. Then click "Checkout" and verify the "Checkout: Your Information" page opens.
+2. Also verify the cart page still offers "Continue Shopping" while both checks run.
 
 Expected outcome unchanged: the added product is listed in the cart. Nothing in the product changed — these steps only add to what the test proves.

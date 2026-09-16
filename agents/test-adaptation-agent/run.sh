@@ -53,7 +53,12 @@ TESTING_MODE="${TESTING_MODE:-false}"
 # config/.env, so that was every run on this machine.
 # A hit also needs the note it was cached from to match INPUT_FILE byte for byte —
 # content, not mtime; see test-authoring-agent/run.sh for why.
-_cache_hit()     { [[ "$TESTING_MODE" == "true" ]] && [[ -f "$CACHE_DIR/$1" ]] \
+# A resume never takes a cache hit. Retrying a step means running it again, and
+# the cached artefact is the output of the very run being retried — a failed
+# exploration, in the case that found this — so the retry restored the failure,
+# reported the step as done in 0s, and every step after it gated on it.
+_cache_hit()     { [[ "$TESTING_MODE" == "true" ]] && [[ "$START_FROM_STEP" -le 1 ]] \
+                     && [[ -f "$CACHE_DIR/$1" ]] \
                      && [[ -f "$CACHE_DIR/$1.input" ]] && cmp -s "$CACHE_DIR/$1.input" "$INPUT_FILE"; }
 _cache_restore() {
   cp "$CACHE_DIR/$1" "$AUDIT_DIR/$1"
@@ -63,8 +68,16 @@ _cache_restore() {
 }
 _cache_save() {
   [[ "$TESTING_MODE" == "true" ]] || return 0
+  [[ -f "$AUDIT_DIR/$1" ]] || return 0
+  # Never cache a step that produced nothing. A skipped exploration was cached
+  # once and then restored on every later run of the same note — including the
+  # retry that existed to replace it. An unreadable file is not cached either.
+  python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(1 if (str(d.get("status", "")).lower() in ("skipped", "failed", "unsafe", "empty")
+               or d.get("skipped") is True) else 0)' "$AUDIT_DIR/$1" 2>/dev/null || return 0
   mkdir -p "$CACHE_DIR"
-  [[ -f "$AUDIT_DIR/$1" ]] && cp "$AUDIT_DIR/$1" "$CACHE_DIR/$1"
+  cp "$AUDIT_DIR/$1" "$CACHE_DIR/$1"
   if [[ -f "$INPUT_FILE" ]]; then cp "$INPUT_FILE" "$CACHE_DIR/$1.input"; else rm -f "$CACHE_DIR/$1.input"; fi
   local md="${1%.json}.md"
   [[ -f "$AUDIT_DIR/$md" ]] && cp "$AUDIT_DIR/$md" "$CACHE_DIR/$md"
@@ -101,7 +114,11 @@ if [[ "$START_FROM_STEP" -gt 1 ]]; then
   for _n in 02 03 04 05; do
     if (( 10#$_n >= START_FROM_STEP )); then rm -f "$AUDIT_DIR"/"${_n}"-*; fi
   done
+  # .fix-history.json goes too when Adapt is being re-run: it is the evidence the
+  # stop rule uses to prove another attempt cannot differ, and keeping a finished
+  # run's attempts would make an explicitly requested retry refuse to start.
   rm -f "$AUDIT_DIR/.fix-passed" "$AUDIT_DIR/.verdict" "$AUDIT_DIR/.cancelled" "$AUDIT_DIR/.skip-reason"
+  [[ "$START_FROM_STEP" -le 4 ]] && rm -f "$AUDIT_DIR/.fix-history.json"
   INPUT_FILE="$QUEUE_DIR/${MODULE}.txt"
   [[ -f "$INPUT_FILE" ]] || INPUT_FILE="$PROCESSED_DIR/${MODULE}.txt"
   MODE="resume"

@@ -39,6 +39,22 @@ against the `PAGE_STATE` inventory you emitted, and the recount is what is used 
 so an inventory that omits the element makes your selector unverifiable rather
 than verified. Emit the full inventory.
 
+**Every page you enter needs a `PAGE_STATE`, before the first `FLOW_STEP` on it.**
+A `PAGE_ENTER` with no inventory is worse than not visiting the page: the steps
+you report there can never be verified, and the page cannot be matched to the
+page object that models it. An observed run entered three pages, inventoried
+none of them, and reported `ok` — every selector it gave was unusable.
+
+Inventory the page's **identity**, not only what you touched: the container the
+page hangs off, its header and title, its nav. Those are what a page object
+asserts on, and they are how the repo's existing page object is matched to the
+page you walked. An observed run inventoried an inventory page as product tiles
+and add-to-cart buttons only, so `ProductsPage` — whose anchors are the
+container, the title and the cart link — matched nothing, and the adapt step was
+told no page object corresponded to a page it has had for months. Include `id`
+and `class` on every element that has them: page objects use `.class` and `#id`
+anchors at least as often as `[data-test]`.
+
 ### 3. Obstructions
 
 Cookie banners, consent dialogs, notification prompts and marketing modals are

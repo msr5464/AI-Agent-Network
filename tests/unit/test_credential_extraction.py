@@ -106,6 +106,16 @@ class TestMaskingParity:
             assert secret not in masked, f"{secret} survived masking: {masked}"
         assert "https://api.x.io/pay" in masked, "the request itself must stay readable"
 
+    def test_a_numeric_user_id_in_a_request_body_is_not_masked(self):
+        # The saucedemo_api_todos example logged `"userId": ***MASKED***`, eating the
+        # `1,` and printing a request body that no longer parses.
+        body = '-d \'{"id": 1, "userId": 1, "title": "Buy Sauce Labs Backpack"}\''
+        assert mask_credential_lines(body) == body
+
+    @pytest.mark.parametrize("line", ["otp: 123456", "password: 1234", '"api_key": 42'])
+    def test_a_numeric_secret_is_still_masked(self, line):
+        assert "***MASKED***" in mask_credential_lines(line)
+
 
 class TestCredentialsFromPlan:
     """Every step that needs credentials reads them through this, so a plan that

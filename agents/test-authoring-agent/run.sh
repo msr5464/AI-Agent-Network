@@ -58,8 +58,12 @@ CACHE_DIR="$AGENT_DIR/cache/$USER_ID/$MODULE"
 # server rewrites a queue file on every save and every run moves it to processed/,
 # so an mtime check would miss on every UI run. Snapshotted per file, so a run that
 # crashed after re-caching step 01 can never validate step 02's older output.
+# A resume never takes a cache hit: retrying a step means running it again, and the
+# cached artefact is the output of the run being retried. See the same guard in
+# test-adaptation-agent/run.sh, where restoring it made the retry a no-op.
 _cache_hit() {
-  [[ "$TESTING_MODE" == "true" ]] && [[ -f "$CACHE_DIR/$1" ]] \
+  [[ "$TESTING_MODE" == "true" ]] && [[ "${START_FROM_STEP:-1}" -le 1 ]] \
+    && [[ -f "$CACHE_DIR/$1" ]] \
     && [[ -f "$CACHE_DIR/$1.input" ]] && cmp -s "$CACHE_DIR/$1.input" "$INPUT_FILE"
 }
 # _cache_restore <filename>  → copies file from cache into current AUDIT_DIR
@@ -69,7 +73,14 @@ _cache_restore() {
 }
 # _cache_save <filename>  → copies file from current AUDIT_DIR into cache
 _cache_save() {
-  if [[ "$TESTING_MODE" == "true" ]] && [[ -f "$AUDIT_DIR/$1" ]]; then
+  # A step that produced nothing is not worth caching: restored on the next run of
+  # the same input it hands back the failure as though it had succeeded. See the
+  # same guard in test-adaptation-agent/run.sh.
+  if [[ "$TESTING_MODE" == "true" ]] && [[ -f "$AUDIT_DIR/$1" ]] \
+     && python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(1 if (str(d.get("status", "")).lower() in ("skipped", "failed", "unsafe", "empty")
+               or d.get("skipped") is True) else 0)' "$AUDIT_DIR/$1" 2>/dev/null; then
     mkdir -p "$CACHE_DIR"
     cp "$AUDIT_DIR/$1" "$CACHE_DIR/$1"
     if [[ -f "$INPUT_FILE" ]]; then cp "$INPUT_FILE" "$CACHE_DIR/$1.input"; else rm -f "$CACHE_DIR/$1.input"; fi
@@ -390,12 +401,19 @@ sys.exit(0 if (d.get('selectors') or d.get('steps_passed') or d.get('steps_faile
   fi
 else
   log "[02/05] Validate Web — skipped (test_type=$TEST_TYPE)"
+  # Write BOTH artefacts, the same way the action would. This used to emit only
+  # the JSON, so an API-only session had no 02-validate-web.md and the session
+  # detail view showed a silent gap where every other step has a report.
   python3 -c "
 import json, os
 from pathlib import Path
-Path(os.environ['AUDIT_DIR']).joinpath('02-validate-web.json').write_text(
+audit = Path(os.environ['AUDIT_DIR'])
+audit.joinpath('02-validate-web.json').write_text(
   json.dumps({'skipped': True, 'reason': 'API-only test', 'selectors': {},
               'steps_passed': [], 'steps_failed': [], 'steps_unverified': []})
+)
+audit.joinpath('02-validate-web.md').write_text(
+  '# Validate Web Results\n\nSkipped: API-only test\n'
 )
 "
 fi

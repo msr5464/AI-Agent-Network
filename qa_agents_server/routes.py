@@ -702,7 +702,16 @@ def session_retry(agent: str, session_id: str):
             "error": "from_step must be between 2 and 5 — to restart from the "
                      "beginning, use POST /run instead"
         }), 400
-    auto_push = bool(body.get("auto_push", False))
+    # A caller that sends the switch decides with it — it is a policy choice, and
+    # a retry from the panel should honour what the panel shows. One that omits it
+    # inherits the run being retried rather than defaulting to false, which turned
+    # the retry of an isolated-worktree run into one editing the developer's own
+    # checkout.
+    if "auto_push" in body:
+        auto_push = bool(body.get("auto_push"))
+    else:
+        from qa_agents_server import storage
+        auto_push = bool((storage.get(session_id) or {}).get("auto_push", False))
 
     # The base comes from the session being resumed, not from whatever the run
     # panel currently shows. auto_push above is deliberately read live because

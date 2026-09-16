@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shared.log import log as _log
 def log(msg): _log("parse-change", msg)
 
-from shared.claude import call_claude as _call_claude
+from shared.claude import call_claude_ex as _call_claude_ex
 from shared.credential_masking import mask_credential_lines
 from shared.flow_map import destructive_token
 from shared.json_extract import extract_json
@@ -204,11 +204,20 @@ def main():
 
     classified = {}
     try:
-        response = _call_claude(classify_prompt(headers.get("module", MODULE),
-                                                items, note),
-                                MODEL, str(REPO_ROOT), timeout=600,
-                                log_dir=str(AUDIT_DIR))
-        for row in ((extract_json(response) or {}).get("items") or []):
+        call = _call_claude_ex(prompt=classify_prompt(headers.get("module", MODULE),
+                                                      items, note),
+                               model=MODEL, cwd=str(REPO_ROOT), timeout=600,
+                               log_dir=str(AUDIT_DIR))
+        if call.status != "ok":
+            # No classification at all — a usage cap, an API error, a timeout.
+            # Falling through defaults every item to `outcome_changed` and
+            # escalates the whole note, which reads as "this change is unsafe to
+            # apply" when the truth is that nobody looked at it. Exiting non-zero
+            # leaves the note queued for a run after the problem clears.
+            log(f"ERROR: the model call {call.describe()}")
+            log("Nothing was classified; the change note stays queued.")
+            sys.exit(1)
+        for row in ((extract_json(call.stdout) or {}).get("items") or []):
             classified[int(row.get("index", 0))] = row
     except Exception as exc:
         log(f"Classification call failed ({exc}) — every item will be escalated")

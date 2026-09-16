@@ -81,6 +81,9 @@ class ClaudeResult(NamedTuple):
                 tail = self.stderr.strip().splitlines()[-1][:200]
             return (f"exited {self.returncode} after {self.duration_s:.0f}s"
                     + (f" — {tail}" if tail else " with no stderr"))
+        if self.status == "usage_limit":
+            return (f"stopped on a usage cap — "
+                    f"{usage_limit(self.stdout) or 'limit reached'}")
         return f"exited 0 after {self.duration_s:.0f}s but produced no output"
 
 
@@ -526,6 +529,11 @@ def call_claude_ex(
         status = "error"
     elif not stdout.strip():
         status = "empty"
+    elif usage_limit(stdout):
+        # A cap is not a bad answer, it is no answer — and the CLI reports it as
+        # ordinary prose with exit code 0, so every caller expecting JSON called
+        # it a malformed model response instead of an infra stop.
+        status = "usage_limit"
     else:
         status = "ok"
 
@@ -555,6 +563,35 @@ def call_claude_ex(
         pass
 
     return result
+
+
+def usage_limit(text: str) -> str:
+    """The CLI's usage-cap message if `text` is one, otherwise "".
+
+    The cap arrives on stdout, in prose, with exit code 0:
+
+        You've hit your session limit · resets 11:50am (Asia/Calcutta)
+
+    An observed adaptation run parsed that as the model's answer and reported
+    "could not parse the model's response as JSON" for both change items, which
+    reads as the model failing rather than the account being out of budget.
+
+    Bounded by length on purpose: an answer that happens to discuss rate limits
+    is not a cap, and must never be reported as one.
+    """
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > 400:
+        return ""
+    # An answer is never a cap, however short. A model that declines a change item
+    # with {"adaptable": false, "unadaptable_reason": "the rate limit resets
+    # hourly"} is inside both word tests below, and swallowing it would hand the
+    # caller "" for a perfectly good reply.
+    if stripped[0] in "{[" or "\n" in stripped.strip():
+        return ""
+    low = stripped.lower()
+    capped = ("hit your" in low and "limit" in low) or \
+             ("limit" in low and "reset" in low)
+    return stripped if capped else ""
 
 
 def _unwrap_json_envelope(raw: str):
