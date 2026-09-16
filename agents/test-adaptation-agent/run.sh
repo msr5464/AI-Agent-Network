@@ -158,7 +158,6 @@ log "module=$MODULE"
 log "change note=$INPUT_FILE"
 log "session=$SESSION_ID"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
 
 if [[ "$MODE" != "resume" ]]; then
 cat > "$AUDIT_DIR/00-session-init.md" << EOF

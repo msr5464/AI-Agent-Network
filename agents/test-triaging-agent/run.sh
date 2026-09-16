@@ -50,7 +50,6 @@ log "test-triaging-agent | mode=$MODE"
 [[ -n "$BUILD_TAG" ]] && log "build_tag=$BUILD_TAG"
 log "session=$SESSION_ID"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
 
 # Write session init
 cat > "$AUDIT_DIR/00-session-init.md" << EOF

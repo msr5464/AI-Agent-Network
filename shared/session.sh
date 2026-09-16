@@ -117,6 +117,8 @@ run_step() {
   local step_key="${3:-}"
   local step_start
   step_start=$(date +%s)
+  # A blank line before each step, so the log reads as one block per step.
+  echo
   log "▶ $label"
 
   # Exported so the Python action tags the LLM calls it makes with this stage.

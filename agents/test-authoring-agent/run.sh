@@ -221,7 +221,6 @@ print(mask_credential_lines(open(os.environ['INPUT_FILE']).read()).rstrip())
 "
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
 
 # Write session init markdown — resuming preserves the ORIGINAL session's
 # record instead of overwriting it; append a short resume marker instead.
