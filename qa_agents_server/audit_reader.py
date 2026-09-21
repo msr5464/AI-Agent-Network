@@ -779,6 +779,9 @@ def _adaptation_summary(spec, session_dir: Path) -> Dict:
         "proposed": sum(1 for i in items if i.get("status") == "proposed"),
         "rejected": sum(1 for i in items if i.get("status") in ("rejected", "rolled_back")),
         "escalated": sum(1 for i in items if i.get("status") in ("escalated", "declined")),
+        # Done by an earlier item's verified edit — no escalation, so count it here
+        # or it disappears from the UI entirely.
+        "covered": sum(1 for i in items if i.get("status") == "covered"),
         "verified": len(adapt.get("verified") or []),
         "failed": len(adapt.get("failed") or []),
     }

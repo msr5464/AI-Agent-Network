@@ -43,11 +43,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Outcomes an attempt can end in. `no_edits` and `all_rejected` are deliberately
 # distinct: nothing reached disk in either case, but only the first is the model
-# telling us it has no fix to offer.
+# telling us it has no fix to offer. `failed` means the fix stayed on disk (the
+# authoring agent keeps it); `rolled_back` means nothing did (the adaptation agent
+# restores every item that fails), so "already on disk" must not be said of it.
 PASSED = "passed"
 FAILED = "failed"
 ALL_REJECTED = "all_rejected"
 NO_EDITS = "no_edits"
+ROLLED_BACK = "rolled_back"
 
 HISTORY_FILE = ".fix-history.json"
 
@@ -211,7 +214,7 @@ def render(history: List[Dict[str, Any]]) -> str:
     lines = ["\n<previous_fix_attempts>",
              "Everything already tried for this failure, oldest first. Do not repeat any of "
              "it — an edit that was rejected will be rejected again, and one that was applied "
-             "is already on disk in the files shown above.", ""]
+             "and kept is already on disk in the files shown above.", ""]
 
     for entry in history:
         lines.append(f"### Attempt {entry.get('attempt', '?')} — {_describe(entry)}")
@@ -238,4 +241,7 @@ def _describe(entry: Dict[str, Any]) -> str:
                 "the test was not re-run, so the failure below is unchanged")
     if outcome == PASSED:
         return "passed"
+    if outcome == ROLLED_BACK:
+        return ("nothing from this attempt is on disk — every edit was declined, rejected, "
+                "or ROLLED BACK after failing compile/conservation/tests")
     return "the fix was applied and the test still failed"

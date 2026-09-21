@@ -331,7 +331,11 @@ drift.
    An expired session is a hard stop — exploring with one lands on a login page
    and "discovers" that the entire flow changed. The session itself comes from
    the entry path the test declares, never from a reconstructed login.
-5. **Refusing is a correct outcome.** Escalation is the design working.
+5. **Refusing is a correct outcome.** Escalation is the design working. But an
+   item that an earlier item *of the same attempt* already did — applied, with
+   verified tests — is `covered`, not escalated. The model's `covered_by` claim is
+   checked in Python (`covering_item`), never trusted: with edits attached, or
+   naming an item that was not applied and verified, it is ignored.
 6. **Compile before verifying**, so our own broken edit is never misread as infra.
 7. **All-or-nothing per change item**, including on crash.
 8. **The PR is always NEEDS-REVIEW.**

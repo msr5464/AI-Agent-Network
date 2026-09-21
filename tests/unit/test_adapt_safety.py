@@ -111,6 +111,41 @@ class TestNegativeDocuments:
         assert adapt.negative_documents({"pages": {}, "_inventories": {}}) == []
 
 
+class TestCoveringItem:
+    """`covered_by` is the model's claim; only a claim Python can check lands.
+
+    Anything unchecked must fall through to the normal handling — the claim may
+    never discard real edits, and in propose-only mode `done` is always empty.
+    """
+    DONE = [{"index": 1, "summary": "s", "diff": "d", "verified": ["T#m"]}]
+
+    def test_a_claim_naming_a_verified_item_holds(self, tmp_path, monkeypatch):
+        adapt = _load("adapt_cov", "actions/04_adapt.py", tmp_path, monkeypatch)
+        for value in (1, "1", " 1 "):
+            assert adapt.covering_item({"covered_by": value}, self.DONE) is self.DONE[0]
+
+    @pytest.mark.parametrize("value", [2, 0, None, "null", "", True, 1.5, "item 1", [1], "²"])
+    def test_anything_else_is_ignored_without_raising(self, value, tmp_path, monkeypatch):
+        adapt = _load("adapt_cov_bad", "actions/04_adapt.py", tmp_path, monkeypatch)
+        assert adapt.covering_item({"covered_by": value}, self.DONE) is None
+
+    def test_edits_always_win_over_the_claim(self, tmp_path, monkeypatch):
+        adapt = _load("adapt_cov_edits", "actions/04_adapt.py", tmp_path, monkeypatch)
+        payload = {"covered_by": 1, "edits": [{"file": "X.java"}]}
+        assert adapt.covering_item(payload, self.DONE) is None
+
+    def test_nothing_done_means_nothing_can_be_covered(self, tmp_path, monkeypatch):
+        adapt = _load("adapt_cov_empty", "actions/04_adapt.py", tmp_path, monkeypatch)
+        assert adapt.covering_item({"covered_by": 1}, []) is None
+        assert adapt.done_section([]) == ""
+
+    def test_the_done_section_carries_the_diff_and_marks_truncation(self, tmp_path,
+                                                                   monkeypatch):
+        adapt = _load("adapt_cov_note", "actions/04_adapt.py", tmp_path, monkeypatch)
+        out = adapt.done_section([{**self.DONE[0], "diff": "+x" * 1500}])
+        assert "Item 1" in out and "T#m" in out and "… (truncated)" in out
+
+
 class TestNeedsAHuman:
     @pytest.fixture
     def ship(self, tmp_path, monkeypatch):

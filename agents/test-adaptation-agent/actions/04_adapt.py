@@ -222,6 +222,44 @@ A row whose Unique? column is not `yes` justifies nothing.
 """
 
 
+def done_section(done: list) -> str:
+    """What earlier items of THIS attempt applied, for the items after them.
+
+    Without it a later item sees an earlier item's passing edit in the file, reads
+    it as a previous attempt's failed one, and declines — which escalates a change
+    that is already done. The file excerpt is truncated at 8k, so the diff goes in
+    too: the edit may not be visible in the file at all.
+    """
+    if not done:
+        return ""
+    parts = ["\n## ✅ Already applied earlier in THIS attempt — on disk, tests passed",
+             "Lines starting with `-` no longer exist; anchor any `old_string` on the "
+             "current file above, not on these diffs.", ""]
+    # ponytail: last 4 only, keeps prompt growth ~8KB; cap by bytes if notes get long
+    for d in done[-4:]:
+        diff = d["diff"][:2000] + ("\n… (truncated)" if len(d["diff"]) > 2000 else "")
+        parts += [f"### Item {d['index']}: {d['summary']}",
+                  f"Verified: {', '.join(d['verified'])}",
+                  f"```diff\n{diff}\n```", ""]
+    parts.append("If one of these already does everything your item asks, return "
+                 "`covered_by` with its number and no edits.\n")
+    return "\n".join(parts)
+
+
+def covering_item(payload: dict, done: list):
+    """The earlier item this one claims already did its work — only if the claim holds.
+
+    Checked, not trusted: a claim with edits attached, or naming an item this
+    attempt did not apply and verify, is ignored and the response is handled
+    exactly as it would be without it.
+    """
+    raw = str(payload.get("covered_by") or "").strip()
+    # isdecimal, not isdigit: "²" is a digit, and int("²") raises mid-loop.
+    if payload.get("edits") or not raw.isdecimal():
+        return None
+    return next((d for d in done if d["index"] == int(raw)), None)
+
+
 _INTERACTION_TARGET = re.compile(
     r"\bElement\s*\.\s*\w+\s*\(\s*\w+\s*,\s*(\w+)"
     r"|\b(\w+)\s*\.\s*(?:click|select|enter|choose|goTo|open|add)\w*\s*\(")
@@ -537,11 +575,14 @@ def main():
                 {"what": "further attempts cannot differ", "why": why})
             finish(result, "skipped", "stuck")
             return
+        # History is per attempt, not per item: on attempt 2 there has been one
+        # failure, and saying "two" talked a later item out of a correct answer.
+        failures = sum(1 for h in history if h.get("outcome") != fix_history.PASSED)
         retry_note = ("\n## ⚠️ What earlier attempts already tried\n"
                       + fix_history.render(history)
-                      + "\nTwo failures on the same item is evidence the "
-                        "approach is wrong, not a reason to try a wider edit. "
-                        "If you cannot justify an edit from the flow map, "
+                      + ("\nTwo failed attempts are evidence the approach is wrong, "
+                         "not a reason to try a wider edit." if failures >= 2 else "")
+                      + "\nIf you cannot justify an edit from the flow map, "
                         "return adaptable: false.\n")
 
     actionable = [i for i in plan["items"] if not i.get("escalate_only")]
@@ -564,10 +605,11 @@ def main():
         finish(result, "skipped", "escalate")
         return
 
+    done = []  # items this attempt applied and verified, shown to the items after them
     for item in actionable:
         log(f"Item {item['index']} [{item['kind']}] — {item['text'][:70]}")
         prompt = build_adapt_prompt(item, plan, scope, flow, workspace, rules,
-                                    retry_note)
+                                    retry_note + done_section(done))
         call = _call_claude_ex(prompt=prompt, model=MODEL, cwd=str(REPO_ROOT),
                                timeout=900, log_dir=str(AUDIT_DIR))
         if call.status != "ok":
@@ -591,6 +633,18 @@ def main():
         if not payload:
             record["reason"] = "could not parse the model's response as JSON"
             result["items"].append(record); log(f"  ERROR: {record['reason']}"); continue
+        covering = covering_item(payload, done)
+        if covering:
+            # An earlier item's verified edit already does this one. Not an
+            # escalation — but visible in the PR, Slack and the UI counts, since it
+            # is the one outcome here that lands no edit of its own.
+            record.update({"status": "covered", "covered_by": covering["index"],
+                           "summary": f"Covered by item {covering['index']} (applied "
+                                      f"and verified in this attempt): "
+                                      f"{payload.get('summary') or ''}".strip()})
+            result["items"].append(record)
+            log(f"  covered by item {covering['index']} — no edit of its own")
+            continue
         if not payload.get("adaptable", False):
             record.update({"status": "declined",
                            "reason": payload.get("unadaptable_reason")
@@ -728,6 +782,11 @@ def main():
         result["verified"] += record["verified"]
         result["failed"] += [f["test"] for f in record["failed"]]
         result["items"].append(record)
+        # Only a fully verified edit can cover a later item: "partial" had failing
+        # tests, and an empty verify set proves nothing ran at all.
+        if record["status"] == "applied" and record["verified"]:
+            done.append({"index": item["index"], "summary": record["summary"],
+                         "diff": record["diff"], "verified": record["verified"]})
 
     statuses = {i["status"] for i in result["items"]}
     # What this attempt tried, for the next one to read and for the stop rule at
@@ -742,7 +801,10 @@ def main():
         # on the strength of something the model never said.
         outcome = fix_history.NO_EDITS
     else:
-        outcome = fix_history.FAILED
+        # Nothing applied, partial or proposed means nothing from this attempt is
+        # on disk — every failing item was restored. FAILED would tell the next
+        # prompt the opposite ("applied, still failing, already on disk").
+        outcome = fix_history.ROLLED_BACK
     fix_history.append(AUDIT_DIR, fix_history.record(
         attempt=ATTEMPT,
         proposed=[fp for i in result["items"] for fp in (i.get("fingerprint") or [])],

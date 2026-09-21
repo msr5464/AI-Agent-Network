@@ -343,9 +343,14 @@ def main():
                     log(f"  item {item['index']} recorded no files — skipping commit")
                     continue
                 run_git(["add", "--"] + paths, workspace)
+                # A covered item has no commit of its own, so reverting this one
+                # undoes it too — say so where the person reverting will read it.
+                also = [i["index"] for i in adapt.get("items") or []
+                        if i.get("status") == "covered" and i.get("covered_by") == item["index"]]
                 message = (f"adaptation: item {item['index']} — {item['kind']} ({MODULE})\n\n"
                            f"{item.get('summary','')}\n\n"
-                           f"Change note: {plan.get('module','')}\n\n"
+                           + (f"Also covers item(s) {', '.join(map(str, also))}\n\n" if also else "")
+                           + f"Change note: {plan.get('module','')}\n\n"
                            f"Session: {SESSION_ID}")
                 run_git(["commit", "-m", message], workspace)
                 log(f"  committed item {item['index']}")
@@ -411,8 +416,10 @@ def main():
         else:
             headline = (f":arrows_counterclockwise: *QA Adaptation — NEEDS REVIEW* "
                         f"— `{MODULE}`")
-            detail = (f"{len(applied)} change item(s) applied, "
-                      f"{len(result['verified'])} test(s) verified.")
+            covered = sum(1 for i in adapt.get("items") or [] if i.get("status") == "covered")
+            detail = (f"{len(applied)} change item(s) applied"
+                      + (f" · {covered} covered by another item" if covered else "")
+                      + f", {len(result['verified'])} test(s) verified.")
         if channel:
             send_slack(SLACK_TOKEN, channel,
                        f"{headline}\n{detail}\n"

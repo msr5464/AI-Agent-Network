@@ -1028,12 +1028,18 @@ def analytics_summary():
 @qa_bp.route("/settings", methods=["GET"])
 def settings_get():
     """Schema + current values for the admin Agent Settings page."""
+    # Studio only reaches this through its admin-gated /api/admin/agent-settings,
+    # but a gap in any proxy route must not hand GITHUB_TOKEN to a member.
+    if not _is_admin():
+        return jsonify({"error": "forbidden"}), 403
     return jsonify(agent_settings.get_all_for_api())
 
 
 @qa_bp.route("/settings", methods=["PUT"])
 def settings_put():
     """Persist a batch of setting updates to config/.env and os.environ."""
+    if not _is_admin():
+        return jsonify({"error": "forbidden"}), 403
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({"error": "request body must be a JSON object"}), 400

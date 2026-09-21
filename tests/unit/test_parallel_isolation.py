@@ -328,6 +328,33 @@ def test_queue_removal_is_scoped_to_the_owner():
         runner._pending_queue.clear()
 
 
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_agent_settings_are_admin_only(method, monkeypatch):
+    """/settings reads GITHUB_TOKEN and writes config/.env. Studio's proxy once let a
+    member reach it with ../../settings; this server must refuse that by itself."""
+    from flask import Flask
+    from qa_agents_server import agent_settings, routes
+
+    writes = []
+    monkeypatch.setattr(agent_settings, "get_all_for_api", lambda: {"fields": []})
+    monkeypatch.setattr(agent_settings, "set_many", writes.append)
+    monkeypatch.delenv("QA_AGENT_PROXY_SECRET", raising=False)
+    app = Flask(__name__)
+    app.register_blueprint(routes.qa_bp)
+    client = app.test_client()
+
+    def status(**headers):
+        return client.open("/settings", method=method, json={}, headers=headers).status_code
+
+    assert status() == 403
+    assert status(**{"X-User-Role": "member"}) == 403
+    assert status(**{"X-User-Role": "admin"}) == 200
+    monkeypatch.setenv("QA_AGENT_PROXY_SECRET", "s3cret")
+    assert status(**{"X-User-Role": "admin"}) == 403      # a typed header is not the proxy
+    assert status(**{"X-User-Role": "admin", "X-Proxy-Secret": "s3cret"}) == 200
+    assert len(writes) == (2 if method == "PUT" else 0)
+
+
 # ── Worktree root validation ──────────────────────────────────────────────────
 @pytest.mark.parametrize("unsafe", ["/", "/Users", "/tmp", "~", ""])
 def test_unsafe_worktree_roots_fall_back_to_the_default(unsafe, monkeypatch):

@@ -107,6 +107,15 @@ class TestRender:
         out = fh.render([_applied(1)])
         assert "applied and the test still failed" in out
 
+    def test_a_rolled_back_attempt_is_not_described_as_on_disk(self):
+        """Adaptation restores every failing item. Calling that "applied" made a later
+        item read an earlier item's fresh, passing edit as the failed one, and decline."""
+        entry = fh.record(1, outcome=fh.ROLLED_BACK)
+        out = fh.render([entry])
+        assert "ROLLED BACK" in out
+        assert "applied and the test still failed" not in out
+        assert fh.exhausted([], entry) == (False, "")
+
 
 class TestPersistence:
 

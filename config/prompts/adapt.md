@@ -73,6 +73,18 @@ Return `adaptable: false` and say why, when:
 Declining is a correct outcome and is reported to a human. A confident wrong edit
 is not.
 
+### When an earlier item already did it
+
+Only when the prompt has an **"Already applied earlier in THIS attempt"** section:
+if one of the items listed there already does everything your item asks — every
+step and every check — return `covered_by` with that item's number, `edits: []`,
+and a `summary` saying which of its lines cover your item. That is not declining;
+the work is done and verified.
+
+Anywhere else `covered_by` is ignored, and so is it whenever you also return
+edits — those are applied as usual. If the earlier item did only part of your
+item, add the rest as edits instead.
+
 ## Output Format (strict)
 
 Respond with a JSON object ONLY. No prose, no markdown fences.
@@ -81,6 +93,7 @@ Respond with a JSON object ONLY. No prose, no markdown fences.
 {
   "adaptable": true | false,
   "unadaptable_reason": "<why, if adaptable is false, else null>",
+  "covered_by": <number of an earlier item in THIS attempt that already did all of this one, else null>,
   "summary": "<1-2 sentences: what the product changed and what you changed>",
   "edits": [
     {
