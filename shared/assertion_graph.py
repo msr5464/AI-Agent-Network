@@ -191,10 +191,12 @@ def _cond_path(text: str, upto: int) -> Tuple[str, ...]:
 
 
 def member_index(repo_path: str) -> Dict[str, Dict]:
-    """Every class in the repo keyed by simple name, with its members and fields.
+    """Every class in the repo keyed by simple name and by full name.
 
-    Keyed on the simple name because that is what a call site gives us:
-    `loginPage.clickLogin()` names a field whose declared type is a simple name.
+    The simple name is what a call site gives us: `loginPage.clickLogin()` names
+    a field whose declared type is a simple name. When two classes share one
+    (GitHub's LoginPage and SauceDemo's), `_lookup` picks by the mentioning
+    file's imports and package, as Java does.
     """
     from shared.blast_radius import index as _index
 
@@ -216,8 +218,10 @@ def member_index(repo_path: str) -> Dict[str, Dict]:
             if types:
                 fields[member["name"]] = types[-1]
         parent = _EXTENDS.search(content)
-        out[entry["simple"]] = {
+        candidates = graph["by_simple"].get(entry["simple"], [fqcn])
+        out[fqcn] = out[entry["simple"]] = {
             "fqcn": fqcn, "path": entry["path"], "content": content,
+            "package": entry.get("package", ""), "imports": entry.get("imports") or [],
             "members": {m["name"]: m for m in members if m.get("name")},
             "fields": fields,
             "extends": parent.group(1) if parent else None,
@@ -225,8 +229,30 @@ def member_index(repo_path: str) -> Dict[str, Dict]:
             # uses. Walking into browser setup or the API base class adds no
             # business assertion and buries the real contract in library calls.
             "infrastructure": fqcn in graph["infrastructure"],
+            # Under the simple name a second class with the same name replaces
+            # the first, so a lookup by simple name must go through `_lookup`.
+            "candidates": candidates,
+            "ambiguous": len(candidates) > 1,
         }
     return out
+
+
+def _lookup(name: Optional[str], context: Optional[Dict], index: Dict[str, Dict]) -> Optional[Dict]:
+    """The class `name` means in `context`'s source, or None if it could be several.
+
+    Imported first, then same package — the rule `blast_radius.index` uses.
+    """
+    entry = index.get(name) if name else None
+    if not entry or not entry.get("ambiguous") or name == entry["fqcn"]:
+        return entry
+    if context is None:
+        return None
+    pool = entry["candidates"]
+    for pick in ([c for c in pool if c in context.get("imports", ())],
+                 [c for c in pool if c.rsplit(".", 1)[0] == context.get("package")]):
+        if len(pick) == 1:
+            return index.get(pick[0])
+    return None
 
 
 def _ancestry(klass: Dict, index: Dict[str, Dict]) -> Tuple[List[Dict], bool]:
@@ -243,7 +269,8 @@ def _ancestry(klass: Dict, index: Dict[str, Dict]) -> Tuple[List[Dict], bool]:
         if parent_name in seen:                      # defensive: cyclic extends
             break
         seen.add(parent_name)
-        parent = index.get(parent_name)
+        # An ambiguous parent reads as unreadable: the same as a library base.
+        parent = _lookup(parent_name, current, index)
         if parent is None:
             complete = False
             break
@@ -264,39 +291,93 @@ def _is_generated_accessor(name: str, chain: List[Dict]) -> bool:
     return False
 
 
+AMBIGUOUS = "?ambiguous"
+
+
 def _resolve_callee(receiver: Optional[str], method: str, klass: Dict,
                     index: Dict[str, Dict],
                     locals_: Optional[Dict[str, str]] = None) -> Optional[str]:
-    """Which class a call lands in, or None when it cannot be decided."""
+    """The full name of the class a call lands in; None when it cannot be
+    decided, AMBIGUOUS when the type's simple name is shared by two classes and
+    neither an import nor the package says which."""
     if receiver is None or receiver in ("this", "super"):
-        return klass["fqcn"].rsplit(".", 1)[-1] if method in klass["members"] else None
+        return klass["fqcn"] if method in klass["members"] else None
+
+    def resolved(name: str, where: Dict) -> str:
+        if name not in index:
+            return name                  # a library type: walk() stops there
+        entry = _lookup(name, where, index)
+        return entry["fqcn"] if entry else AMBIGUOUS
+
     if locals_ and receiver in locals_:              # local variable or parameter
-        return locals_[receiver]
+        return resolved(locals_[receiver], klass)
     # Fields, including inherited ones: a page object holds `page` on its base
     # class far more often than on itself.
     for ancestor in _ancestry(klass, index)[0]:
         if receiver in ancestor["fields"]:
-            return ancestor["fields"][receiver]
+            return resolved(ancestor["fields"][receiver], ancestor)
     if receiver in index:                            # static call on a type
-        return receiver
+        return resolved(receiver, klass)
     return None
 
 
+def asserts_in(text: str, site: str) -> List[Dict]:
+    """The assertions written in one member's text, in source order.
+
+    Shared by the call-graph walk and by callers that compare edited files
+    directly, so an assertion is described the same way by both. `raw` is what
+    the fingerprint hashes; callers that do not hash can ignore it.
+    """
+    found = []
+    for match in ASSERT_CALL.finditer(text):
+        if _is_declaration(text, match.start()):
+            continue
+        callee = match.group(1)
+        args = _call_args(text, match.end() - 1)
+        skeleton, expected = _normalise_args(args)
+        found.append({
+            "callee": callee, "site": site,
+            "cond_path": list(_cond_path(text, match.start())),
+            "strength": _strength(callee.split(".")[-1]),
+            "literals": _STRING.findall(args),
+            "skeleton": skeleton,
+            "raw": f"{callee.split('.')[-1]}|{skeleton}|{expected}",
+        })
+    return found
+
+
+# `new CartPage(config)`, `new ArrayList<>()`. Qualified names (`new a.B(`) are
+# deliberately not matched: the simple-name index cannot place them.
+_NEW = re.compile(r"\bnew\s+([A-Z]\w*)\s*(?:<[^<>()]*>)?\s*\(")
+
+
 def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
-                 max_depth: int = MAX_DEPTH) -> Dict:
+                 max_depth: int = MAX_DEPTH, follow_constructors: bool = False) -> Dict:
     """Every assertion reachable from one test method, with how it is guarded.
 
     Returns {"asserts": {fp: {...}}, "unresolved": [...], "log_steps": [...]}.
+
+    `follow_constructors` also walks into `new X(...)`. A page object's
+    constructor usually asserts that its page loaded, so without it, removing
+    the only step that reaches a page drops that check without a trace. Off by
+    default: the authoring agent compares against assertions it froze without
+    it, and must keep comparing like with like.
     """
     result: Dict = {"asserts": {}, "unresolved": [], "log_steps": []}
     seen: Set[Tuple[str, str]] = set()
     occurrences: Dict[str, int] = {}
 
-    def walk(simple: str, member_name: str, depth: int):
-        if depth > max_depth or (simple, member_name) in seen:
+    def walk(key: str, member_name: str, depth: int, via: str = ""):
+        # `key` is a full name, or at depth 0 whatever the caller passed; sites
+        # keep the simple name so check ids do not depend on which.
+        if depth > max_depth:
             return
-        seen.add((simple, member_name))
-        klass = index.get(simple)
+        simple = key.rsplit(".", 1)[-1]
+        klass = index.get(key) or (index.get(simple) if depth == 0 else None)
+        visit = (klass["fqcn"] if klass else key, member_name)
+        if visit in seen:
+            return
+        seen.add(visit)
         if not klass:
             # At depth 0 this is the test we were asked about and not finding it
             # is a real answer. Deeper, it means the trail led into a type this
@@ -357,28 +438,25 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
         # source for a derived intent contract.
         result["log_steps"].extend(log_steps(text))
 
-        for match in ASSERT_CALL.finditer(text):
-            if _is_declaration(text, match.start()):
-                continue
-            callee = match.group(1)
-            args = _call_args(text, match.end() - 1)
-            cond = _cond_path(text, match.start())
-            skeleton, expected = _normalise_args(args)
-            raw = f"{callee.split('.')[-1]}|{skeleton}|{expected}"
+        # `site` names the class the walk came through; `defined_in` names the
+        # class whose source holds the assertion, which is what a comparison of
+        # edited files sees for an inherited method.
+        defined_in = f"{klass['fqcn'].rsplit('.', 1)[-1]}#{member_name}"
+        for info in asserts_in(text, f"{simple}#{member_name}"):
+            raw = info.pop("raw")
             base = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
             # Two identical assertions — cart total and checkout total, both
             # "$ 183.99" — hashed to one key, so the second overwrote the first and
             # deleting either went unnoticed. The occurrence number keeps them
             # apart; the walk is in source order, so the numbering is stable.
             occurrences[base] = occurrences.get(base, 0) + 1
-            fp = f"{base}_{occurrences[base]}"
-            result["asserts"][fp] = {
-                "callee": callee, "site": f"{simple}#{member_name}",
-                "depth": depth, "cond_path": list(cond),
-                "strength": _strength(callee.split(".")[-1]),
-                "literals": _STRING.findall(args),
-                "skeleton": skeleton,
-            }
+            info.update({"depth": depth, "defined_in": defined_in,
+                         # Full name: two classes can share `defined_in`.
+                         "owner": klass["fqcn"],
+                         # The first call in the test that leads here, so a
+                         # reader can tell which step a helper's check hangs off.
+                         "via": via})
+            result["asserts"][f"{base}_{occurrences[base]}"] = info
 
         for match in _CALL.finditer(text):
             receiver, name = match.group(1), match.group(2)
@@ -387,6 +465,10 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
             if ASSERT_CALL.match(text[match.start():]):
                 continue
             target = _resolve_callee(receiver, name, klass, index, locals_)
+            if target == AMBIGUOUS:
+                result["unresolved"].append(
+                    f"{simple}#{member_name} -> {receiver}.{name}() (ambiguous class name)")
+                continue
             if target is None:
                 # A capitalised receiver this repo does not define is a static
                 # call into the JDK or a library — `Paths.get()`, `Duration.
@@ -407,7 +489,27 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
                     result["unresolved"].append(
                         f"{simple}#{member_name} -> {receiver}.{name}()")
                 continue
-            walk(target, name, depth + 1)
+            walk(target, name, depth + 1,
+                 via or f"{receiver + '.' if receiver else ''}{name}()")
+
+        if not follow_constructors:
+            return
+        for match in _NEW.finditer(text):
+            target = match.group(1)
+            if target not in index:
+                continue                     # a library type: nothing of ours runs
+            entry = _lookup(target, klass, index)
+            if entry is None:
+                # Two classes share the name and neither an import nor the
+                # package says which. Walking one could measure the wrong
+                # page's checks, so say so.
+                result["unresolved"].append(
+                    f"{simple}#{member_name} -> new {target}() (ambiguous class name)")
+                continue
+            ctor = entry["members"].get(target)
+            if not ctor or ctor.get("kind") != "constructor":
+                continue                     # no written constructor to run
+            walk(entry["fqcn"], target, depth + 1, via or f"new {target}()")
 
     walk(class_simple, method, 0)
     result["unresolved"] = sorted(set(result["unresolved"]))
@@ -532,3 +634,199 @@ def describe(report: Dict) -> str:
                      f"{', '.join(report['new_unresolved'][:3])}")
         return line
     return "assertion conservation FAILED — " + report["reason"]
+
+
+# ── Per-item comparison (the adaptation agent) ────────────────────────────────
+#
+# `conserved` answers "was anything lost?" against a snapshot, pairing by
+# fingerprint and then by source order. That is enough to refuse, but not to
+# *name* what changed: two checks with the same call shape and expected value
+# (both `getPageTitle(), "Products"`) differ only in their message, so removing
+# the first reads as losing the second. An agent that may change checks once it
+# declares them needs the right one named, so `delta` pairs as multisets,
+# message first. `conserved` is left exactly as it is for the other agents.
+
+_VALUE_TOKEN = re.compile(r"@|(?<![\w.])(0[xX][0-9a-fA-F_]+|\d[\d_]*(?:\.\d+)?)[lLfFdD]?(?![\w.])")
+_NUMBER_TEXT = re.compile(r"(-?)(0[xX][0-9a-fA-F_]+|\d[\d_]*(?:\.\d+)?)[lLfFdD]?")
+
+
+def _number(token: str, negative: bool) -> str:
+    raw = token.replace("_", "")
+    try:
+        if raw[:2].lower() == "0x":
+            value = int(raw, 16)
+        elif "." in raw:
+            value = float(raw)
+            value = int(value) if value.is_integer() else value
+        else:
+            value = int(raw)
+    except ValueError:
+        return token
+    return f"-{value}" if negative else str(value)
+
+
+def canonical_value(value) -> str:
+    """One expected value however it was written: quotes, case, spacing and
+    number spelling (`1_000`, `10L`, `0x1F`, `1.50`) do not change it."""
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1]
+    number = _NUMBER_TEXT.fullmatch(text)
+    if number:
+        return _number(number.group(2), bool(number.group(1)))
+    return re.sub(r"\s+", "", text).lower()
+
+
+def check_parts(info: Dict) -> Dict:
+    """An assertion split into what `delta` compares.
+
+    `shape` is the call with every expected value taken out; `values` are those
+    values in source order, canonical; `top` says which of them are a whole
+    argument rather than something nested in a call (`get("title")`, `get(0)`,
+    `> 0`) — only a whole argument is something a page can be seen to show. The
+    last string literal is the failure message, as `_normalise_args` has it.
+    """
+    literals = list(info.get("literals") or [])
+    message_index = len(literals) - 1
+    skeleton = info.get("skeleton") or ""
+
+    args, depth, current = [], 0, ""
+    for ch in skeleton:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            args.append(current)
+            current = ""
+        else:
+            current += ch
+    args.append(current)
+
+    shape, values, display, top = [], [], [], []
+    string_no = 0
+    for arg in args:
+        out, last = "", 0
+        for match in _VALUE_TOKEN.finditer(arg):
+            start = match.start()
+            if match.group(0) == "@":
+                index, string_no = string_no, string_no + 1
+                out += arg[last:match.end()]
+                last = match.end()
+                if index == message_index or index >= len(literals):
+                    continue
+                values.append(canonical_value(literals[index]))
+                display.append(literals[index])
+                top.append(arg == "@")
+                continue
+            # A leading minus is part of the number; `a-1` is subtraction.
+            negative = (start > 0 and arg[start - 1] == "-"
+                        and (start == 1 or arg[start - 2] in "(=<>!?:&|"))
+            begin = start - 1 if negative else start
+            out += arg[last:begin] + "#"
+            last = match.end()
+            raw = arg[begin:match.end()]
+            values.append(canonical_value(raw))
+            display.append(raw)
+            top.append(arg == raw)
+        shape.append(out + arg[last:])
+    return {"shape": ",".join(shape), "values": values, "display": display,
+            "top": top,
+            "message": literals[message_index].strip('"') if literals else ""}
+
+
+def merge(per_test: Dict[str, Dict]) -> Dict:
+    """Several tests' fingerprints as one list: one entry per assertion in code.
+
+    A helper's check reached by three tests is one check, not three; two
+    identical checks in one method are still two. Ids are built from content,
+    so a check keeps its id across measurements for as long as it is unchanged.
+    """
+    merged: Dict[tuple, Dict] = {}
+    unresolved: Set[str] = set()
+    for test, fps in per_test.items():
+        unresolved |= set(fps.get("unresolved") or [])
+        counts: Dict[tuple, int] = {}
+        for info in (fps.get("asserts") or {}).values():
+            parts = check_parts(info)
+            site = info.get("defined_in") or info.get("site", "")
+            cond = len(info.get("cond_path") or [])
+            owner = info.get("owner", "")
+            key = (site, info["callee"], parts["shape"], tuple(parts["values"]),
+                   parts["message"], cond, owner)
+            counts[key] = counts.get(key, 0) + 1
+            slot = key + (counts[key],)
+            if slot not in merged:
+                merged[slot] = {**parts, "site": site, "callee": info["callee"],
+                                "cond": cond, "owner": owner,
+                                "strength": tuple(info.get("strength") or (-1, -1)),
+                                "via": info.get("via", ""), "tests": []}
+            merged[slot]["tests"].append(test)
+
+    checks = list(merged.values())
+    bases: Dict[str, int] = {}
+    for check in checks:
+        raw = "|".join([check["site"], check["callee"], check["shape"],
+                        "\x1f".join(check["values"]), check["message"]])
+        base = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:7]
+        bases[base] = bases.get(base, 0) + 1
+        check["id"] = f"c{base}" + (f"_{bases[base]}" if bases[base] > 1 else "")
+    return {"checks": checks, "unresolved": sorted(unresolved)}
+
+
+def delta(before: List[Dict], after: List[Dict]) -> Dict:
+    """What an edit did to a list of checks (entries from `merge`).
+
+    Pairing order: unchanged, then reworded (same check, new message), then
+    moved (same check elsewhere), then changed (same call and place, new values
+    — same message first, then source order), then weakened (lower on a ladder
+    at the same place). Whatever is left was removed or added. Any pair whose
+    guard depth grew is also reported as conditional: it now runs only when it
+    would pass.
+    """
+    left, right = list(before), list(after)
+    out: Dict[str, list] = {k: [] for k in ("reworded", "moved", "changed", "weakened",
+                                            "conditional", "removed", "added")}
+
+    def key(check):
+        return check["callee"], check["shape"], tuple(check["values"])
+
+    def where(check):
+        # Two classes can share a simple name, and so a site string.
+        return check["site"], check.get("owner", "")
+
+    def take(same, label):
+        for b in list(left):
+            a = next((c for c in right if same(b, c)), None)
+            if a is None:
+                continue
+            left.remove(b)
+            right.remove(a)
+            if a["cond"] > b["cond"]:
+                out["conditional"].append((b, a))
+            if label:
+                out[label].append((b, a))
+
+    take(lambda b, a: key(b) == key(a) and where(b) == where(a)
+         and b["message"] == a["message"], None)
+    take(lambda b, a: key(b) == key(a) and where(b) == where(a), "reworded")
+    take(lambda b, a: key(b) == key(a) and b["message"] == a["message"], "moved")
+    take(lambda b, a: key(b) == key(a), "moved")
+    take(lambda b, a: (b["callee"], b["shape"], where(b), b["message"])
+         == (a["callee"], a["shape"], where(a), a["message"]), "changed")
+    take(lambda b, a: (b["callee"], b["shape"], where(b))
+         == (a["callee"], a["shape"], where(a)), "changed")
+
+    for b in list(left):
+        family, rung = b["strength"]
+        if family < 0:
+            continue
+        a = next((c for c in right if where(c) == where(b)
+                  and c["strength"][0] == family and c["strength"][1] > rung), None)
+        if a is not None:
+            left.remove(b)
+            right.remove(a)
+            out["weakened"].append((b, a))
+
+    out["removed"], out["added"] = left, right
+    return out

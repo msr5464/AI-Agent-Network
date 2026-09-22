@@ -244,3 +244,21 @@ def test_a_run_on_the_default_records_an_empty_base_branch(tmp_path, store):
     d = _session(tmp_path, "test-authoring-agent")
 
     assert analytics.build_record(d)["base_branch"] == ""
+
+
+def test_adaptation_crash_marker_wins(tmp_path, store):
+    d = _session(tmp_path, "test-adaptation-agent")
+    (d / ".crashed").write_text("boom")
+    _write_metrics(d)
+    assert analytics.build_record(d, agent="test-adaptation-agent")["status"] == "failed"
+
+
+@pytest.mark.parametrize("agent", ["test-healing-agent", "test-adaptation-agent"])
+def test_cancel_outranks_the_crash_it_causes(tmp_path, store, agent):
+    """Cancelling kills the step, and run.sh's ERR trap then writes .crashed as
+    well. The run was cancelled, not failed — the order session.sh already uses."""
+    d = _session(tmp_path, agent)
+    (d / ".crashed").write_text("Crashed at run.sh:66 with exit 1")
+    (d / ".cancelled").write_text("true")
+    _write_metrics(d)
+    assert analytics.build_record(d, agent=agent)["status"] == "cancelled"

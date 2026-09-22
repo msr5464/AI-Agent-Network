@@ -152,3 +152,17 @@ class TestVerifies:
         # STRONG asserts `assertEquals(testConfig, "Order total", total, "42.00")`
         # — the last literal is the value, so there is no sentence to show.
         assert intent.verifies(contract) == []
+
+
+class TestChecks:
+    def test_each_check_is_listed_with_its_id_expected_value_and_message(self, repo):
+        contract = intent.derive(repo, "automation.checkout.CheckoutTest#placeOrder")
+        listed = intent.checks(contract)
+        assert listed and all(c["id"].startswith("c") for c in listed)
+        assert all(set(c) == {"id", "callee", "site", "expected", "message", "via"}
+                   for c in listed)
+
+    def test_a_frozen_contract_lists_the_same_ids(self, repo):
+        contract = intent.derive(repo, "automation.checkout.CheckoutTest#placeOrder")
+        frozen = intent.freeze({"t": contract})["t"]
+        assert [c["id"] for c in intent.checks(frozen)] == [c["id"] for c in intent.checks(contract)]

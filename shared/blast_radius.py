@@ -349,7 +349,12 @@ def resolve(repo_path: str, affects: Optional[List[str]] = None,
             if ident in seed_idents:
                 row["reason"] = how or "named"
                 tiers["named"].append(row)
-            elif fq in backward and fq not in seed_classes:
+            elif fq in seed_classes:
+                # Shares the named test's fields, setup and helpers — and was in
+                # no tier at all, so it was never frozen or verified.
+                row["reason"] = "same class as a named test"
+                tiers["shared_surface"].append(row)
+            elif fq in backward:
                 via = sorted((classes[fq]["references"] & editable))[:2]
                 row["reason"] = ("via " + ", ".join(classes[v]["simple"] for v in via)
                                  if via else "reaches the changed area")

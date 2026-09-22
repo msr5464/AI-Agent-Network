@@ -38,11 +38,14 @@ from shared import workspace as workspace_helper
 from shared.log import blocked
 def log(msg): _log("ship", msg)
 
+from shared import assertion_graph
 from shared import baseline as baseline_store
 from shared import flow_map
 from shared.git import run_git
 from shared.github import create_pr
 from shared.slack import send_slack
+
+from lib import check_changes
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
@@ -66,7 +69,7 @@ ESCALATING = ("escalate", "unsafe", "no-session", "unreachable", "stuck")
 
 
 def needs_a_human(skip_reason: str, escalations: list, items: list,
-                  applied: list) -> tuple:
+                  applied: list, failed: list = ()) -> tuple:
     """Does this run belong in the alert channel, and what should it say?
 
     Work that did not land needs a person as much as an explicit escalation does.
@@ -76,10 +79,14 @@ def needs_a_human(skip_reason: str, escalations: list, items: list,
     """
     stalled = [i for i in (items or [])
                if i.get("status") in ("rejected", "failed", "rolled_back")]
-    if not (skip_reason in ESCALATING or escalations or (stalled and not applied)):
+    # Tests that still fail after the last attempt: shipped for review, not done.
+    if not (skip_reason in ESCALATING or escalations or (stalled and not applied)
+            or failed):
         return False, ""
     detail = "\n".join(f"• {e['what']}: {e['why'][:160]}"
                        for e in (escalations or [])[:4])
+    if not detail and failed:
+        detail = f"{len(failed)} verified test(s) still fail after the last attempt"
     if not detail and stalled:
         detail = (f"{len(stalled)} change item(s) could not be adapted: "
                   + "; ".join((i.get("reason") or i.get("status", ""))[:80]
@@ -135,8 +142,63 @@ def open_prs_touching(edit_candidates: list) -> list:
     return clashes
 
 
+def _checks_changed(rows) -> int:
+    return sum(1 for r in rows or [] if r.get("action") in ("remove", "change"))
+
+
+def measured_rows(scope: dict, workspace: Path):
+    """What the branch changes about the tests' checks, measured end to end.
+
+    The checks the in-scope tests reach — the snapshot frozen in step 02 against
+    the final tree — and the assertions in every Java file the branch touches,
+    base against final. The log of accepted changes only supplies the why. None
+    when it cannot be measured, which the body says rather than hiding.
+    """
+    try:
+        contracts = scope.get("intent_contracts") or {}
+        frozen = assertion_graph.merge(
+            {t: {"asserts": c.get("_asserts") or {}} for t, c in contracts.items()})["checks"]
+        final = check_changes.measure(scope, workspace)["checks"]
+        base = scope.get("base_sha") or "HEAD"
+        ok, names, _ = run_git(["diff", "--name-only", base, "--", "*.java"], workspace)
+        before_texts, after_texts = {}, {}
+        for rel in (names.splitlines() if ok else []):
+            rel = rel.strip()
+            if not rel:
+                continue
+            shown, text, _ = run_git(["show", f"{base}:{rel}"], workspace)
+            before_texts[rel] = text if shown else ""
+            path = Path(workspace) / rel
+            after_texts[rel] = path.read_text(encoding="utf-8", errors="ignore") \
+                if path.exists() else ""
+        files = assertion_graph.delta(check_changes.file_checks(before_texts),
+                                      check_changes.file_checks(after_texts))
+        logged = load_list(".check-changes.json")
+        return check_changes.ship_rows(assertion_graph.delta(frozen, final), files, logged)
+    except Exception as exc:  # noqa: BLE001 — the PR still ships, saying what is missing
+        log(f"could not measure the checks this branch changes: {exc}")
+        return None
+
+
+def declared_rows(adapt: dict) -> list:
+    """Without a PR the agent's own per-item rows are the table: proposals, or
+    edits left uncommitted in a local checkout."""
+    return [row for item in adapt.get("items") or []
+            if item.get("status") in ("applied", "partial", "proposed")
+            for row in item.get("check_changes") or []]
+
+
+def load_list(name: str) -> list:
+    path = AUDIT_DIR / name
+    try:
+        data = json.loads(path.read_text()) if path.exists() else []
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
 def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
-               skip_reason: str) -> str:
+               skip_reason: str, check_rows=(), check_title: str = "") -> str:
     flow = explore.get("flow") or {}
     items = adapt.get("items") or []
     verified = adapt.get("verified") or []
@@ -151,6 +213,18 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
         "here, not just selectors. Every mechanical check below passed, but only a "
         "human can confirm the test still means what it should.",
         "",
+    ]
+    if check_rows is None:
+        parts += [f"### ⚠️ {check_title or 'Checks this PR changes'}", "",
+                  "_Could not be measured — read every assertion in the diff._", ""]
+    elif check_rows:
+        parts += [f"### ⚠️ {check_title or 'Checks this PR changes'}", "",
+                  "Each row is a check the tests no longer make, make with a new "
+                  "expected value, or make somewhere else. Every removal and change "
+                  "was declared by the agent and matched against what the edit did. "
+                  "Confirm each one follows from the change note.", ""]
+        parts += check_changes.render_table(check_rows) + [""]
+    parts += [
         "### 📋 Overview",
         "| Property | Value |",
         "|---|---|",
@@ -214,10 +288,16 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
             parts += [f"- {'✅' if g['ok'] else '❌'} `{g['guard']}` "
                       f"{g.get('reason','')}" for g in guards]
             parts += ["", "</details>", ""]
-        for report in item.get("conservation") or []:
-            if not report.get("ok") or report.get("verdict") == "PLAUSIBLE":
-                parts += [f"- assertion conservation ({report.get('test','')}): "
-                          f"**{report.get('verdict')}** {report.get('reason','')}", ""]
+        changed = _checks_changed(item.get("check_changes"))
+        if changed:
+            parts += [f"- changes {changed} check(s) — listed at the top", ""]
+        if item.get("unmeasured"):
+            parts += ["- ⚠️ also edits values a check may read, which is not measured: "
+                      + "; ".join(item["unmeasured"]), ""]
+        if item.get("new_unresolved"):
+            parts += [f"- check measurement is **PLAUSIBLE**, not CONFIRMED: "
+                      f"{len(item['new_unresolved'])} new call(s) could not be followed "
+                      f"({', '.join(item['new_unresolved'][:3])})", ""]
 
     parts += ["### 🧪 Validation & Test Results", ""]
     parts += [f"- ✅ verified: `{t}`" for t in verified] or ["- _nothing verified_"]
@@ -261,7 +341,8 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
         "",
         "### 🔍 How to Review",
         "1. Confirm the flow map steps match the actual intended product changes.",
-        "2. Verify that modified assertions preserve expected test intent.",
+        "2. Read the checks table at the top first: each row is a check the tests "
+        "no longer make or make differently. Confirm every one follows from the note.",
         "3. Run the adapted tests locally in the target environment.",
         "",
         "---",
@@ -289,12 +370,24 @@ def main():
 
     applied = [i for i in (adapt.get("items") or [])
                if i.get("status") in ("applied", "partial")]
-    body = build_body(plan, scope, explore, adapt, skip_reason)
+    pr_mode = bool(applied and AUTO_PUSH and GITHUB_TOKEN and GITHUB_ORG and GITHUB_REPO)
+    if pr_mode:
+        check_rows = measured_rows(
+            scope, workspace_helper.resume_workspace(scope["workspace"], log=log))
+        title = "Checks this PR changes"
+    else:
+        check_rows = declared_rows(adapt)
+        title = ("Checks these edits change" if applied
+                 else "Checks these proposals would change")
+    result["checks_changed"] = _checks_changed(check_rows)
+    body = build_body(plan, scope, explore, adapt, skip_reason, check_rows, title)
 
-    if not applied or not AUTO_PUSH or not (GITHUB_TOKEN and GITHUB_ORG and GITHUB_REPO):
+    if not pr_mode:
         reason = ("nothing was applied" if not applied else
                   "AUTO_PUSH=false" if not AUTO_PUSH else "GitHub not configured")
         result["ship_detail"] = f"no PR — {reason}"
+        if not adapt.get("items"):
+            result["status"] = "skipped"
         log(result["ship_detail"])
     else:
         workspace = workspace_helper.resume_workspace(scope["workspace"], log=log)
@@ -347,7 +440,9 @@ def main():
                 # undoes it too — say so where the person reverting will read it.
                 also = [i["index"] for i in adapt.get("items") or []
                         if i.get("status") == "covered" and i.get("covered_by") == item["index"]]
-                message = (f"adaptation: item {item['index']} — {item['kind']} ({MODULE})\n\n"
+                changed = _checks_changed(item.get("check_changes"))
+                message = (f"adaptation: item {item['index']} — {item['kind']} ({MODULE})"
+                           + (f" — changes {changed} check(s)" if changed else "") + "\n\n"
                            f"{item.get('summary','')}\n\n"
                            + (f"Also covers item(s) {', '.join(map(str, also))}\n\n" if also else "")
                            + f"Change note: {plan.get('module','')}\n\n"
@@ -376,6 +471,21 @@ def main():
                              f"Session: {SESSION_ID}"], workspace)
                     log(f"  committed {len(baselines)} locator baseline(s)")
                     result["baselines_committed"] = sorted(baselines)
+
+            # Anything this run edited that no commit above carries — an edit an
+            # earlier attempt left on disk that the last attempt did not re-apply.
+            # It would be thrown away with the worktree, so the reviewer is told.
+            ok, names, _ = run_git(["diff", "--name-only", "HEAD"], workspace)
+            left = [n.strip() for n in (names.splitlines() if ok else [])
+                    if n.strip() and "src/main/resources/baselines/" not in n
+                    and "loginStorage" not in n]
+            if left:
+                log(f"  WARNING: {len(left)} edited file(s) are not in any commit")
+                body += ("\n\n#### ⚠️ Edits not committed\n\nChanged by this run but "
+                         "in no commit on this branch — usually an earlier attempt's "
+                         "edit that the last attempt did not re-apply:\n\n"
+                         + "\n".join(f"- `{n}`" for n in left[:20]))
+                result["uncommitted"] = left
 
             pushed, _, perr = run_git(["push", "-u", "origin", branch], workspace,
                                       push_url=push_url())
@@ -406,7 +516,8 @@ def main():
 
     if SLACK_TOKEN:
         escalating, escalation_detail = needs_a_human(
-            skip_reason, result["escalations"], adapt.get("items") or [], applied)
+            skip_reason, result["escalations"], adapt.get("items") or [], applied,
+            result["failed"])
         channel = SLACK_ALERT if (escalating or result["ship_status"] in
                                   ("push_failed", "pr_failed")) else SLACK_NOTIFY
         if escalating:

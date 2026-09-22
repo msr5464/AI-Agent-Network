@@ -67,18 +67,19 @@ from what the steps actually do and logs the discrepancy if they disagree.
 ## test-adaptation-agent
 
 A change note does not have to describe a breakage. It can just as well extend an
-existing test with more steps and checks — the `coverage_added` kind, which the
-agent applies: new assertions are fine, and what the guards refuse is removing,
-weakening or changing an existing one. For a real
-product change, the *kind* decides how much authority the agent has. Most kinds
-it can apply; `outcome_changed` and `content_changed` it may only propose, since
-those mean the specification moved rather than the test breaking.
+existing test with more steps and checks (`coverage_added`), or ask a test to stop
+doing something or do it differently (`coverage_changed`). The *kind* decides how
+much authority the agent has. `step_merge`, `content_changed`, `outcome_changed`,
+`api_contract` and `coverage_changed` may remove or change an existing check — but
+only one the agent declares, only if the edit does exactly that, and never against
+what the browser saw. Every other kind must leave every check as it is. Weakening
+a check is refused whatever the kind.
 
 | Example | Kind | Shows |
 |---|---|---|
 | [`saucedemo_cart_details.txt`](test-adaptation-agent/saucedemo_cart_details.txt) | `coverage_added` | No product change — adds quantity, price and checkout checks to `verifyProductAppearsInCart` |
 | [`saucedemo_api_contract.txt`](test-adaptation-agent/saucedemo_api_contract.txt) | `api_contract` | `getPostById`, `createPost` and `updatePost` read renamed fields, and writes need a new `X-Request-Id` header |
-| [`saucedemo_saved_for_later.txt`](test-adaptation-agent/saucedemo_saved_for_later.txt) | `outcome_changed` | Step 5 of `simulateWebLifecycle` now proves the wrong thing — escalate-only, the agent proposes and writes nothing |
+| [`saucedemo_saved_for_later.txt`](test-adaptation-agent/saucedemo_saved_for_later.txt) | `outcome_changed` | Step 5 of `simulateWebLifecycle` must now prove something else. On the real SauceDemo the removed product is gone, so the browser contradicts the change and it is refused |
 
 ```bash
 cp docs/examples/queue/test-adaptation-agent/saucedemo_cart_details.txt \

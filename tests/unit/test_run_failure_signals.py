@@ -73,6 +73,32 @@ class TestResultStatus:
     def test_a_cap_is_not_ok(self):
         assert self._result("usage_limit", "hit your limit, resets 1pm").status != "ok"
 
+    def test_a_cap_mid_run_that_exits_1_is_still_a_cap(self):
+        # Observed: six turns in, the CLI exited 1 with the cap only in the final
+        # result event, and the log blamed a stderr trust warning instead.
+        import io, json
+        from unittest import mock
+        from shared.claude import call_claude_ex
+        cap = "You've hit your session limit · resets 2:20am (Asia/Calcutta)"
+        events = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Reading the test file first."}]}},
+            {"type": "result", "is_error": True, "api_error_status": 429,
+             "result": cap},
+        ]
+        with mock.patch("shared.claude.subprocess.Popen") as popen:
+            popen.return_value.stdout = io.StringIO(
+                "".join(json.dumps(e) + "\n" for e in events))
+            popen.return_value.stderr = io.StringIO(
+                "Ignoring 3 permissions.allow entries from .claude/settings.json\n")
+            popen.return_value.wait.return_value = 1
+            popen.return_value.poll.return_value = 1
+            popen.return_value.returncode = 1
+            result = call_claude_ex(prompt="p", model="m", cwd=".", timeout=5,
+                                    stream_json=True)
+        assert result.status == "usage_limit"
+        assert "2:20am" in result.describe()
+
 
 class TestStepHasError:
     def test_an_adapt_step_whose_items_all_failed_is_a_failure(self):

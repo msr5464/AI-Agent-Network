@@ -56,6 +56,38 @@ class TestParsing:
             "line must not cost the steps around it")
         assert any(n["kind"] == "unparsed" for n in flow["notes"])
 
+    def test_backtick_wrapped_markers_are_parsed(self):
+        # Models often render markers as inline code; losing them emptied a whole run.
+        flow = fm.build(f"`FLOW_STEP: {_step(0, 'p')}`\n")
+        assert [s["index"] for s in flow["steps"]] == [0]
+
+    def test_bold_markdown_markers_are_parsed(self):
+        # An observed retry wrote every marker this way and parsed as an empty walk.
+        flow = fm.build(f"**PAGE_STATE:** p|https://x/|{INVENTORY}\n"
+                        f"**FLOW_STEP:** `{_step(0, 'p')}`\n")
+        assert [s["index"] for s in flow["steps"]] == [0]
+        assert fm.pages_without_inventory(flow) == []
+
+    def test_pretty_printed_inventory_is_parsed(self):
+        # An observed run wrote every PAGE_STATE one element per line; the parser
+        # saw only "[" and every selector downstream stayed unverified.
+        pretty = json.dumps(json.loads(INVENTORY), indent=2)
+        flow = fm.build(f"PAGE_STATE: workspace|https://x/|{pretty}\n"
+                        f"FLOW_STEP: {_step(0, 'workspace')}\n")
+        assert len(flow["_inventories"]["workspace"]) == 3
+        assert flow["steps"][0]["selector_check"]["unique"] is True
+
+    def test_an_unterminated_inventory_does_not_swallow_the_next_marker(self):
+        flow = fm.build(f"PAGE_STATE: p|https://x/|[\n  {{\"tag\": \"div\"}},\n"
+                        f"FLOW_STEP: {_step(0, 'p')}\n")
+        assert [s["index"] for s in flow["steps"]] == [0]
+
+    def test_a_restated_walk_is_not_counted_twice(self):
+        flow = fm.build(f"FLOW_STEP: {_step(1, 'p')}\nFLOW_STEP: {_step(2, 'p')}\n"
+                        "## Summary\n"
+                        f"FLOW_STEP: {_step(1, 'p')}\nFLOW_STEP: {_step(2, 'p')}\n")
+        assert [s["index"] for s in flow["steps"]] == [1, 2]
+
     def test_page_identity_is_attached(self):
         flow = fm.build(STDOUT)
         page = flow["steps"][0]["page"]
@@ -190,6 +222,14 @@ class TestUninventoriedPages:
         assert fm.score(seeing, "ok") > fm.score(blind, "ok"), (
             "more steps across pages nobody described is less usable than fewer "
             "steps that can actually be verified")
+
+    def test_an_empty_walk_never_outranks_one_with_steps(self):
+        blind = {"pages": {"a": {}, "b": {}}, "_inventories": {},
+                 "steps": [{"result": {"outcome": "ok"}} for _ in range(5)]}
+        empty = {"pages": {}, "_inventories": {}, "steps": []}
+        assert fm.score(blind, "ok") > fm.score(empty, "ok"), (
+            "an empty walk has no uninventoried pages; that must not let it "
+            "replace a walk that has steps")
 
 
 class TestScoreAndValidate:

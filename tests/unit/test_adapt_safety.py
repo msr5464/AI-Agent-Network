@@ -13,6 +13,7 @@ Three findings from one review of a live run:
 """
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -79,7 +80,7 @@ class TestVerifyProposal:
         ok, why = adapt.verify_proposal(_Txn((True, "")), {}, tmp_path, record)
         assert (ok, why) == (True, "")
         assert record["compile_status"] == "compiles"
-        assert record["conservation"] == [], "no contracts in scope, nothing to conserve"
+        assert record["check_changes"] == [], "no contracts in scope, no check changed"
 
 
 class TestNegativeDocuments:
@@ -166,6 +167,211 @@ class TestNeedsAHuman:
             "escalate", [{"what": "item 1", "why": "the specification moved"}], [], [])
         assert alert is True and "item 1" in detail
 
+    def test_tests_that_still_fail_reach_a_person(self, ship):
+        applied = [{"status": "partial"}]
+        alert, detail = ship.needs_a_human("", [], applied, applied, ["T#b"])
+        assert alert is True and "still fail" in detail
+
     def test_being_stuck_is_escalating(self, ship):
         assert "stuck" in ship.ESCALATING, (
             "the stop rule writes this skip reason; it means a human has to look")
+
+
+class TestAlreadyApplied:
+    """The "nothing to change" skip, per kind of item."""
+
+    @pytest.fixture
+    def adapt(self, tmp_path, monkeypatch):
+        return _load("adapt_skip", "actions/04_adapt.py", tmp_path, monkeypatch)
+
+    @pytest.mark.parametrize("kind", ["step_insert", "locator", "route", "test_data"])
+    def test_items_that_only_add_or_retarget_steps_are_skipped_when_seen(self, adapt, kind):
+        assert adapt.already_applied({"added": []}, [{"kind": kind}]) is True
+
+    @pytest.mark.parametrize("kind", ["step_merge", "coverage_changed", "outcome_changed",
+                                      "content_changed", "coverage_added"])
+    def test_items_that_remove_or_check_are_never_skipped(self, adapt, kind):
+        # None of these adds an interaction, so each would always look applied.
+        assert adapt.already_applied({"added": []}, [{"kind": kind}]) is False
+
+    def test_a_new_step_means_not_applied(self, adapt):
+        assert adapt.already_applied({"added": [{"flow_index": 1}]}, [{"kind": "step_insert"}]) is False
+
+    def test_a_note_of_only_unclassified_items_goes_on_to_escalate(self, adapt):
+        assert adapt.already_applied({"added": []}, [{"kind": "unclassified"}]) is False
+
+
+class TestCheckChangesGuard:
+    BEFORE = ("public class T {\n    public void flow() {\n"
+              '        AssertHelper.assertEquals(config, a.count(), "1", "Badge shows 1");\n'
+              '        AssertHelper.assertTrue(config, a.shown(), "Page is shown");\n'
+              "    }\n}\n")
+    AFTER = BEFORE.replace('        AssertHelper.assertTrue(config, a.shown(), "Page is shown");\n', "")
+
+    @pytest.fixture
+    def adapt(self, tmp_path, monkeypatch):
+        module = _load("adapt_guard", "actions/04_adapt.py", tmp_path, monkeypatch)
+        cc = module.check_changes
+        after = {"checks": cc.file_checks({"T.java": self.AFTER}), "unresolved": []}
+        monkeypatch.setattr(cc, "measure", lambda scope, workspace: after)
+        monkeypatch.setattr(cc, "enabled_tests", lambda workspace: [])
+        return module
+
+    def _judge(self, adapt, tmp_path, declared, kind="coverage_changed"):
+        from types import SimpleNamespace
+        cc = adapt.check_changes
+        before = {"checks": cc.file_checks({"T.java": self.BEFORE}), "unresolved": [],
+                  "index": {}}
+        txn = SimpleNamespace(snapshots={"/ws/T.java": self.BEFORE},
+                              staged={"/ws/T.java": self.AFTER})
+        record = {"guards": []}
+        ok, why = adapt.judge_checks({"index": 1, "kind": kind}, {"check_changes": declared},
+                                     txn, {"intent_contracts": {}}, tmp_path, {}, before, record)
+        return ok, why, record, before
+
+    def test_an_undeclared_removal_is_refused_and_recorded_as_a_guard(self, adapt, tmp_path):
+        ok, why, record, _ = self._judge(adapt, tmp_path, [])
+        assert not ok and "without declaring" in why
+        assert record["guards"][-1] == {"guard": "check_changes", "ok": False, "reason": why}
+
+    def test_the_declared_removal_passes_and_is_listed(self, adapt, tmp_path):
+        before = adapt.check_changes.file_checks({"T.java": self.BEFORE})
+        cid = next(c["id"] for c in before if c["message"] == "Page is shown")
+        ok, why, record, _ = self._judge(adapt, tmp_path,
+                                         [{"check": cid, "action": "remove", "why": "item 1"}])
+        assert (ok, why) == (True, "")
+        assert [r["message"] for r in record["check_changes"]] == ["Page is shown"]
+
+    def test_a_refusing_judge_rejects_the_proposal(self, adapt, tmp_path):
+        ok, why = adapt.verify_proposal(_Txn((True, "")), {}, tmp_path, {},
+                                        judge=lambda: (False, "changes a check without declaring it"))
+        assert (ok, why) == (False, "changes a check without declaring it")
+
+    def test_outside_means_not_re_run(self, adapt, tmp_path, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(adapt.check_changes, "reached_outside",
+                            lambda entries, tests, in_scope, fp: seen.setdefault("s", in_scope) and {})
+        from types import SimpleNamespace
+        cc = adapt.check_changes
+        before = {"checks": cc.file_checks({"T.java": self.BEFORE}), "unresolved": [], "index": {}}
+        txn = SimpleNamespace(snapshots={"/ws/T.java": self.BEFORE}, staged={"/ws/T.java": self.AFTER})
+        adapt.judge_checks({"index": 1, "kind": "coverage_changed"}, {"check_changes": []}, txn,
+                           {"intent_contracts": {"a.T#flow": {}, "a.T#sibling": {}},
+                            "verify": ["a.T#flow"]}, tmp_path, {}, before, {"guards": []})
+        assert seen["s"] == {"a.T#flow"}, (
+            "a sibling that is measured but not re-run must count as outside")
+
+    def test_a_measurement_that_fails_is_not_a_pass(self, adapt, tmp_path, monkeypatch):
+        def broken(scope, workspace):
+            raise RuntimeError("index failed")
+        monkeypatch.setattr(adapt.check_changes, "measure", broken)
+        with pytest.raises(RuntimeError):
+            self._judge(adapt, tmp_path, [])
+
+
+class TestChecksInThePullRequest:
+    @pytest.fixture
+    def ship(self, tmp_path, monkeypatch):
+        return _load("ship_body", "actions/05_ship.py", tmp_path, monkeypatch)
+
+    ROW = {"id": "c1", "site": "T#flow", "message": "Page is shown", "action": "remove",
+           "before": [], "after": [], "why": "item 1 drops the step", "evidence": "test-only",
+           "saw": ""}
+
+    def test_the_table_leads_the_body(self, ship):
+        body = ship.build_body({}, {}, {}, {}, "", [self.ROW], "Checks this PR changes")
+        assert body.index("Checks this PR changes") < body.index("Overview")
+        assert "Page is shown" in body and "item 1 drops the step" in body
+
+    def test_an_unmeasurable_table_says_so(self, ship):
+        body = ship.build_body({}, {}, {}, {}, "", None, "Checks this PR changes")
+        assert "Could not be measured" in body
+
+    def test_no_changes_no_section(self, ship):
+        assert "Checks this" not in ship.build_body({}, {}, {}, {}, "")
+
+    def test_without_a_pr_the_rows_are_the_items_own(self, ship):
+        adapt = {"items": [{"status": "proposed", "check_changes": [self.ROW]},
+                           {"status": "rejected", "check_changes": [self.ROW]}]}
+        assert ship.declared_rows(adapt) == [self.ROW]
+
+
+class TestCarryForward:
+    """A retry must not drop what an earlier attempt applied: its edit is still
+    on disk, and ship commits only what 04-adapt.json lists."""
+
+    ROW = {"id": "c1", "site": "T#flow", "message": "Badge shows 1", "before": ["1"],
+           "after": [], "why": "step 5 dropped", "evidence": "test_only"}
+    APPLIED = {"index": 1, "kind": "step_merge", "status": "applied", "files": ["A.java"],
+               "check_changes": [{**ROW, "action": "remove"}], "summary": "drop step 5"}
+
+    @pytest.fixture
+    def adapt(self, tmp_path, monkeypatch):
+        module = _load("adapt_carry", "actions/04_adapt.py", tmp_path, monkeypatch)
+        monkeypatch.setattr(module, "ATTEMPT", 2)
+        return module
+
+    def _earlier(self, tmp_path, items, applied_mode=True):
+        (tmp_path / "04-adapt.json").write_text(json.dumps(
+            {"attempt": 1, "applied_mode": applied_mode, "items": items,
+             "verified": ["T#a"], "failed": ["T#b"]}))
+
+    def _result(self, items=(), verified=()):
+        return {"attempt": 2, "applied_mode": True, "items": list(items), "escalations": [],
+                "verified": list(verified), "failed": [], "proposed": []}
+
+    def test_the_first_attempt_carries_nothing(self, adapt, tmp_path, monkeypatch):
+        monkeypatch.setattr(adapt, "ATTEMPT", 1)
+        self._earlier(tmp_path, [self.APPLIED])
+        result = self._result()
+        adapt.carry_forward(result)
+        assert result["items"] == []
+
+    def test_an_early_stop_keeps_what_the_earlier_attempt_applied(self, adapt, tmp_path):
+        self._earlier(tmp_path, [self.APPLIED, {"index": 2, "status": "rolled_back"}])
+        result = self._result()
+        adapt.finish(result, "skipped", "stuck")
+        written = json.loads((tmp_path / "04-adapt.json").read_text())
+        assert [(i["index"], i["status"], i["attempt"]) for i in written["items"]] == \
+            [(1, "applied", 1)], "otherwise ship sees nothing applied and raises no PR"
+        assert (written["verified"], written["failed"]) == (["T#a"], ["T#b"])
+        assert "(from attempt 1)" in (tmp_path / "04-adapt.md").read_text()
+
+    def test_a_reapplied_item_keeps_both_attempts_files_and_checks(self, adapt, tmp_path):
+        self._earlier(tmp_path, [self.APPLIED])
+        result = self._result([{"index": 1, "status": "applied", "files": ["B.java"],
+                                "check_changes": [{**self.ROW, "action": "change"}]}],
+                              verified=["T#c"])
+        adapt.carry_forward(result)
+        item = result["items"][0]
+        assert item["files"] == ["A.java", "B.java"]
+        assert [r["action"] for r in item["check_changes"]] == ["remove", "change"]
+        assert result["verified"] == ["T#c"] and "attempt" not in item
+
+    def test_a_retry_that_did_not_land_keeps_the_earlier_record(self, adapt, tmp_path):
+        self._earlier(tmp_path, [self.APPLIED])
+        result = self._result([{"index": 1, "status": "failed",
+                                "reason": "the model proposed no edits"}])
+        adapt.carry_forward(result)
+        item = result["items"][0]
+        assert (item["status"], item["files"]) == ("applied", ["A.java"])
+        assert item["retry"] == {"attempt": 2, "status": "failed",
+                                 "reason": "the model proposed no edits"}
+
+    def test_a_covered_retry_never_replaces_an_applied_record(self, adapt, tmp_path):
+        self._earlier(tmp_path, [self.APPLIED])
+        result = self._result([{"index": 1, "status": "covered", "covered_by": 2}])
+        adapt.carry_forward(result)
+        assert result["items"][0]["status"] == "applied", "a covered item commits nothing"
+
+    def test_covered_items_come_along(self, adapt, tmp_path):
+        self._earlier(tmp_path, [self.APPLIED, {"index": 2, "status": "covered", "covered_by": 1}])
+        result = self._result()
+        adapt.carry_forward(result)
+        assert [i["status"] for i in result["items"]] == ["applied", "covered"]
+
+    def test_a_propose_only_earlier_run_is_ignored(self, adapt, tmp_path):
+        self._earlier(tmp_path, [self.APPLIED], applied_mode=False)
+        result = self._result()
+        adapt.carry_forward(result)
+        assert result["items"] == []

@@ -105,6 +105,28 @@ Then read the console errors, note any 4xx/5xx requests, emit a
 
 Then continue with the next step. One failure does not end the run.
 
+### 7. What the tests check
+
+When the prompt lists **the checks the tests make today**, judge each one you can
+on the new flow, and emit one line per check **the moment you have seen it**:
+
+```
+OUTCOME_OBSERVED: <checkId>|pass|<what the page shows for it now>
+OUTCOME_OBSERVED: <checkId>|fail|<what the page shows for it now>
+OUTCOME_OBSERVED: <checkId>|gone|<what replaced it, or why it is no longer there>
+```
+
+- `pass` — the check's expectation still holds. `fail` — it no longer holds.
+  `gone` — the thing it looks at is no longer in the flow at all.
+- Judge against the check's **expected value** when one is listed, and against its
+  message only when none is. For a check that something is *absent* ("should no
+  longer be in cart"), `pass` means it is still absent.
+- Copy the exact text the page shows — a count, a heading, a label. Report what you
+  see, not what the check expects.
+- Never take an action only to evaluate a check. If judging one would mean logging
+  out, placing an order or leaving the flow, skip it: an unreported check is fine.
+- Leave out checks on pages you never reached.
+
 ## Output markers (exact)
 
 ```
@@ -112,7 +134,7 @@ PAGE_ENTER: <pageId>|<url>|<title>
 PAGE_STATE: <pageId>|<url>|<json array of up to 25 interactive elements>
 FLOW_STEP: <one-line json object>
 SELECTOR_COUNT: <pageId>|<selector>|<n>
-OUTCOME_OBSERVED: <invariantId>|<what you saw>
+OUTCOME_OBSERVED: <checkId>|<pass|fail|gone>|<what you saw>
 REFUSED: <index>|<target>|<rule>
 UNREACHABLE_STATE: <reached>|<missing>
 ```

@@ -117,6 +117,21 @@ class TestResolve:
             "a test that passes today but shares the changed helper is the "
             "whole reason this runs before the tests go red")
 
+    def test_other_tests_in_the_named_tests_class_are_shared_surface(self, repo):
+        _java(Path(repo) / "src/test/java/automation/checkout/CheckoutWebTest.java",
+              "automation.checkout", "CheckoutWebTest",
+              "    CheckoutHelper helper;\n"
+              "    @Test public void placeOrder() {}\n"
+              "    @Test public void applyCoupon() {}\n"
+              "    @Test(enabled = false) public void legacy() {}")
+        br._cache.clear()
+        result = br.resolve(repo, named_tests=["automation.checkout.CheckoutWebTest#placeOrder"])
+        shared = {r["test"]: r["reason"] for r in result["tiers"]["shared_surface"]}
+        assert shared.get("automation.checkout.CheckoutWebTest#applyCoupon") == \
+            "same class as a named test", "it shares the named test's setup and helpers"
+        assert "automation.checkout.CheckoutWebTest#legacy" not in shared
+        assert "automation.checkout.CheckoutWebTest#placeOrder" not in shared
+
     def test_framework_only_neighbour_is_excluded_and_reported(self, repo):
         result = br.resolve(repo, affects=["automation.checkout.*"])
         verify = {r["test"] for r in

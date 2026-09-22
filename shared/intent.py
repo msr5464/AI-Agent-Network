@@ -69,14 +69,16 @@ def load(workspace, test: str) -> Optional[Dict]:
     return None
 
 
-def derive(workspace, test: str, index: Optional[Dict] = None) -> Dict:
+def derive(workspace, test: str, index: Optional[Dict] = None,
+           follow_constructors: bool = False) -> Dict:
     """Compute a contract from the current source. Cheap, mechanical, no model."""
-    simple_class, _, method = test.replace("#", ".").rpartition(".")
-    simple_class = simple_class.rsplit(".", 1)[-1]
+    # The full class name when the id has one: two classes can share a simple name.
+    klass, _, method = test.replace("#", ".").rpartition(".")
     if index is None:
         index = assertion_graph.member_index(str(workspace))
 
-    fingerprints = assertion_graph.fingerprints(simple_class, method, index)
+    fingerprints = assertion_graph.fingerprints(
+        klass, method, index, follow_constructors=follow_constructors)
     identity = sorted({
         info["site"] for info in fingerprints["asserts"].values()
         if "assertPageLoaded" in info["callee"]})
@@ -99,10 +101,11 @@ def derive(workspace, test: str, index: Optional[Dict] = None) -> Dict:
     }
 
 
-def for_test(workspace, test: str, index: Optional[Dict] = None) -> Dict:
+def for_test(workspace, test: str, index: Optional[Dict] = None,
+             follow_constructors: bool = False) -> Dict:
     """The best contract available for one test, always something."""
     authored = load(workspace, test)
-    derived = derive(workspace, test, index)
+    derived = derive(workspace, test, index, follow_constructors)
     if authored:
         # An authored contract states intent; the derived fingerprints are what
         # the guards actually compare. Keep both rather than choosing.
@@ -160,6 +163,23 @@ def verifies(contract: Dict) -> List[str]:
         seen.add(message)
         out.append(message)
     return out
+
+
+def checks(contract: Dict) -> List[Dict]:
+    """Every check one contract makes, one entry per assertion, for a reader.
+
+    Takes a derived contract, a frozen one, or bare fingerprints. The ids are
+    the ones `assertion_graph.merge` gives, so a check listed here can be
+    matched to the same check in the adaptation agent's own lists.
+    """
+    asserts = (contract.get("_asserts")
+               or (contract.get("_fingerprints") or {}).get("asserts")
+               or contract.get("asserts") or {})
+    merged = assertion_graph.merge({contract.get("test", ""): {"asserts": asserts}})
+    return [{"id": c["id"], "callee": c["callee"].split(".")[-1], "site": c["site"],
+             "expected": [d.strip('"') for d in c["display"]],
+             "message": c["message"], "via": c["via"]}
+            for c in merged["checks"]]
 
 
 def describe(contract: Dict) -> str:

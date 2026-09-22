@@ -62,11 +62,17 @@ writing it down has already answered it.
 | `step_merge` | steps merged or removed | 40/file |
 | `field_added` | something the page object does not model at all — a new required field, or a control with no locator yet | 60 across ≤3 files |
 | `coverage_added` | no product change — extra steps and checks on an existing test; every existing assertion stays | 60/file, 120 per item |
+| `coverage_changed` | no product change — a test should stop doing something, or do it differently; may remove or change **declared** checks | 60/file, 120 per item |
 | `api_contract` | request/response shape, status, header | 30 |
 | `test_data` | a fixture or default | 30 |
 | `page_object_new` | a whole new page object | 300 (the one whole-file case) |
-| `content_changed` | expected copy only | **escalate — proposed, never applied** |
-| `outcome_changed` | what the feature *does* | **escalate — the spec moved, not the test** |
+| `content_changed` | expected copy only; may change **declared** checks | 10 |
+| `outcome_changed` | what the feature *does*; may remove or change **declared** checks | 60/file, 120 per item |
+| `unclassified` | the classifier could not place the item (never offered to it) | **escalate — no authority to edit** |
+
+`step_merge`, `content_changed`, `outcome_changed`, `api_contract` and
+`coverage_changed` may remove or change a check — see "Changing a check" below.
+Every other kind must leave every check exactly as it is.
 
 ---
 
@@ -182,6 +188,54 @@ than a heuristic. Two consequences worth knowing:
   configured entry URL and refuses. Minting writes to a staging file and promotes
   it only on success, so a failed attempt can never delete a session that worked.
 
+## Changing a check
+
+A check may be removed or changed only when all of these hold, and each is decided
+in Python (`lib/check_changes.py`), never by the model:
+
+1. the item's kind is one of the five above;
+2. the model declared it in `check_changes` — the id of a listed check, `remove` or
+   `change` with the new expected values, and why;
+3. what the edit did equals the declaration. Two measurements, both taken just
+   before and just after **this item's** edit (`assertion_graph.delta`): the checks
+   every in-scope test reaches through the call graph, and the assertions written in
+   every edited file. The second catches `@BeforeMethod`, data providers and methods
+   no in-scope test reaches;
+4. no enabled test outside the run makes the check — a changed helper would
+   silently change what those tests check. "Outside" means not in the verify set:
+   a test measured but not re-run (a same-class sibling, or shared surface under
+   `named_only`) counts as outside;
+5. nothing the explorer reported contradicts it. The explorer judges the named web
+   tests' checks on the new flow (`OUTCOME_OBSERVED: <id>|pass|fail|gone|<seen>`);
+   a contradiction refuses, no report is allowed and flagged ⚠️, a
+   `coverage_changed` removal is flagged 🧪 test-only, and `api_contract` changes
+   are always ⚠️ (exploration only GETs and only sees top-level keys).
+
+Weakening a check or wrapping it in a condition is refused whatever is declared.
+Adding, moving and rewording checks is always allowed and is listed.
+
+`delta` pairs checks as multisets — same message first — so the right one of two
+identical-looking checks is named, and a moved check stays a move. It is used only
+here; `conserved` is unchanged for the other agents. Constructors are followed
+(`fingerprints(follow_constructors=True)`) so a page-object constructor's page-load
+check is measured. Where two classes share a simple name (both `LoginPage`s),
+the name is resolved as Java does — the mentioning file's import, then its
+package — for every agent; only when neither decides is it reported as ambiguous
+(PLAUSIBLE) rather than guessed at. Each check carries its class's full name
+(`owner`), so the two `LoginPage` constructors' identical checks stay apart.
+
+Other tests in the named test's class share its fields, setup and helpers, so the
+blast radius puts them in the shared surface ("same class as a named test"): their
+contracts are frozen and measured, and under `named_only` they are not re-run —
+so a check they reach cannot change (rule 4).
+
+What cannot be measured is listed instead: a check's expected value held in a
+variable, a constant or a data file (identifiers are not part of a fingerprint).
+The analysis is Java only.
+
+Once outcome and content changes became actionable, escalation and
+`items_adapted` numbers shift — expect that on dashboards.
+
 ## Guards
 
 Run over the combined diff of one change item, before anything compiles:
@@ -189,7 +243,7 @@ Run over the combined diff of one change item, before anything compiles:
 | guard | rejects |
 |---|---|
 | `validate_fix` | oversized diffs, emptied files, lost methods |
-| `assertion_graph.conserved` | an assertion removed, weakened, made conditional, or given a different expected value (whitespace/case-only reformatting is allowed) — **anywhere in the call graph** |
+| `check_changes` | an assertion removed or changed without being declared, or declared but not changed; one changed by a kind that may not; one also made by a test outside the run; one the browser contradicts; any weakened or made conditional — **anywhere in the call graph and in every edited file**. Fails closed when it cannot measure |
 | `no_new_swallowing` | empty catch, `Thread.sleep`, `@Ignore`, `enabled=false`, `assumeTrue`, `SkipException` |
 | `wrapper_compliance` | raw Selenium — `driver.findElement`, `.sendKeys()`, `new WebDriverWait` |
 | `logstep_present` | an interaction added to a test class with no `logStep` |
@@ -245,7 +299,7 @@ checkout is, and leaves HEAD alone.
 
 ## Escalate — never attempt
 
-- the note says the expected **outcome** changed (the spec moved, not the test);
+- the classifier could not place an item (`unclassified`);
 - `unexplained_failures` is non-empty — a failure no line of the note accounts
   for. A human asserted change A; that says nothing about an unrelated defect B.
   **This is the change-vs-bug gate**;
@@ -256,9 +310,10 @@ checkout is, and leaves HEAD alone.
   about the module, not a reason to sign in some other way;
 - the flow's terminal action is destructive and `ADAPTATION_SANDBOX` is unset;
 - an **existing** page object would need regenerating wholesale;
-- assertion conservation would have to be violated to make the test green;
+- a check would have to change without the note saying so, or be weakened, to
+  make the test green;
 - the blast radius exceeds `ADAPTATION_BLAST_MAX_TESTS` — bigger than one agent run;
-- a changed expected string: propose, never apply.
+- a changed expected string that the browser does not show.
 
 ## Two ways in
 
@@ -316,14 +371,17 @@ drift.
 | `02-scope.json` + `.md` | blast radius, cost estimate, **frozen intent contracts** |
 | `03-explore-api.json`, `03-explore-web.json` | per-interface exploration |
 | `03-explore.json` + `.md` | combined flow map — the file the server polls |
-| `04-adapt.json` + `.md` | per-item diffs, guard results, conservation reports |
+| `04-adapt.json` + `.md` | per-item diffs, guard results, the checks each item changes |
 | `05-ship.json` + `.md` | PR URL, verdict, escalations |
 | `.snapshots.json` | transient; the ERR trap's rollback source |
+| `.check-changes.json` | every applied check change with its why and evidence. Only feeds the PR table's why column — the table itself is measured — so it is never cleared |
 | `.fix-history.json` | every attempt: proposed-edit hashes, guard rejections, outcome. Feeds the next attempt's prompt and the stop rule. Cleared when a resume re-runs Adapt, or an explicitly requested retry would refuse to start |
 
 ## Key Rules
 
-1. **The mechanism is mutable; the proof is not.** Assertions survive, always.
+1. **The mechanism is mutable; the proof changes only as declared.** A check
+   survives unless the note allows it and the item declares it — measured per
+   item, and reported in the PR against the snapshot frozen in step 02.
 2. **Freeze the contract before editing.** Never re-derive it afterwards.
 3. **Transcribe, do not invent.** Every added step maps to an observed one.
 4. **`storage_state`, never a password.** `shared/claude.py` writes the whole
@@ -348,3 +406,8 @@ drift.
    guard rejected everything twice running, or this attempt proposed only edits an
    earlier one already made. All three write `.skip-reason=stuck`, which ships for
    review and alerts a human rather than burning the remaining budget.
+   What an earlier attempt applied stays on disk, so `finish()` carries those items
+   into each later `04-adapt.json` (`carry_forward`, tagged `attempt`) unless the
+   later attempt re-applied them — otherwise ship would commit only the last
+   attempt's items, and a retry that stopped early would raise no PR at all. A run
+   that ships with verified tests still failing goes to the alert channel.

@@ -37,7 +37,7 @@ from qa_agents_server import storage
 from qa_agents_server.audit_reader import (
     get_session as _get_session,
     _safe_load_json,
-    _step_has_error,
+    _step_status,
 )
 from qa_agents_server.feature_files import feature_exists
 from qa_agents_server.paths import (
@@ -1213,7 +1213,7 @@ def _audit_watcher(run: RunState) -> None:
 
         for idx, (key, fname, display) in enumerate(steps):
             prior = run.step_progress.get(key)
-            if prior in ("done", "failed"):
+            if prior in ("done", "failed", "skipped"):
                 if not stages_changed:
                     continue
                 attempts = _recorded_attempts(run, key)
@@ -1223,8 +1223,7 @@ def _audit_watcher(run: RunState) -> None:
                 slot["_emitted_attempts"] = attempts
                 # The retry rewrote the step's file: judge that outcome, not the
                 # previous attempt's, or a fix that passed on attempt 2 stays red.
-                status = "failed" if _step_has_error(
-                    _safe_load_json(run.audit_dir / fname)) else "done"
+                status = _step_status(_safe_load_json(run.audit_dir / fname))
                 run.step_progress[key] = status
                 _append_event(run, "step", {
                     "key": key, "display": display, "status": status,
@@ -1237,9 +1236,9 @@ def _audit_watcher(run: RunState) -> None:
                 # says nothing about whether the step's OWN outcome was good
                 # (e.g. 04-run-and-fix.json exists whether the test passed or
                 # never did; 05-ship.json exists whether the push succeeded
-                # or failed). _step_has_error() reads each step's own result
+                # or failed). _step_status() reads each step's own result
                 # vocabulary to tell the two apart.
-                step_status = "failed" if _step_has_error(_safe_load_json(file_path)) else "done"
+                step_status = _step_status(_safe_load_json(file_path))
                 run.step_progress[key] = step_status
                 payload = _mark_step_done(run, key)
                 run.step_metrics.setdefault(key, {})["_emitted_attempts"] = \
@@ -1352,14 +1351,14 @@ def _wait_and_reap(run: RunState) -> None:
     # race _step_file_is_fresh guards against in _audit_watcher — but this
     # calls it too anyway for defense-in-depth/consistency between the two.
     for _idx, (_key, _fname, _display) in enumerate(get_agent(run.agent).steps):
-        if run.step_progress.get(_key) in ("done", "failed"):
+        if run.step_progress.get(_key) in ("done", "failed", "skipped"):
             continue
         _file_path = run.audit_dir / _fname
         if _file_path.exists() and _step_file_is_fresh(run, _idx, _file_path):
-            _step_status = "failed" if _step_has_error(_safe_load_json(_file_path)) else "done"
-            run.step_progress[_key] = _step_status
+            _step_status_v = _step_status(_safe_load_json(_file_path))
+            run.step_progress[_key] = _step_status_v
             _append_event(run, "step", {
-                "key": _key, "display": _display, "status": _step_status,
+                "key": _key, "display": _display, "status": _step_status_v,
                 **_mark_step_done(run, _key),
             })
         elif run.step_progress.get(_key) == "running":

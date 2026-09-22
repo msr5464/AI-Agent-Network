@@ -199,7 +199,10 @@ def main():
     contracts = {}
     for row in named + shared:
         try:
-            contracts[row["test"]] = intent.for_test(workspace, row["test"], index)
+            # Constructors followed, as steps 04 and 05 measure: a page's
+            # page-load check is part of what the test proves.
+            contracts[row["test"]] = intent.for_test(workspace, row["test"], index,
+                                                     follow_constructors=True)
         except Exception as exc:
             log(f"  could not derive a contract for {row['test']}: {exc}")
     frozen = intent.freeze(contracts)

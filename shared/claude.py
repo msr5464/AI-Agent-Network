@@ -63,6 +63,8 @@ class ClaudeResult(NamedTuple):
     # URL properties from it, so a navigation whose summary omits the URL still
     # mints a key. Only meaningful with stream_json=True.
     navigated_urls: list = []
+    # The CLI's usage-cap message, when that is why the call stopped.
+    limit_message:  str = ""
 
     @property
     def ok(self) -> bool:
@@ -83,7 +85,7 @@ class ClaudeResult(NamedTuple):
                     + (f" — {tail}" if tail else " with no stderr"))
         if self.status == "usage_limit":
             return (f"stopped on a usage cap — "
-                    f"{usage_limit(self.stdout) or 'limit reached'}")
+                    f"{self.limit_message or usage_limit(self.stdout) or 'limit reached'}")
         return f"exited 0 after {self.duration_s:.0f}s but produced no output"
 
 
@@ -523,17 +525,20 @@ def call_claude_ex(
         raw_stdout = "".join(stdout_chunks)
         stdout, usage = _unwrap_json_envelope(raw_stdout)
 
+    # A cap is not a bad answer, it is no answer — and the CLI reports it as
+    # ordinary prose with exit code 0, so every caller expecting JSON called it a
+    # malformed model response instead of an infra stop. A cap mid-run instead
+    # exits 1 with the message only in the final result event (the assistant text
+    # before it hides it), and was logged as whatever stderr last said.
+    cap = usage_limit(stdout) or usage_limit(decoder.result_text if decoder else "")
     if timed_out["hit"]:
         status = "timeout"
+    elif cap:
+        status = "usage_limit"
     elif returncode != 0:
         status = "error"
     elif not stdout.strip():
         status = "empty"
-    elif usage_limit(stdout):
-        # A cap is not a bad answer, it is no answer — and the CLI reports it as
-        # ordinary prose with exit code 0, so every caller expecting JSON called
-        # it a malformed model response instead of an infra stop.
-        status = "usage_limit"
     else:
         status = "ok"
 
@@ -552,6 +557,7 @@ def call_claude_ex(
         model_resolved=str(usage.get("model_resolved") or ""),
         tool_uses=decoder.tool_uses if decoder is not None else None,
         navigated_urls=list(decoder.navigated_urls) if decoder is not None else [],
+        limit_message=cap,
     )
 
     # One choke point instruments every call site. Best-effort by construction —

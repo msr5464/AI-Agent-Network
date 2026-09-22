@@ -141,6 +141,13 @@ def _step_has_error(data: Optional[Dict]) -> bool:
     return False
 
 
+def _step_status(data: Optional[Dict]) -> str:
+    """Chip state for one step's file: failed, skipped (did nothing), or done."""
+    if _step_has_error(data):
+        return "failed"
+    return "skipped" if isinstance(data, dict) and data.get("status") == "skipped" else "done"
+
+
 def _derive_status(session_dir: Path, ship_data: Optional[Dict],
                    steps: Optional[List[Tuple[str, str, str]]] = None) -> str:
     """Compute a UI status: running / completed / diagnosed / failed / cancelled / unknown.
@@ -355,7 +362,7 @@ def replay_events(session_id: str,
         data = _safe_load_json(session_dir / fname)
         if data is None:
             continue
-        step_status = "failed" if _step_has_error(data) else "done"
+        step_status = _step_status(data)
         emit("step", {
             "key": key,
             "display": display,
@@ -651,10 +658,13 @@ def _healing_status(session_dir: Path, fix_gate: Optional[str],
                     shape: str = "") -> str:
     if (ship_data or {}).get("pr_url"):
         return "pr_created"
-    if (session_dir / ".crashed").exists():
-        return "crashed"
+    # Cancelled before crashed: cancelling kills the step, which trips run.sh's
+    # ERR trap into writing .crashed too. .cancelled only exists if the cancel
+    # landed while the run was alive, so the crash is the cancel's own echo.
     if (session_dir / ".cancelled").exists():
         return "cancelled"
+    if (session_dir / ".crashed").exists():
+        return "crashed"
     if (session_dir / ".interrupted").exists():
         return "interrupted"
     gate = (fix_gate or "").strip()
@@ -754,6 +764,19 @@ def _get_healing_session(spec, session_id: str) -> Optional[Dict]:
 
 # ── test-adaptation-agent ─────────────────────────────────────────────────────
 
+def _flow_line(step: Dict) -> str:
+    """One explored step as 'Page · verb · target', plus its outcome if not ok."""
+    page = step.get("page")
+    page = page.get("id", "") if isinstance(page, dict) else (page or "")
+    action = step.get("action") or {}
+    target = action.get("target") or {}
+    outcome = (step.get("result") or {}).get("outcome") or "ok"
+    line = " · ".join(str(x) for x in (page, action.get("verb"),
+                                        target.get("accessible_name") or target.get("name"))
+                      if x)
+    return line if outcome == "ok" else f"{line} — {outcome}"
+
+
 def _adaptation_summary(spec, session_dir: Path) -> Dict:
     """One session row for the adaptation agent.
 
@@ -782,16 +805,27 @@ def _adaptation_summary(spec, session_dir: Path) -> Dict:
         # Done by an earlier item's verified edit — no escalation, so count it here
         # or it disappears from the UI entirely.
         "covered": sum(1 for i in items if i.get("status") == "covered"),
+        # Checks removed or changed by applied or proposed items — the number a
+        # reviewer most needs, so the badge shows it rather than burying it.
+        "checks_changed": sum(
+            1 for i in items if i.get("status") in ("applied", "partial", "proposed")
+            for r in i.get("check_changes") or []
+            if r.get("action") in ("remove", "change")),
         "verified": len(adapt.get("verified") or []),
         "failed": len(adapt.get("failed") or []),
     }
 
-    if (session_dir / ".crashed").exists():
-        status = "failed"
-    elif (session_dir / ".cancelled").exists():
+    # Cancelled before crashed — see _healing_status.
+    if (session_dir / ".cancelled").exists():
         status = "cancelled"
+    elif (session_dir / ".crashed").exists():
+        status = "failed"
     elif (session_dir / ".interrupted").exists():
         status = "interrupted"
+    elif skip == "infra":
+        # The model call never happened (a usage cap, an API error). Falling
+        # through to the ship check below reported that as "completed".
+        status = "blocked"
     elif skip in ("escalate", "unsafe", "no-session", "unreachable"):
         # The agent stopped rather than guessing. That is the design working, so
         # it must not be painted red — reporting a correct refusal as a failure
@@ -837,6 +871,18 @@ def _adaptation_summary(spec, session_dir: Path) -> Dict:
         "counts": counts,
         "escalations": escalations,
         "failure_headline": headline,
+        # The Result panel's digest. The .md reports stay the full audit trail;
+        # read raw, three of them buried the answer under excluded-test lists
+        # and per-guard checkmarks.
+        "items": [{**{k: i.get(k) for k in ("index", "kind", "text", "status", "summary",
+                                          "reason", "covered_by", "attempt")},
+                   "check_changes": [{k: r.get(k) for k in ("action", "message",
+                                                           "evidence", "why")}
+                                     for r in i.get("check_changes") or []
+                                     if r.get("action") in ("remove", "change")]}
+                  for i in items],
+        "tests": {"passed": adapt.get("verified") or [], "failed": adapt.get("failed") or []},
+        "flow": [_flow_line(step) for step in (explore.get("flow") or {}).get("steps") or []],
         "duration_s": _duration_with_fallback(session_dir, session_dir.name, ship),
         **metrics_reader.summary_fields(
             metrics_reader.read_session_metrics(session_dir)),

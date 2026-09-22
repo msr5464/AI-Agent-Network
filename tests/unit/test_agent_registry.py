@@ -125,6 +125,12 @@ class TestStepProgressIsAlwaysTerminal:
             "a flow map that recorded most of a journey is a usable result, "
             "not a failed step")
 
+    def test_a_step_that_did_nothing_shows_skipped_not_done(self):
+        from qa_agents_server.audit_reader import _step_status
+        assert _step_status({"status": "skipped", "items": []}) == "skipped"
+        assert _step_status({"status": "empty"}) == "failed"
+        assert _step_status({"ship_status": "dry_run"}) == "done"
+
     def test_a_fix_that_repaired_nothing_is_failed(self):
         """01-fix.json has no status key; its gate is the verdict."""
         from qa_agents_server.audit_reader import _step_has_error

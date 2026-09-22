@@ -227,6 +227,16 @@ def is_destructive(step: Dict) -> Optional[str]:
     return destructive_token(haystack) or None
 
 
+def _json_tail_complete(kind: str, payload: str) -> bool:
+    """Whether a FLOW_STEP / PAGE_STATE payload's JSON is whole yet."""
+    body = payload if kind == "FLOW_STEP" else (payload.split("|", 2) + ["", ""])[2]
+    try:
+        json.loads(body)
+        return True
+    except ValueError:
+        return False
+
+
 def parse_markers(stdout: str) -> Dict:
     """Every marker in an exploration's stdout, in the order it was emitted.
 
@@ -242,11 +252,25 @@ def parse_markers(stdout: str) -> Dict:
     inventories: Dict[str, List[Dict]] = {}
     page_enters: Dict[str, Dict] = {}
 
-    for line in (stdout or "").splitlines():
-        match = _MARKER.match(line.strip())
+    lines = (stdout or "").splitlines()
+    position = 0
+    while position < len(lines):
+        line = lines[position]
+        position += 1
+        # Markdown decoration is tolerated: an observed run wrote every marker as
+        # **FLOW_STEP:** `{...}`, and a walk with verified selectors parsed as empty.
+        match = _MARKER.match(line.strip("`* \t"))
         if not match:
             continue
-        kind, payload = match.group(1), match.group(2).strip()
+        kind, payload = match.group(1), match.group(2).strip("`* \t")
+        # So is pretty-printed JSON. Every page of an observed run had its PAGE_STATE
+        # element list one element per line, the parser saw only "[", and every
+        # selector downstream stayed unverified. Stops at the next marker.
+        if kind in ("FLOW_STEP", "PAGE_STATE"):
+            while position < len(lines) and not _json_tail_complete(kind, payload) \
+                    and not _MARKER.match(lines[position].strip("`* \t")):
+                payload = (payload + "\n" + lines[position]).strip("`* \t")
+                position += 1
         try:
             if kind == "FLOW_STEP":
                 flow["steps"].append(json.loads(payload))
@@ -278,6 +302,15 @@ def parse_markers(stdout: str) -> Dict:
         except (ValueError, json.JSONDecodeError) as exc:
             flow["notes"].append({"kind": "unparsed", "marker": kind,
                                   "detail": str(exc)[:120]})
+
+    # A model that restates its walk in a closing summary emits every step twice;
+    # the restatement is the same step, so the last copy of an index stands.
+    by_index: Dict = {}
+    for step in flow["steps"]:
+        key = step.get("index") if isinstance(step.get("index"), int) else id(step)
+        by_index.pop(key, None)
+        by_index[key] = step
+    flow["steps"] = list(by_index.values())
 
     for page_id, enter in page_enters.items():
         flow["pages"][page_id] = facts_from_markers(enter, inventories.get(page_id, []))
@@ -363,14 +396,15 @@ def build(stdout: str) -> Dict:
 
 
 def diff_against_test(flow: Dict, test_steps: List[Dict]) -> Dict:
-    """What the product does now versus what the test does today.
+    """What the product does now that the tests do not do yet.
 
-    `test_steps` are `{index, description, page, target}` derived from source.
-    Anything on either side with no counterpart is reported; nothing is guessed.
+    `test_steps` are `{index, target}` derived from source. Each observed step is
+    marked with its counterpart (`maps_to_test`), which the guards read; one with
+    no counterpart is reported as added. Nothing is guessed. What the tests do
+    that the product no longer does is not derivable from `{index, target}`, so
+    it is not reported here — the adapt step measures removed checks directly.
     """
-    added, removed, changed = [], [], []
-    observed_pages = {(s.get("page") or {}).get("identity_digest")
-                      for s in flow.get("steps") or []}
+    added = []
     test_targets = {re.sub(r"[^a-z0-9]+", "", (s.get("target") or "").lower()): s
                     for s in test_steps or []}
 
@@ -389,13 +423,7 @@ def diff_against_test(flow: Dict, test_steps: List[Dict]) -> Dict:
                           "why": f"no test step reaches "
                                  f"{target.get('accessible_name') or target.get('name')}"})
 
-    for step in test_steps or []:
-        digest = step.get("page_digest")
-        if digest and digest not in observed_pages:
-            removed.append({"test_step_index": step.get("index"),
-                            "why": f"page {step.get('page')} never observed"})
-
-    return {"added": added, "removed": removed, "changed": changed}
+    return {"added": added}
 
 
 def pages_without_inventory(flow: Dict) -> List[str]:
@@ -422,10 +450,12 @@ def score(flow: Dict, status: str) -> tuple:
     steps = flow.get("steps") or []
     failed = [s for s in steps if (s.get("result") or {}).get("outcome") == "failed"]
     unique = [s for s in steps if (s.get("selector_check") or {}).get("unique")]
-    # Ranked above step count on purpose: more steps across pages nobody described
-    # is less usable than fewer steps that can actually be verified.
-    return (1 if status == "ok" else 0, -len(pages_without_inventory(flow)),
-            len(steps), -len(failed), len(unique))
+    # Uninventoried pages rank above step count on purpose: more steps across pages
+    # nobody described is less usable than fewer steps that can be verified. But
+    # having steps at all comes first — an empty walk has no uninventoried pages,
+    # and it replaced a five-step one on exactly that tie-break.
+    return (1 if status == "ok" else 0, 1 if steps else 0,
+            -len(pages_without_inventory(flow)), len(steps), -len(failed), len(unique))
 
 
 def validate(flow: Dict) -> tuple:
@@ -456,8 +486,9 @@ def validate(flow: Dict) -> tuple:
 
 def describe(flow: Dict) -> str:
     """The flow map as a markdown table, for the audit report and the PR body."""
-    lines = [f"**Status:** {flow.get('status','?')} — "
-             f"{len(flow.get('steps') or [])} step(s)", "",
+    # The combined explore flow carries no status of its own; "?" read as broken.
+    status = f"**Status:** {flow['status']} — " if flow.get("status") else ""
+    lines = [f"{status}{len(flow.get('steps') or [])} step(s)", "",
              "| # | Page | Action | Target | Unique? | Result |",
              "|---|---|---|---|---|---|"]
     for step in flow.get("steps") or []:

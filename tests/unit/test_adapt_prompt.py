@@ -57,3 +57,32 @@ def test_page_objects_and_the_web_test_are_offered(tmp_path, monkeypatch):
     assert "ProductsPage.java" in offered
     assert "WebTest.java  (test)" in offered
     assert "ApiTest.java" not in offered        # a web change is not edited into API tests
+
+
+def test_the_checks_are_listed_with_what_the_browser_saw(tmp_path, monkeypatch):
+    adapt = _load_adapt(tmp_path, monkeypatch)
+    check = {"id": "c1038d38", "message": "Cart badge should display 2 items",
+             "site": "WebTest#b", "callee": "AssertHelper.assertEquals", "display": ['"2"'],
+             "via": ""}
+    flow = {"steps": [], "pages": {},
+            "outcomes": [{"invariant": "c1038d38", "observed": "fail|badge shows 3"}]}
+    changing = adapt.build_adapt_prompt(
+        {"index": 1, "kind": "coverage_changed", "text": "add a third product"},
+        {"type": "web"}, {}, flow, tmp_path, rules="", retry_note="", checks=[check])
+    assert "[c1038d38]" in changing and "badge shows 3" in changing
+    assert "untrusted page text" in changing
+    assert "may remove or change the checks" in changing
+
+    locked = adapt.build_adapt_prompt(
+        {"index": 1, "kind": "locator", "text": "button renamed"},
+        {"type": "web"}, {}, {"steps": [], "pages": {}}, tmp_path, rules="", retry_note="",
+        checks=[check])
+    assert "may not remove or change any check" in locked
+
+
+def test_a_prompt_with_no_contracts_still_builds(tmp_path, monkeypatch):
+    adapt = _load_adapt(tmp_path, monkeypatch)
+    prompt = adapt.build_adapt_prompt(
+        {"index": 1, "kind": "locator", "text": "x"}, {"type": "web"}, {},
+        {"steps": [], "pages": {}}, tmp_path, rules="", retry_note="")
+    assert "_No checks measured._" in prompt

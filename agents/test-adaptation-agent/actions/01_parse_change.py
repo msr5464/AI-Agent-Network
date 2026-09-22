@@ -49,14 +49,23 @@ MODEL = os.environ.get("ADAPTATION_MODEL", "claude-opus-5")
 # something permissive.
 KINDS = ("locator", "interaction", "route", "step_insert", "step_merge",
          "field_added", "api_contract", "test_data", "page_object_new",
-         "coverage_added", "content_changed", "outcome_changed")
+         "coverage_added", "coverage_changed", "content_changed", "outcome_changed")
 
-# Kinds no agent may apply. `outcome_changed` means the spec moved, not the test;
-# `content_changed` is where a real product bug hides most comfortably.
-ESCALATE_ONLY = ("outcome_changed", "content_changed")
+# What an item the classifier did not place becomes. It is not in KINDS — the
+# classifier is never offered it — and it is the one kind that escalates. It
+# used to default to `outcome_changed`, which was safe only while that kind
+# escalated; now that it may change what a test checks, an item nobody
+# classified must not inherit the widest authority there is.
+UNCLASSIFIED = "unclassified"
 
 _HEADER = re.compile(r"^\s*([A-Za-z][A-Za-z ]*?)\s*:\s*(.+?)\s*$")
 _NUMBERED = re.compile(r"^\s*(\d+)[.)]\s*(.+)$")
+
+
+# "Expected outcome unchanged: …" / "Expected outcome changed: …". Anchored at the
+# start of a line and ending in a colon, so item prose that merely mentions an
+# expected outcome is not mistaken for the header.
+_OUTCOME = re.compile(r"^\s*(?:expected\s+)?outcome\b[^:]*:\s*(.*)$", re.IGNORECASE)
 
 
 def parse_headers(text: str) -> dict:
@@ -84,6 +93,12 @@ def parse_items(text: str) -> list:
     """
     items, current = [], None
     for line in text.splitlines():
+        # The outcome ends the item list. A second line of a wrapped outcome
+        # used to be appended to the last item and classified as a change.
+        if _OUTCOME.match(line):
+            if current:
+                break
+            continue
         match = _NUMBERED.match(line)
         if match:
             if current:
@@ -98,11 +113,24 @@ def parse_items(text: str) -> list:
 
 
 def expected_outcome(text: str) -> str:
+    """The outcome line, joined with the lines that continue it.
+
+    A continuation is any following line that is not blank, not numbered and not
+    a `#` comment — the same rule the Adapt page applies when it loads a note.
+    """
+    parts, inside = [], False
     for line in text.splitlines():
-        low = line.lower()
-        if "expected outcome" in low or low.startswith("outcome"):
-            return line.split(":", 1)[-1].strip() if ":" in line else line.strip()
-    return ""
+        if not inside:
+            match = _OUTCOME.match(line)
+            if match:
+                inside = True
+                parts.append(match.group(1).strip())
+            continue
+        stripped = line.strip()
+        if not stripped or _NUMBERED.match(line) or stripped.startswith("#"):
+            break
+        parts.append(stripped)
+    return " ".join(p for p in parts if p)
 
 
 def looks_destructive(text: str) -> str:
@@ -135,7 +163,8 @@ What the kinds mean:
 - route            — a URL or route changed.
 - step_insert      — a NEW step now exists in the flow (a modal, an interstitial,
                      a confirmation screen).
-- step_merge       — steps were merged or removed (a 3-page wizard became 2).
+- step_merge       — steps were merged or removed (a 3-page wizard became 2),
+                     including a removed screen that a check used to look at.
 - field_added      — the page gained something the page object does not model at
                      all: a newly required form field, or a new control the tests
                      have no locator for. This needs a locator AND an accessor,
@@ -146,17 +175,23 @@ What the kinds mean:
 - coverage_added   — nothing in the product changed: the team wants an existing test
                      to do more — extra steps, extra checks — while every check it
                      already makes stays exactly as it is.
+- coverage_changed — nothing in the product changed: the team wants an existing test
+                     to stop doing something or to do it differently — remove or
+                     change steps, or remove or change checks it makes today.
 - content_changed  — only visible copy/label/expected text changed.
 - outcome_changed  — what the feature DOES changed, so what the test should prove
                      has changed too.
 
-Two of these stop the agent rather than directing it, so do not reach for them
-loosely and do not avoid them when they fit:
-- `outcome_changed` means the specification moved. No edit to the test is correct,
-  because the test is not what is broken. A note that only ADDS steps or checks,
-  and keeps every existing one, is `coverage_added`, not this.
+Five of these let the agent change what a test checks — `step_merge`,
+`content_changed`, `outcome_changed`, `api_contract` and `coverage_changed` — and
+only because the note says so. Choose them when the note says a check has to go or
+change, and not otherwise:
+- `outcome_changed` means the specification moved: what the flow must now prove is
+  different. A note that only ADDS steps or checks, and keeps every existing one,
+  is `coverage_added`, not this.
 - `content_changed` is where a genuine product bug hides most comfortably — a
-  changed expected string looks identical whether it was intended or is a defect.
+  changed expected string looks identical whether it was intended or is a defect —
+  so use it only when the note states the new text.
 
 Also extract, per item, the product nouns a reader would use to find the affected
 page objects (e.g. "workspace", "checkout", "cart").
@@ -225,14 +260,14 @@ def main():
     for item in items:
         row = classified.get(item["index"], {})
         kind = row.get("kind", "")
-        item["kind"] = kind if kind in KINDS else "outcome_changed"
+        item["kind"] = kind if kind in KINDS else UNCLASSIFIED
         item["nouns"] = row.get("nouns") or []
         item["page_hint"] = row.get("page_hint", "")
         item["rationale"] = row.get("rationale", "")
         if not kind:
             item["rationale"] = ("not classified — escalating rather than "
                                  "guessing at how much authority this needs")
-        item["escalate_only"] = item["kind"] in ESCALATE_ONLY
+        item["escalate_only"] = item["kind"] == UNCLASSIFIED
         log(f"  {item['index']}. {item['kind']}"
             + ("  [escalate]" if item["escalate_only"] else "")
             + f" — {item['text'][:70]}")
@@ -273,9 +308,8 @@ def main():
            + (" ⚠️ escalate" if i["escalate_only"] else "")
            + f" | {i['text'][:100]} |" for i in items]
     if plan["escalate_only_items"]:
-        md += ["", "> Items marked escalate are reported to a human and never "
-               "applied: `outcome_changed` means the specification moved, and "
-               "`content_changed` is where a real product bug hides."]
+        md += ["", "> Items marked escalate were not classified, so they are "
+               "reported to a human rather than given any authority to edit."]
     (AUDIT_DIR / "01-parse-change.md").write_text("\n".join(md) + "\n")
     log(f"Wrote {AUDIT_DIR / '01-parse-change.json'}")
 

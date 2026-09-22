@@ -41,11 +41,12 @@ from shared import workspace as workspace_helper
 def log(msg): _log("adapt", msg)
 
 from shared import (assertion_graph, code_analyzer, edit_guards, fix_history,
-                    flow_map, intent, url_properties, verdict_feedback)
+                    flow_map, url_properties, verdict_feedback)
 from shared.claude import call_claude_ex as _call_claude_ex
 from shared.code_analyzer import invalidate_file, read_source
 from shared.test_runner import run_test
 
+from lib import check_changes
 from lib.transaction import Transaction
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
@@ -73,13 +74,17 @@ DIFF_BUDGETS = {
     "page_object_new": 300,
     # Extra steps and checks usually mean new locators and accessors in a page
     # object plus the calls and assertions in the test — field_added's shape.
-    "coverage_added": 60,
+    # Changing or dropping steps and checks is the same size of edit.
+    "coverage_added": 60, "coverage_changed": 60, "outcome_changed": 60,
+    # A changed expected string is one literal, and should look like one.
+    "content_changed": 10,
 }
 DEFAULT_BUDGET = 40
 # A step_insert may legitimately touch a call site and a page object; the
 # per-file budget alone would let it do that in six files and stay inside every
 # individual limit. coverage_added touches the same two, at field_added's size.
-CLUSTER_BUDGETS = {"step_insert": 80, "coverage_added": 120}
+CLUSTER_BUDGETS = {"step_insert": 80, "coverage_added": 120, "coverage_changed": 120,
+                   "outcome_changed": 120}
 
 # A URL belongs in the properties file the tests already read, never inline.
 # Which framework wrapper a control type implies. An `interaction` change is only
@@ -103,7 +108,55 @@ def write_gate(value: str):
     (AUDIT_DIR / ".fix-passed").write_text(value)
 
 
+LANDED = ("applied", "partial", "covered")
+
+
+def carry_forward(result: dict) -> None:
+    """Keep what earlier attempts landed and this one did not re-land.
+
+    An earlier attempt's committed edit is still on disk — a later attempt only
+    rolls back its own — but 04-adapt.json is rewritten per attempt and ship
+    commits only what it lists. So a retry that answered "no edits" for an item
+    left its edit out of the PR, and one that stopped early ("stuck", "nothing
+    to change") listed no items at all, and no PR was raised.
+    """
+    if ATTEMPT <= 1:
+        return
+    try:
+        earlier = json.loads((AUDIT_DIR / "04-adapt.json").read_text())
+    except (OSError, ValueError):
+        return
+    if not earlier.get("applied_mode"):
+        return
+    kept = {i["index"]: {**i, "attempt": i.get("attempt", earlier.get("attempt"))}
+            for i in earlier.get("items") or [] if i.get("status") in LANDED}
+    if not kept:
+        return
+    items = []
+    for item in result["items"]:
+        old = kept.pop(item["index"], None)
+        # A covered record commits nothing, so it never replaces an applied one.
+        if old and (item.get("status") in ("applied", "partial")
+                    or item.get("status") == old["status"] == "covered"):
+            item["files"] = sorted(set(item.get("files") or []) | set(old.get("files") or []))
+            item["check_changes"] = ((old.get("check_changes") or [])
+                                     + (item.get("check_changes") or []))
+        elif old:
+            item = {**old, "retry": {"attempt": ATTEMPT, "status": item.get("status"),
+                                     "reason": item.get("reason", "")}}
+        items.append(item)
+    result["items"] = sorted(items + list(kept.values()), key=lambda i: i["index"])
+    if not result["verified"] and not result["failed"]:
+        # Nothing of this attempt's own was verified, so the tree is the one the
+        # earlier attempt's tests ran on.
+        result["verified"] = earlier.get("verified") or []
+        result["failed"] = earlier.get("failed") or []
+
+
 def finish(result: dict, gate: str, skip_reason: str = ""):
+    carry_forward(result)
+    if not result.get("items"):
+        result["status"] = "skipped"  # the UI greys the stage instead of calling it done
     result["timestamp"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     (AUDIT_DIR / "04-adapt.json").write_text(json.dumps(result, indent=2, default=str))
     (AUDIT_DIR / "04-adapt.md").write_text(render_md(result))
@@ -117,8 +170,13 @@ def render_md(result: dict) -> str:
     md = ["# Adapt", "",
           f"Mode: **{'apply' if result.get('applied_mode') else 'propose-only'}** "
           f"— attempt {result.get('attempt')}", ""]
+    if not result.get("applied_mode"):
+        md += ["_Proposals are measured one item at a time, so an item that depends "
+               "on an earlier item's edit is measured without it._", ""]
     for item in result.get("items", []):
-        md += [f"## Item {item['index']} — `{item['kind']}` — {item['status']}", "",
+        md += [f"## Item {item['index']} — `{item['kind']}` — {item['status']}"
+               + (f" (from attempt {item['attempt']})" if item.get("attempt") else ""),
+               "",
                item.get("summary") or item.get("reason") or "", ""]
         for guard in item.get("guards", []):
             mark = "✅" if guard["ok"] else "❌"
@@ -128,6 +186,12 @@ def render_md(result: dict) -> str:
         if item.get("justification"):
             md += ["", "| edit | justified by flow step |", "|---|---|"]
             md += [f"| `{j['file']}` | {j['step']} |" for j in item["justification"]]
+        if item.get("check_changes"):
+            md += ["", "**Checks changed**", ""]
+            md += check_changes.render_table(item["check_changes"])
+        if item.get("unmeasured"):
+            md += ["", "⚠️ Also edits values a check may read, which is not measured: "
+                   + "; ".join(item["unmeasured"])]
         md.append("")
     if result.get("escalations"):
         md += ["## Escalations", ""]
@@ -141,7 +205,8 @@ def excerpt(path: Path, limit: int = 8000) -> str:
 
 
 def build_adapt_prompt(item: dict, plan: dict, scope: dict, flow: dict,
-                       workspace: Path, rules: str, retry_note: str) -> str:
+                       workspace: Path, rules: str, retry_note: str,
+                       checks: list = None) -> str:
     # Order by what exploration MEASURED, not by what step 02 guessed. The file
     # a page actually turned out to be belongs at the top of the prompt; a
     # name-similarity guess that nothing corroborated belongs below it.
@@ -182,8 +247,25 @@ def build_adapt_prompt(item: dict, plan: dict, scope: dict, flow: dict,
                                     "unreachable": flow.get("unreachable") or []})
 
     contracts = scope.get("intent_contracts") or {}
-    contract_text = "\n\n".join(
-        intent.describe(c) for c in list(contracts.values())[:5])
+    # The checks as they are right now — measured just before this item, so an
+    # earlier item's change shows as done rather than as still to do.
+    if checks is None:
+        checks = assertion_graph.merge(
+            {t: {"asserts": c.get("_asserts") or {}} for t, c in contracts.items()})["checks"]
+    found = check_changes.reports(flow)
+    check_text = "\n".join(check_changes.list_lines(
+        checks, extra=lambda c: (check_changes.fenced_report(found[c["id"]])
+                                 if c["id"] in found else ""))) or "_No checks measured._"
+    if item["kind"] in check_changes.CHECK_CHANGING:
+        permission = (f"This item is `{item['kind']}`: it may remove or change the checks "
+                      f"listed here, but only the ones you declare in `check_changes`. "
+                      f"Every other check must still be made exactly as it is.")
+    else:
+        permission = (f"This item is `{item['kind']}`: it may not remove or change any "
+                      f"check listed here. Adding checks is fine.")
+    narrated = "\n".join(
+        f"- **{t.split('.')[-1]}**: " + "; ".join(c.get("proves") or [])[:500]
+        for t, c in list(contracts.items())[:5] if c.get("proves"))
 
     page_object_map = flow_map.describe_page_objects(flow) or (
         "_Nothing measured — treat the files below as candidates, not confirmed "
@@ -209,8 +291,13 @@ A row whose Unique? column is not `yes` justifies nothing.
 
 {flow_table}
 
-## 📜 WHAT THESE TESTS PROVE — measured before any edit, and must still hold
-{contract_text}
+## 📜 WHAT THESE TESTS CHECK — measured just before this edit
+{permission}
+
+{check_text}
+
+What the tests narrate (their logStep lines):
+{narrated or '_none_'}
 
 ## Tests that must still pass
 {chr(10).join('- ' + t for t in (scope.get('verify') or [])[:20])}
@@ -398,27 +485,79 @@ def run_guards(item: dict, edits_by_file: dict, snapshots: dict, flow: dict,
     return guards
 
 
-def check_conservation(scope: dict, workspace: Path) -> list:
-    """Assertion conservation for every test in scope, against the frozen copy."""
-    code_analyzer.reset_caches()
-    from shared import blast_radius
-    blast_radius._cache.clear()
-    index_after = assertion_graph.member_index(str(workspace))
+def already_applied(diff: dict, items: list) -> bool:
+    """Whether exploration saw nothing the tests do not already do — and that
+    means the note is done.
 
-    reports = []
-    for test, frozen in (scope.get("intent_contracts") or {}).items():
+    Only for items whose job is adding interactions. Removing a step, changing a
+    check or adding a check adds no interaction, so any of those would always
+    look done; notes with only unclassified items go on to escalate instead.
+    """
+    kinds = {i.get("kind") for i in items} - {check_changes.UNCLASSIFIED}
+    return (bool(kinds) and not diff["added"]
+            and not kinds & (check_changes.CHECK_CHANGING | {"coverage_added"}))
+
+
+def judge_checks(item: dict, payload: dict, txn, scope: dict, workspace: Path,
+                 flow: dict, before: dict, record: dict) -> tuple:
+    """The `check_changes` guard, over an edit that is on disk. Returns (ok, why).
+
+    Two measurements, because each sees what the other cannot: the call graph
+    sees a check that disappeared because a step stopped calling a helper; the
+    edited files show a check changed in code no in-scope test reaches.
+    """
+    after = check_changes.measure(scope, workspace)
+    graph = assertion_graph.delta(before["checks"], after["checks"])
+    file_before = check_changes.file_checks(txn.snapshots)
+    files = assertion_graph.delta(file_before, check_changes.file_checks(txn.staged))
+    listed = {c["id"]: c for c in file_before}
+    listed.update({c["id"]: c for c in before["checks"]})
+
+    touched = files["removed"] + [b for b, _ in files["changed"]]
+    index = before["index"]
+
+    def fingerprint(test: str) -> dict:
         klass, _, method = test.replace("#", ".").rpartition(".")
-        simple = klass.rsplit(".", 1)[-1]
-        try:
-            after = assertion_graph.fingerprints(simple, method, index_after)
-        except Exception as exc:
-            reports.append({"test": test, "ok": True, "verdict": "PLAUSIBLE",
-                            "reason": f"could not re-measure: {exc}"})
-            continue
-        report = assertion_graph.conserved(intent.thaw(frozen), after)
-        report["test"] = test
-        reports.append(report)
-    return reports
+        return assertion_graph.fingerprints(klass, method, index,
+                                            follow_constructors=True)
+
+    # Outside means not re-run: a test measured but left out of the verify set
+    # (same class as the named test, or shared surface under named_only) would
+    # have its check changed with nothing to prove it still passes.
+    outside = check_changes.reached_outside(
+        touched, check_changes.enabled_tests(workspace) if touched else [],
+        set(scope.get("verify") or []), fingerprint)
+    ok, why, rows = check_changes.validate(
+        payload.get("check_changes"), graph, files, item["kind"], listed,
+        check_changes.reports(flow), outside)
+
+    holes = sorted(set(after["unresolved"]) - set(before["unresolved"]))
+    record["check_changes"] = rows
+    record["unmeasured"] = check_changes.unmeasured_edits(txn.snapshots, txn.staged)
+    record["new_unresolved"] = holes
+    record.setdefault("guards", []).append(
+        {"guard": "check_changes", "ok": ok, "reason": why})
+    log(f"  {'OK' if ok else 'REJECT'} check_changes — "
+        + (why or f"{len(rows)} change(s) listed")
+        + (f"; PLAUSIBLE: {len(holes)} new call(s) could not be followed" if holes else ""))
+    return ok, why
+
+
+def log_rows(item: dict, rows: list) -> None:
+    """Accepted check changes, kept across attempts for the PR's why column.
+
+    Never cleared: the PR table is measured, so a row that matches nothing on
+    disk any more is simply not used.
+    """
+    if not rows:
+        return
+    path = AUDIT_DIR / ".check-changes.json"
+    try:
+        logged = json.loads(path.read_text()) if path.exists() else []
+    except ValueError:
+        logged = []
+    path.write_text(json.dumps(logged + [{**row, "item": item["index"]} for row in rows],
+                               indent=2))
 
 
 # Pages an adapted test must never be sitting on at the end of a step.
@@ -450,7 +589,8 @@ def negative_documents(flow: dict) -> list:
     return docs
 
 
-def verify_proposal(txn, scope: dict, workspace: Path, record: dict) -> tuple:
+def verify_proposal(txn, scope: dict, workspace: Path, record: dict,
+                    judge=None) -> tuple:
     """Compile a proposal and re-measure its assertions. Returns (ok, why).
 
     Propose-only used to stop at the diff-shaped guards, so the diff handed to a
@@ -472,16 +612,12 @@ def verify_proposal(txn, scope: dict, workspace: Path, record: dict) -> tuple:
         record["compile_output"] = output
         return False, "the proposal does not compile"
 
-    conservation = check_conservation(scope, workspace)
-    record["conservation"] = conservation
-    for report in conservation:
-        log(f"    conservation {report.get('test','')}: "
-            f"{assertion_graph.describe(report)}")
-    broken = [c for c in conservation if not c["ok"]]
-    if broken:
-        return False, ("assertion conservation failed: "
-                       + "; ".join(b.get("reason", "") for b in broken[:2]))
-    return True, ""
+    if judge is None:
+        # Nothing to hold the proposal to — no model answer, no contracts.
+        record.setdefault("check_changes", [])
+        return True, ""
+    ok, why = judge()
+    return (True, "") if ok else (False, why)
 
 
 def compile_ok(workspace: Path) -> tuple:
@@ -548,9 +684,9 @@ def main():
     current = test_steps_from_source(scope, workspace)
     diff = flow_map.diff_against_test(flow, current)
     result["flow_diff"] = diff
-    log(f"Flow vs tests: {len(diff['added'])} added, {len(diff['removed'])} removed "
-        f"(against {len(current)} interaction(s) in the current tests)")
-    if not diff["added"] and not diff["removed"]:
+    log(f"Flow map: {len(flow['steps'])} step(s) observed, {len(diff['added'])} not "
+        f"yet in the tests (which make {len(current)} interaction(s) today)")
+    if already_applied(diff, plan["items"]):
         log("Every observed step already exists in the tests — this change looks "
             "applied already. Nothing to do.")
         result["escalations"].append({
@@ -585,16 +721,16 @@ def main():
                       + "\nIf you cannot justify an edit from the flow map, "
                         "return adaptable: false.\n")
 
-    actionable = [i for i in plan["items"] if not i.get("escalate_only")]
+    # Decided by kind, not by the stored `escalate_only` flag: a session parsed
+    # before outcome_changed/content_changed became actionable still carries it.
+    actionable = [i for i in plan["items"] if i.get("kind") != check_changes.UNCLASSIFIED]
     for item in plan["items"]:
-        if item.get("escalate_only"):
+        if item.get("kind") == check_changes.UNCLASSIFIED:
             result["escalations"].append({
-                "what": f"item {item['index']} ({item['kind']})",
-                "why": ("the specification moved — no edit to the test is correct, "
-                        "because the test is not what is broken"
-                        if item["kind"] == "outcome_changed" else
-                        "a changed expected string is where a real product bug "
-                        "hides most comfortably — proposed, never applied")})
+                "what": f"item {item['index']} (not classified): {item['text']}",
+                "why": ("the classifier could not place this item, so it gets no "
+                        "authority to edit — say more plainly what changed, or split "
+                        "it into separate items")})
             result["items"].append({**item, "status": "escalated",
                                     "reason": result["escalations"][-1]["why"],
                                     "guards": []})
@@ -607,9 +743,20 @@ def main():
 
     done = []  # items this attempt applied and verified, shown to the items after them
     for item in actionable:
-        log(f"Item {item['index']} [{item['kind']}] — {item['text'][:70]}")
+        log(f"Item {item['index']} [{item['kind']}] — {item['text']}")
+        try:
+            before = check_changes.measure(scope, workspace)
+        except Exception as exc:  # noqa: BLE001 — fail closed: nothing to judge against
+            why = f"could not measure the tests' checks before editing: {exc}"
+            result["items"].append({**item, "status": "rejected", "reason": why,
+                                    "guards": [{"guard": "check_changes", "ok": False,
+                                                "reason": why}]})
+            log(f"  REJECT {why}")
+            continue
+        log("  asking the model…")
         prompt = build_adapt_prompt(item, plan, scope, flow, workspace, rules,
-                                    retry_note + done_section(done))
+                                    retry_note + done_section(done),
+                                    checks=before["checks"])
         call = _call_claude_ex(prompt=prompt, model=MODEL, cwd=str(REPO_ROOT),
                                timeout=900, log_dir=str(AUDIT_DIR))
         if call.status != "ok":
@@ -634,6 +781,15 @@ def main():
             record["reason"] = "could not parse the model's response as JSON"
             result["items"].append(record); log(f"  ERROR: {record['reason']}"); continue
         covering = covering_item(payload, done)
+        if covering and payload.get("check_changes"):
+            why = ("covered_by came with check_changes — an item covered by another "
+                   "makes no edits, so it cannot change a check")
+            record.update({"status": "rejected", "reason": why,
+                           "guards": [{"guard": "check_changes", "ok": False,
+                                       "reason": why}]})
+            result["items"].append(record)
+            log(f"  REJECT {why}")
+            continue
         if covering:
             # An earlier item's verified edit already does this one. Not an
             # escalation — but visible in the PR, Slack and the UI counts, since it
@@ -649,7 +805,7 @@ def main():
             record.update({"status": "declined",
                            "reason": payload.get("unadaptable_reason")
                                      or "declared unadaptable"})
-            result["escalations"].append({"what": f"item {item['index']}",
+            result["escalations"].append({"what": f"item {item['index']}: {item['text']}",
                                           "why": record["reason"]})
             result["items"].append(record)
             log(f"  declined: {record['reason']}")
@@ -666,6 +822,8 @@ def main():
             log("  no edits proposed")
             continue
         record["summary"] = payload.get("summary", "")
+        if record["summary"]:
+            log(f"  plan: {record['summary']}")
         record["justification"] = [
             {"file": Path(e.get("file", "")).name, "step": e.get("justified_by")}
             for e in edits]
@@ -687,8 +845,11 @@ def main():
                             index_before)
         record["guards"] = guards
         rejected = [g for g in guards if not g["ok"]]
-        for guard in guards:
-            log(f"    {'OK' if guard['ok'] else 'REJECT'} {guard['guard']}"
+        passed_guards = [g["guard"] for g in guards if g["ok"]]
+        if passed_guards:
+            log(f"  guards OK ({len(passed_guards)}): {', '.join(passed_guards)}")
+        for guard in rejected:
+            log(f"  REJECT {guard['guard']}"
                 + (f" — {guard['reason']}" if guard["reason"] else ""))
         if rejected:
             record.update({"status": "rejected",
@@ -706,9 +867,14 @@ def main():
             # write and the restore would leave our edit sitting in it.
             txn.apply()
             try:
-                sound, why = verify_proposal(txn, scope, workspace, record)
+                sound, why = verify_proposal(
+                    txn, scope, workspace, record,
+                    judge=lambda: judge_checks(item, payload, txn, scope, workspace,
+                                               flow, before, record))
             except Exception as exc:                       # noqa: BLE001 — see above
                 sound, why = False, f"could not verify the proposal: {exc}"
+                record["guards"].append({"guard": "check_changes", "ok": False,
+                                         "reason": why})
             finally:
                 txn.rollback("propose-only — nothing is kept")
             if not sound:
@@ -748,15 +914,14 @@ def main():
             continue
         log("  compiles")
 
-        conservation = check_conservation(scope, workspace)
-        broken = [c for c in conservation if not c["ok"]]
-        record["conservation"] = conservation
-        for report in conservation:
-            log(f"    conservation {report.get('test','')}: "
-                f"{assertion_graph.describe(report)}")
-        if broken:
-            why = ("assertion conservation failed: "
-                   + "; ".join(b.get("reason", "") for b in broken[:2]))
+        try:
+            sound, why = judge_checks(item, payload, txn, scope, workspace, flow,
+                                      before, record)
+        except Exception as exc:  # noqa: BLE001 — fail closed: an unmeasured edit is not safe
+            sound, why = False, f"could not measure the checks after the edit: {exc}"
+            record["guards"].append({"guard": "check_changes", "ok": False,
+                                     "reason": why})
+        if not sound:
             txn.rollback(why)
             record.update({"status": "rolled_back", "reason": why})
             result["items"].append(record)
@@ -767,6 +932,7 @@ def main():
             log(f"  verifying {test}…")
             status, out = run_test(test, workspace, timeout_s=TEST_TIMEOUT_S, log=log)
             (passed if status == "passed" else failed).append((test, status, out))
+            log(f"  {status}: {test.rpartition('#')[2]}")
         record["verified"] = [t for t, _, _ in passed]
         record["failed"] = [{"test": t, "status": s} for t, s, _ in failed]
 
@@ -778,7 +944,10 @@ def main():
             continue
 
         txn.commit()
+        log_rows(item, record.get("check_changes"))
         record["status"] = "applied" if not failed else "partial"
+        log(f"  {record['status']} — {len(passed)}/{len(passed) + len(failed)} "
+            f"verified test(s) pass")
         result["verified"] += record["verified"]
         result["failed"] += [f["test"] for f in record["failed"]]
         result["items"].append(record)

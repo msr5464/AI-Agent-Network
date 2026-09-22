@@ -219,6 +219,11 @@ that looks like a real one.) Same 404 / 503 gates as `GET /tests`.
     "Verify cart badge shows 1 item"
   ],
   "verifies": ["Cart badge should show 1 after adding a product"],
+  "checks": [
+    {"id": "c1a2b3c4", "callee": "assertEquals",
+     "site": "SauceDemoWebTest#addProductToCart", "expected": ["1"],
+     "message": "Cart badge should show 1 after adding a product", "via": ""}
+  ],
   "identity": [],
   "unresolved_count": 5
 }
@@ -229,6 +234,11 @@ that looks like a real one.) Same 404 / 503 gates as `GET /tests`.
   no narration to read, and the UI says so rather than showing an empty box.
 - `verifies` — the message argument of each reachable assertion (`AssertHelper` puts
   it last in every signature), de-duplicated.
+- `checks` — every reachable assertion, one entry each, including the page-load
+  checks in page-object constructors. `id` is the id the adaptation agent uses in
+  `check_changes`; `expected` excludes the message; `via` is the call in the test
+  that reaches a check made in a helper or page object (empty when the test makes
+  it itself).
 - `source` — `authored` if a contract file exists under
   `src/test/resources/intents/`, else `derived`.
 - `unresolved_count` — calls the analyser could not follow. Non-zero means the two

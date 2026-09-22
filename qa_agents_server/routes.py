@@ -467,8 +467,11 @@ def tests_intent(agent: str):
         }), 503
 
     try:
+        # Constructors followed, as the adaptation agent measures — the panel
+        # should list the checks a change note can actually touch.
         contract = intent.for_test(str(workspace), test,
-                                   _member_index(str(workspace)))
+                                   _member_index(str(workspace)),
+                                   follow_constructors=True)
     except Exception as e:
         return jsonify({"error": "could not read the test's intent",
                         "detail": str(e)}), 500
@@ -481,6 +484,8 @@ def tests_intent(agent: str):
         "source": contract.get("source", "derived"),
         "proves": contract.get("proves") or [],
         "verifies": intent.verifies(contract),
+        # One entry per check, with the id the agent uses for it.
+        "checks": intent.checks(contract),
         "identity": contract.get("identity") or [],
         "unresolved_count": len(contract.get("unresolved") or []),
     })

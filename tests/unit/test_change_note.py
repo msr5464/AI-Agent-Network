@@ -117,24 +117,42 @@ class TestOutcome:
     def test_a_read_only_outcome_is_not_destructive(self):
         assert pc.looks_destructive("the dashboard shows the latest balance") == ""
 
+    WRAPPED = ("Module: SauceDemo\n\nWhat changed:\n1. Remove now saves the item.\n\n"
+               "Expected outcome changed: after removing a product it is still\n"
+               "listed under \"Saved for later\".\n\n# observed by a human\n")
+
+    def test_a_wrapped_outcome_is_one_outcome(self):
+        assert pc.expected_outcome(self.WRAPPED) == (
+            'after removing a product it is still listed under "Saved for later".')
+
+    def test_a_wrapped_outcome_is_not_part_of_the_last_item(self):
+        assert [i["text"] for i in pc.parse_items(self.WRAPPED)] == [
+            "Remove now saves the item."], (
+            "the second line of the outcome used to be appended to item 1 and "
+            "classified as part of the change")
+
+    def test_item_prose_that_mentions_an_outcome_is_not_the_outcome(self):
+        note = "1. The expected outcome of checkout: unchanged screens.\n"
+        assert pc.expected_outcome(note) == ""
+
 
 class TestKinds:
     def test_the_kind_vocabulary_is_closed(self):
         assert "outcome_changed" in pc.KINDS and "step_insert" in pc.KINDS
 
-    def test_escalate_only_kinds_are_the_two_that_must_never_auto_apply(self):
-        assert set(pc.ESCALATE_ONLY) == {"outcome_changed", "content_changed"}, (
-            "outcome_changed means the specification moved, so no edit to the "
-            "test is correct; content_changed is where a real product bug hides "
-            "most comfortably")
+    def test_only_an_unclassified_item_escalates(self):
+        assert not hasattr(pc, "ESCALATE_ONLY"), (
+            "outcome_changed and content_changed are actionable now — they may "
+            "change a check, but only one the agent declares")
+        assert pc.UNCLASSIFIED not in pc.KINDS, (
+            "the classifier is never offered 'unclassified'; it is what an item "
+            "becomes when the classifier could not place it")
 
-    def test_every_escalate_only_kind_is_a_real_kind(self):
-        assert set(pc.ESCALATE_ONLY) <= set(pc.KINDS)
+    def test_a_change_to_the_test_itself_has_a_kind(self):
+        assert "coverage_changed" in pc.KINDS and "coverage_added" in pc.KINDS
+        prompt = pc.classify_prompt("saucedemo", [{"index": 1, "text": "drop step 7"}], "")
+        assert "coverage_changed" in prompt
 
-    def test_added_coverage_is_applied_not_escalated(self):
-        assert "coverage_added" in pc.KINDS and "coverage_added" not in pc.ESCALATE_ONLY, (
-            "a note that only adds steps or checks changes nothing in the product; "
-            "with no kind for it, the classifier reached for outcome_changed and the "
-            "agent escalated an edit it was allowed to make")
+    def test_added_coverage_is_still_not_an_outcome_change(self):
         prompt = pc.classify_prompt("saucedemo", [{"index": 1, "text": "also verify the price"}], "")
         assert "is `coverage_added`, not this" in prompt

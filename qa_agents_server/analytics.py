@@ -157,10 +157,12 @@ def _read_text(path: Path) -> Optional[str]:
 
 def _healing_status(d: Path) -> str:
     """Healing's own ladder: the fix gate plus whether a PR was raised."""
-    if (d / ".crashed").exists():
-        return "failed"
+    # Cancelled before crashed: cancelling kills the step, which trips run.sh's
+    # ERR trap into writing .crashed too — the same order shared/session.sh uses.
     if (d / ".cancelled").exists():
         return "cancelled"
+    if (d / ".crashed").exists():
+        return "failed"
     if (d / ".interrupted").exists():
         return "interrupted"
     gate = (_read_text(d / ".fix-passed") or "").lower()
@@ -183,10 +185,11 @@ def _adaptation_status(d: Path) -> str:
     "failed" — so scoring adaptation by verdict makes EVERY adaptation run a
     failure. A dashboard showing 0% adaptation success is that bug.
     """
-    if (d / ".crashed").exists():
-        return "failed"
+    # Cancelled before crashed — see _healing_status.
     if (d / ".cancelled").exists():
         return "cancelled"
+    if (d / ".crashed").exists():
+        return "failed"
     if (d / ".interrupted").exists():
         return "interrupted"
     ship = _load_json(d / "05-ship.json")

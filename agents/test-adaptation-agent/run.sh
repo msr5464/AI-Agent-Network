@@ -57,8 +57,13 @@ TESTING_MODE="${TESTING_MODE:-false}"
 # the cached artefact is the output of the very run being retried — a failed
 # exploration, in the case that found this — so the retry restored the failure,
 # reported the step as done in 0s, and every step after it gated on it.
+# Bumped whenever what steps 01-03 write changes shape. A hit from before the
+# bump would restore a plan whose kinds mean something else now, and an
+# exploration that was never asked about the tests' checks.
+CACHE_VERSION=2
 _cache_hit()     { [[ "$TESTING_MODE" == "true" ]] && [[ "$START_FROM_STEP" -le 1 ]] \
                      && [[ -f "$CACHE_DIR/$1" ]] \
+                     && [[ "$(cat "$CACHE_DIR/$1.version" 2>/dev/null)" == "$CACHE_VERSION" ]] \
                      && [[ -f "$CACHE_DIR/$1.input" ]] && cmp -s "$CACHE_DIR/$1.input" "$INPUT_FILE"; }
 _cache_restore() {
   cp "$CACHE_DIR/$1" "$AUDIT_DIR/$1"
@@ -72,13 +77,19 @@ _cache_save() {
   # Never cache a step that produced nothing. A skipped exploration was cached
   # once and then restored on every later run of the same note — including the
   # retry that existed to replace it. An unreadable file is not cached either.
+  # Nor is a walk with a page it never inventoried (flow_map.pages_without_inventory):
+  # every selector on it stays unverified, so every later run declined the same items.
   python3 -c 'import json, sys
 d = json.load(open(sys.argv[1]))
+f = d.get("flow") or {}
+inv = f.get("_inventories") or {}
 sys.exit(1 if (str(d.get("status", "")).lower() in ("skipped", "failed", "unsafe", "empty")
-               or d.get("skipped") is True) else 0)' "$AUDIT_DIR/$1" 2>/dev/null || return 0
+               or d.get("skipped") is True
+               or any(not inv.get(p) for p in (f.get("pages") or {}))) else 0)' "$AUDIT_DIR/$1" 2>/dev/null || return 0
   mkdir -p "$CACHE_DIR"
   cp "$AUDIT_DIR/$1" "$CACHE_DIR/$1"
   if [[ -f "$INPUT_FILE" ]]; then cp "$INPUT_FILE" "$CACHE_DIR/$1.input"; else rm -f "$CACHE_DIR/$1.input"; fi
+  echo "$CACHE_VERSION" > "$CACHE_DIR/$1.version"
   local md="${1%.json}.md"
   [[ -f "$AUDIT_DIR/$md" ]] && cp "$AUDIT_DIR/$md" "$CACHE_DIR/$md"
   return 0

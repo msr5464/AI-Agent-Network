@@ -45,6 +45,8 @@ from shared.code_analyzer import read_source
 from shared.claude import call_claude_ex
 from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools
 
+from lib import check_changes
+
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 MODEL = os.environ.get("ADAPTATION_MODEL", "claude-opus-5")
@@ -71,7 +73,22 @@ def load_explore_rules() -> str:
     return "## Instructions\nExplore the flow and emit FLOW_STEP markers.\n"
 
 
-def build_prompt(plan: dict, rules: str, attempt_notes: str, stop_before: str) -> str:
+def checks_section(scope: dict) -> str:
+    """What the named tests check today, for the explorer to judge on the new flow.
+
+    Step 04 rebuilds this list from the same frozen contracts, so the ids the
+    explorer reports against are the ids the adapt step looks up.
+    """
+    listed = check_changes.explore_checks(scope or {})
+    if not listed:
+        return ""
+    return ("\n## The checks the tests make today\n"
+            "Judge each one you can on the new flow — see \"What the tests check\" "
+            "below.\n" + "\n".join(check_changes.list_lines(listed)) + "\n")
+
+
+def build_prompt(plan: dict, rules: str, attempt_notes: str, stop_before: str,
+                 scope: dict = None) -> str:
     # GET /agents/<a>/artifact serves from the audit dir; the workspace's
     # test-output does not survive the automation repo being re-cloned.
     shots = AUDIT_DIR / "screenshots"
@@ -109,18 +126,18 @@ The browser is already signed in through a saved session.
 
 ## What the flow is supposed to achieve
 {plan.get('expected_outcome') or '(not stated — record what the flow does)'}
-{destructive_note}{attempt_notes}
+{checks_section(scope)}{destructive_note}{attempt_notes}
 {rules}
 """
 
 
 def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
-                stop_before: str) -> tuple:
+                stop_before: str, scope: dict = None) -> tuple:
     """One exploration. Returns (flow, status, raw_stdout)."""
     seen = {"steps": 0}
 
     def on_output(_label, line):
-        text = (line or "").strip()
+        text = (line or "").strip().strip("`")
         if text.startswith("FLOW_STEP:"):
             seen["steps"] += 1
             log(f"    step {seen['steps']}")
@@ -137,7 +154,7 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
 
     log("  Sending to Claude for exploration...")
     result = call_claude_ex(
-        prompt=build_prompt(plan, rules, notes, stop_before),
+        prompt=build_prompt(plan, rules, notes, stop_before, scope),
         model=MODEL, cwd=str(REPO_ROOT), timeout=TIMEOUT_S,
         on_output=on_output, log_dir=str(AUDIT_DIR),
         allowed_tools=mcp_allowed_tools(),
@@ -260,9 +277,9 @@ def main():
 
     rules = load_explore_rules()
     best, best_score, notes = None, None, ""
-    for attempt in range(1, max(1, ATTEMPTS + 1) + 0 or 1):
+    for attempt in range(1, ATTEMPTS + 2):
         log(f"Exploration attempt {attempt}/{ATTEMPTS + 1} (budget {TIMEOUT_S}s)")
-        flow, status, raw = run_attempt(plan, rules, notes, mcp_path, stop_before)
+        flow, status, raw = run_attempt(plan, rules, notes, mcp_path, stop_before, scope)
         if status == "usage_limit":
             # An empty flow map here would be read as "the flow could not be
             # walked", which is a finding about the product. This is a finding
