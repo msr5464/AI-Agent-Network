@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from shared.dom_snapshot import find_snapshot, parse_header
 from shared.telemetry import read_actions, failing_action
+from shared import baseline as _baseline
 from shared import failure_context as _failure_context
 
 
@@ -184,23 +185,8 @@ def attach_baselines(issues: list, workspace: Path, audit_dir: Path, log=print) 
         return
     try:
         source = Path(os.environ.get("HEALING_BASELINE_DIR") or (Path(workspace) / "baselines"))
-        if not source.exists():
-            return
         preserved = audit_dir / "baselines"
-        preserved.mkdir(parents=True, exist_ok=True)
-        copied = 0
-        # Recursive, keeping the layout: the framework stores baselines per module
-        # ({module}/{PageObject}.json), and a flat glob preserved none of those.
-        # Never pending/ — fingerprints from a test that had not finished.
-        for record in source.rglob("*.json"):
-            relative = record.relative_to(source)
-            if "pending" in relative.parts:
-                continue
-            target = preserved / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                record.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
-            copied += 1
+        copied = _baseline.preserve(source, preserved)
         if copied:
             for issue in issues:
                 issue["healing_baseline_dir"] = str(preserved)

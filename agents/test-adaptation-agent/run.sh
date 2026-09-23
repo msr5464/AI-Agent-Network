@@ -265,6 +265,7 @@ if [[ "$EXPLORE_ONLY" == "true" ]]; then
   log "EXPLORE_ONLY=true — stopping after exploration. Flow map: $AUDIT_DIR/03-explore.md"
   echo "skipped" > "$AUDIT_DIR/.fix-passed"
   echo "explore-only" > "$AUDIT_DIR/.skip-reason"
+  flush_step_done
   TOTAL_ELAPSED=$(elapsed_since $SESSION_START)
   log "Done. Total time: $(fmt_duration $TOTAL_ELAPSED)"
   log "Audit: $AUDIT_DIR"
@@ -308,12 +309,11 @@ elif [[ -f "$INPUT_FILE" && "$(dirname "$INPUT_FILE")" != "$PROCESSED_DIR" ]]; t
   log "Change note moved to processed/"
 fi
 
+flush_step_done
 TOTAL_ELAPSED=$(elapsed_since $SESSION_START)
 echo ""
 log "Done. Total time: $(fmt_duration $TOTAL_ELAPSED)"
-for i in "${!STEP_NAMES[@]}"; do
-  printf "  %-50s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
-done
+print_step_table 50
 
 # Roll up now so the spend is on screen with the timings rather than only in
 # metrics.json. The EXIT trap re-runs this; a rollup is idempotent.

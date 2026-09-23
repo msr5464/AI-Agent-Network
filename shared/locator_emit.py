@@ -36,6 +36,18 @@ def text_stability(t: str) -> float:
     return s
 
 
+# What the capture normalises into `testid`. The element carries exactly one of
+# them, and which one decides whether getByTestId can find it at all.
+TESTID_ATTRS = ("data-testid", "data-test-id", "data-test", "data-qa", "data-cy")
+
+
+def testid_attribute(el: dict) -> str:
+    """The attribute THIS element spells its test id with. Never a guess."""
+    attrs = el.get("attrs") or {}
+    return next((a for a in TESTID_ATTRS if attrs.get(a) == el.get("testid")),
+                "data-testid")
+
+
 VOLATILE_SELECTOR = re.compile(
     r"(nth-child|nth-of-type|/html\[|\[\d+\]|css-[0-9a-z]{5,}|jss\d+|sc-[0-9a-z]{6,})", re.I)
 
@@ -199,7 +211,19 @@ def candidates_for(el: dict, vol: Volatility) -> list[dict]:
 
     if el.get("testid"):
         t = el["testid"]
-        add("testid", f'[data-testid={_css(t)}]', testid=t)
+        attribute = testid_attribute(el)
+        if attribute == "data-testid":
+            # getByTestId resolves against Playwright's configured
+            # testIdAttribute, which is data-testid unless the repo changed it.
+            add("testid", f'[data-testid={_css(t)}]', testid=t)
+        else:
+            # The element spells it differently — data-test, data-cy, data-qa.
+            # getByTestId would look for data-testid and find nothing, and the
+            # `sel` probe would fail too, so the whole strongest tier silently
+            # dropped out and the ladder fell through to whatever came next. On a
+            # cart link that was its badge count: getByText("2").
+            sel = f'[{attribute}={_css(t)}]'
+            add("testid", sel, selector=sel)
 
     if role and acc and role not in ("generic", "presentation"):
         jrole = code.map_role(role)
@@ -229,7 +253,11 @@ def candidates_for(el: dict, vol: Volatility) -> list[dict]:
         add("name", sel, selector=sel)
 
     text = (el.get("text") or "").strip()
-    if text and len(text) <= 60 and el["is_interactive"]:
+    # Only text worth anchoring on. `text_stability` already knows a badge count
+    # or a price is not identity — it was consulted when ranking fallbacks and
+    # not when emitting, so a cart link whose text was "2" got
+    # getByText("2", exact) and broke on the next run with a different count.
+    if text and len(text) <= 60 and el["is_interactive"] and text_stability(text) > 0:
         add("text", f'{tag}:text-is({_css(text)})', text=text, exact=True)
 
     stable = vol.stable_classes(el.get("class_list"))

@@ -61,6 +61,13 @@ AGENT_DIR   = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[
 REPO_ROOT   = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
 SESSION_ID  = os.environ.get("SESSION_ID", AUDIT_DIR.name)
 FIX_ATTEMPT = int(os.environ.get("FIX_ATTEMPT", "1"))
+# How many attempts may make NO PROGRESS before the loop gives up. A chain of
+# broken locators is repaired one link per attempt and every link but the last
+# leaves the test red, so counting those as retries spends the budget on progress
+# and a long chain could never finish.
+RETRY_COUNT = int(os.environ.get("HEALING_RETRY_COUNT", "4"))
+# The absolute ceiling, so that no amount of progress can spin forever.
+MAX_ATTEMPTS = int(os.environ.get("HEALING_MAX_ATTEMPTS", "12"))
 
 # Handoff file written by test-triaging-agent/05_ship.py
 HANDOFF_FILE = Path(os.environ["HANDOFF_FILE"])
@@ -128,6 +135,30 @@ TEST_TIMEOUT_S     = int(os.environ.get("HEALING_TEST_TIMEOUT_S", "300"))
 
 def write_gate(value: str):
     (AUDIT_DIR / ".fix-passed").write_text(value)
+
+
+def retry_verdict(gate: str, stuck: int, attempt: int) -> str:
+    """"retry", or the reason run.sh should stop attempting.
+
+    Decided here because every input is here. An attempt that repaired a locator
+    and moved the test on to the NEXT one is progress, however red the run still
+    looks, and it must not be charged to a budget meant for attempts that got
+    nowhere.
+    """
+    if gate != "false":
+        return "stop: nothing left to retry"
+    if attempt >= MAX_ATTEMPTS:
+        return (f"stop: {attempt} attempts is the ceiling "
+                f"(HEALING_MAX_ATTEMPTS={MAX_ATTEMPTS})")
+    if stuck >= RETRY_COUNT:
+        return (f"stop: {stuck} attempt(s) in a row made no progress "
+                f"(HEALING_RETRY_COUNT={RETRY_COUNT})")
+    return "retry"
+
+
+def stuck_after(advanced: int, previous_stuck: int) -> int:
+    """Consecutive attempts that moved nothing. Reset by any progress at all."""
+    return 0 if advanced else previous_stuck + 1
 
 
 def load_known_issues() -> list:
@@ -483,9 +514,13 @@ def park_browser_for_repair(workspace: Path, test_name: str,
         log=log,
     )
     if status == "passed":
-        # It passed this time — flaky, not a broken locator.
-        log("  The test passed on the re-run; nothing to inspect")
-        return {}
+        # It passed this time, so there is nothing to fix — not merely nothing
+        # to inspect. Said out loud rather than returning a bare {}, which the
+        # caller could not tell from "repair mode is unavailable" and so went on
+        # to ask the model to repair a green test. Three attempts did that in one
+        # run, and reported the test as unfixable afterwards.
+        log("  The test passed on the re-run — nothing to fix")
+        return {"passed": True}
     return find_repair_session(workspace, test_name, expected_url)
 
 
@@ -1310,22 +1345,12 @@ def locate_resolution(ctx: dict):
     """
     if HEALING_LOCATE_MODE != "enforce":
         return None
-    # Only on the first attempt. Reaching attempt 2 means the located locator was
-    # applied and the test still failed, so re-applying the identical edit would
-    # burn the retry on a known-failing answer. Hand the retry to the model, which
-    # is what the retry loop is for.
-    if FIX_ATTEMPT > 1:
-        # Say which of those two happened. This used to announce a failed located
-        # fix on every retry, including runs where Locate crashed before it
-        # resolved anything — a line that describes work nobody did, in the one
-        # place someone reads to find out what the retry is reacting to.
-        if (ctx.get("locate_outcome") or {}).get("verdict") == "HEALED":
-            log(f"  attempt {FIX_ATTEMPT}: the located fix did not verify — "
-                f"asking the model")
-        else:
-            log(f"  attempt {FIX_ATTEMPT}: Locate has no answer for this selector "
-                f"— asking the model")
-        return None
+    # Retries are no longer excluded. One broken locator hides the next, so a
+    # retry is usually working on a DIFFERENT selector — the one the last
+    # verification run uncovered — and Locate has just resolved it from the
+    # capture that run wrote. The narrow case this used to guard, re-applying an
+    # answer that was already applied and still failed, is refused by Locate
+    # itself now (ALREADY_TRIED), which is where the evidence for it lives.
     failed = ctx.get("failed_selector") or ""
     if not failed:
         return None
@@ -1376,8 +1401,8 @@ def build_located_fix(resolution: dict, ctx: dict, workspace: Path):
             f"Located deterministically: {resolution['failed_selector']} no longer "
             f"matches. Scored {resolution.get('score')} against the fingerprint "
             f"recorded on the last good run (margin {resolution.get('margin'):+}, "
-            f"{resolution.get('tier')}), then verified by performing the step "
-            f"({resolution.get('verification')})."),
+            f"{resolution.get('tier')}), and the new selector is "
+            f"{resolution.get('verification')}. This run is what verifies it."),
     }, ""
 
 
@@ -1727,6 +1752,9 @@ def _attempt_history(result: dict) -> list:
             kept = f.get("status") == "advanced"
             entries.append({
                 "test_name": f.get("test_name"),
+                # Every test this one edit covers, so the console summary can
+                # say so on one line instead of repeating the edit per test.
+                "test_names": f.get("test_names") or [],
                 "target_file": f.get("target_file"),
                 "fix_description": f.get("fix_description") or "",
                 "unfixable_reason": f.get("unfixable_reason") or "",
@@ -1929,6 +1957,11 @@ def _refresh_issue(issue: dict, output: str, workspace: Path,
     return refreshed
 
 
+def ctx_slim_for(context: dict) -> dict:
+    """A context without the repo conventions, which are bulky and identical."""
+    return {k: v for k, v in context.items() if k != "repo_conventions"}
+
+
 def _advanced_record(entry: tuple, cluster, target_file, fix_description: str,
                      fix_diff: str, workspace: Path) -> dict:
     """A failed_fixes entry for a test that moved on to a DIFFERENT element.
@@ -1957,6 +1990,29 @@ def _advanced_record(entry: tuple, cluster, target_file, fix_description: str,
         "next_issue": _refresh_issue(
             cluster.issues[cluster.contexts.index(member)],
             member_output, workspace, member_started),
+    }
+
+
+def _reverted_record(member: dict, output: str, cluster, target_file,
+                     fix_description: str, fix_diff: str) -> dict:
+    """A failed_fixes entry for a test whose edit was put back.
+
+    `next_issue` is the issue this attempt worked on, carried forward verbatim
+    and NOT refreshed. The edit has just been reverted, so the state is exactly
+    what it was before the attempt — and the artefacts the verification run
+    wrote describe a run made with an edit that no longer exists.
+
+    Carrying it is what stops the next attempt falling back to the ORIGINAL
+    handoff. That fallback is how a run working on the cart link went back to
+    re-resolving a login button two attempts had already repaired and committed.
+    """
+    slim = {k: v for k, v in member.items() if k != "repo_conventions"}
+    return {
+        **slim, "status": "test_failed", "verified": False,
+        "target_file": str(target_file),
+        "fix_description": fix_description, "fix_diff": fix_diff,
+        "test_passed": False, "test_output": (output or "")[-2000:],
+        "next_issue": cluster.issues[cluster.contexts.index(member)],
     }
 
 
@@ -2041,6 +2097,7 @@ def main():
         (AUDIT_DIR / "01-fix.json").write_text(json.dumps(result, indent=2))
         (AUDIT_DIR / "01-fix.md").write_text(f"# Fix\n\nSkipped — {reason}.\n")
         write_gate("skipped")
+        (AUDIT_DIR / ".fix-retry").write_text("stop: nothing was attempted")
         # run.sh reads this to decide whether the handoff may be consumed. An
         # infra skip means nothing was even attempted, so the work must stay queued.
         (AUDIT_DIR / ".skip-reason").write_text("infra" if infra else "no-work")
@@ -2073,6 +2130,7 @@ def main():
     prev_test_outputs: dict = {}
     carried_fixes: list = []
     carried_unverified: list = []
+    previous_stuck = 0
     if FIX_ATTEMPT > 1:
         prev_path = AUDIT_DIR / "01-fix.json"
         if prev_path.exists():
@@ -2090,6 +2148,7 @@ def main():
                     refreshed[fix["test_name"]] = fix["next_issue"]
             carried_fixes = prev_data.get("fixes", [])
             carried_unverified = prev_data.get("unverified_fixes", [])
+            previous_stuck = prev_data.get("stuck_attempts", 0)
             if failed_names:
                 before = len(eligible)
                 eligible = [refreshed.get(i["test_name"], i) for i in eligible
@@ -2350,55 +2409,92 @@ def main():
             fail_cluster("locate_refused", reason=note)
             continue
 
-        # Ground the fix in the real DOM rather than in stale source. Four tiers,
-        # best first:
-        #   1. a browser still parked on the failing page (repairMode) — live and
-        #      interactive, so a candidate selector can be counted for uniqueness;
-        #   2. the DOM captured at the moment of failure — correct mid-flow state;
-        #   3. re-opening the page in a browser — URL-addressable pages only;
-        #   4. none of the above: the prompt says so and Claude infers.
-        # A browser someone already parked (a developer ran with -DrepairMode=true)
-        # always wins. Otherwise the agent parks one itself, but only from the
-        # second attempt on — see park_browser_for_repair for why.
-        failure_url = issue.get("failure_url", "") or ctx.get("page_url", "")
-        repair_session = (find_repair_session(workspace, test_name, failure_url)
-                          if INSPECT_DOM else {})
-        if not repair_session and INSPECT_DOM:
-            explicit = os.environ.get("REPAIR", "").lower() == "true"
-            if explicit or FIX_ATTEMPT > 1:
-                repair_session = park_browser_for_repair(workspace, test_name,
-                                                         failure_url)
-
-        ctx["dom_snapshot"] = load_dom_snapshot(issue, ctx["element_names"])
-
-        if repair_session:
-            ctx["dom_findings"] = inspect_live_dom(ctx, ctx["page_url"], workspace,
-                                                   framework_props, repair_session)
-        elif ctx["dom_snapshot"]:
-            ctx["dom_findings"] = {
-                "status": "not needed — failure-time DOM snapshot available",
-                "selectors": {}, "page_dump": "", "absent": [], "raw": "",
-            }
-        elif INSPECT_DOM:
-            ctx["dom_findings"] = inspect_live_dom(ctx, ctx["page_url"], workspace,
-                                                   framework_props)
-        else:
-            ctx["dom_findings"] = {"status": "disabled (HEALING_INSPECT_DOM=false)",
-                                   "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
-
-        ctx_slim = {k: v for k, v in ctx.items() if k != "repo_conventions"}
-
-        # A locator the Locate step already found and proved needs no model.
+        # A locator Locate already resolved needs no model — and so needs none of
+        # the DOM grounding below, which exists only to give the model something
+        # to reason from. Asking first is what stops a proved answer paying for a
+        # parked browser, a Maven run and a live inspection nothing will read.
         fix_json = None
         located = locate_resolution(ctx)
         if located:
             fix_json, why = build_located_fix(located, ctx, workspace)
             if fix_json:
                 ctx["located"] = located
+                ctx["dom_findings"] = {
+                    "status": "not needed — Locate resolved this from the failure capture",
+                    "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
                 log(f"  Located deterministically: {located.get('strategy')} "
-                    f"score {located.get('score')} — no model call")
+                    f"score {located.get('score')} — no model call, no DOM inspection")
             else:
                 log(f"  Located, but not applicable here ({why}) — asking the model")
+
+        if fix_json is None:
+            # Ground the fix in the real DOM rather than in stale source. Four tiers,
+            # best first:
+            #   1. a browser still parked on the failing page (repairMode) — live and
+            #      interactive, so a candidate selector can be counted for uniqueness;
+            #   2. the DOM captured at the moment of failure — correct mid-flow state;
+            #   3. re-opening the page in a browser — URL-addressable pages only;
+            #   4. none of the above: the prompt says so and Claude infers.
+            # A browser someone already parked (a developer ran with -DrepairMode=true)
+            # always wins. Otherwise the agent parks one itself, but only from the
+            # second attempt on — see park_browser_for_repair for why.
+            failure_url = issue.get("failure_url", "") or ctx.get("page_url", "")
+            repair_session = (find_repair_session(workspace, test_name, failure_url)
+                              if INSPECT_DOM else {})
+            if not repair_session and INSPECT_DOM:
+                explicit = os.environ.get("REPAIR", "").lower() == "true"
+                if explicit or FIX_ATTEMPT > 1:
+                    repair_session = park_browser_for_repair(workspace, test_name,
+                                                             failure_url)
+
+            if repair_session.get("passed"):
+                # The re-run just proved there is nothing wrong. A failure that does
+                # not reproduce is not a locator to repair, and asking the model to
+                # repair it produces an edit against evidence from a run that will
+                # never happen again. Credit the members that pass and let the rest
+                # of the cluster be re-examined on its own.
+                passed_now, still_red = [], []
+                for member in cluster.contexts:
+                    name = member["test_name"]
+                    status, output = (("passed", "") if name == test_name
+                                      else run_single_test(name, workspace))
+                    (passed_now if status == "passed" else still_red).append((name, output))
+                log(f"  ✅ {len(passed_now)}/{cluster.size} test(s) in this cluster pass "
+                    f"without a fix — the failure did not reproduce")
+                if passed_now:
+                    fixes.append({**ctx_slim_for(ctx), "status": "not_reproduced",
+                                  "verified": True, "target_file": "",
+                                  "fix_description": "no edit needed — the failure did "
+                                                     "not reproduce on a clean re-run",
+                                  "fix_diff": "", "test_name": passed_now[0][0],
+                                  "test_names": [n for n, _ in passed_now],
+                                  "test_passed": True,
+                                  "test_output": f"{len(passed_now)} test(s) passed"})
+                for name, output in still_red:
+                    member = next(m for m in cluster.contexts if m["test_name"] == name)
+                    failed_fixes.append({**ctx_slim_for(member), "status": "test_failed",
+                                         "verified": False, "fix_diff": "",
+                                         "test_passed": False,
+                                         "test_output": (output or "")[-2000:]})
+                continue
+
+            ctx["dom_snapshot"] = load_dom_snapshot(issue, ctx["element_names"])
+
+            if repair_session:
+                ctx["dom_findings"] = inspect_live_dom(ctx, ctx["page_url"], workspace,
+                                                       framework_props, repair_session)
+            elif ctx["dom_snapshot"]:
+                ctx["dom_findings"] = {
+                    "status": "not needed — failure-time DOM snapshot available",
+                    "selectors": {}, "page_dump": "", "absent": [], "raw": "",
+                }
+            elif INSPECT_DOM:
+                ctx["dom_findings"] = inspect_live_dom(ctx, ctx["page_url"], workspace,
+                                                       framework_props)
+            else:
+                ctx["dom_findings"] = {"status": "disabled (HEALING_INSPECT_DOM=false)",
+                                       "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
+        ctx_slim = {k: v for k, v in ctx.items() if k != "repo_conventions"}
 
         if fix_json is None:
             prompt = build_fix_prompt(ctx, fix_rules)
@@ -2532,9 +2628,10 @@ def main():
             "cluster_size": cluster.size,
             "cluster_description": cluster.describe(),
             "dom_verified": bool((ctx.get("dom_findings") or {}).get("selectors")
-                                 or ctx.get("dom_snapshot")),
+                                 or ctx.get("dom_snapshot") or ctx.get("located")),
             "dom_source": (
-                "live-parked-browser" if "parked" in (ctx.get("dom_findings") or {}).get("status", "")
+                "failure-capture (located)" if ctx.get("located")
+                else "live-parked-browser" if "parked" in (ctx.get("dom_findings") or {}).get("status", "")
                 else "failure-snapshot" if ctx.get("dom_snapshot")
                 else "live-browser" if (ctx.get("dom_findings") or {}).get("selectors")
                 else "none"),
@@ -2576,11 +2673,9 @@ def main():
             except Exception as e:
                 log(f"  WARNING: could not revert {target_file.name}: {e}")
             for member_name, member_output, member, _started in still_failing:
-                slim = {k: v for k, v in member.items() if k != "repo_conventions"}
-                failed_fixes.append({**slim, "status": "test_failed", "verified": False,
-                                     "target_file": str(target_file),
-                                     "fix_description": fix_description, "fix_diff": fix_diff,
-                                     "test_passed": False, "test_output": member_output[-2000:]})
+                failed_fixes.append(_reverted_record(
+                    member, member_output, cluster, target_file,
+                    fix_description, fix_diff))
             continue
 
         if passed:
@@ -2708,6 +2803,13 @@ def main():
         gate = "true"
 
     write_gate(gate)
+    stuck = stuck_after(len(advanced_fixes), previous_stuck)
+    verdict = retry_verdict(gate, stuck, FIX_ATTEMPT)
+    (AUDIT_DIR / ".fix-retry").write_text(verdict)
+    if advanced_fixes:
+        log(f"Progress: {len(advanced_fixes)} edit(s) moved their test(s) on to the "
+            f"next locator — this attempt is not charged to the retry budget "
+            f"({stuck}/{RETRY_COUNT} with no progress)")
     _tests_fixed = sum(len(f.get("test_names") or [f.get("test_name")]) for f in fixes)
     log(f"Gate: .fix-passed = {gate} ({len(fixes)} edit(s) → {_tests_fixed} test(s) verified, "
         f"{len(unverified_fixes)} unverified, {len(failed_fixes)} failed)")
@@ -2733,6 +2835,15 @@ def main():
         # What .fix-passed says; the UI's step status reads it
         # (audit_reader._step_has_error).
         "fix_gate":       gate,
+        # Whether run.sh is done with this step. Every attempt overwrites this
+        # file, and a mid-run attempt legitimately ends with the gate false —
+        # some tests fixed, others still being worked on. The UI read that file
+        # the moment it changed and painted the step red while the next attempt
+        # was starting. An unfinished step has no outcome to report yet.
+        "final_attempt":  verdict != "retry",
+        # Consecutive attempts that moved nothing, carried across attempts the
+        # way `fixes` is. run.sh reads the verdict this produces, not the count.
+        "stuck_attempts": stuck,
         # How much rework clustering avoided: one edit can green several tests.
         "distinct_fixes":     len(fixes),
         "distinct_unverified": len(unverified_fixes),

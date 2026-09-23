@@ -192,3 +192,78 @@ class TestBaselineCutoffIsPinned:
         refreshed = fix._refresh_issue({"test_name": "pkg.T.aCase"},
                                        PROFILE_FAILURE, tmp_path, 0.0)
         assert refreshed["baseline_not_after"] == ""
+
+
+class TestAGreenTestIsNotWorkForTheModel:
+    """A failure that does not reproduce is not a locator to repair.
+
+    The bug this pins: from attempt 2 on, the fix step re-runs the failing test
+    with a browser parked so it can inspect the live page. When that re-run
+    PASSED, the helper logged "nothing to inspect" and returned {} — the same
+    value it returns when repair mode is simply unavailable. The caller could not
+    tell the two apart and asked the model to repair a green test anyway, three
+    attempts running, then reported it as unfixable. The test had failed once on
+    a dropped connection and passed every time since.
+    """
+
+    def test_a_passing_re_run_says_so(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(fix, "repair_possible", lambda w: (True, ""))
+        monkeypatch.setattr(fix, "run_test",
+                            lambda *a, **k: ("passed", "BUILD SUCCESS"))
+        assert fix.park_browser_for_repair(tmp_path, "pkg.T.aCase") == {"passed": True}
+
+    def test_an_unavailable_repair_mode_is_not_mistaken_for_a_pass(self, monkeypatch,
+                                                                   tmp_path):
+        monkeypatch.setattr(fix, "repair_possible", lambda w: (False, "CI is set"))
+        session = fix.park_browser_for_repair(tmp_path, "pkg.T.aCase")
+        assert session == {}
+        assert not session.get("passed"), \
+            "the caller keys on this to decide whether to skip the fix entirely"
+
+    def test_a_still_failing_re_run_goes_on_to_look_for_the_parked_browser(
+            self, monkeypatch, tmp_path):
+        monkeypatch.setattr(fix, "repair_possible", lambda w: (True, ""))
+        monkeypatch.setattr(fix, "run_test", lambda *a, **k: ("failed", "boom"))
+        monkeypatch.setattr(fix, "find_repair_session",
+                            lambda w, t, u="": {"endpoint": "http://localhost:9222"})
+        session = fix.park_browser_for_repair(tmp_path, "pkg.T.aCase")
+        assert session == {"endpoint": "http://localhost:9222"}
+        assert not session.get("passed")
+
+
+class TestRevertedRecord:
+    """What a reverted cluster hands the next attempt.
+
+    The bug this pins: a reverted cluster recorded no `next_issue` at all, so the
+    next attempt's `refreshed` map was empty and both steps fell back to the
+    ORIGINAL handoff. On a real run that meant attempt 3 went back to resolving
+    `#login-mukesh` — a locator attempt 1 had already repaired and committed —
+    while the cart link it was actually stuck on went unexamined.
+    """
+
+    CART = {"test_name": "pkg.SomeTest.aCase", "failed_selector": ".mukesh",
+            "dom_snapshot": "/audit/dom/cart.html",
+            "healing_baseline_dir": "/audit/baselines",
+            "baseline_not_after": "2026-09-23T17:41:40"}
+
+    def _cluster(self, member):
+        return SimpleNamespace(contexts=[member], issues=[self.CART])
+
+    def test_it_carries_the_issue_the_attempt_worked_on(self, tmp_path):
+        member = {"test_name": "pkg.SomeTest.aCase", "failed_selector": ".mukesh",
+                  "repo_conventions": "bulky"}
+        record = fix._reverted_record(member, "still red", self._cluster(member),
+                                      tmp_path / "ProductsPage.java",
+                                      "swapped the cart link", "--- a/x")
+        assert record["status"] == "test_failed"
+        assert record["next_issue"]["failed_selector"] == ".mukesh"
+        # Evidence kept, not cleared: after a revert the state is exactly what it
+        # was before the attempt, so the capture it was resolved from still holds.
+        assert record["next_issue"]["dom_snapshot"] == "/audit/dom/cart.html"
+        assert record["next_issue"]["baseline_not_after"] == "2026-09-23T17:41:40"
+
+    def test_the_conventions_blob_is_not_dragged_into_the_report(self, tmp_path):
+        member = {"test_name": "pkg.SomeTest.aCase", "repo_conventions": "bulky"}
+        record = fix._reverted_record(member, "", self._cluster(member),
+                                      tmp_path / "x.java", "", "")
+        assert "repo_conventions" not in record

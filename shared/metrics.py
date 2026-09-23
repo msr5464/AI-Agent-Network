@@ -375,17 +375,28 @@ def format_summary(data: Optional[Dict[str, Any]]) -> str:
     calls = int(totals.get("llm_calls") or 0)
     turns = int(totals.get("num_turns") or 0)
     out_tokens = int(totals.get("output_tokens") or 0)
+    if not calls:
+        # "$0.0000 · 0 calls (0 turns) · 0 output tokens" reads as missing data.
+        # It is the opposite: nothing needed the model.
+        return f"${cost:.4f} · no model calls"
     return (f"${cost:.4f} · {calls} call{'' if calls == 1 else 's'} "
             f"({turns} turns) · {out_tokens:,} output tokens")
 
 
-def format_stage(data: Optional[Dict[str, Any]], key: str) -> str:
+def format_stage(data: Optional[Dict[str, Any]], key: str, label: str = "") -> str:
     """One stage's spend, for the `✓ Stage` line run.sh prints as it ends.
 
     Cost belongs on that line rather than on a second one the GUI appends when
     its own metrics arrive: two ✓ lines for one stage, separated by later stages'
     output, read as the run having gone backwards.
     """
+    # With a label, answer for THAT attempt. The rollup's per-stage entry sums
+    # every attempt of the stage, so attempt 2's ✓ line was reporting attempt 1's
+    # money as well as its own.
+    if label:
+        base = audit_dir()
+        if base is not None:
+            return _spent(_spend_by_label(Path(base) / "metrics").get(label))
     for stage in (data or {}).get("stages") or []:
         if stage.get("key") != key:
             continue
@@ -403,14 +414,88 @@ def format_stage(data: Optional[Dict[str, Any]], key: str) -> str:
     return ""
 
 
+def _spend_by_label(directory: Path) -> Dict[str, dict]:
+    """What each step spent, keyed by its printed label.
+
+    The label is the key because it already distinguishes the attempts —
+    "[03/04] Fix (attempt 2)" — and the rollup folds a stage that ran twice into
+    one entry. On a retry loop that walks a chain of locators, attributing every
+    attempt's spend to the first one is the difference between "the model wrote
+    this fix" and "it did not".
+    """
+    spend: Dict[str, dict] = {}
+    for row in _read_jsonl(directory / "llm-calls.jsonl"):
+        slot = spend.setdefault(row.get("stage_label") or row.get("stage") or "",
+                                {"cost_usd": 0.0, "calls": 0, "output_tokens": 0})
+        slot["cost_usd"] += float(row.get("cost_usd") or 0.0)
+        slot["calls"] += 1
+        slot["output_tokens"] += int(row.get("output_tokens") or 0)
+    return spend
+
+
+def _spent(money: Optional[dict]) -> str:
+    """`$0.1234 · 2 calls · 1,419 out`, or nothing when no call was made."""
+    if not money or not money.get("calls"):
+        return ""
+    return (f"${money['cost_usd']:.4f} · {money['calls']} "
+            f"call{'' if money['calls'] == 1 else 's'} · "
+            f"{money['output_tokens']:,} out")
+
+
+def _duration(seconds: float) -> str:
+    """Mirrors fmt_duration in shared/session.sh, so both tables read alike."""
+    seconds = int(seconds or 0)
+    return f"{seconds // 60}m {seconds % 60}s" if seconds >= 60 else f"{seconds}s"
+
+
+def format_table(base: Optional[Path] = None) -> str:
+    """The end-of-run table: every step, in order, with what it spent.
+
+    Built from the per-attempt rows rather than the rollup, because the rollup
+    folds a stage that ran twice into one entry — and "which attempt cost the
+    money" is the whole question when a retry loop walks a chain of locators.
+
+    A step with no model call says so. Printing $0.0000 there reads as missing
+    data, when it is the thing this agent is trying to achieve.
+    """
+    base = base or audit_dir()
+    if base is None:
+        return ""
+    directory = Path(base) / "metrics"
+    if not directory.is_dir():
+        return ""
+
+    spend = _spend_by_label(directory)
+    rows = _read_jsonl(directory / "stages.jsonl")
+    if not rows:
+        return ""
+    # Wide enough for the longest label this run produced, rather than a number
+    # that happens to suit one agent's step names and truncates another's.
+    width = max(40, max(len(r.get("label") or r.get("key") or "") for r in rows))
+
+    lines = []
+    for row in rows:
+        label = row.get("label") or row.get("key") or ""
+        detail = _spent(spend.get(label)) or "no model call"
+        lines.append(
+            f"  {label:<{width}} {_duration(row.get('duration_s')):>8}   {detail}")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     # `python3 -m shared.metrics` — roll up and print the summary. Used by run.sh.
     # `--stage <key>` prints just that stage's spend, for its own ✓ line.
     import sys as _sys
-    _data = rollup()
-    if len(_sys.argv) > 2 and _sys.argv[1] == "--stage":
-        _line = format_stage(_data, _sys.argv[2])
+    if len(_sys.argv) > 1 and _sys.argv[1] == "--table":
+        # Per-step, per-attempt spend. Reads the streams directly, so it needs
+        # no rollup and works on a run that was killed part-way.
+        _line = format_table()
     else:
-        _line = format_summary(_data)
+        _data = rollup()
+        if len(_sys.argv) > 2 and _sys.argv[1] == "--stage":
+            _line = format_stage(_data, _sys.argv[2],
+                                 _sys.argv[3] if len(_sys.argv) > 3 else "")
+        else:
+            _line = format_summary(_data)
     if _line:
         print(_line)

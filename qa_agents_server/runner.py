@@ -1129,6 +1129,14 @@ def _mark_step_done(run: RunState, key: str) -> dict:
         session = metrics_reader.read_session_metrics(run.audit_dir)
         exact = metrics_reader.step_metrics(session, key)
         if exact:
+            # run.sh appends the stage's stages.jsonl row only AFTER the step's
+            # JSON file lands, so a rollup rebuilt in that window has a stage
+            # entry (built from the step's tool/LLM rows) whose duration is
+            # still the 0.0 placeholder. Taking it would report a step that
+            # really took minutes as "0s"; the measured span is right until the
+            # agent's own row arrives.
+            if not exact.get("duration_s"):
+                exact.pop("duration_s", None)
             slot.update(exact)          # agent-side duration_s overrides the estimate
     except Exception:
         pass
@@ -1224,6 +1232,8 @@ def _audit_watcher(run: RunState) -> None:
                 # The retry rewrote the step's file: judge that outcome, not the
                 # previous attempt's, or a fix that passed on attempt 2 stays red.
                 status = _step_status(_safe_load_json(run.audit_dir / fname))
+                if status == "running":
+                    continue          # another attempt is coming; nothing to report yet
                 run.step_progress[key] = status
                 _append_event(run, "step", {
                     "key": key, "display": display, "status": status,
@@ -1239,6 +1249,18 @@ def _audit_watcher(run: RunState) -> None:
                 # or failed). _step_status() reads each step's own result
                 # vocabulary to tell the two apart.
                 step_status = _step_status(_safe_load_json(file_path))
+                if step_status == "running":
+                    # The step wrote its file but says run.sh will retry it.
+                    # Leave it running and re-read on the next poll: marking it
+                    # done here is what let a mid-retry attempt show as failed
+                    # while the next attempt was already starting.
+                    if run.step_progress.get(key) is None:
+                        run.step_progress[key] = "running"
+                        _append_event(run, "step", {
+                            "key": key, "display": display, "status": "running",
+                            **_mark_step_running(run, key),
+                        })
+                    continue
                 run.step_progress[key] = step_status
                 payload = _mark_step_done(run, key)
                 run.step_metrics.setdefault(key, {})["_emitted_attempts"] = \

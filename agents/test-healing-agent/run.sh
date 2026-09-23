@@ -145,6 +145,7 @@ if [[ "$MODE" == "local" ]]; then
     # step 00 has already written the explanation — there is nothing to fix, so
     # running the fix and ship steps would only produce noise.
     log "Nothing to fix — see $AUDIT_DIR/00-reproduce.md"
+    flush_step_done
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     sed -n '3,12p' "$AUDIT_DIR/00-reproduce.md" 2>/dev/null || true
@@ -195,17 +196,18 @@ PYALERT
 }
 trap 'on_error $LINENO' ERR
 
-# ── Step 01 — Locate ─────────────────────────────────────────────────────────
-# Work out which element each broken locator meant, deterministically, before any
-# model call. Never edits a file — 01_fix decides what to do with the result — so
-# the worst case here is a model call the run would have made anyway.
-run_step "[02/04] Locate" "python3 '$AGENT_DIR/actions/01_locate.py'" locate
-
-# ── Step 02 — Fix (with retry loop) ──────────────────────────────────────────
-# Each attempt now either fixes an element or proves it cannot, and an attempt
-# that repairs one locator and uncovers the next keeps its edit — so the loop
-# walks a chain of broken locators instead of re-guessing at one. Two was enough
-# for a single locator; a chain needs room to finish.
+# ── Steps 01 + 02 — Locate, then Fix, once per attempt ───────────────────────
+# One broken locator hides the next: the test cannot reach locator #2 until #1 is
+# repaired and it is re-run. So Locate runs inside the loop, working each time
+# from the artifacts the last verification run wrote — that is what makes every
+# link of a chain deterministic instead of only the first. It never edits a file
+# (01_fix decides what to do with the result) and costs about a second, which is
+# nothing beside the test run it precedes.
+#
+# The loop stops when 01_fix says so. The budget it applies counts attempts that
+# made NO progress: an edit that repairs one locator and uncovers the next leaves
+# the run red but is not a failed retry, and charging it as one meant a long chain
+# could never finish. See retry_verdict in 01_fix.py.
 HEALING_RETRY_COUNT="${HEALING_RETRY_COUNT:-4}"
 if [[ -n "${MAX_FIX_ATTEMPTS:-}" ]]; then
   log "NOTE: MAX_FIX_ATTEMPTS is set but no longer read — use HEALING_RETRY_COUNT (currently $HEALING_RETRY_COUNT)"
@@ -213,18 +215,28 @@ fi
 FIX_ATTEMPT=1
 
 while true; do
+  LOCATE_LABEL="[02/04] Locate"
+  if [[ "$FIX_ATTEMPT" -gt 1 ]]; then
+    LOCATE_LABEL="[02/04] Locate (attempt $FIX_ATTEMPT)"
+  fi
+  # Exported before EACH step, not once per pass: run_step unsets it on the way
+  # out, so a single export at the top of the loop reached Locate and left Fix
+  # recording every attempt as attempt 1 — which is what attributes the spend.
   export STEP_ATTEMPT="$FIX_ATTEMPT"
-  run_step "[03/04] Fix (attempt $FIX_ATTEMPT/$HEALING_RETRY_COUNT)" \
+  run_step "$LOCATE_LABEL" \
+    "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_locate.py'" locate
+
+  export STEP_ATTEMPT="$FIX_ATTEMPT"
+  run_step "[03/04] Fix (attempt $FIX_ATTEMPT)" \
     "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_fix.py'" fix
 
-  FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
-
-  if [[ "$FIX_RESULT" == "true" || "$FIX_RESULT" == "skipped" ]]; then
-    break
-  fi
-
-  if [[ "$FIX_ATTEMPT" -ge "$HEALING_RETRY_COUNT" ]]; then
-    log "Fixes still failing after $FIX_ATTEMPT attempt(s) — proceeding to ship (will escalate)"
+  # Missing means the step never got far enough to decide — stop rather than
+  # loop on a file nobody wrote.
+  RETRY_VERDICT=$(tr -d '\n' < "$AUDIT_DIR/.fix-retry" 2>/dev/null || echo "stop: no verdict written")
+  if [[ "$RETRY_VERDICT" != "retry" ]]; then
+    if [[ "$RETRY_VERDICT" == stop:* ]]; then
+      log "${RETRY_VERDICT#stop: }"
+    fi
     break
   fi
 
@@ -260,14 +272,13 @@ else
 fi
 
 # ── Final summary ─────────────────────────────────────────────────────────────
+flush_step_done
 TOTAL_ELAPSED=$(elapsed_since $SESSION_START)
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log "Done. Total time: $(fmt_duration $TOTAL_ELAPSED)"
 echo ""
-for i in "${!STEP_NAMES[@]}"; do
-  printf "  %-50s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
-done
+print_step_table 50
 
 # Roll up now so the spend is on screen with the timings rather than only in
 # metrics.json. The EXIT trap re-runs this; a rollup is idempotent.
@@ -296,18 +307,34 @@ for a in history:
     if not a.get("entries"):
         print(f"    attempt {n}: nothing applied")
         continue
+    # One edit is recorded once per failing test it covers, so a locator three
+    # tests shared printed its description and diff three times over. Group on
+    # the change itself; the verdicts below it say which test got which result,
+    # which was the only thing that ever differed between those copies.
+    groups = {}
     for e in a["entries"]:
-        verdict = e.get("outcome", "?")
-        if e.get("reverted"):
-            verdict += ", reverted"
         tgt = Path(e["target_file"]).name if e.get("target_file") else "-"
-        print(f"    attempt {n}: {tgt} — {verdict}")
         why = e.get("fix_description") or e.get("unfixable_reason") or ""
+        diff = "\n".join(l for l in (e.get("fix_diff") or "").splitlines()
+                         if l.startswith(("+", "-")) and not l.startswith(("+++", "---")))
+        verdict = e.get("outcome", "?") + (", reverted" if e.get("reverted") else "")
+        tests = e.get("test_names") or [e.get("test_name")]
+        groups.setdefault((tgt, why, diff), {}).setdefault(verdict, []).extend(
+            t.rsplit(".", 1)[-1] for t in tests if t)
+
+    for (tgt, why, diff), verdicts in groups.items():
+        head = f"    attempt {n}: {tgt}"
+        if len(verdicts) == 1:
+            head += f" — {next(iter(verdicts))}"
+        print(head)
         if why:
             print(f"      {why[:150]}")
-        for line in (e.get("fix_diff") or "").splitlines():
-            if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
-                print(f"      {line[:150]}")
+        for line in diff.splitlines():
+            print(f"      {line[:150]}")
+        for verdict, tests in verdicts.items():
+            label = f"{verdict}: " if len(verdicts) > 1 else ""
+            if label or len(tests) > 1:
+                print(f"      {label}{', '.join(tests)}"[:150])
 PYSUM
 fi
 echo ""

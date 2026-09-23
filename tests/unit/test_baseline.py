@@ -120,3 +120,49 @@ class TestDiff:
         result = baseline.diff({"available": False}, {"url": "x"}, None)
         assert result["available"] is False
         assert baseline.is_different_page(result) is False
+
+
+class TestPreserve:
+    """The bug this pins: a session destroys the baselines it is about to need.
+
+    The framework re-records a page's baseline whenever a test that walks
+    through it passes — so a class where four tests pass and one fails rewrites
+    four pages' worth before the failure is even diagnosed, and a repair that
+    greens a test does it again. Locate then asks for "the page when it last
+    worked", is handed a record written two minutes ago, and correctly refuses it
+    as younger than the failure it would explain. On a real run that cost the
+    second locator of a chain its deterministic answer and sent it to the model.
+    """
+
+    def _tree(self, root: Path) -> Path:
+        source = root / "live"
+        (source / "saucedemo").mkdir(parents=True)
+        (source / "pending").mkdir(parents=True)
+        (source / "saucedemo" / "LoginPage.json").write_text('{"recordedAt": "old"}')
+        (source / "saucedemo" / "ProductsPage.json").write_text('{"recordedAt": "old"}')
+        (source / "NaukriLoginPage.json").write_text('{"recordedAt": "old"}')
+        (source / "pending" / "half.json").write_text("{}")
+        return source
+
+    def test_the_module_layout_survives_the_copy(self, tmp_path):
+        # Two modules can each own a LoginPage, so a flat copy loses the answer.
+        assert baseline.preserve(self._tree(tmp_path), tmp_path / "kept") == 3
+        assert (tmp_path / "kept" / "saucedemo" / "ProductsPage.json").exists()
+        assert (tmp_path / "kept" / "NaukriLoginPage.json").exists()
+
+    def test_a_half_written_baseline_is_not_preserved(self, tmp_path):
+        baseline.preserve(self._tree(tmp_path), tmp_path / "kept")
+        assert not (tmp_path / "kept" / "pending").exists()
+
+    def test_nothing_to_copy_is_not_an_error(self, tmp_path):
+        assert baseline.preserve(tmp_path / "missing", tmp_path / "kept") == 0
+        assert baseline.preserve(None, tmp_path / "kept") == 0
+
+    def test_the_copy_is_what_load_reads_afterwards(self, tmp_path):
+        source = self._tree(tmp_path)
+        baseline.preserve(source, tmp_path / "kept")
+        # The live tree is then rewritten by this session, as a passing test does.
+        (source / "saucedemo" / "ProductsPage.json").write_text('{"recordedAt": "new"}')
+        found = baseline.path_for("ProductsPage", None, str(tmp_path / "kept"),
+                                  module="saucedemo")
+        assert json.loads(found.read_text())["recordedAt"] == "old"

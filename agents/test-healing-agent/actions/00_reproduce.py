@@ -40,6 +40,7 @@ from shared import diagnosis
 from shared import workspace as workspace_helper
 from shared.git import run_git
 from shared import failure_context as _failure_context
+from shared import baseline as baseline_store
 from shared import narration, run_artifacts
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -401,6 +402,21 @@ def main():
         properties["repairMode"] = "true"
         log("REPAIR=true — parking the browser on the failing page")
 
+    # Copy the recorded good-run fingerprints BEFORE anything runs. The run is
+    # about to overwrite them: the framework re-records a page's baseline on a
+    # passing test, so a class where four tests pass and one fails rewrites the
+    # baselines of every page the four walked through — and a repair that greens
+    # a test does it again. Locate then asks for "the page when it last worked"
+    # and is handed a record written minutes ago, which it correctly refuses as
+    # younger than the failure it would explain. That is how the second locator
+    # in a chain lost its baseline and went to the model instead.
+    preserved_baselines = AUDIT_DIR / "baselines"
+    kept = baseline_store.preserve(baseline_store.directory(workspace),
+                                   preserved_baselines)
+    log(f"{kept} baseline(s) preserved for this session" if kept else
+        "no recorded baselines to preserve — locator resolution will have no "
+        "reference for this run")
+
     log("Running the test to reproduce the failure...")
     # Anything older than this belongs to an earlier run, whatever it is named.
     # A second of slack absorbs filesystem timestamp granularity.
@@ -462,6 +478,10 @@ def main():
             "dom_snapshot": "", "failure_url": "", "trace_path": "", "failed_selector": "",
             "screenshot": "",
             "cause_group_key": "", "cause_group_size": 1,
+            # The copy taken before this run started. Every later reader —
+            # diagnosis here, Locate on each attempt — prefers it over the live
+            # tree, which this session is busy rewriting.
+            "healing_baseline_dir": str(preserved_baselines) if kept else "",
         }
         trace_selector = attach_artifacts(issue, results_dir, entry_method,
                                           not_before=run_started)

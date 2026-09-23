@@ -117,6 +117,37 @@ def _stored_session_path(workspace, helper_source: str, method: str) -> Optional
     }
 
 
+# `TestDataReader.loadCsvRowByColumnValue("saucedemo", "users", "user_key", key, env)`
+# — the data method's own call, with the module, file and key column it reads.
+# Matched by shape rather than by class name so a repo that wraps or renames the
+# reader still resolves; the three leading string literals are the contract.
+_CSV_READ = re.compile(
+    r"\b(\w*[Cc]sv\w*)\s*\(\s*\"([^\"]+)\"\s*,\s*\"([^\"]+)\"\s*,\s*\"([^\"]+)\"\s*(,[^;]*)?\)")
+
+
+def _data_source(helper_source: str, data_method: str) -> Dict:
+    """Where `data_method` actually reads its row from. {} when it cannot be read.
+
+    The test does not hold its credentials; it names a row — `getUser("standard")`
+    — and the helper knows which file and column that row lives in. Reading the
+    helper is what turns "some CSV under this module, probably" into the file the
+    test itself opens. Without it a caller has to scan for a file that looks
+    right, and "looks right" is how you sign in as the wrong user.
+    """
+    body = method_body(helper_source or "", data_method or "")
+    match = _CSV_READ.search(body)
+    if not match:
+        return {}
+    _call, module, csv_file, column, extra = match.groups()
+    return {
+        "kind": "csv", "module": module, "file": csv_file, "column": column,
+        # The environment-aware overload takes a fifth argument and requires the
+        # row to match it. The four-argument form does not look at environment
+        # at all, so demanding one would reject a perfectly good row.
+        "environment_scoped": bool(extra and extra.strip(" ,")),
+    }
+
+
 def extract(workspace, test_id: str) -> Dict:
     """The entry path the named test uses. See the module docstring for modes."""
     result: Dict = {"mode": "none", "test": test_id, "reason": "",
@@ -177,6 +208,9 @@ def extract(workspace, test_id: str) -> Dict:
             return {**result, "mode": "credential", "helper": fqcn,
                     "method": called, "data_method": data_method,
                     "data_arg": data_arg,
+                    # Which file and column that row name refers to, read from
+                    # the helper rather than guessed at by the caller.
+                    "data_source": _data_source(helper_source, data_method),
                     "reason": f"the test calls {called}() with "
                               f"{data_method}(\"{data_arg}\")"}
 

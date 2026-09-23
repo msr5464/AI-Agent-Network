@@ -346,6 +346,7 @@ login session, or when the flow ends in something that cannot be undone. See
 | `HEALING_MODEL` | `claude-opus-4-6` | Claude model for fix generation |
 | `HEALING_BRANCH_PREFIX` | `healing` | Branch prefix. Full name: `<prefix>/<session-id>` — one branch per run |
 | `HEALING_RETRY_COUNT` | `4` | Retry cycles if tests still fail after fix — enough to walk a chain of broken locators |
+| `DIAGNOSIS_MODE` | `shadow` | Whether the failure diagnosis may stop a run. `shadow` logs what it would have stopped and changes nothing; `enforce` ends the run on a stop verdict before any model call. Measure yours with `scripts/diagnosis_soak.py` |
 | `HEALING_MAX_FIXES_PER_RUN` | `5` | Max tests to fix per session |
 | `TEST_RUNNER_CMD` | auto-detect | Override test runner. Placeholders: `{class}` `{class_simple}` `{method}` |
 | `REPO_CONTEXT_FILE` | `CONVENTIONS.md` | Path to conventions file (relative to automation repo root, or absolute). Falls back to the bundled `agents/test-healing-agent/CONVENTIONS.md`. |

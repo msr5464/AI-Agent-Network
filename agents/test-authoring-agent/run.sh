@@ -497,14 +497,13 @@ else
 fi
 
 # ── Final summary ─────────────────────────────────────────────────────────────
+flush_step_done
 TOTAL_ELAPSED=$(elapsed_since $SESSION_START)
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log "Done. Total time: $(fmt_duration $TOTAL_ELAPSED)"
 echo ""
-for i in "${!STEP_NAMES[@]}"; do
-  printf "  %-55s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
-done
+print_step_table 55
 
 # Roll up now so the spend is on screen with the timings rather than only in
 # metrics.json. The EXIT trap re-runs this; a rollup is idempotent.

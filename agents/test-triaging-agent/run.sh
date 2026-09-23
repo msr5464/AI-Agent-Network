@@ -139,14 +139,13 @@ stop_check review
 run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'" ship
 
 # ── Final summary ─────────────────────────────────────────────────────────────
+flush_step_done
 TOTAL_ELAPSED=$(elapsed_since $SESSION_START)
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log "Done. Total time: $(fmt_duration $TOTAL_ELAPSED)"
 echo ""
-for i in "${!STEP_NAMES[@]}"; do
-  printf "  %-50s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
-done
+print_step_table 50
 echo ""
 log "Audit: $AUDIT_DIR"
 

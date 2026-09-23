@@ -2,22 +2,28 @@
 """
 Step 01 — Locate
 
-Work out which element a broken locator meant, and prove it by performing the
-step. No model call: the answer comes from comparing the failing page against a
-fingerprint recorded while the locator still worked, and is then verified by
-executing the action and checking a post-condition.
+Work out which element a broken locator meant, from the evidence the failing run
+already wrote. No model call and no browser: the answer comes from comparing the
+fingerprint recorded while the locator still worked against the fingerprint
+capture taken at the moment it failed, and the new selector is proved unique
+against the DOM saved beside it.
 
-Two halves, as designed. The failure-time fingerprint array written beside the
-DOM snapshot is ranked offline, which needs no browser and costs milliseconds.
-Only the top candidates are then verified live, which is the part that separates
-a plausible match from a working one — and the part every published
-relocalization tool skips.
+Locate used to drive the application to recreate the failure — signing in,
+minting sessions, filling a form — so it could click the candidate and watch it
+work. That is where it spent its time and where it broke: one `Page.fill`
+timeout, five tests, nothing resolved, having asked a live site for something
+that was already sitting in two JSON files on disk. It was also duplicated work.
+Fix applies the edit and re-runs the real test, which is a stronger proof than a
+click in a scratch browser and happens either way.
+
+So the division of labour is: Locate proposes, with its evidence and with
+refusals it can defend; Fix applies, and the test proves.
 
 Writes a resolution per locator. Applying it is 01_fix's job; this step never
 edits a file, so a wrong answer here cannot reach the repo on its own.
 
 Reads:   HANDOFF_FILE, AUDIT_DIR, WORKSPACE_DIR, GITHUB_REPO_AUTOMATION,
-         HEALING_LOCATE_MODE (shadow|enforce), HEALING_LOCATE_STORAGE_STATE
+         HEALING_LOCATE_MODE (shadow|enforce)
 Outputs: audit/<session>/01-locate.json + 01-locate.md
 
 Exits 0 in every non-crash case. "No baseline for this locator" and "this is not
@@ -29,7 +35,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → shared.*
@@ -41,33 +47,34 @@ def log(msg): _log("locate", msg)
 import yaml
 
 from shared import baseline as baseline_store
-from shared import browser_mode
-from shared import entry_path, mint_session, session_state
 from shared import dom_snapshot, failure_context, locator_assertions, page_identity
-from shared import locator_capture
+from shared import locator_capture as capture
+from shared import locator_emit as emit_mod
 from shared import workspace as workspace_helper
-from shared import locator_resolve as engine
-from shared import locator_verify
+from shared import locator_resolve as engine          # baseline_for: pure, no browser
+from shared.locator_candidates import Candidate
+from shared import locator_decide as decide_mod
+from shared.locator_score import Volatility
 
 AUDIT_DIR    = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT    = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 HANDOFF_FILE = Path(os.environ["HANDOFF_FILE"])
 CONFIG_FILE  = Path(os.environ.get("HEALING_LOCATE_CONFIG", REPO_ROOT / "config" / "locator.yaml"))
 
-# shadow: locate, verify, record what we would have done, and change nothing.
-# enforce: 01_fix applies a verified resolution instead of calling the model.
+# shadow: locate, record what we would have done, and change nothing.
+# enforce: 01_fix applies a resolution instead of calling the model.
 #
 # Shadow is the default for the same reason DIAGNOSIS_MODE is: this step can
 # refuse work the agent used to attempt, and that risk deserves a measurement
 # rather than a leap.
 HEALING_LOCATE_MODE = os.environ.get("HEALING_LOCATE_MODE", "shadow").strip().lower()
 
-STORAGE_STATE = os.environ.get("HEALING_LOCATE_STORAGE_STATE", "")
-# Minting runs the test's own login through maven, so it costs a minute the
-# first time. Worth it: the alternative is refusing every locator on a page
-# the replay never actually reached.
-MINT_SESSION = os.environ.get("LOCATE_MINT", "true").strip().lower() != "false"
-SESSION_MIN_S = int(os.environ.get("LOCATE_SESSION_MIN_S", "60"))
+# Which Fix attempt this run precedes. One broken locator hides the next: the
+# test cannot reach locator #2 until #1 is repaired and it is re-run, so Locate
+# runs once per attempt and works from what the last verification run wrote.
+FIX_ATTEMPT = int(os.environ.get("FIX_ATTEMPT", "1") or 1)
+
+HEALED, NO_HEAL = "HEALED", "NO_HEAL"
 
 
 def _workspace() -> Path | None:
@@ -135,9 +142,9 @@ _TRACE_CLASS = re.compile(r"\b([A-Z]\w+)\.java\b")
 def _owner_hint(issue: dict) -> str:
     """The page object the failure itself names. Empty when nothing does.
 
-    Two independent records point at it and this step read neither: the failure
-    context the framework wrote while the element was failing, which names the
-    page object it belongs to, and the stack frame the assertion was raised from.
+    Two independent records point at it: the failure context the framework wrote
+    while the element was failing, which names the page object it belongs to, and
+    the stack frame the assertion was raised from.
     """
     context = issue.get("failure_context") or ""
     if isinstance(context, dict):
@@ -191,249 +198,181 @@ def _declaring_field(sources: dict, failed_selector: str, prefer: str = ""):
     return chosen
 
 
-def _failure_fingerprints(issue: dict) -> list:
-    """The element array captured beside the DOM snapshot at failure time.
-
-    Re-deriving these from the saved HTML would lose bounding boxes and computed
-    ARIA roles, which is most of what separates two similar candidates.
-    """
+def _snapshot_path(issue: dict) -> Path | None:
     path = issue.get("dom_snapshot") or issue.get("dom_snapshot_path") or ""
-    if not path or not Path(path).exists():
-        return []
+    return Path(path) if path and Path(path).exists() else None
+
+
+def _failure_capture(issue: dict) -> tuple[dict, dict]:
+    """(snapshot header, element capture) written at failure time.
+
+    The capture is the whole input to the search. Re-deriving it from the saved
+    HTML would lose bounding boxes and computed ARIA roles, which is most of what
+    separates two similar candidates — and computed visibility, which is what
+    separates a candidate from one nobody can click. The header comes back too
+    because it carries `capturedAt`, which decides which baselines may be used.
+    """
+    path = _snapshot_path(issue)
+    if path is None:
+        return {}, {}
     try:
-        header = dom_snapshot.parse_header(Path(path).read_text(errors="ignore")[:2000])
+        header = dom_snapshot.parse_header(path.read_text(errors="ignore")[:2000])
     except OSError:
-        return []
+        return {}, {}
     sidecar = header.get("fingerprints") or ""
     if not sidecar or not Path(sidecar).exists():
-        return []
+        return header, {}
     try:
-        return (json.loads(Path(sidecar).read_text()) or {}).get("elements") or []
+        return header, json.loads(Path(sidecar).read_text()) or {}
     except (OSError, ValueError):
-        return []
+        return header, {}
 
 
-def _headless(workspace) -> bool:
-    """Launch the browser the way the run was asked to.
+def _emit_offline(el: dict, vol: Volatility, soup, prints: dict) -> dict | None:
+    """The first selector on the ladder that matches THIS element and only it.
 
-    Not cosmetic. Some sites serve a bot-block page to a headless browser, and a
-    verdict reached on "Access Denied" is worse than no verdict — every locator
-    looks removed and the page looks like the wrong one.
+    `locator_emit.emit` asks a live page the same question with `count()`.
+    `selector_visibility` asks the saved DOM, and cross-checks the one node it
+    finds against the capture's own visibility record — so a selector that
+    resolves to something nobody could have clicked is rejected here too.
 
-    HEADLESS_BROWSER governs, as it does for every other browser in the
-    network; failing that, follow the framework's own answer in
-    parameters/config.properties rather than guessing.
-
-    The bot-block case does not get its own switch. A manual variable is no
-    defence against something nobody knows to set it for — the suite-level
-    circuit breaker in locator_resolve is, because it trips on the signature
-    itself: twenty locators that all look removed at once.
+    Requiring (1, 1) also disposes of a latent bug for free: `candidates_for`
+    emits `[data-testid=…]` for any test id, which matches nothing on a page that
+    spells the attribute `data-test`. That candidate scores (0, 0) and the ladder
+    moves on, exactly as the live count used to make it.
     """
-    decided = browser_mode.configured()
-    if decided is not None:
-        return decided
-    from_framework = baseline_store.framework_property(workspace, "headless")
-    return (from_framework or "true").strip().lower() != "false"
-
-
-def _headless_source() -> str:
-    """Which setting decided it. Worth logging: a browser in the wrong mode
-    explains a whole run's worth of odd verdicts, and nothing else says so."""
-    if browser_mode.configured() is not None:
-        return f"from {browser_mode.ENV_VAR}"
-    return "from parameters/config.properties"
-
-
-# A page object whose name says it is where you sign in, and a URL that says the
-# same. Either alone is weak; the pair is what the check below asks for.
-_SIGN_IN_CLASS = re.compile(r"(login|signin|sign_in|auth)", re.I)
-_SIGN_IN_URL = re.compile(r"/(login|signin|sign-in|auth)(/|\?|$)", re.I)
-
-
-def _is_sign_in_page(class_name: str, url: str) -> bool:
-    """Whether the page holding this locator is the one you sign in on.
-
-    Named by the page object OR by the URL: a repo may call it AuthPage while the
-    route is /nlogin/login, and either naming is enough to make authenticating
-    before the examination the wrong move.
-    """
-    return bool(_SIGN_IN_CLASS.search(class_name or "")
-                or _SIGN_IN_URL.search(url or ""))
-
-
-def _entry(workspace: Path | None, issue: dict) -> dict:
-    """How this test signs in, read from its own setup. {} when unknown.
-
-    entry_path expects Class#method; the handoff carries Class.method. A method
-    name starts lower-case and a class name does not, which is what separates
-    "…WebTest.toggleDot" from a bare "…WebTest".
-    """
-    if not workspace:
-        return {}
-    test_id = issue.get("test_name") or ""
-    tail = test_id.rsplit(".", 1)
-    if "#" not in test_id and len(tail) == 2 and tail[1][:1].islower():
-        test_id = f"{tail[0]}#{tail[1]}"
-    try:
-        return entry_path.extract(workspace, test_id) or {}
-    except Exception as exc:                         # noqa: BLE001 - advisory only
-        log(f"  could not read the test's entry path ({type(exc).__name__})")
-        return {}
-
-
-_USER_FIELD = re.compile(r"user|email|login|mobile|phone", re.I)
-_PASS_FIELD = re.compile(r"pass|pwd|secret", re.I)
-_SUBMIT_FIELD = re.compile(r"login|signin|sign_in|submit|continue", re.I)
-
-
-def _login_fields(workspace: Path, module: str) -> dict:
-    """The sign-in page object's username / password / submit selectors.
-
-    Found by shape rather than by name: a repo names these LoginPage, SignInPage
-    or AuthPage, and the fields inside them are usernameField / emailInput /
-    mobileNo. Guessing wrong here is cheap — the replay simply fails and we fall
-    back to refusing, which is what happens today anyway.
-    """
-    roots = list((workspace / "src" / "main" / "java").rglob("*Login*.java"))
-    roots += list((workspace / "src" / "main" / "java").rglob("*SignIn*.java"))
-    preferred = [r for r in roots if module and module in str(r).lower()]
-    for source_file in (preferred or roots):
-        try:
-            declared = page_identity.extract_locators(source_file.read_text(errors="ignore"))
-        except OSError:
+    for cand in emit_mod.candidates_for(el, vol):
+        if emit_mod.VOLATILE_SELECTOR.search(cand["sel"]):
             continue
-        found = {}
-        for entry in declared:
-            name, selector = entry.get("name") or "", entry.get("selector") or ""
-            if not selector:
-                continue
-            if "user" not in found and _USER_FIELD.search(name) and not _PASS_FIELD.search(name) \
-                    and not _SUBMIT_FIELD.search(name):
-                found["user"] = selector
-            elif "password" not in found and _PASS_FIELD.search(name):
-                found["password"] = selector
-            elif "submit" not in found and _SUBMIT_FIELD.search(name):
-                found["submit"] = selector
-        if {"user", "password", "submit"} <= set(found):
-            return found
-    return {}
-
-
-def _login_replay(workspace: Path | None, issue: dict, entry: dict, target_url: str):
-    """Sign in the way the test does, in the browser we are about to search with.
-
-    Restoring a saved session is the cheaper route and the one Locate tried first,
-    but it is not universal: this site binds a session to a short-lived bot-manager
-    cookie and refuses a restored one in a fresh browser, so the replay landed on
-    the sign-in page with a session that was, by every local check, perfectly
-    valid. Performing the login is the only replay that is true by construction —
-    it is what the test itself does.
-
-    Returns None when anything is missing, because a half-configured login is a
-    worse answer than an honest refusal.
-    """
-    if not workspace or entry.get("mode") != "credential" or not target_url:
-        return None
-    parts = [part for part in (issue.get("test_name") or "").split(".") if part]
-    module = parts[1].lower() if len(parts) > 2 else ""
-
-    props = mint_session.read_properties(mint_session.properties_path(workspace))
-    keys = [k for k in (entry.get("arg_keys") or []) if k]
-    values = [props.get(k) for k in keys]
-    if len(values) < 2 or not all(values):
-        return None
-    username, password = values[0], values[1]
-
-    login_url = ""
-    for key in (f"{module}.login.url", f"{module}LoginUrl", f"{module}.url"):
-        if props.get(key):
-            login_url = props[key]
-            break
-    fields = _login_fields(workspace, module)
-    if not login_url or not fields:
-        return None
-
-    def replay(page):
-        page.goto(login_url)
-        page.fill(fields["user"], username)
-        page.fill(fields["password"], password)
-        page.click(fields["submit"])
-        try:
-            # The click starts a navigation that has not committed yet; going
-            # straight to the target races the redirect and one of them aborts.
-            page.wait_for_url(lambda url: "login" not in url.lower(), timeout=30_000)
-        except Exception:                            # noqa: BLE001 - best effort
-            pass
-        page.goto(target_url)
-
-    log(f"  replaying the sign-in the test performs ({', '.join(keys)})")
-    return replay
-
-
-def _storage_state(workspace: Path | None, issue: dict) -> str | None:
-    """The signed-in session to replay with, established the way the test does.
-
-    Globbing loginStorage/ for the newest file was wrong twice over. It answered
-    "is there a session for this module?" when the question is "how does THIS test
-    sign in" — and this repo has tests that never touch a stored session, so it
-    handed the replay a file the test does not use. And it validated that file by
-    mtime, which says nothing: an expired session still parses, the browser still
-    accepts it, and the flow simply lands on a login page. Every locator then looks
-    missing and the honest-looking verdict is WRONG_STATE, blaming a page that was
-    never examined.
-
-    `entry_path` already reads the test's own setup and `session_state` already
-    audits cookie expiry — both written for the adaptation agent, both skipped here.
-    """
-    if STORAGE_STATE:
-        return STORAGE_STATE if Path(STORAGE_STATE).exists() else None
-    if not workspace:
-        return None
-
-    test_id = issue.get("test_name") or ""
-    parts = [part for part in test_id.split(".") if part]
-    module = parts[1].lower() if len(parts) > 2 else ""
-    if not module:
-        return None
-
-    entry = _entry(workspace, issue)
-
-    mode = entry.get("mode")
-    # The default headroom is sized for adaptation's long exploration. A locate
-    # replay is seconds, and sites like this one rotate short-lived bot-manager
-    # cookies every couple of minutes — demanding five minutes of life from those
-    # would re-mint a perfectly good session on every run.
-    state = session_state.usable(workspace, module, min_remaining_s=SESSION_MIN_S)
-    if state.get("ok"):
-        log(f"  session: {Path(state['path']).name} — {entry_path.describe(entry)}")
-        return str(state["path"])
-
-    if mode == "credential":
-        # The test signs in with credentials, so there is nothing stale to
-        # apologise for — mint the session by making the very call it makes.
-        if not MINT_SESSION:
-            log(f"  no usable session and LOCATE_MINT=false — replaying "
-                f"unauthenticated ({entry_path.describe(entry)})")
-            return None
-        log(f"  no usable session — minting one: {entry_path.describe(entry)}")
-        result = mint_session.mint(workspace, module, entry,
-                                   headless=_headless(workspace), log=log)
-        if result.get("ok") and result.get("path"):
-            log(f"  session minted: {Path(result['path']).name}")
-            return str(result["path"])
-        log(f"  could not mint a session ({result.get('reason', 'unknown')}) — "
-            f"replaying unauthenticated")
-        return None
-
-    # A stored-session test with no usable session: say which cookies died,
-    # rather than pointing at a config key that would not help.
-    log(f"  {state.get('reason', 'no usable session')}")
+        if dom_snapshot.selector_visibility(cand["sel"], soup, prints) == (1, 1):
+            return emit_mod._flag(cand)
     return None
 
 
+def _resolve_offline(baseline: dict, prints: dict, soup, cfg: dict, vol: Volatility):
+    """Rank every captured element against the baseline, then write a locator.
+
+    Returns (emitted, candidate, decision). `emitted` is None when the decision
+    refused, or when no candidate could be expressed as a unique selector — two
+    outcomes the caller must keep apart, which is why the decision comes back too.
+    """
+    base_el = baseline["element"]
+    cands = []
+    for el in capture.scorable(prints.get("elements") or []):
+        c = Candidate(index=el["index"], el=el)
+        # The tier the live search would have assigned by querying the page for
+        # the baseline's own identity attributes. It is what lets `decide` accept
+        # a unique test id without demanding a margin over the runner-up.
+        if base_el.get("testid") and el.get("testid") == base_el["testid"]:
+            c.tiers.add("T1_identity")
+        elif base_el.get("id") and el.get("id") == base_el["id"]:
+            c.tiers.add("T1_identity")
+        cands.append(c)
+
+    ranked = decide_mod.rank(cands, baseline, cfg, vol)
+    decision = decide_mod.decide(ranked, cfg)
+    if not decision.proceed:
+        return None, None, decision
+
+    # Genuine near-ties only. Falling through to a lower-scoring DIFFERENT element
+    # because the winner could not be expressed is how a healer silently rebinds a
+    # test; that is a failure of emit, not evidence for the runner-up.
+    pool = [c for c in ranked[:cfg["budgets"]["candidates_to_verify"]]
+            if decision.top.score - c.score < cfg["thresholds"]["margin"]]
+    for cand in pool:
+        emitted = _emit_offline(cand.el, vol, soup, prints)
+        if emitted:
+            return emitted, cand, decision
+    return None, None, decision
+
+
+def _heals_in_window(baseline: dict, cfg: dict) -> int:
+    """How many times this locator has been healed inside the history window.
+
+    A locator that keeps breaking needs a stable test id, not a fourth heal.
+    """
+    window = datetime.now(timezone.utc) - timedelta(
+        days=cfg["budgets"]["heal_history_window_days"])
+    recent = 0
+    for entry in baseline.get("history") or []:
+        try:
+            if datetime.fromisoformat(entry["healed_at"]) > window:
+                recent += 1
+        except (KeyError, TypeError, ValueError):
+            continue
+    return recent
+
+
+def _previous_attempt() -> tuple[dict, list]:
+    """(last Fix result, last Locate resolutions). Empty on the first attempt.
+
+    Both files sit in the audit session and hold the previous attempt's view: Fix
+    rewrites 01-fix.json as it finishes, Locate rewrites 01-locate.json as it
+    starts. Reading them is what lets this run work on the failure that exists
+    NOW rather than the one the handoff describes.
+    """
+    if FIX_ATTEMPT <= 1:
+        return {}, []
+
+    def load(name: str) -> dict:
+        try:
+            return json.loads((AUDIT_DIR / name).read_text()) or {}
+        except (OSError, ValueError):
+            return {}
+
+    return load("01-fix.json"), load("01-locate.json").get("resolutions") or []
+
+
+def _issues(handoff: dict, previous_fix: dict) -> list:
+    """The failures to work on: the handoff's, or what is left of them.
+
+    An attempt that repaired one locator and uncovered the next wrote the NEW
+    failure down, refreshed from the artifacts its verification run produced — a
+    new selector, a new DOM capture, a new page object. Carrying the handoff
+    forward instead would hand this run a selector that has already been repaired
+    and a capture taken before the edit. Filtered and overlaid exactly as 01_fix
+    does it, so both steps work from the same set.
+    """
+    issues = handoff.get("automation_issues") or []
+    if FIX_ATTEMPT <= 1 or not previous_fix:
+        return issues
+    failed = previous_fix.get("failed_fixes") or []
+    refreshed = {f["test_name"]: f["next_issue"] for f in failed if f.get("next_issue")}
+    names = {f.get("test_name") for f in failed}
+    return [refreshed.get(i.get("test_name"), i) for i in issues
+            if i.get("test_name") in names]
+
+
+def _already_tried(previous_fix: dict, previous_locate: list) -> set:
+    """Selectors whose located answer was applied and left the test still failing.
+
+    Fix reverts an edit that helped nobody, so the source holds the broken
+    selector again and this step would resolve it to the same answer, for ever.
+    The retry exists to try something ELSE, which is the model's job — so refuse
+    here rather than hand Fix an answer it has already disproved.
+    """
+    healed = {r.get("failed_selector") for r in previous_locate
+              if r.get("verdict") == HEALED}
+    return {f.get("failed_selector") for f in (previous_fix.get("failed_fixes") or [])
+            if f.get("status") == "test_failed" and f.get("failed_selector") in healed}
+
+
+def _merge(previous: list, current: list) -> list:
+    """This attempt's resolutions over the earlier ones, keyed by test+selector.
+
+    A chain is repaired one link per attempt, so the file has to hold all of
+    them: reporting only the last link would credit one heal to a run that made
+    four. Keys are distinct per link — a different selector every time — and an
+    entry for the same key is this attempt's, which is the newer answer.
+    """
+    keyed = {(r.get("test_name"), r.get("failed_selector")): r for r in previous}
+    keyed.update({(r.get("test_name"), r.get("failed_selector")): r for r in current})
+    return list(keyed.values())
+
+
 def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
-               workspace: Path, browser) -> dict:
-    """One locator: identify it, rank offline, then prove it live."""
+               vol: Volatility, workspace: Path) -> dict:
+    """One locator: identify it, rank it against the failure capture, write it."""
     failed = issue.get("failed_selector") or ""
     record = {
         "test_name": issue.get("test_name", ""),
@@ -464,10 +403,67 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
         record["verdict"] = "NO_DECLARATION"
         return record
     record["locator_id"] = f"{class_name}#{field}"
+    record["page_object"], record["field"] = class_name, field
 
-    captured_at = (issue.get("failure_context") or {}).get("captured_at", "") \
-        if isinstance(issue.get("failure_context"), dict) else ""
-    stored = baseline_store.load(class_name, workspace, not_after=captured_at,
+    # Heal how a test FINDS an element; never what it VERIFIES. A healed assertion
+    # locator turns a caught regression into a green build, which is the exact
+    # failure this whole system exists to avoid.
+    if field in assertion_used and not cfg["classify"].get("heal_assertions", False):
+        record["verdict"], record["classification"] = NO_HEAL, "ASSERTION_LOCATOR"
+        record["reason"] = ("locator is read by an assertion — reported for review, "
+                            "never auto-healed")
+        return record
+
+    snapshot = _snapshot_path(issue)
+    header, prints = _failure_capture(issue)
+    if not prints.get("elements"):
+        record["verdict"] = "NO_CAPTURE"
+        record["reason"] = (
+            "the failure DOM was shipped without its element capture — nothing to "
+            "search. The framework writes one beside every snapshot; check the "
+            "handoff's dom_snapshot path still exists" if snapshot else
+            "the handoff carries no DOM snapshot for this failure — nothing to search")
+        return record
+    html = snapshot.read_text(errors="ignore")
+    soup = page_identity.parse(html)
+    if soup is None:
+        record["verdict"] = "NO_CAPTURE"
+        record["reason"] = "the failure DOM could not be parsed — cannot prove a selector unique"
+        return record
+
+    # Is this locator drift at all? The old live search answered that by resolving
+    # the failing selector on the page before searching for a replacement; the
+    # capture answers it just as well. A selector that still matches was not what
+    # broke — the element was hidden, late or covered — and a new selector cannot
+    # fix any of those. None means the selector could not be evaluated, which is
+    # not the same as matching nothing, so it falls through rather than refusing.
+    still_matching = dom_snapshot.selector_visibility(failed, soup, prints)
+    if still_matching is not None and still_matching[0]:
+        matches, visible = still_matching
+        record["verdict"], record["classification"] = NO_HEAL, "NOT_LOCATOR"
+        record["reason"] = (
+            f"{failed!r} still matches {matches} element(s) in the DOM captured at "
+            f"failure" + (f", {visible} of them visible — the element was there, so "
+                          f"this is a timing or obstruction problem, not locator drift"
+                          if visible else
+                          ", none of them visible — the element was present but "
+                          "hidden, which a new selector cannot fix"))
+        return record
+
+    # Which baselines may stand as evidence. `baseline_not_after` is set by Fix
+    # once it has repaired something this session and pins the cutoff to the
+    # ORIGINAL failure: a baseline younger than that was written during the
+    # repair — a passing sibling test promotes every locator on the page it
+    # touched — and a record made while repairing says nothing about the page
+    # before it. This capture's own timestamp is the right answer on a first look.
+    cutoff = issue.get("baseline_not_after") or header.get("capturedAt", "")
+    # The copy taken before this session ran anything, when there is one. Without
+    # it the live tree is read — and a run that greens a test re-records the very
+    # page the next link of the chain needs, so the answer that was on disk at
+    # session start is gone by the time anything asks for it.
+    stored = baseline_store.load(class_name, workspace,
+                                 issue.get("healing_baseline_dir") or None,
+                                 not_after=cutoff,
                                  module=baseline_store.module_of(issue.get("test_name", "")))
     if not stored.get("available"):
         record["verdict"] = "NO_BASELINE"
@@ -475,114 +471,113 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
             f"no recorded good run for {class_name} — nothing to compare against")
         return record
 
-    baseline = engine.baseline_for(class_name, field, raw, stored,
-                                   action=_action_for(issue))
+    baseline = engine.baseline_for(class_name, field, raw, stored)
     if baseline is None:
         record["verdict"] = "NO_BASELINE"
         record["reason"] = (f"{class_name} has a baseline but no fingerprint for "
                             f"{field} — it did not resolve on the last good run")
         return record
 
-    # Prefer the repo's own page comparison over the engine's landmark fallback:
-    # baseline.diff weighs url shape, title, body class and locator coverage
-    # together and demands corroboration before calling a page "different".
-    comparison = None
-    snapshot_path = issue.get("dom_snapshot") or issue.get("dom_snapshot_path") or ""
-    if snapshot_path and Path(snapshot_path).exists():
-        try:
-            facts = page_identity.page_facts(
-                Path(snapshot_path).read_text(errors="ignore"))
-            comparison = baseline_store.diff(stored, facts)
-        except Exception:                          # noqa: BLE001 - advisory only
-            comparison = None
-
-    url = issue.get("failure_url") or stored.get("url_shape") or ""
-    if not url or browser is None:
-        record["verdict"] = "UNVERIFIED"
-        record["reason"] = ("no reachable page to verify against; "
-                            "offline ranking only")
+    healed_before = _heals_in_window(baseline, cfg)
+    if healed_before >= cfg["budgets"]["heal_history_max"]:
+        record["verdict"], record["classification"] = NO_HEAL, "UNSTABLE_LOCATOR"
+        record["reason"] = (f"healed {healed_before}x in "
+                            f"{cfg['budgets']['heal_history_window_days']}d — "
+                            f"needs a stable test id, not another selector")
         return record
 
-    # Two ways to reach an authenticated page, best first. Signing in is true by
-    # construction — it is the test's own entry path — so it is tried ahead of a
-    # restored session, which some sites decline in a fresh browser however valid
-    # the cookies look locally.
-    #
-    # Unless the failing page IS the sign-in page. Authenticating first is then
-    # self-defeating: the site redirects a signed-in visitor away from /login, so
-    # the replay examines the post-login home page, finds none of the login
-    # page's locators, and reports WRONG_STATE about a page it never opened. That
-    # is precisely what happened to this login button.
-    if _is_sign_in_page(class_name, url):
-        log(f"  {class_name} is the sign-in page — examining it signed out, "
-            f"because signing in first would redirect away from it")
-        entry, replay, storage_state = {}, None, None
-    else:
-        entry = _entry(workspace, issue)
-        replay = _login_replay(workspace, issue, entry, url)
-        storage_state = None if replay else _storage_state(workspace, issue)
-        if replay is None and storage_state is None:
-            log("  no way to authenticate this replay — the page cannot be verified; "
-                "mint a session with scripts/mint_session.py --module <module> --headed")
-    page = browser.new_page(viewport=locator_capture.VIEWPORT,
-                            storage_state=storage_state)
-    try:
-        result = engine.heal(page, baseline, cfg, url, browser=browser,
-                             storage_state=storage_state, replay=replay,
-                             assertion_fields=assertion_used,
-                             page_comparison=comparison,
-                             failure_elements=_failure_fingerprints(issue))
-    finally:
-        page.close()
+    # Is this even the right page? Searching a page the test never reached finds a
+    # plausible element every time, which is the most expensive way to be wrong.
+    # baseline.diff weighs url shape, title, body class and locator coverage
+    # together and demands corroboration before calling a page "different".
+    # Every locator on this page object EXCEPT the one that failed. Counting the
+    # failing one is circular: it is absent by definition, that is the whole
+    # report — and on a page object whose only evaluable locator is the broken
+    # one it made "nothing matches" the verdict every time, refusing a page the
+    # test was demonstrably on.
+    coverage = page_identity.locator_coverage(
+        page_identity.extract_locators(sources.get(class_name, "")), soup)
+    details = {d["name"]: d["count"] for d in coverage.get("details") or []
+               if d.get("name") and d["name"] != field and isinstance(d.get("count"), int)}
+    comparison = baseline_store.diff(
+        stored, page_identity.page_facts(html, soup), {"details": details})
+    if baseline_store.is_different_page(comparison):
+        record["verdict"], record["classification"] = NO_HEAL, "WRONG_STATE"
+        record["reason"] = ("the DOM captured at failure is not the page this locator "
+                            "belongs to: "
+                            + "; ".join((comparison.get("mismatches") or ["identity differs"])[:2]))
+        return record
+
+    started = time.time()
+    emitted, cand, decision = _resolve_offline(baseline, prints, soup, cfg, vol)
+    record["elapsed_ms"] = int((time.time() - started) * 1000)
+    record["rejected"] = [
+        {"tag": r.el["tag"], "name": r.el.get("accessible_name"),
+         "score": round(r.score, 3), "tier": r.best_tier}
+        for r in (decision.runners or [])]
+
+    if emitted is None:
+        record["verdict"] = NO_HEAL
+        if decision.proceed:
+            record["classification"] = "NO_STABLE_LOCATOR"
+            record["reason"] = ("found the element but could not express it as a stable "
+                                "unique locator — it needs a test id")
+        elif decision.outcome == decide_mod.NONE:
+            record["classification"] = "ELEMENT_GONE"
+            record["reason"] = decision.reason
+        else:
+            record["classification"] = "LOW_CONFIDENCE"
+            record["reason"] = decision.reason
+        if decision.top is not None:
+            record["score"] = round(decision.top.score, 3)
+            record["margin"] = round(decision.margin, 3)
+        return record
+
+    # Nothing to change. The answer is already in the file — an earlier attempt
+    # applied it, or a PR did — so the failure this was read from is older than
+    # the source. Reporting it as a heal produces an edit that changes nothing
+    # and spends an attempt saying so.
+    if emitted["sel"] == raw:
+        record["verdict"], record["classification"] = NO_HEAL, "ALREADY_CURRENT"
+        record["reason"] = (f"{class_name}#{field} already declares {raw!r} — this "
+                            f"failure predates the file and has nothing left to fix")
+        return record
 
     record.update({
-        "verdict": result.verdict,
-        "classification": result.classification,
-        "reason": result.reason,
-        "score": round(result.score, 3),
-        "margin": round(result.margin, 3),
-        "tier": result.tier,
-        "verification": result.verification,
-        "elapsed_ms": result.elapsed_ms,
-        "page_object": class_name,
-        "field": field,
-        "rejected": result.top_rejected,
-        "attempts": result.attempts,
+        "verdict": HEALED,
+        "classification": "LOCATOR_STALE",
+        "reason": decision.reason,
+        "score": round(cand.score, 3),
+        "margin": round(decision.margin, 3),
+        "tier": cand.best_tier,
+        # What stands behind the answer. Not "executed": Fix applies the edit and
+        # runs the real test, and claiming a proof this step did not perform is
+        # how an unverified fix gets reported as a verified one.
+        "verification": "unique in the failure capture",
+        "new_locator": emitted["sel"],
+        "new_expression": emitted.get("java") or f'page.locator("{emitted["sel"]}")',
+        "strategy": emitted.get("strategy"),
+        "fragile": emitted.get("fragile"),
     })
-    if result.emitted:
-        record["new_locator"] = result.emitted.get("sel")
-        record["new_expression"] = (result.emitted.get("java")
-                                    or f'page.locator("{result.emitted["sel"]}")')
-        record["strategy"] = result.emitted.get("strategy")
-        record["fragile"] = result.emitted.get("fragile")
     return record
-
-
-def _action_for(issue: dict) -> str:
-    """What the failing step was doing, from the runtime error."""
-    text = (issue.get("error_message") or "") + (issue.get("root_cause") or "")
-    lowered = text.lower()
-    if "enter data" in lowered or "fill" in lowered or "type" in lowered:
-        return "fill"
-    if "select" in lowered:
-        return "select"
-    return "click"
 
 
 def main() -> int:
     started = time.time()
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
     cfg = yaml.safe_load(CONFIG_FILE.read_text())
+    vol = Volatility(cfg)
 
     handoff = json.loads(HANDOFF_FILE.read_text())
-    issues = handoff.get("automation_issues") or []
-    log(f"{len(issues)} issue(s) from the handoff; mode={HEALING_LOCATE_MODE}")
+    previous_fix, previous_locate = _previous_attempt()
+    issues = _issues(handoff, previous_fix)
+    tried = _already_tried(previous_fix, previous_locate)
 
     workspace = _workspace()
     if workspace is None:
         log("WORKSPACE_DIR/GITHUB_REPO_AUTOMATION not set — cannot read page objects")
-        _write({"mode": HEALING_LOCATE_MODE, "resolutions": [], "reason": "no workspace"},
-               started)
+        _write({"mode": HEALING_LOCATE_MODE, "resolutions": previous_locate,
+                "reason": "no workspace"}, started)
         return 0
 
     sources = _page_object_sources(workspace)
@@ -591,61 +586,80 @@ def main() -> int:
               for declared in page_identity.extract_locators(source)
               if declared.get("name")}
     assertion_used = locator_assertions.assertion_fields(sources, fields)
+
+    # One broken locator fails every test that walks past it. Fix already clusters
+    # on that; Locate did not, and ran the identical search five times over for one
+    # login button. The failure names the locator, so the grouping needs nothing
+    # the resolution itself produces.
+    groups: dict = {}
+    for issue in issues:
+        groups.setdefault(
+            ((issue.get("failed_selector") or ""), _owner_hint(issue)), []).append(issue)
+    source = ("still failing after attempt %d" % (FIX_ATTEMPT - 1)
+              if FIX_ATTEMPT > 1 else "from the handoff")
+    log(f"{len(issues)} issue(s) {source}, {len(groups)} distinct locator(s); "
+        f"mode={HEALING_LOCATE_MODE}")
     if assertion_used:
         log(f"{len(assertion_used)} locator(s) are read by assertions and will not be healed")
 
-    browser = None
-    playwright = None
-    try:
-        from playwright.sync_api import sync_playwright
-        playwright = sync_playwright().start()
-        headless = _headless(workspace)
-        browser = playwright.chromium.launch(headless=headless)
-        log(f"browser: {browser_mode.label(headless)} ({_headless_source()})")
-    except Exception as exc:                       # noqa: BLE001 - optional capability
-        log(f"no browser available ({type(exc).__name__}) — offline ranking only")
-
     resolutions = []
-    try:
-        for issue in issues:
-            # Per issue, deliberately. One `Page.goto` timeout used to propagate
-            # out of this loop and end the whole step: five issues in, nothing
-            # resolved, a traceback written where the resolutions belonged, and
-            # every fix that a deterministic answer would have covered sent to
-            # the model instead. A page that will not load is one locator's bad
-            # luck, not a verdict on the other four.
-            try:
-                resolution = locate_one(issue, sources, assertion_used, cfg,
-                                        workspace, browser)
-            except Exception as exc:               # noqa: BLE001 - per-issue isolation
-                resolution = {
-                    "test_name": issue.get("test_name", ""),
-                    "failed_selector": issue.get("failed_selector", ""),
-                    "verdict": "SKIPPED",
-                    "reason": f"locate raised {type(exc).__name__}: "
-                              f"{str(exc).splitlines()[0][:160]}",
-                    "locator_id": "",
-                }
-            resolutions.append(resolution)
+    for members in groups.values():
+        # The member with a capture behind it. They share a locator, so any of them
+        # answers the question, but only one of them may have shipped the DOM.
+        issue = next((m for m in members if _snapshot_path(m)), members[0])
+        failed = issue.get("failed_selector") or ""
+        if failed in tried:
+            resolution = {
+                "test_name": issue.get("test_name", ""), "failed_selector": failed,
+                "verdict": NO_HEAL, "classification": "ALREADY_TRIED", "locator_id": "",
+                "reason": ("this answer was applied on an earlier attempt and the test "
+                           "still failed on the same element — the retry needs a "
+                           "different approach, not the same selector again"),
+            }
             _log_resolution(resolution)
-    finally:
-        if browser is not None:
-            browser.close()
-        if playwright is not None:
-            playwright.stop()
+            for member in members:
+                resolutions.append({**resolution, "test_name": member.get("test_name", "")})
+            continue
+        try:
+            resolution = locate_one(issue, sources, assertion_used, cfg, vol, workspace)
+        except Exception as exc:                       # noqa: BLE001 - per-locator isolation
+            # The whole message, not its first 160 characters. Truncating cut off
+            # exactly the half that says why — "waiting for locator(...)" — and
+            # left a line nobody could act on.
+            resolution = {
+                "test_name": issue.get("test_name", ""),
+                "failed_selector": issue.get("failed_selector", ""),
+                "verdict": "SKIPPED",
+                "reason": f"locate raised {type(exc).__name__}: {' '.join(str(exc).split())[:400]}",
+                "locator_id": "",
+            }
+        _log_resolution(resolution)
+        if len(members) > 1:
+            log(f"  same locator in {len(members)} failing tests — resolved once")
+        for member in members:
+            resolutions.append({**resolution, "test_name": member.get("test_name", "")})
 
-    located = [r for r in resolutions if r["verdict"] == "HEALED"]
+    located = [r for r in resolutions if r["verdict"] == HEALED]
     log(f"located {len(located)} of {len(resolutions)} deterministically "
         f"({'applied by fix' if HEALING_LOCATE_MODE == 'enforce' else 'shadow — fix unchanged'})")
 
+    # Every link of the chain, not just this attempt's. Fix matches a resolution
+    # by its failing selector and each link has a different one, so carrying the
+    # earlier answers costs nothing and keeps the report honest about the work.
+    all_resolutions = _merge(previous_locate, resolutions)
     _write({
         "mode": HEALING_LOCATE_MODE,
-        "attempted": len(resolutions),
-        "located": len(located),
-        "refused": len([r for r in resolutions
-                        if r["verdict"] not in ("HEALED", "SKIPPED")]),
-        "verdicts": _counts(resolutions),
-        "resolutions": resolutions,
+        "attempt": FIX_ATTEMPT,
+        "attempted": len(all_resolutions),
+        # Across every attempt, not just this one: a chain repaired link by link
+        # would otherwise report the last link as the whole run's work.
+        "distinct_locators": len({r.get("locator_id") or r.get("failed_selector")
+                                  for r in all_resolutions}),
+        "located": len([r for r in all_resolutions if r["verdict"] == HEALED]),
+        "refused": len([r for r in all_resolutions
+                        if r["verdict"] not in (HEALED, "SKIPPED")]),
+        "verdicts": _counts(all_resolutions),
+        "resolutions": all_resolutions,
     }, started)
     return 0
 
@@ -654,9 +668,9 @@ def _log_resolution(r: dict) -> None:
     """One console line per decision. The Live Run panel reads stdout, and a
     reviewer looking for *why* looks there rather than at a badge."""
     name = r.get("locator_id") or r.get("failed_selector", "")[:40]
-    if r["verdict"] == "HEALED":
+    if r["verdict"] == HEALED:
         log(f"{name}  {r.get('classification')}  score {r.get('score')} "
-            f"margin {r.get('margin'):+} tier {r.get('tier')} {r.get('verification')}")
+            f"margin {r.get('margin'):+} tier {r.get('tier')} — {r.get('verification')}")
         log(f"  -> {r.get('new_expression', '')[:110]}")
         for rejected in (r.get("rejected") or [])[:2]:
             log(f"  rejected: <{rejected['tag']}> {str(rejected['name'])[:28]!r} "
@@ -664,9 +678,8 @@ def _log_resolution(r: dict) -> None:
         if r.get("fragile"):
             log(f"  fragile: {r['fragile'][:100]}")
     else:
-        # Refusals carry the reason a human acts on — "set HEALING_LOCATE_STORAGE_STATE",
-        # "the feature was removed". Truncating at 90 characters cut off exactly
-        # the actionable half. The console scrolls; the advice should survive.
+        # Refusals carry the reason a human acts on — "no recorded good run",
+        # "the feature was removed". The console scrolls; the advice should survive.
         log(f"{name}  {r.get('classification') or r['verdict']} — {r.get('reason','')[:220]}")
 
 
@@ -689,18 +702,25 @@ def _write(payload: dict, started: float) -> None:
 
 
 def _markdown(payload: dict) -> str:
+    """One section per locator, not per test — five tests on one broken login
+    button are one piece of work and reading it five times says otherwise."""
+    resolutions = payload.get("resolutions", [])
+    by_locator = {r.get("locator_id") or r.get("failed_selector", "?"): r
+                  for r in resolutions}
+    located = [r for r in by_locator.values() if r.get("verdict") == HEALED]
     lines = [f"# Locate ({payload.get('mode')})", "",
-             f"- attempted: {payload.get('attempted', 0)}",
-             f"- located deterministically: {payload.get('located', 0)}",
-             f"- refused: {payload.get('refused', 0)}", ""]
-    for r in payload.get("resolutions", []):
-        lines.append(f"## {r.get('locator_id') or r.get('failed_selector', '?')}")
+             f"- {len(by_locator)} distinct locator(s) across "
+             f"{len({r.get('test_name') for r in resolutions})} failing test(s)",
+             f"- located deterministically: {len(located)}",
+             f"- refused: {len(by_locator) - len(located)}", ""]
+    for key, r in by_locator.items():
+        lines.append(f"## {key}")
         lines.append(f"- verdict: **{r.get('classification') or r['verdict']}** — {r.get('reason','')}")
         if r.get("new_expression"):
             lines += [f"- was: `{r.get('failed_selector')}`",
                       f"- now: `{r['new_expression']}`",
                       f"- score {r.get('score')} (margin {r.get('margin'):+}), "
-                      f"{r.get('tier')}, verification {r.get('verification')}"]
+                      f"{r.get('tier')}, {r.get('verification')}"]
         lines.append("")
     return "\n".join(lines)
 
@@ -718,7 +738,11 @@ if __name__ == "__main__":
         log(f"locate failed ({type(exc).__name__}: {exc}) — continuing to Fix")
         traceback.print_exc()
         try:
-            _write({"mode": HEALING_LOCATE_MODE, "resolutions": [],
+            # Keep the links already resolved: Fix reads this file to decide what
+            # it still has to ask the model, and an empty one would send it back
+            # to the model for answers this session already proved.
+            _write({"mode": HEALING_LOCATE_MODE, "attempt": FIX_ATTEMPT,
+                    "resolutions": _previous_attempt()[1],
                     "error": f"{type(exc).__name__}: {exc}"}, time.time())
         except Exception:                          # noqa: BLE001
             pass

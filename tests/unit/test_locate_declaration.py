@@ -25,8 +25,11 @@ sys.path.insert(0, str(ROOT))
 
 
 def _load():
-    import os
-    os.environ.setdefault("AUDIT_DIR", str(ROOT / "tests" / "fixtures"))
+    import os, tempfile
+    # A throwaway directory, not tests/fixtures: this leaks into the rest of the
+    # session, and anything that later writes a metrics row through AUDIT_DIR
+    # edits the fixture tree on every run of the suite.
+    os.environ.setdefault("AUDIT_DIR", tempfile.mkdtemp(prefix="locate-decl-"))
     os.environ.setdefault("HANDOFF_FILE", str(ROOT / "tests" / "fixtures" / "none.json"))
     path = ROOT / "agents" / "test-healing-agent" / "actions" / "01_locate.py"
     spec = importlib.util.spec_from_file_location("healing_locate_decl", path)
@@ -136,36 +139,3 @@ class TestOwnerHint:
 
     def test_nothing_named_is_empty(self):
         assert loc._owner_hint({}) == ""
-
-
-class TestSignInPage:
-    """The bug this pins: Locate signed in before examining a locator that lives
-    on the sign-in page.
-
-    `_login_replay` performs the login and then navigates to the failure URL —
-    which is /nlogin/login. A signed-in visitor is redirected away from it, so
-    the replay examined the post-login home page, found none of the login page's
-    locators, and reported WRONG_STATE about a page it never opened.
-    """
-
-    def test_named_by_the_page_object(self):
-        assert loc._is_sign_in_page("NaukriLoginPage", "") is True
-        assert loc._is_sign_in_page("AuthPage", "") is True
-        assert loc._is_sign_in_page("SignInPage", "") is True
-
-    def test_named_by_the_url(self):
-        # A repo may call it something else entirely; the route still says so.
-        assert loc._is_sign_in_page("EntryPage", "https://www.naukri.com/nlogin/login") is True
-        assert loc._is_sign_in_page("EntryPage", "https://x.com/sign-in") is True
-
-    def test_an_ordinary_page_is_not_one(self):
-        assert loc._is_sign_in_page("NaukriProfilePage",
-                                    "https://www.naukri.com/mnjuser/profile") is False
-
-    def test_a_url_merely_containing_the_word_is_not_enough(self):
-        # "/mnjuser/loginhistory" is not the sign-in page; the segment must be.
-        assert loc._is_sign_in_page("ProfilePage",
-                                    "https://x.com/mnjuser/loginhistory") is False
-
-    def test_nothing_known_is_not_one(self):
-        assert loc._is_sign_in_page("", "") is False

@@ -94,6 +94,41 @@ def directory(workspace=None, results_dirname: str = "test-output",
     return Path(workspace) / results_dirname / _DEFAULT_DIRNAME
 
 
+def preserve(source, destination) -> int:
+    """Copy the recorded good-run fingerprints into the session. Returns the count.
+
+    Two different things destroy them, and both happen on exactly the runs that
+    need them most. CI deletes the framework's results directory between builds.
+    And a run that repairs anything re-records the pages its now-passing tests
+    walk through — so a session overwrites the very baseline its next step is
+    about to ask for, and every later comparison is refused for being younger
+    than the failure it would explain.
+
+    So take the copy before anything runs. `directory(preserved=...)` prefers it
+    over the live tree from then on.
+
+    `source` is the caller's own answer to "where do baselines live" — the two
+    agents resolve it differently and neither should inherit the other's guess.
+    """
+    if source is None or not Path(source).exists():
+        return 0
+    source, target_root = Path(source), Path(destination)
+    copied = 0
+    # Recursive, keeping the layout: the framework stores baselines per module
+    # ({module}/{PageObject}.json), and a flat glob preserved none of those.
+    # Never pending/ — fingerprints from a test that had not finished.
+    for record in source.rglob("*.json"):
+        relative = record.relative_to(source)
+        if "pending" in relative.parts:
+            continue
+        target = target_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(record.read_text(encoding="utf-8", errors="ignore"),
+                          encoding="utf-8")
+        copied += 1
+    return copied
+
+
 def module_of(test_name: str) -> str:
     """`automation.checkout.CheckoutWebTest.placeOrder` → "checkout".
 
@@ -168,6 +203,11 @@ def load(page_object: str, workspace=None, preserved: Optional[str] = None,
         # did it resolve to", which is what a renamed or moved element needs.
         # Absent for baselines recorded before fingerprinting, hence the default.
         "fingerprints": data.get("fingerprints") or {},
+        # Every heal this page object has had, by field. Written by
+        # locator_patch.update_baseline and dropped here until now, which quietly
+        # disabled the circuit breaker that reads it: a locator that has broken
+        # three times needs a stable test id, not a fourth selector.
+        "healHistory": data.get("healHistory") or {},
         # Headings and landmark roles from the good run. Answers "are we on the
         # right screen" without depending on a URL, which a redirect leaves intact.
         "landmarks": data.get("landmarks") or [],

@@ -72,10 +72,27 @@ One session = one handoff file = one PR (or Slack escalation if fixes fail).
 ```
 run.sh (orchestrator)
   │
+  ├─ 01_locate.py [Python only]       Read handoff → match the baseline fingerprint
+  │                                   against the failure capture → propose a locator
   ├─ 01_fix.py    [Python + Claude]   Read handoff → inspect live DOM → fix locators
   │                                   → run tests → commit
   └─ 02_ship.py   [Python only]       Push branch → create PR → Slack notify
 ```
+
+**Locate proposes; Fix proves.** Locate is deterministic and offline: no model, no
+browser, no credentials. It scores the fingerprint recorded on the last good run
+against the element capture the framework wrote at the moment of failure, and
+proves the new selector unique against the DOM saved beside it. In `enforce` mode
+Fix applies that answer instead of calling the model — through the same edit
+guards, diff cap and test run as a model-written fix, which is what actually
+verifies it. It resolves one locator once however many tests it broke, and every
+refusal (`NO_BASELINE`, `NO_CAPTURE`, `ASSERTION_LOCATOR`, `UNSTABLE_LOCATOR`,
+`WRONG_STATE`, `LOW_CONFIDENCE`) hands the work back to Fix with its reason.
+
+It deliberately does **not** drive the application to recreate the failure —
+signing in, minting sessions, replaying a journey. It used to, and that is where
+it spent its time and where it broke; the capture is already the failure state,
+and Fix's test run is a better proof than a click in a scratch browser.
 
 **How a locator actually gets fixed.** A locator breaks because the DOM changed,
 so the correct new value exists nowhere in the source — inferring it from stale
@@ -247,6 +264,7 @@ source tree rather than 30.
 
 | Step | Owns | Does NOT do |
 |------|------|-------------|
+| **01 Locate** | Identify the owning page-object field, rank the failure capture against the baseline, emit a unique selector — once per attempt, so each link of a chain is resolved as the run uncovers it | No model, no browser, no credentials, no file edits |
 | **01 Fix** | Read handoff, build context, inspect live DOM, call Claude, apply edits, run test, commit | No DB, no HTML parsing |
 | **02 Ship** | Push branch, create PR, Slack notify | No AI, no code changes |
 
@@ -257,17 +275,30 @@ source tree rather than 30.
 ```
 agents/test-healing-agent/queue/<build_tag>.json   ← written by test-triaging-agent
     ↓
+01-locate.json              (one resolution per broken locator; accumulates across attempts)
+    ↓
 01-fix.json + .fix-passed   (per-test results, pr_branch)
+   + .fix-retry             (retry / stop: <reason> — the loop reads only this)
    + .skip-reason            (infra / no-work — controls whether the handoff is consumed)
+    ↓  (loop back to 01-locate.json while .fix-retry says retry)
     ↓
 02-ship.json                (pr_url, slack_notified)
     ↓
 queue/processed/<build_tag>.json   ← moved after completion
 ```
 
-**Retry loop (in run.sh):** If `.fix-passed=false`, re-runs `01_fix.py` up to `HEALING_RETRY_COUNT`
-(default 4 — each attempt either fixes an element or proves it cannot, so the loop walks a
-chain of broken locators rather than re-guessing at one).
+**Retry loop (in run.sh):** Locate and Fix both run inside it, once per attempt. One broken
+locator hides the next — the test cannot reach locator #2 until #1 is repaired and it is
+re-run — so Locate works each time from the artifacts the last verification run wrote, and
+every link of a chain gets a deterministic answer instead of only the first.
+
+`01_fix.py` decides when to stop and writes `.fix-retry`; run.sh just reads it. The budget
+counts attempts that made **no progress**: an edit that repairs one locator and moves the test
+on to the next one leaves the run red but is not a failed retry, and charging it as one meant a
+long chain could never finish. `HEALING_RETRY_COUNT` (default 4) caps consecutive attempts that
+moved nothing; `HEALING_MAX_ATTEMPTS` (default 12) is the absolute ceiling, so progress cannot
+spin forever. See `retry_verdict` in `01_fix.py`.
+
 A retry re-attempts **only the tests that actually failed** — fixes already applied and
 committed by an earlier attempt are carried forward into the report rather than redone.
 On retry, `01_fix.py` injects the previous test failure output into the Claude prompt so it
@@ -334,6 +365,21 @@ path-scoped commit for the fingerprints that actually changed — measured with
 `recordedAt` excluded, through `shared/baseline.py`, so two runs that differ only in
 their timestamp commit nothing. Never `git add -A`: this step holds a write token.
 
+**The session copies them before it starts.** The framework re-records a page's
+baseline whenever a test that walks through it passes — so a class where four tests
+pass and one fails rewrites four pages' worth before the failure is even diagnosed,
+and a repair that greens a test does it again. Every later reader then asks for "the
+page when it last worked" and is handed a record written minutes ago, which
+`baseline.load` correctly refuses as younger than the failure it would explain. On a
+real run that cost the second locator of a chain its deterministic answer and sent it
+to the model.
+
+`baseline.preserve()` takes the copy into `audit/<session>/baselines/` before the
+reproduce run and stamps `healing_baseline_dir` on every issue; the triaging agent
+does the same for the pipeline path (`artifacts.attach_baselines`). `baseline.load`
+and `baseline.directory` prefer that copy over the live tree, so what the session
+writes can never stand as evidence about the run before it.
+
 
 ## Fix Gate Values (.fix-passed)
 
@@ -363,8 +409,11 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `00-session-init.md` | run.sh | Session metadata |
 | `00-reproduce.json` + `.md` | Reproduce | Standalone only: what was run, the failure shape, why it did or did not proceed |
 | `00-handoff.json` | Reproduce | Standalone only: the synthesised handoff |
+| `baselines/` | Reproduce | The recorded good-run fingerprints, copied before this run could overwrite them |
 | `01-fix.json` + `.md` | Fix | Per-test context, diffs, test output |
+| `01-locate.json` + `.md` | Locate | Per-locator resolution and the reason for every refusal |
 | `.fix-passed` | Fix | Gate: true / false / skipped |
+| `.fix-retry` | Fix | `retry`, or `stop: <reason>` — the only thing run.sh's loop reads |
 | `02-ship.json` + `.md` | Ship | PR URL, Slack status |
 
 ---
@@ -400,7 +449,8 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `REPO_CONTEXT_FILE` | Path to conventions file in the automation repo (relative to repo root or absolute). If unset or not found, falls back to `agents/test-healing-agent/CONVENTIONS.md` bundled in this agent. |
 | `TEST_RUNNER_CMD` | Override test runner — use `{class}`, `{class_simple}`, `{method}` placeholders. Without it, runners are auto-detected at the repo root and one level down; if none is found, fixes are reported `unverified` |
 | `HEALING_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
-| `HEALING_RETRY_COUNT` | Max retry cycles if tests fail (default: 4) |
+| `HEALING_RETRY_COUNT` | Max **consecutive attempts that made no progress** before the loop gives up (default: 4). An attempt that repairs one locator and uncovers the next does not count |
+| `HEALING_MAX_ATTEMPTS` | Absolute ceiling on Locate+Fix attempts, however much progress is being made (default: 12) |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) |
 | `SLACK_BOT_TOKEN`, `SLACK_NOTIFY_CHANNEL` | Slack notifications on success |
 | `SLACK_ALERT_CHANNEL` | Slack channel for failures/partial fixes |

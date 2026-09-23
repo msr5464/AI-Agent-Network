@@ -261,3 +261,60 @@ def test_golden_log_reports_real_cli_numbers():
     # attributed to what actually ran, never to the --model flag.
     assert usage["model_resolved"] == "claude-sonnet-4-6"
     assert usage["by_model"]["claude-sonnet-4-6"]["output_tokens"] == 10805
+
+
+class TestPerStepSpend:
+    """What each step cost, per attempt.
+
+    Two bugs this pins, both from the run where Locate moved inside the retry
+    loop. The end-of-run table showed durations only, so a run whose fixes were
+    all located deterministically printed "$0.0000 · 0 calls" and read as
+    missing data rather than as the point. And the rollup folds a stage that ran
+    twice into one entry, so attempt 2's ✓ line reported attempt 1's money too.
+    """
+
+    @staticmethod
+    def _run(session: Path):
+        stages = [
+            {"index": 1, "key": "reproduce", "label": "[01/04] Reproduce",
+             "attempt": 1, "duration_s": 208.0},
+            {"index": 2, "key": "fix", "label": "[03/04] Fix (attempt 1)",
+             "attempt": 1, "duration_s": 219.0},
+            {"index": 3, "key": "fix", "label": "[03/04] Fix (attempt 2)",
+             "attempt": 2, "duration_s": 68.0},
+        ]
+        (session / "metrics").mkdir(exist_ok=True)
+        (session / "metrics" / "stages.jsonl").write_text(
+            "\n".join(json.dumps(s) for s in stages) + "\n")
+        (session / "metrics" / "llm-calls.jsonl").write_text("\n".join(json.dumps(c) for c in [
+            {"stage": "fix", "stage_label": "[03/04] Fix (attempt 1)", "attempt": 1,
+             "cost_usd": 0.2, "num_turns": 3, "output_tokens": 900},
+            {"stage": "fix", "stage_label": "[03/04] Fix (attempt 2)", "attempt": 2,
+             "cost_usd": 0.1, "num_turns": 1, "output_tokens": 300},
+        ]) + "\n")
+
+    def test_every_step_appears_with_what_it_spent(self, audit):
+        self._run(audit)
+        table = metrics.format_table(audit)
+        assert "[01/04] Reproduce" in table and "3m 28s" in table
+        assert "$0.2000 · 1 call · 900 out" in table
+        assert "$0.1000 · 1 call · 300 out" in table
+
+    def test_a_step_that_never_called_the_model_says_so(self, audit):
+        self._run(audit)
+        assert "no model call" in metrics.format_table(audit).splitlines()[0]
+
+    def test_an_attempt_is_not_charged_for_the_one_before_it(self, audit):
+        self._run(audit)
+        rollup = metrics.build_rollup(audit)
+        # Without a label the rollup answers for the whole stage — both attempts.
+        assert "$0.3000" in metrics.format_stage(rollup, "fix")
+        assert metrics.format_stage(rollup, "fix", "[03/04] Fix (attempt 2)") == (
+            "$0.1000 · 1 call · 300 out")
+
+    def test_nothing_recorded_yet_is_an_empty_table(self, audit):
+        assert metrics.format_table(audit) == ""
+
+    def test_a_run_that_needed_no_model_says_that_rather_than_zeroes(self):
+        assert metrics.format_summary({"totals": {"cost_usd": 0.0, "llm_calls": 0}}) == (
+            "$0.0000 · no model calls")

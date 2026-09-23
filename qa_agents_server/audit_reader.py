@@ -141,8 +141,23 @@ def _step_has_error(data: Optional[Dict]) -> bool:
     return False
 
 
+def _step_unfinished(data: Optional[Dict]) -> bool:
+    """Whether the step wrote this file mid-way and is still working.
+
+    A step that run.sh retries rewrites its own file on every attempt, and a
+    mid-run attempt legitimately ends with a failing gate — some tests repaired,
+    others still being worked on. Judging the file the moment it changed painted
+    the step red while the next attempt was starting. `final_attempt` is the
+    step's own statement that run.sh is done with it; a step that does not write
+    the key never retries, so its absence means finished.
+    """
+    return isinstance(data, dict) and data.get("final_attempt") is False
+
+
 def _step_status(data: Optional[Dict]) -> str:
-    """Chip state for one step's file: failed, skipped (did nothing), or done."""
+    """Chip state for one step's file: running, failed, skipped, or done."""
+    if _step_unfinished(data):
+        return "running"
     if _step_has_error(data):
         return "failed"
     return "skipped" if isinstance(data, dict) and data.get("status") == "skipped" else "done"
@@ -176,10 +191,13 @@ def _derive_status(session_dir: Path, ship_data: Optional[Dict],
     if (session_dir / ".interrupted").exists():
         return "interrupted"
 
-    # No ship.json — check if any step JSON carries an error flag.
+    # No ship.json — check if any step JSON carries an error flag. A step that
+    # says it is being retried is excluded: its file is a mid-run snapshot, and
+    # reading a failing gate off it reports the whole session failed while the
+    # next attempt is still running.
     for _, fname, _ in (steps or STEPS):
         data = _safe_load_json(session_dir / fname)
-        if data is not None and _step_has_error(data):
+        if data is not None and not _step_unfinished(data) and _step_has_error(data):
             return "failed"
 
     # Session init file exists → run started, just hasn't finished step 1 yet.

@@ -83,6 +83,24 @@ def _authenticated_url() -> str:
             f"{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}.git")
 
 
+def test_count(entries: list) -> int:
+    """How many TESTS these entries cover, not how many edits they are.
+
+    Clustering is the whole point of the fix step: one locator edit greens every
+    test that walked past it, so `fixes` holds one entry per edit and each entry
+    names the tests it repaired in `test_names`. Counting the entries reported
+    "Fixed 2" for a run that turned five tests green, in the PR title, the
+    summary table and the Slack message — the clustering was doing its job and
+    the reporting hid it. A failure entry is always exactly one test.
+    """
+    return sum(len(e.get("test_names") or [e.get("test_name")]) for e in entries)
+
+
+def tests_in(entry: dict) -> list:
+    """Every test one fix entry repaired, oldest field first for older files."""
+    return entry.get("test_names") or [entry.get("test_name", "unknown")]
+
+
 def short_name(test_name: str) -> str:
     """Return the simple class.method portion of a fully-qualified test name."""
     parts = test_name.split(".")
@@ -121,7 +139,8 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
     full_repo = f"{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}"
     build_tag = fix_data.get("build_tag", "unknown")
     fixes     = fix_data.get("fixes", [])
-    total     = len(fixes) + len(unverified_fixes) + len(failed_fixes)
+    n_fixed   = test_count(fixes)
+    total     = n_fixed + test_count(unverified_fixes) + len(failed_fixes)
 
     # Push branch. run_git swaps "origin" for a token-bearing URL for this one
     # command, so the credential never lands in .git/config.
@@ -139,9 +158,9 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
 
     # PR title reflects partial/full fix
     if failed_fixes or unverified_fixes:
-        pr_title = f"Healing: Fixed {len(fixes)}/{total} locator failures for {build_tag} [NEEDS-REVIEW]"
+        pr_title = f"Healing: Fixed {n_fixed}/{total} failing tests for {build_tag} [NEEDS-REVIEW]"
     else:
-        pr_title = f"Healing: Fixed {len(fixes)}/{total} locator failures for {build_tag} [PASSED]"
+        pr_title = f"Healing: Fixed {n_fixed}/{total} failing tests for {build_tag} [PASSED]"
 
     def target_name(f: dict) -> str:
         target = f.get("target_file") or f.get("test_file")
@@ -164,9 +183,16 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
 
     def fixed_line(f: dict) -> str:
         dom = " _(selector confirmed in a live browser)_" if f.get("dom_verified") else ""
-        return (f"- ✅ `{short_name(f.get('test_name', 'unknown'))}` — "
-                f"{f.get('fix_description', '')} (`{target_name(f)}`){dom}"
+        names = tests_in(f)
+        # One edit, every test it repaired. Naming only the first made a
+        # five-test fix read as a two-test one.
+        head = f"- ✅ `{short_name(names[0])}`" + (
+            f" _(+{len(names) - 1} more)_" if len(names) > 1 else "")
+        line = (f"{head} — {f.get('fix_description', '')} (`{target_name(f)}`){dom}"
                 f"{evidence_links(f)}")
+        for name in names[1:]:
+            line += f"\n  - ✅ `{short_name(name)}`"
+        return line
 
     fixed_lines = "\n".join(fixed_line(f) for f in fixes) or "_(none)_"
 
@@ -202,17 +228,18 @@ executed**. Review and run them manually before merging.
         validation = ("Every fix listed above was re-run locally and passed before this PR "
                       "was created.")
     elif fixes and unverified_fixes:
-        validation = (f"The {len(fixes)} fix(es) under **Fixed** were re-run locally and "
-                      f"passed. The {len(unverified_fixes)} under **Applied but NOT Verified** "
+        validation = (f"The {n_fixed} test(s) under **Fixed** were re-run locally and "
+                      f"passed. The {test_count(unverified_fixes)} under **Applied but NOT Verified** "
                       f"were not executed — no test runner was available.")
     else:
         validation = ("⚠️ **Nothing in this PR was verified by a test run** — no test runner "
                       "was available in the workspace.")
 
     status_tag = "NEEDS-REVIEW" if (failed_fixes or unverified_fixes) else "PASSED"
-    status_summary = (f"{len(fixes)}/{total} locator fixes verified and passing locally."
+    status_summary = (f"{n_fixed}/{total} failing tests verified and passing locally "
+                      f"({len(fixes)} locator edit(s))."
                       if not (failed_fixes or unverified_fixes)
-                      else f"{len(fixes)}/{total} locator fixes applied; manual review needed.")
+                      else f"{n_fixed}/{total} failing tests fixed; manual review needed.")
 
     all_files = {target_name(f) for f in (fixes + unverified_fixes + failed_fixes) if target_name(f) != "unknown file"}
     files_changed_count = len(all_files) or len(fixes)
@@ -297,9 +324,9 @@ def _build_slack_message(build_tag: str, fixes: list, unverified_fixes: list,
     Build a rich Slack message. Returns (channel, text).
     Uses SLACK_ALERT_CHANNEL if any failures, SLACK_NOTIFY_CHANNEL otherwise.
     """
-    total      = len(fixes) + len(unverified_fixes) + len(failed_fixes)
-    n_fixed    = len(fixes)
-    n_unverif  = len(unverified_fixes)
+    n_fixed    = test_count(fixes)
+    n_unverif  = test_count(unverified_fixes)
+    total      = n_fixed + n_unverif + len(failed_fixes)
     n_failed   = len(failed_fixes)
 
     if fix_gate == "skipped":
@@ -437,7 +464,9 @@ def main():
     (AUDIT_DIR / "02-ship.json").write_text(json.dumps(result, indent=2))
 
     # ── Write Markdown ─────────────────────────────────────────────────────────
-    total = len(fixes) + len(unverified_fixes) + len(failed_fixes)
+    n_fixed = test_count(fixes)
+    n_unverified = test_count(unverified_fixes)
+    total = n_fixed + n_unverified + len(failed_fixes)
     md_lines = [
         "# Ship Results",
         "",
@@ -450,16 +479,18 @@ def main():
         "| | Count |",
         "|---|---|",
         f"| Queued for fix | {total} |",
-        f"| ✅ Fixed (verified) | {len(fixes)} |",
-        f"| ⚠️ Applied but not verified | {len(unverified_fixes)} |",
+        f"| ✅ Fixed (verified) | {n_fixed} |",
+        f"| ⚠️ Applied but not verified | {n_unverified} |",
         f"| ❌ Could not fix | {len(failed_fixes)} |",
         f"| PR | {pr_url or 'Not created'} |",
         f"| Slack | {'Sent to ' + channel if slack_notified else 'Skipped'} |",
     ]
     if fixes:
-        md_lines += ["", "## Fixed Tests (verified)", ""]
+        md_lines += ["", f"## Fixed Tests (verified) — {len(fixes)} edit(s)", ""]
         for f in fixes:
-            md_lines.append(f"- ✅ `{short_name(f['test_name'])}` — {f.get('fix_description', '')}")
+            names = tests_in(f)
+            md_lines.append(f"- ✅ `{short_name(names[0])}` — {f.get('fix_description', '')}")
+            md_lines += [f"- ✅ `{short_name(n)}` — same edit" for n in names[1:]]
     if unverified_fixes:
         md_lines += ["", "## Applied but Not Verified", ""]
         for f in unverified_fixes:

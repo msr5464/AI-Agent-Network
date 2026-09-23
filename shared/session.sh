@@ -4,16 +4,15 @@
 # Usage (source, do not execute):
 #   source "$REPO_ROOT/shared/session.sh"
 #
-# Provides: log(), elapsed_since(), fmt_duration(), run_step()
+# Provides: log(), elapsed_since(), fmt_duration(), run_step(), flush_step_done(),
+#           print_step_table()
 # Sets:     SESSION_START (epoch seconds at time of sourcing)
 #
 # Callers track per-step timing with:
 #   declare -a STEP_NAMES=()
 #   declare -a STEP_DURATIONS=()
 # Then print the table at the end:
-#   for i in "${!STEP_NAMES[@]}"; do
-#     printf "  %-50s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
-#   done
+#   print_step_table 50        # 50 is the label width used by the fallback
 
 SESSION_START=$(date +%s)
 
@@ -56,6 +55,10 @@ _severity_color() {
 }
 
 log() {
+  # A "✓ <step>" marker closes a step, so it also closes any earlier step still
+  # holding its own ✓ back (see flush_step_done). This keeps the skip/reuse
+  # markers a run.sh logs directly in order with the ones run_step defers.
+  [[ "$*" == "✓ "* ]] && flush_step_done
   local msg
   msg="$(_redact_secrets "$*")"
   local color=""
@@ -74,6 +77,21 @@ elapsed_since() {
   echo $(( now - start ))
 }
 
+# The "✓ <step>" line is held back until the step's block is really over. Each
+# run.sh logs an epilogue after run_step returns — the handoff it wrote, the
+# change note it consumed, the retry it decided on — and those lines belong to
+# the step that produced them, so the ✓ that closes the step has to come after
+# them. Flushed by the next run_step, by each run.sh before its final summary,
+# and by the EXIT trap for the paths that exit early.
+_STEP_DONE_LINE=""
+
+flush_step_done() {
+  [[ -z "$_STEP_DONE_LINE" ]] && return 0
+  local line="$_STEP_DONE_LINE"
+  _STEP_DONE_LINE=""
+  log "$line"
+}
+
 fmt_duration() {
   local secs=$1
   if (( secs >= 60 )); then
@@ -81,6 +99,26 @@ fmt_duration() {
   else
     printf "%ds" "$secs"
   fi
+}
+
+# The end-of-run table: every step, its duration, and what it spent.
+#
+# Built from the metrics streams, so the spend is per ATTEMPT — a retry loop that
+# walks a chain of broken locators is the case where "which attempt cost the
+# money" is the only interesting question, and a rollup folds that away. Falls
+# back to the names and durations this shell collected if the streams cannot be
+# read, so the table never disappears just because metrics did.
+print_step_table() {
+  local width="${1:-50}" table=""
+  table=$(cd "${REPO_ROOT:-.}" && python3 -m shared.metrics --table 2>/dev/null || true)
+  if [[ -n "$table" ]]; then
+    echo "$table"
+    return 0
+  fi
+  local i
+  for i in "${!STEP_NAMES[@]}"; do
+    printf "  %-${width}s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
+  done
 }
 
 # Append one stage record to $AUDIT_DIR/metrics/stages.jsonl.
@@ -117,6 +155,8 @@ run_step() {
   local step_key="${3:-}"
   local step_start
   step_start=$(date +%s)
+  # Close the previous step first: its ✓ waited for that step's epilogue.
+  flush_step_done
   # A blank line before each step, so the log reads as one block per step.
   echo
   log "▶ $label"
@@ -139,15 +179,18 @@ run_step() {
   # Record before clearing — record_stage reads STEP_ATTEMPT.
   record_stage "$step_key" "$label" "${#STEP_NAMES[@]}" \
                "$step_start" "$(date +%s)" 0 false
-  unset STEP_KEY STEP_LABEL STEP_ATTEMPT
   # Spend goes on this line, as the stage ends and in stream order. The GUI used
   # to append its own "✓ <stage> — <time> · <cost>" when the step event's metrics
   # arrived, which landed after later stages had already logged output and read
   # as the run looping back to a stage that had long finished.
+  #
+  # The label goes with the key so a retried stage reports THIS attempt's spend
+  # rather than every attempt's so far.
   local spend=""
   [[ -n "$step_key" ]] && spend=$(cd "${REPO_ROOT:-.}" &&
-    python3 -m shared.metrics --stage "$step_key" 2>/dev/null || true)
-  log "✓ $label — $(fmt_duration $dur)${spend:+ · $spend}"
+    python3 -m shared.metrics --stage "$step_key" "$label" 2>/dev/null || true)
+  unset STEP_KEY STEP_LABEL STEP_ATTEMPT
+  _STEP_DONE_LINE="✓ $label — $(fmt_duration $dur)${spend:+ · $spend}"
 }
 
 # ── Metrics rollup ────────────────────────────────────────────────────────────
@@ -157,6 +200,7 @@ run_step() {
 # crashed still spent money, and its rollup is how that spend gets reported.
 finalize_metrics() {
   local rc=$?
+  flush_step_done
   [[ -z "${AUDIT_DIR:-}" ]] && return $rc
   METRICS_SUMMARY=$(cd "${REPO_ROOT:-.}" && python3 -m shared.metrics 2>/dev/null || true)
 

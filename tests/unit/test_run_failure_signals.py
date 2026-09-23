@@ -17,7 +17,8 @@ if str(ROOT) not in sys.path:
 import pytest                                                    # noqa: E402
 
 from shared.claude import ClaudeResult, usage_limit              # noqa: E402
-from qa_agents_server.audit_reader import _step_has_error        # noqa: E402
+from qa_agents_server.audit_reader import (_step_has_error,      # noqa: E402
+                                           _step_status)
 
 
 class TestUsageLimit:
@@ -121,3 +122,37 @@ class TestStepHasError:
         data = {"module": "SauceDemo", "items": [
             {"index": 1, "kind": "coverage_added", "escalate_only": False}]}
         assert _step_has_error(data) is False
+
+
+class TestARetriedStepHasNoOutcomeYet:
+    """A step run.sh will retry is not finished, so it has nothing to report.
+
+    The bug this pins: 01_fix.py rewrites 01-fix.json after every attempt, and a
+    mid-run attempt legitimately ends with the gate false — some tests repaired,
+    the rest still being worked on. The UI read that file the moment it changed,
+    saw `fix_gate: "false"`, and painted the Fix step red while attempt 2 was
+    starting. Nothing had failed; the step had not finished.
+    """
+
+    def test_a_failing_gate_mid_retry_reports_running(self):
+        data = {"fix_gate": "false", "final_attempt": False, "failed": 2}
+        assert _step_status(data) == "running"
+        assert _step_has_error(data) is True, \
+            "the gate really is false — it is the timing that makes it unreportable"
+
+    def test_the_last_attempt_still_reports_failed(self):
+        data = {"fix_gate": "false", "final_attempt": True, "failed": 2}
+        assert _step_status(data) == "failed"
+
+    def test_a_gate_that_passed_is_final_even_mid_loop(self):
+        # run.sh stops retrying the moment the gate passes, so this IS the last
+        # attempt however many were allowed.
+        data = {"fix_gate": "true", "final_attempt": True}
+        assert _step_status(data) == "done"
+
+    def test_a_step_that_never_retries_is_unaffected(self):
+        # Only 01-fix.json writes final_attempt; every other step's file must
+        # keep being judged the moment it appears.
+        assert _step_status({"ship_status": "push_failed"}) == "failed"
+        assert _step_status({"status": "skipped"}) == "skipped"
+        assert _step_status({"resolutions": []}) == "done"
