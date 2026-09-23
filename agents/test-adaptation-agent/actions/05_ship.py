@@ -471,6 +471,18 @@ def main():
                              f"Session: {SESSION_ID}"], workspace)
                     log(f"  committed {len(baselines)} locator baseline(s)")
                     result["baselines_committed"] = sorted(baselines)
+            else:
+                # Not the same thing, and a bare `if` reported both as silence:
+                # fingerprints on disk that genuinely match HEAD is the normal
+                # no-op, while none on disk at all means the verification run
+                # recorded them somewhere this step is not looking.
+                on_disk = baseline_store.promoted(workspace)
+                if on_disk:
+                    log(f"  {len(on_disk)} baseline(s) on disk, none changed — "
+                        f"nothing to commit")
+                else:
+                    log(f"  no locator baselines were recorded by this run "
+                        f"(looked in {baseline_store.repo_directory(workspace)})")
 
             # Anything this run edited that no commit above carries — an edit an
             # earlier attempt left on disk that the last attempt did not re-apply.

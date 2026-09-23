@@ -2043,6 +2043,17 @@ def _commit_baselines(workspace, build_tag: str) -> list:
     """
     changed = baseline.changed(workspace)
     if not changed:
+        # These two used to be one silent `return []`, which is how a workspace
+        # split that wrote fingerprints where this step never read them went
+        # unnoticed for months: a total failure and "nothing actually changed"
+        # printed exactly the same thing — nothing.
+        on_disk = baseline.promoted(workspace)
+        if on_disk:
+            log(f"{len(on_disk)} baseline(s) on disk, none changed — "
+                f"nothing to commit")
+        else:
+            log(f"No locator baselines were recorded by this run "
+                f"(looked in {baseline.repo_directory(workspace)})")
         return []
     paths = sorted(changed)
     ok, _, err = run_git(["add", "--"] + paths, workspace)
@@ -2741,6 +2752,7 @@ def main():
     # Commit everything that was applied this attempt (carried entries are
     # already committed, and git add on an unchanged file is a no-op anyway).
     pr_branch = None
+    committed_baselines: list = []
     applied = [f for f in fixes + unverified_fixes + advanced_fixes
                if f.get("target_file")]
     if applied and not on_branch:
@@ -2770,12 +2782,17 @@ def main():
         if ok:
             log(f"Committed {len(applied)} fix(es) to {branch_name}")
             pr_branch = branch_name
-            _commit_baselines(workspace, build_tag)
+            committed_baselines = _commit_baselines(workspace, build_tag)
         elif "nothing to commit" in f"{out}{err}".lower():
             # Everything applied this attempt was already committed by an earlier
             # one. git reports this on stdout, not stderr.
             log("Nothing new to commit — reusing existing branch")
             pr_branch = branch_name
+            # The fix was already committed; the fingerprints the verification
+            # run recorded were not. Skipping them here is how a retry — the
+            # normal way a chain of broken locators finishes — shipped a PR with
+            # no baselines even when everything else worked.
+            committed_baselines = _commit_baselines(workspace, build_tag)
         else:
             log(blocked(f"commit failed ({(err or out).strip()[:120]})",
                         "no PR will be raised; edits remain in the working tree",
@@ -2848,6 +2865,7 @@ def main():
         "distinct_fixes":     len(fixes),
         "distinct_unverified": len(unverified_fixes),
         "pr_branch":      pr_branch,
+        "baselines_committed": committed_baselines,
         "candidates":     candidates_json,
         "fixes":          fixes,
         "unverified_fixes": unverified_fixes,

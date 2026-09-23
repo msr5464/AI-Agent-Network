@@ -360,10 +360,29 @@ describes an element the page no longer uses. `_refresh_baseline_after_heal()` a
 rewrote the file on disk; what was missing was committing it, because the fix commit
 stages only `fix["target_file"]`.
 
-`_commit_baselines()` now runs straight after a successful fix commit and adds a second,
-path-scoped commit for the fingerprints that actually changed — measured with
-`recordedAt` excluded, through `shared/baseline.py`, so two runs that differ only in
-their timestamp commit nothing. Never `git add -A`: this step holds a write token.
+`_commit_baselines()` adds a second, path-scoped commit for the fingerprints that
+actually changed — measured with `recordedAt` excluded, through `shared/baseline.py`, so
+two runs that differ only in their timestamp commit nothing. Never `git add -A`: this
+step holds a write token.
+
+It runs after **either** commit outcome, not just a fresh fix commit. A retry whose edit
+an earlier attempt already committed takes git's "nothing to commit" path — which is the
+normal way a chain of broken locators finishes — and committing baselines only on the
+other branch skipped exactly those runs.
+
+**The run has to record them where this step reads them.** `baselineDir` in
+`parameters/config.properties` is a relative path, and `Baseline.java` resolves it against
+the JVM's working directory — one directory for the main checkout, another for a
+per-session worktree. So a verification run could promote its fingerprints somewhere the
+ship step never looked, `baseline.changed()` compared a directory nothing had written to,
+found no diff, and committed nothing; the worktree was then deleted with the fingerprints
+still in it. `shared/test_runner.run_test` now pins `-Dbaseline.dir` to an absolute path
+inside the workspace it is running in, for every JVM runner and every agent at once.
+
+An empty result is logged either way, and the two cases are distinguished: fingerprints on
+disk that genuinely match HEAD is the ordinary no-op, none on disk at all names the
+directory that was searched. They used to share one silent `return []`, which is why this
+went unnoticed across ten PRs in a single day.
 
 **The session copies them before it starts.** The framework re-records a page's
 baseline whenever a test that walks through it passes — so a class where four tests

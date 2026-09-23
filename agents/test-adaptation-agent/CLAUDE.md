@@ -347,6 +347,14 @@ Ship now adds a final path-scoped commit for the baselines whose substance chang
 (`shared/baseline.py`, `recordedAt` excluded from the comparison). Same rule as the item
 commits above: only the paths that changed, never `git add -A`.
 
+Two things had to be true for that commit to ever appear. `shared/test_runner.run_test`
+pins `-Dbaseline.dir` to an absolute path inside the workspace being committed, because
+`baselineDir` is relative and `Baseline.java` resolves it against the JVM's working
+directory — so a verification run could record fingerprints in a different checkout than
+the one ship reads. And an empty result is now logged rather than passed over: baselines
+on disk that match HEAD is the ordinary no-op, none on disk at all names the directory
+that was searched.
+
 
 ## Gate Values
 

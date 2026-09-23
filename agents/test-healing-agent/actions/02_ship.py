@@ -244,6 +244,15 @@ executed**. Review and run them manually before merging.
     all_files = {target_name(f) for f in (fixes + unverified_fixes + failed_fixes) if target_name(f) != "unknown file"}
     files_changed_count = len(all_files) or len(fixes)
 
+    # A heal is exactly what makes the committed fingerprint stale, so the PR
+    # carries refreshed ones in their own path-scoped commit. Say so: a reviewer
+    # who does not know to expect that commit reads it as unrelated noise.
+    committed_baselines = fix_data.get("baselines_committed") or []
+    baselines_line = ("\n> 🔍 Also refreshed {n} locator baseline(s): {names}\n".format(
+        n=len(committed_baselines),
+        names=", ".join(f"`{Path(b).name}`" for b in committed_baselines[:8]))
+        if committed_baselines else "")
+
     pr_body = f"""## 🤖 Test Healing Agent — {build_tag}
 
 > Status: **{status_tag}** — {status_summary}
@@ -261,6 +270,7 @@ executed**. Review and run them manually before merging.
 ### 🛠️ Changes Applied
 
 {fixed_lines}
+{baselines_line}
 {needs_review}{needs_manual}
 ### 🧪 Validation & Test Results
 

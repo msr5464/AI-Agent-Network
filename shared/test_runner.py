@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from shared import browser_mode, narration
+from shared import baseline, browser_mode, narration
 from shared.frameworks import get_active_plugin
 
 DEFAULT_TIMEOUT_S = int(os.environ.get("HEALING_TEST_TIMEOUT_S", "300"))
@@ -82,6 +82,35 @@ def _apply_browser_mode(cmd: List[str],
     return get_active_plugin().runner.apply_browser_mode(cmd, properties)
 
 
+def _pin_baseline_dir(cmd: List[str], properties: Dict[str, str],
+                      workspace: Path) -> Dict[str, str]:
+    """Make the run record its fingerprints in the checkout we will commit from.
+
+    `baselineDir` in parameters/config.properties is a RELATIVE path, and
+    Baseline.java resolves it against the JVM's working directory. That is one
+    directory for a run in the main checkout and another for a run in a
+    per-session worktree — so a verification run could promote its baselines
+    somewhere the ship step never looked, `baseline.changed()` would compare a
+    directory nothing had written to, find no diff, and commit nothing. The
+    worktree was then deleted with the fingerprints still in it, which is why
+    ten healing PRs in one day carried fix commits and no baselines.
+
+    Absolute, so the working directory stops mattering. `-Dbaseline.dir` is the
+    highest-priority source Baseline.java reads, and `setdefault` leaves a
+    caller that genuinely means a different directory in charge.
+
+    JVM runners only: fingerprints are a Java-side feature and `_as_properties`
+    turns every entry here into `-Dkey=value`, which would be a bad argument to
+    `npx playwright test`. Same runner sniff the plugin's browser mode uses.
+    """
+    runner = " ".join(cmd[:3]).lower()
+    if not any(tool in runner for tool in ("mvn", "maven", "gradle")):
+        return properties
+    properties.setdefault("baseline.dir",
+                          str(Path(workspace).resolve() / baseline.REPO_SUBPATH))
+    return properties
+
+
 def detect_test_command(workspace: Path, class_simple: str, method: str,
                         log: Callable[[str], None] = lambda _m: None) -> List[str]:
     """Find a runner at the repo root or one level down (multi-module layouts)."""
@@ -124,6 +153,7 @@ def run_test(test_name: str, workspace: Path,
         return "unverified", NO_RUNNER_MESSAGE
 
     cmd, properties = _apply_browser_mode(cmd, dict(extra_properties or {}))
+    properties = _pin_baseline_dir(cmd, properties, workspace)
     cmd = cmd + _as_properties(properties)
 
     try:

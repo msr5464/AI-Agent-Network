@@ -204,3 +204,65 @@ def test_authoring_ship_reads_baselines_before_it_branches():
     branch_at = source.index("workspace_helper.checkout_base(")
     commit_at = source.index("baseline_store.changed(")
     assert read_at < branch_at < commit_at
+
+
+# ── Where the run records them ────────────────────────────────────────────────
+#
+# Everything above checks that the ship steps commit the baselines they find.
+# None of it could catch the actual failure: the verification run recorded its
+# fingerprints in a DIFFERENT checkout than the one the agent committed from, so
+# every ship step correctly found nothing and correctly committed nothing. The
+# invariant that was missing is the one below — the run writes where we look.
+
+from shared import baseline as _baseline          # noqa: E402
+from shared.test_runner import _pin_baseline_dir  # noqa: E402
+
+
+@pytest.mark.parametrize("cmd", [
+    ["mvn", "test", "-Dtest=LoginTest"],
+    ["./gradlew", "test", "--tests", "*.LoginTest"],
+])
+def test_jvm_run_records_baselines_inside_the_committed_workspace(tmp_path, cmd):
+    """`baselineDir` is relative, and Baseline.java resolves it against the JVM's
+    working directory — one directory for the main checkout, another for a
+    per-session worktree. Absolute and workspace-scoped is what keeps the run
+    and the commit pointing at the same place."""
+    workspace = tmp_path / "qa-runs" / "session-1"
+    workspace.mkdir(parents=True)
+
+    pinned = _pin_baseline_dir(cmd, {}, workspace)["baseline.dir"]
+
+    assert Path(pinned).is_absolute()
+    # The whole point: inside the tree the ship step will commit from.
+    assert Path(pinned).resolve() == (workspace / _baseline.REPO_SUBPATH).resolve()
+
+
+def test_non_jvm_runner_gets_no_d_flag(tmp_path):
+    """Properties become `-Dkey=value`, which is a bad argument to
+    `npx playwright test`. Fingerprints are a Java-side feature."""
+    assert _pin_baseline_dir(["npx", "playwright", "test"], {}, tmp_path) == {}
+
+
+def test_an_explicit_baseline_dir_still_wins(tmp_path):
+    """The preserve flows deliberately point somewhere else."""
+    pinned = _pin_baseline_dir(["mvn", "test"], {"baseline.dir": "/elsewhere"},
+                               tmp_path)
+    assert pinned["baseline.dir"] == "/elsewhere"
+
+
+def test_healing_commits_baselines_on_both_commit_paths():
+    """A retry whose fix an earlier attempt already committed takes the
+    "nothing to commit" branch — the normal way a chain of broken locators
+    finishes. Committing baselines only after a fresh fix commit skipped it."""
+    source = (REPO / "agents/test-healing-agent/actions/01_fix.py").read_text()
+    assert source.count("_commit_baselines(workspace, build_tag)") == 2
+
+
+def test_no_agent_reports_an_empty_baseline_result_silently():
+    """A total failure and "nothing actually changed" must not print the same
+    thing — they did, and that is why this went unnoticed across ten PRs."""
+    for relative in ("agents/test-healing-agent/actions/01_fix.py",
+                     "agents/test-adaptation-agent/actions/05_ship.py",
+                     "agents/test-authoring-agent/actions/05_ship.py"):
+        source = (REPO / relative).read_text()
+        assert "none changed" in source, f"{relative} cannot explain an empty result"
