@@ -344,7 +344,7 @@ login session, or when the flow ends in something that cannot be undone. See
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `HEALING_MODEL` | `claude-opus-4-6` | Claude model for fix generation |
-| `HEALING_BRANCH_PREFIX` | `healing` | Branch prefix. Full name: `<prefix>/<build-tag>` |
+| `HEALING_BRANCH_PREFIX` | `healing` | Branch prefix. Full name: `<prefix>/<session-id>` — one branch per run |
 | `HEALING_RETRY_COUNT` | `4` | Retry cycles if tests still fail after fix — enough to walk a chain of broken locators |
 | `HEALING_MAX_FIXES_PER_RUN` | `5` | Max tests to fix per session |
 | `TEST_RUNNER_CMD` | auto-detect | Override test runner. Placeholders: `{class}` `{class_simple}` `{method}` |

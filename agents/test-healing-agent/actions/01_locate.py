@@ -608,8 +608,24 @@ def main() -> int:
     resolutions = []
     try:
         for issue in issues:
-            resolution = locate_one(issue, sources, assertion_used, cfg,
-                                    workspace, browser)
+            # Per issue, deliberately. One `Page.goto` timeout used to propagate
+            # out of this loop and end the whole step: five issues in, nothing
+            # resolved, a traceback written where the resolutions belonged, and
+            # every fix that a deterministic answer would have covered sent to
+            # the model instead. A page that will not load is one locator's bad
+            # luck, not a verdict on the other four.
+            try:
+                resolution = locate_one(issue, sources, assertion_used, cfg,
+                                        workspace, browser)
+            except Exception as exc:               # noqa: BLE001 - per-issue isolation
+                resolution = {
+                    "test_name": issue.get("test_name", ""),
+                    "failed_selector": issue.get("failed_selector", ""),
+                    "verdict": "SKIPPED",
+                    "reason": f"locate raised {type(exc).__name__}: "
+                              f"{str(exc).splitlines()[0][:160]}",
+                    "locator_id": "",
+                }
             resolutions.append(resolution)
             _log_resolution(resolution)
     finally:

@@ -229,7 +229,8 @@ def _acted_on_as_one(line: str, original: str) -> bool:
 
 def validate_diagnosis_fit(original: str, updated: str, verdict: str,
                            snapshot_soup=None, fingerprints=None,
-                           require_unique: bool = False) -> tuple:
+                           require_unique: bool = False,
+                           failing_selector: str = "") -> tuple:
     """Reject an edit that does not match what the diagnosis actually found.
 
     Returns (ok, reason). Runs before the test does, so a fix that could only
@@ -242,7 +243,21 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
     `require_unique` says the test failed acting on this element (a click, a
     fill), so a replacement matching more than one fails the same way. Off by
     default: callers that cannot say keep the previous behaviour.
+
+    `failing_selector` is the selector the capture was taken for. Supplying it is
+    what lets the snapshot rules tell "this replacement is a guess" from "this
+    capture is no longer about the failure in front of us".
     """
+    # A capture is evidence only for the failure it was captured for. When the
+    # selector that failed is no longer in the file, an earlier edit already
+    # repaired it and the flow has since moved on to a page this capture never
+    # saw — so every replacement for that later page "matches nothing" here, and
+    # rule 3 rejects correct fixes as guesses. Unevaluable is not absent: drop
+    # the capture rather than rule against it, and let the test run decide.
+    if (failing_selector and snapshot_soup is not None
+            and failing_selector not in original):
+        snapshot_soup, fingerprints = None, None
+
     changed = [line for line in difflib.unified_diff(
         original.splitlines(), updated.splitlines(), lineterm="", n=0)
         if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]

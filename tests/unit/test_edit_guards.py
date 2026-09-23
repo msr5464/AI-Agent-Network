@@ -200,6 +200,46 @@ class TestVisibilityPreflight:
             "TOO_SLOW", soup, self.PRINTS)[0]
 
 
+class TestStaleCaptureIsNotEvidence:
+    """A capture is evidence only for the failure it was captured for.
+
+    The bug this pins: attempt 1 repaired the login button and three tests went
+    green; two reached the cart page and failed there. The retry still carried
+    the login page's capture, so when the model answered with the cart locator
+    the match-count rule found nothing, called a correct fix "a guess" and
+    reverted it — before any test ran.
+    """
+
+    LINE = '    private final Locator cart = page.locator("%s");\n'
+    # The file no longer mentions the selector the capture was taken for: an
+    # earlier edit already repaired it.
+    ORIGINAL = LINE % ".mukesh"
+
+    BODY = '<div id="login-box"><input id="login-button"></div>'
+
+    @pytest.fixture
+    def soup(self):
+        bs4 = pytest.importorskip("bs4")
+        return bs4.BeautifulSoup(self.BODY, "html.parser")
+
+    def test_a_capture_for_an_already_repaired_selector_does_not_rule(self, soup):
+        ok, _why = g.validate_diagnosis_fit(
+            self.ORIGINAL, self.LINE % "#shopping_cart_container", "LOCATOR_STALE",
+            soup, {}, failing_selector="#login-mukesh")
+        assert ok, "a capture of a page the flow has moved past must not reject"
+
+    def test_a_capture_for_the_failure_in_hand_still_rules(self, soup):
+        ok, why = g.validate_diagnosis_fit(
+            self.LINE % "#login-mukesh", self.LINE % "#nowhere", "LOCATOR_STALE",
+            soup, {}, failing_selector="#login-mukesh")
+        assert not ok and "matches nothing" in why
+
+    def test_callers_that_name_no_selector_are_unchanged(self, soup):
+        ok, why = g.validate_diagnosis_fit(
+            self.ORIGINAL, self.LINE % "#nowhere", "LOCATOR_STALE", soup, {})
+        assert not ok and "matches nothing" in why
+
+
 class TestAmbiguousLocatorGuard:
     """A fix for an ambiguous locator has to be unambiguous.
 

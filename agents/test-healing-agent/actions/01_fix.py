@@ -158,7 +158,7 @@ except ImportError:
 
 from shared.dom_snapshot import (distill as distill_dom,
                                 format_for_prompt as format_dom,
-                                load_fingerprints,
+                                load_fingerprints, parse_header,
                                 candidates_from_fingerprints)
 from shared import (adaptation_handoff, baseline, diagnosis, failure_identity,
                     locator_patch, narration, run_artifacts, verdict_feedback,
@@ -1315,7 +1315,16 @@ def locate_resolution(ctx: dict):
     # burn the retry on a known-failing answer. Hand the retry to the model, which
     # is what the retry loop is for.
     if FIX_ATTEMPT > 1:
-        log(f"  attempt {FIX_ATTEMPT}: the located fix did not verify — asking the model")
+        # Say which of those two happened. This used to announce a failed located
+        # fix on every retry, including runs where Locate crashed before it
+        # resolved anything — a line that describes work nobody did, in the one
+        # place someone reads to find out what the retry is reacting to.
+        if (ctx.get("locate_outcome") or {}).get("verdict") == "HEALED":
+            log(f"  attempt {FIX_ATTEMPT}: the located fix did not verify — "
+                f"asking the model")
+        else:
+            log(f"  attempt {FIX_ATTEMPT}: Locate has no answer for this selector "
+                f"— asking the model")
         return None
     failed = ctx.get("failed_selector") or ""
     if not failed:
@@ -1830,6 +1839,40 @@ def split_by_progress(still_failing: list) -> tuple:
     return advanced, unchanged
 
 
+def fix_branch_name(prefix: str, build_tag: str, session_id: str) -> str:
+    """`<prefix>/<session id>`, or `<prefix>/<safe-build-tag>` without one.
+
+    The session id is what stops a second run of the same test colliding with
+    the first. The name used to come from the build tag alone, so a re-run
+    pushed a branch the remote already had from an earlier session — cut from
+    the same base, so a sibling rather than a descendant. `--force-with-lease`
+    refuses that with "stale info" on a worktree that never fetched the ref, and
+    the run ended NO_PR with its verified fixes stranded in a /tmp worktree that
+    is then cleaned up.
+
+    The whole id is used rather than a timestamp picked out of it, because the
+    id is already unique by construction and a parse is one more thing to get
+    wrong: run.sh and the GUI build it differently, and the GUI appends "-2" to
+    tell apart two runs submitted in the same second. It also already carries
+    the build tag, so nothing is lost by not repeating it. It is stable for the
+    life of a run, which is what keeps every retry attempt on one branch.
+    """
+    safe = lambda text: re.sub(r"[^a-zA-Z0-9_-]", "-", text).lower()
+    return f"{prefix}/{safe(session_id.strip() or build_tag)}"
+
+
+def _captured_at(issue: dict) -> str:
+    """When this issue's DOM snapshot was taken, from the snapshot's own header."""
+    path = issue.get("dom_snapshot") or ""
+    if not path or not Path(path).exists():
+        return ""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore")[:2000]
+    except OSError:
+        return ""
+    return parse_header(text).get("capturedAt", "")
+
+
 def _refresh_issue(issue: dict, output: str, workspace: Path,
                    started: float) -> dict:
     """The same test's issue, rebuilt around the element that fails NOW.
@@ -1843,8 +1886,24 @@ def _refresh_issue(issue: dict, output: str, workspace: Path,
     refreshed = dict(issue)
     failure = failure_identity.identify(output)
     refreshed.update({
+        # Pinned to the FIRST capture of this session and never moved forward.
+        # A baseline is "what the page looked like when the test last passed",
+        # and `baseline.load` already refuses one stamped after the failure — but
+        # the cutoff used to be this attempt's capture, so a baseline written in
+        # between still counted. It is written in between: a sibling test that
+        # passes promotes every declared locator on the page, including ones it
+        # never touched, so a broken-but-unused selector gets recorded as
+        # legitimately absent and the next attempt reads that as ELEMENT_GONE.
+        # Nothing this run wrote may stand as evidence about the run before it.
+        "baseline_not_after": (issue.get("baseline_not_after")
+                               or _captured_at(issue)),
         "error_message": output[-2000:],
-        "root_cause": (output or "")[:400],
+        # The head of a Maven run is the build banner, so slicing the front of
+        # the output put "[INFO] from pom.xml" in the report where the root cause
+        # belongs. Name the element that failed, and keep the raw text only as a
+        # fallback for output nothing could be identified in.
+        "root_cause": (failure_identity.describe(failure)
+                       or (output or "")[-400:]),
         "execution_log": narration.for_handoff(output),
         # Cleared before re-attaching: a stale path that survives is worse than
         # an absent one, because it reads as this failure's evidence.
@@ -1868,6 +1927,37 @@ def _refresh_issue(issue: dict, output: str, workspace: Path,
         log(f"  could not attach fresh artifacts ({type(exc).__name__}) — the next "
             f"attempt will work from the failure text alone")
     return refreshed
+
+
+def _advanced_record(entry: tuple, cluster, target_file, fix_description: str,
+                     fix_diff: str, workspace: Path) -> dict:
+    """A failed_fixes entry for a test that moved on to a DIFFERENT element.
+
+    The edit worked; the flow simply reached the next broken locator. What makes
+    that useful to the next attempt is `next_issue` — the same test's failure
+    rebuilt around the element that fails NOW. Without it the retry re-reads the
+    original handoff: a selector this run already repaired, a DOM snapshot from
+    before the edit, and a diagnosis of a problem that no longer exists.
+
+    One helper, two callers, deliberately. This used to be inlined in the branch
+    where the whole cluster still failed, so a cluster that greened SOME of its
+    tests recorded the rest as a flat `test_failed` with no refreshed issue — and
+    every retry after it re-investigated the locator that was already fixed.
+    """
+    member_name, member_output, member, member_started, before, after = entry
+    slim = {k: v for k, v in member.items() if k != "repo_conventions"}
+    return {
+        **slim, "status": "advanced", "verified": False,
+        "target_file": str(target_file),
+        "fix_description": fix_description, "fix_diff": fix_diff,
+        "test_passed": False, "test_output": member_output[-2000:],
+        # Kept so `02_ship` and the retry can tell a fix that worked and
+        # uncovered the next problem from one that did nothing.
+        "progressed_from": before, "progressed_to": after,
+        "next_issue": _refresh_issue(
+            cluster.issues[cluster.contexts.index(member)],
+            member_output, workspace, member_started),
+    }
 
 
 def run_single_test(test_name: str, workspace: Path) -> tuple:
@@ -2012,11 +2102,9 @@ def main():
 
     log(f"{len(eligible)} eligible failing test(s) to analyse")
 
-    # Create / checkout fix branch
-    # Branch name: <HEALING_BRANCH_PREFIX>/<safe-build-tag>
     # On retry (FIX_ATTEMPT > 1), reuse the same branch so commits stack
-    safe_tag    = re.sub(r"[^a-zA-Z0-9_-]", "-", build_tag).lower()
-    branch_name = f"{HEALING_BRANCH_PREFIX}/{safe_tag}"
+    branch_name = fix_branch_name(HEALING_BRANCH_PREFIX, build_tag,
+                                  os.environ.get("SESSION_ID", ""))
     on_branch = False
     if not AUTO_PUSH:
         # Dry run: no branch, no commit. The whole block below is skipped rather
@@ -2174,12 +2262,22 @@ def main():
                 "declarations to work from")
 
         def fail_cluster(status: str, reason: str = "", output: str = "", diff: str = ""):
-            """Record every test in this cluster as unfixed for the same reason."""
+            """Record every test in this cluster as unfixed for the same reason.
+
+            Nothing routed through here ran a test: every caller is a guard, a
+            refusal or an unusable model response. `test_output` is what the next
+            attempt shows the model as the previous failure, so writing a guard's
+            reason into it discards the last real failure text and hands the retry
+            nothing to work from — which is how an attempt ended up reasoning
+            about a selector an earlier attempt had already repaired. The reason
+            is kept in `unfixable_reason`, which is where the report reads it.
+            """
             for member in cluster.contexts:
                 slim = {k: v for k, v in member.items() if k != "repo_conventions"}
                 failed_fixes.append({**slim, "status": status, "fix_diff": diff,
-                                     "unfixable_reason": reason,
-                                     "test_passed": False, "test_output": output})
+                                     "unfixable_reason": reason, "test_passed": False,
+                                     "test_output": prev_test_outputs.get(
+                                         member.get("test_name", ""), "") or output})
 
         # Ask why the element was missing before assuming the locator is at
         # fault. A handoff from triaging never runs step 00, so this is the only
@@ -2369,7 +2467,8 @@ def main():
             valid, invalid_reason = validate_diagnosis_fit(
                 target_original, fixed_content,
                 (ctx.get("diagnosis") or {}).get("verdict", ""), snapshot_soup,
-                snapshot_prints, require_unique=acted_on)
+                snapshot_prints, require_unique=acted_on,
+                failing_selector=ctx.get("failed_selector") or "")
         # Guards built for test-adaptation-agent, evaluated here but never acting.
         # They are about to become load-bearing for edits far larger than a
         # locator, and the cheapest place to find out that one of them is wrong is
@@ -2448,23 +2547,14 @@ def main():
             # than the one that is now repaired.
             log(f"  ➜  Fix kept — the repaired element no longer fails; "
                 f"{len(advanced)} test(s) now stop at a different locator")
-            for member_name, member_output, member, member_started, before, after in advanced:
+            for entry in advanced:
+                member_name, _out, _member, _started, before, after = entry
                 log(f"     {member_name.rsplit('.', 1)[-1]}: "
                     f"{failure_identity.describe(before)} → "
                     f"{failure_identity.describe(after)}")
-                slim = {k: v for k, v in member.items() if k != "repo_conventions"}
-                failed_fixes.append({
-                    **slim, "status": "advanced", "verified": False,
-                    "target_file": str(target_file),
-                    "fix_description": fix_description, "fix_diff": fix_diff,
-                    "test_passed": False, "test_output": member_output[-2000:],
-                    # Kept so `02_ship` and the retry can tell a fix that worked
-                    # and uncovered the next problem from one that did nothing.
-                    "progressed_from": before, "progressed_to": after,
-                    "next_issue": _refresh_issue(
-                        cluster.issues[cluster.contexts.index(member)],
-                        member_output, workspace, member_started),
-                })
+                failed_fixes.append(_advanced_record(
+                    entry, cluster, target_file, fix_description, fix_diff,
+                    workspace))
             advanced_fixes.append({**record, "status": "advanced",
                                    "verified": False, "test_passed": False,
                                    "test_names": [m[0] for m in advanced]})
@@ -2523,10 +2613,21 @@ def main():
                                      "test_name": unverified[0][0],
                                      "test_names": [n for n, _ in unverified],
                                      "test_passed": False, "test_output": unverified[0][1][-500:]})
-        for member_name, member_output, member, _started in still_failing:
+        # Some members passed, so the branches above did not run — but a member
+        # that now stops at a DIFFERENT element was helped by this edit just the
+        # same, and needs the same refreshed issue. Recording it as a plain
+        # failure is what sent every later attempt back to the locator this one
+        # had already repaired.
+        for entry in advanced:
+            member_name, _out, _member, _started, _before, after = entry
+            log(f"  ➜  {member_name.rsplit('.', 1)[-1]} got past the fix and now "
+                f"stops at {failure_identity.describe(after)}")
+            failed_fixes.append(_advanced_record(
+                entry, cluster, target_file, fix_description, fix_diff, workspace))
+        for member_name, member_output, member in unchanged:
             # The fix worked for its cluster but not this test — a different
             # root cause hiding behind the same symptom. Keep it separate.
-            log(f"  ❌ Still failing after the cluster fix: {member_name}")
+            log(f"  ❌ Still failing on the same element: {member_name}")
             slim = {k: v for k, v in member.items() if k != "repo_conventions"}
             failed_fixes.append({**slim, "status": "test_failed", "verified": False,
                                  "target_file": str(target_file),

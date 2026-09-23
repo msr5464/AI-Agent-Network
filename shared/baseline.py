@@ -171,6 +171,13 @@ def load(page_object: str, workspace=None, preserved: Optional[str] = None,
         # Headings and landmark roles from the good run. Answers "are we on the
         # right screen" without depending on a URL, which a redirect leaves intact.
         "landmarks": data.get("landmarks") or [],
+        # Field -> when it last matched something, carried across promotions by
+        # Baseline.carryForwardLastSeen. A count of zero in `coverage` alone
+        # cannot tell an element that was removed from one whose selector was
+        # always wrong: a passing test promotes counts for every locator on the
+        # page, including ones it never touched. This is the history that can.
+        # Empty for baselines written before the framework recorded it.
+        "last_seen": data.get("lastSeen") or {},
         "recorded_at": data.get("recordedAt", ""),
     })
     return result

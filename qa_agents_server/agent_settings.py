@@ -400,7 +400,7 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "key": "healing_branch_prefix",
         "env_var": "HEALING_BRANCH_PREFIX",
         "label": "Branch Prefix",
-        "description": "Full branch name becomes <prefix>/<build-tag>",
+        "description": "Full branch name becomes <prefix>/<session-id> — one branch per run",
         "type": "text",
         "category": "healing",
         "default": "healing",

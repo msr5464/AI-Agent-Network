@@ -395,7 +395,7 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `GITHUB_TOKEN` | GitHub authentication for PR creation |
 | `GITHUB_ORG` | GitHub org owning the automation repo |
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs (default: main) |
-| `HEALING_BRANCH_PREFIX` | Prefix for fix branches (default: `healing`). Full name: `<prefix>/<build-tag>` |
+| `HEALING_BRANCH_PREFIX` | Prefix for fix branches (default: `healing`). Full name: `<prefix>/<session-id>`, e.g. `healing/20260923-111221-fix-saucedemowebtest` — one branch per run, so re-running the same test never collides with an earlier run's branch |
 | `GITHUB_PR_REVIEWERS` | Comma-separated list of PR reviewers |
 | `REPO_CONTEXT_FILE` | Path to conventions file in the automation repo (relative to repo root or absolute). If unset or not found, falls back to `agents/test-healing-agent/CONVENTIONS.md` bundled in this agent. |
 | `TEST_RUNNER_CMD` | Override test runner — use `{class}`, `{class_simple}`, `{method}` placeholders. Without it, runners are auto-detected at the repo root and one level down; if none is found, fixes are reported `unverified` |

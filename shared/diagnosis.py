@@ -339,9 +339,16 @@ def collect(issue: Dict, workspace=None, page_objects: Optional[List[Dict]] = No
     # What this page looked like the last time a test reached it successfully.
     # Absent for a page never yet seen passing, which only lowers confidence.
     expected_name = evidence["expected_page_object"]
+    # `baseline_not_after` is set by a caller that has repaired something since
+    # the run began and pins the cutoff to the ORIGINAL failure. This capture's
+    # own timestamp is the right answer only on a first look: once an edit has
+    # landed and the tests have been re-run, a baseline younger than the first
+    # failure was written by this session, and a record made during the repair
+    # says nothing about the page before it.
+    cutoff = issue.get("baseline_not_after") or header.get("capturedAt", "")
     evidence["baseline"] = baseline.load(expected_name, workspace,
                                          issue.get("healing_baseline_dir"),
-                                         not_after=header.get("capturedAt", ""),
+                                         not_after=cutoff,
                                          module=baseline.module_of(issue.get("test_name", "")))
     if evidence["baseline"].get("rejected"):
         evidence["notes"].append(
@@ -706,10 +713,26 @@ def _baseline_field_for(ev: Dict) -> str:
     measured it and found nothing. The name comes from the page object source,
     the only place that ties a selector to the field the baseline counts under —
     a live coverage report is keyed by field name and carries no selectors.
+
+    A recorded zero is also not enough on its own. A passing test promotes a
+    baseline for every page object it loaded, and the framework counts every
+    locator declared on those pages — including the ones that test never went
+    near. So a selector that has simply always been wrong gets written down as
+    matching nothing on a run that passed, and reading that back as "absent when
+    the test last passed" concludes the element was removed from the product.
+    `lastSeen` is what separates the two: an element that really was removed
+    matched in an earlier run, a selector that was always wrong never did.
     """
-    recorded = (ev.get("baseline") or {}).get("coverage") or {}
+    record = ev.get("baseline") or {}
+    recorded = record.get("coverage") or {}
+    # No lastSeen at all means a baseline written before the framework recorded
+    # it. Abstain rather than fall back to the zero: the whole point of this
+    # verdict is to stop a locator edit, and it may not rest on a signal that
+    # cannot tell removal from a selector that never worked. The next green run
+    # writes the history and the verdict becomes available again.
+    seen = record.get("last_seen") or {}
     selector = page_identity.normalize_selector(ev.get("failed_selector") or "")
-    if not recorded or not selector:
+    if not recorded or not selector or not seen:
         return ""
     for report in ev.get("coverage") or []:
         for detail in report.get("details") or []:
@@ -719,7 +742,11 @@ def _baseline_field_for(ev: Dict) -> str:
                 continue
             name = detail.get("name") or ""
             if name in recorded:
-                return name if recorded[name] == 0 else ""
+                # Absent now, and once present: it went away. Absent now and
+                # never seen: the selector is wrong, which is a locator fix.
+                if recorded[name] == 0 and name in seen:
+                    return name
+                return ""
     return ""
 
 
