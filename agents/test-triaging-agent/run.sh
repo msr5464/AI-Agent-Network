@@ -5,12 +5,12 @@ set -euo pipefail
 # agents/test-triaging-agent/run.sh
 # Orchestrates a full test-triaging-agent session (5 steps).
 #
-# Usage (via Makefile):
-#   make run AGENT=test-triaging-agent                          # scout mode
-#   make run AGENT=test-triaging-agent BUILD_TAG=ProdSanity-541 # direct mode
+# Usage:
+#   ./scripts/run-triaging-agent.sh                   # scout mode
+#   ./scripts/run-triaging-agent.sh ProdSanity-541    # direct mode
 #
 # Stop early:
-#   STOP_AFTER=collect make run AGENT=test-triaging-agent
+#   STOP_AFTER=collect ./scripts/run-triaging-agent.sh
 #   Valid values: scout, collect, classify, review
 #
 # Output: HTML report + agents/test-healing-agent/queue/<tag>.json (if APPROVED)
@@ -154,6 +154,6 @@ SAFE_BT="${BUILD_TAG//\//-}"
 QUEUE_FILE="$REPO_ROOT/agents/test-healing-agent/queue/${SAFE_BT}.json"
 if [[ -f "$QUEUE_FILE" ]]; then
   log "Queued for test-healing-agent: agents/test-healing-agent/queue/${SAFE_BT}.json"
-  log "Run: make run AGENT=test-healing-agent BUILD_TAG=$BUILD_TAG"
+  log "Run: ./scripts/run-healing-agent.sh $BUILD_TAG"
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

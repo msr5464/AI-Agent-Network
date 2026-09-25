@@ -4,12 +4,12 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # agents/test-authoring-agent/run.sh
 # Takes plain English test steps from queue/<feature>.txt, generates
-# framework-compliant Java tests in Thanos-pw, validates, and raises a PR.
+# framework-compliant Java tests in the automation repo, validates, and raises a PR.
 #
-# Usage (via Makefile):
-#   make run AGENT=test-authoring-agent MODULE=payments    # direct mode
-#   make run AGENT=test-authoring-agent                    # queue mode: picks oldest .txt
-#   AUTO_PUSH=false make run AGENT=test-authoring-agent MODULE=payments   # dry-run
+# Usage:
+#   ./scripts/run-authoring-agent.sh payments                   # direct mode
+#   ./scripts/run-authoring-agent.sh                            # queue mode: picks oldest .txt
+#   AUTO_PUSH=false ./scripts/run-authoring-agent.sh payments   # dry-run
 #
 # Retry loop: if mvn test fails after generation, re-runs 04_run_and_fix.py
 # up to AUTHORING_FIX_RETRY_COUNT (default: 2).
@@ -47,7 +47,7 @@ source "$REPO_ROOT/shared/session.sh"
 #   rm -rf agents/test-authoring-agent/cache/<module>/
 TESTING_MODE="${TESTING_MODE:-false}"
 # Resolved here rather than further down, because the cache path depends on it.
-USER_ID="${USER_ID:-${USER:-cli}}"
+USER_ID="${USER_ID:-cli}"
 # Scoped by user. Two people running the same module name shared one cache
 # directory, so run A's cached step output was restored into run B's audit dir —
 # cross-user content leakage, plus torn reads from a concurrent cp.

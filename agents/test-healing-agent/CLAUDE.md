@@ -82,12 +82,16 @@ run.sh (orchestrator)
 **Locate proposes; Fix proves.** Locate is deterministic and offline: no model, no
 browser, no credentials. It scores the fingerprint recorded on the last good run
 against the element capture the framework wrote at the moment of failure, and
-proves the new selector unique against the DOM saved beside it. In `enforce` mode
-Fix applies that answer instead of calling the model — through the same edit
+proves the new selector unique against the DOM saved beside it. With
+`HEALING_LOCATE_MODE=enforce` (the code default is `shadow`, which only logs the
+proposal) Fix applies that answer instead of calling the model — through the same edit
 guards, diff cap and test run as a model-written fix, which is what actually
 verifies it. It resolves one locator once however many tests it broke, and every
-refusal (`NO_BASELINE`, `NO_CAPTURE`, `ASSERTION_LOCATOR`, `UNSTABLE_LOCATOR`,
-`WRONG_STATE`, `LOW_CONFIDENCE`) hands the work back to Fix with its reason.
+refusal hands the work back to Fix with its reason — missing evidence
+(`NO_BASELINE`, `NO_CAPTURE`, `NO_DECLARATION`), not a locator problem
+(`NOT_LOCATOR`, `WRONG_STATE`, `APP_BUG`, `FEATURE_REMOVED`, `ASSERTION_LOCATOR`,
+`MISBOUND`), no safe answer (`LOW_CONFIDENCE`, `AMBIGUOUS`, `UNSTABLE_LOCATOR`,
+`NO_STABLE_LOCATOR`), or nothing new to try (`ALREADY_CURRENT`, `ALREADY_TRIED`).
 
 It deliberately does **not** drive the application to recreate the failure —
 signing in, minting sessions, replaying a journey. It used to, and that is where
@@ -96,7 +100,7 @@ and Fix's test run is a better proof than a click in a scratch browser.
 
 **How a locator actually gets fixed.** A locator breaks because the DOM changed,
 so the correct new value exists nowhere in the source — inferring it from stale
-code is guessing. Step 01 grounds the fix in the real DOM, in three tiers:
+code is guessing. Step 01 grounds the fix in the real DOM, in four tiers:
 
 | Tier | Source | Mid-flow? | Can count selector matches? |
 |---|---|---|---|
@@ -163,9 +167,8 @@ drains it. This is the nightly path.
 **Standalone mode** — you already know which test is broken, so name it:
 
 ```bash
-make run AGENT=test-healing-agent TEST=LoginTest#testLogin
-make run AGENT=test-healing-agent TEST=automation.saucedemo.SauceDemoWebTest   # whole class
-./scripts/run-fix-test.sh LoginTest#testLogin
+./scripts/run-healing-agent.sh --test LoginTest#testLogin
+./scripts/run-healing-agent.sh --test automation.saucedemo.SauceDemoWebTest   # whole class
 ```
 
 Step `00_reproduce.py` runs the test locally with `-DtraceMode=on`, reproduces the
@@ -219,7 +222,7 @@ share one automation-repo checkout, and each derives its own CDP port from the
 session id — so repair mode works in several runs at once. Beyond the limit,
 requests queue, drained fewest-active-runs-first so one user cannot starve
 another. Steps stream as
-Reproduce → Fix → Ship; Reproduce only appears in standalone mode.
+Reproduce → Locate → Fix → Ship; Reproduce only appears in standalone mode.
 
 ## Fixing by defect, not by test
 
@@ -279,7 +282,7 @@ agents/test-healing-agent/queue/<build_tag>.json   ← written by test-triaging-
     ↓
 01-fix.json + .fix-passed   (per-test results, pr_branch)
    + .fix-retry             (retry / stop: <reason> — the loop reads only this)
-   + .skip-reason            (infra / no-work — controls whether the handoff is consumed)
+   + .skip-reason            (infra / no-work / diagnosed — controls whether the handoff is consumed)
     ↓  (loop back to 01-locate.json while .fix-retry says retry)
     ↓
 02-ship.json                (pr_url, slack_notified)
@@ -343,11 +346,13 @@ Written by `test-triaging-agent/actions/05_ship.py`. Contains everything needed 
 }
 ```
 
-Only issues with `AUTOMATION_ISSUE + HIGH + ELEMENT_NOT_FOUND` are included.
+Only `AUTOMATION_ISSUE` + `HIGH` issues whose category is `LOCATOR_STALE`,
+`AMBIGUOUS_LOCATOR` or `ELEMENT_NOT_FOUND` are included — see
+[the handoff criteria](../../docs/ARCHITECTURE.md#handoff-criteria).
 
 `dom_snapshot` and `failure_url` are empty when the framework captured no DOM for
 that test (an API test, screenshots disabled, or a framework without the capture
-hook). The healing agent then falls back to tier 2.
+hook). The healing agent then falls back to tier 3 (re-opening the page) or 4.
 
 ---
 
@@ -416,6 +421,9 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 - `infra`   — nothing was attempted (no GitHub token, workspace missing). run.sh
               leaves the handoff in the queue so the work is not lost.
 - `no-work` — the handoff held nothing eligible. The handoff is consumed.
+- `diagnosed` — the diagnosis returned a stop verdict under `DIAGNOSIS_MODE=enforce`
+              (e.g. `WRONG_PAGE`); the handoff is consumed, except for
+              `ENV_UNREACHABLE` / `ERROR_STATE`, which map to `infra` and stay queued.
 
 ---
 
@@ -446,13 +454,15 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `HEALING_INSPECT_DOM` | Read the failing page in a real browser before fixing (default: true) |
 | `HEALING_BASE_URL` | Page URL for DOM inspection, overriding whatever is recovered from the execution log |
 | `AUTOFIX_DOM_TIMEOUT_S` | Wall-clock budget for one browser inspection (default: 600) |
-| `HEADLESS_BROWSER` | Set `false` to watch every browser this agent starts: DOM inspection, the locate replay, session minting, and the reproduce / verification / probe runs (as `-Dheadless`) |
+| `HEADLESS_BROWSER` | Set `false` to watch every browser this agent starts: DOM inspection and the reproduce / verification / probe runs (as `-Dheadless`). Locate opens no browser |
 | `AUTOFIX_LOGIN_USERNAME`, `AUTOFIX_LOGIN_PASSWORD` | Credentials override. Normally unnecessary — a saved session or `parameters/*.properties` is used first |
 | `AUTOFIX_ENVIRONMENT`, `AUTOFIX_COUNTRY` | Which `parameters/{environment}-{country}.properties` to read (default: `staging` / `SG`) |
 | `AUTOFIX_REPAIR_SESSION` | Explicit path to a `.repair-session.json`. Unset → looked for under the workspace's `test-output/` |
 | `AUTOFIX_MAX_DIFF_LINES` | Reject a fix whose diff exceeds this many lines (default: 40) |
 | `DIAGNOSIS_PROBE` | `false` to skip confirmation probes (default: on). A probe costs one test run and buys a measured verdict instead of an assumed one |
-| `HEALING_BASELINE_DIR` | Where page baselines are read from. Unset → `<workspace>/test-output/baselines`. Point CI at a path that survives between builds, or baselines are discarded with every report directory |
+| `HEALING_BASELINE_DIR` | Where page baselines are read from. Order: a copy preserved in the session, then this variable, then the framework's `baselineDir` in `config.properties` (`src/main/resources/baselines` in Playwright-Automation-Framework), then `<workspace>/test-output/baselines`. In CI, use a path that survives between builds |
+| `HEALING_LOCATE_MODE` | `shadow` (default) — Locate's proposal is logged in `01-locate.md` and Fix decides as before. `enforce` — Fix applies a verified Locate proposal instead of calling the model |
+| `HEALING_MAX_ATTEMPTS` | Hard ceiling on Locate+Fix attempts (default: 12); `HEALING_RETRY_COUNT` counts only attempts without progress |
 | `DIAGNOSIS_MODE` | `shadow` (default) — diagnose and log, but let the old behaviour decide. `enforce` — a stop verdict skips the work before any model call. Shadow exists so the verdicts can be measured against real outcomes before they refuse work the agent used to do |
 | `AUTOFIX_PAGE_OBJECT_CHARS` | Budget per page object shown to Claude (default: 8000). Declarations are always kept in full |
 | `PAGE_OBJECT_DIRS` | Comma-separated page-object search dirs. Unset → derived from the repo layout |
@@ -465,7 +475,7 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs (default: main) |
 | `HEALING_BRANCH_PREFIX` | Prefix for fix branches (default: `healing`). Full name: `<prefix>/<session-id>`, e.g. `healing/20260923-111221-fix-saucedemowebtest` — one branch per run, so re-running the same test never collides with an earlier run's branch |
 | `GITHUB_PR_REVIEWERS` | Comma-separated list of PR reviewers |
-| `REPO_CONTEXT_FILE` | Path to conventions file in the automation repo (relative to repo root or absolute). If unset or not found, falls back to `agents/test-healing-agent/CONVENTIONS.md` bundled in this agent. |
+| `REPO_CONTEXT_FILE` | Conventions file to show the model (relative to the repo root, or absolute). Unset or missing → the first of `CONVENTIONS.md`, `CLAUDE.md`, `docs/TESTING.md`, `TESTING.md`, `CONTRIBUTING.md` in the automation repo, then this agent's bundled `CONVENTIONS.md`. Up to 64,000 characters are used (`MAX_CONVENTIONS_CHARS`) |
 | `TEST_RUNNER_CMD` | Override test runner — use `{class}`, `{class_simple}`, `{method}` placeholders. Without it, runners are auto-detected at the repo root and one level down; if none is found, fixes are reported `unverified` |
 | `HEALING_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
 | `HEALING_RETRY_COUNT` | Max **consecutive attempts that made no progress** before the loop gives up (default: 4). An attempt that repairs one locator and uncovers the next does not count |
@@ -485,13 +495,13 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 
 ```bash
 # Queue mode — picks the oldest unprocessed handoff
-make run AGENT=test-healing-agent
+./scripts/run-healing-agent.sh
 
 # Direct mode — process a specific build tag
-make run AGENT=test-healing-agent BUILD_TAG=ProdSanity-All-Tests-541
+./scripts/run-healing-agent.sh ProdSanity-All-Tests-541
 
 # Dry-run — fixes applied and tested locally, but no PR pushed
-AUTO_PUSH=false make run AGENT=test-healing-agent
+AUTO_PUSH=false ./scripts/run-healing-agent.sh
 
 # View audit trail
 make audit AGENT=test-healing-agent
@@ -511,9 +521,11 @@ make audit AGENT=test-healing-agent SESSION=20260328-143022-fix-ProdSanity-All-T
    signal never blocks a genuine fix
 2. **Every fix must pass the test before it is committed** — restore original on failure
 3. **Write audit entry before any irreversible action** (git commit, push)
-4. **Use wrapper methods, not raw Selenium** — CONVENTIONS.md teaches Claude the patterns
-   (plus `config/skills/automation-repo.md`, passed as `--system-prompt-file`, and
-   `config/prompts/fix.md`, which holds the instructions and output contract)
+4. **Use wrapper methods, never raw driver calls** — the automation repo's
+   conventions file (normally its `CLAUDE.md`, see `REPO_CONTEXT_FILE`) teaches
+   Claude the patterns, alongside `config/skills/automation-repo.md` (framework-neutral
+   rules, passed as `--system-prompt-file`) and `config/prompts/fix.md` (the
+   instructions and output contract)
 5. **Exit cleanly** — success or failure. Not a daemon.
 6. **Secrets never logged** — env var names are fine, never their values
 7. **Tokens never persisted** — clone and push supply the credential per-invocation

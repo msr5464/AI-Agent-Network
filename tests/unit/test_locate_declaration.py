@@ -26,16 +26,16 @@ sys.path.insert(0, str(ROOT))
 
 def _load():
     import os, tempfile
-    # A throwaway directory, not tests/fixtures: this leaks into the rest of the
-    # session, and anything that later writes a metrics row through AUDIT_DIR
-    # edits the fixture tree on every run of the suite.
-    os.environ.setdefault("AUDIT_DIR", tempfile.mkdtemp(prefix="locate-decl-"))
-    os.environ.setdefault("HANDOFF_FILE", str(ROOT / "tests" / "fixtures" / "none.json"))
+    from unittest import mock
     path = ROOT / "agents" / "test-healing-agent" / "actions" / "01_locate.py"
     spec = importlib.util.spec_from_file_location("healing_locate_decl", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["healing_locate_decl"] = mod
-    spec.loader.exec_module(mod)
+    # Set only for the import (the step reads them into module constants); left in
+    # os.environ they leaked into every later test in the session.
+    with mock.patch.dict(os.environ, {"AUDIT_DIR": tempfile.mkdtemp(prefix="locate-decl-"),
+                                      "HANDOFF_FILE": str(ROOT / "tests" / "fixtures" / "none.json")}):
+        spec.loader.exec_module(mod)
     return mod
 
 

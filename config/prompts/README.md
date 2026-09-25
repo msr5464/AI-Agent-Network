@@ -23,3 +23,12 @@ does not.
 
 `tests/unit/test_prompt_files.py` enforces that every file here has a loader and
 every loader has a file, so that trap cannot be set again.
+
+## System prompt: `config/skills/automation-repo.md`
+
+A different mechanism, same trap. `config/skills/automation-repo.md` is passed
+as `--system-prompt-file` — replacing Claude Code's default system prompt — by
+the healing fix step (`01_fix.py`), adaptation's web exploration
+(`03_explore_web.py`) and adaptation's edit step (`04_adapt.py`). It holds framework-neutral rules only; the target repo's
+own `CLAUDE.md` is the source of truth for its APIs. It is not covered by
+`test_prompt_files.py`, so keep this list current if you add a loader.

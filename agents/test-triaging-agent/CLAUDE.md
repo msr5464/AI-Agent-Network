@@ -4,7 +4,7 @@ Read this file first. Every time. Before doing anything else.
 
 ## What This Agent Does
 
-Autonomously analyses test build results, classifies failures as PRODUCT_BUG vs AUTOMATION_ISSUE, reviews classifications independently via an adversarial debate, generates an HTML report, and queues fixable automation issues for the `test-healing-agent` agent.
+Autonomously analyses test build results, classifies failures as PRODUCT_BUG vs AUTOMATION_ISSUE (or UNKNOWN), reviews classifications independently via an adversarial debate, generates an HTML report, and queues fixable automation issues for the `test-healing-agent` agent.
 
 One session = one build tag = one HTML report + one handoff JSON (if APPROVED + eligible failures found).
 
@@ -63,14 +63,16 @@ audit/<session>/traces/<method>.zip               ← Playwright trace, referenc
 **Handoff criteria** (written only when verdict=APPROVED):
 - `classification = AUTOMATION_ISSUE`
 - `confidence = HIGH`
-- `root_cause_category` is something the healing agent can act on — a stale
-  locator, or a page that was merely slow, still loading, or covered. Stop
-  verdicts (`WRONG_PAGE`, `DATA_PRECONDITION`, `ERROR_STATE`, …) are never
-  forwarded: no code edit can fix them.
+- `root_cause_category` is one the healing agent can act on: `LOCATOR_STALE`,
+  `AMBIGUOUS_LOCATOR` (`diagnosis.ACTIONS`) or the classifier's `ELEMENT_NOT_FOUND`
+  — and not a `diagnosis.STOP` verdict. Stop verdicts (`WRONG_PAGE`,
+  `NOT_READY`, `TOO_SLOW`, `BLOCKED`, `DATA_PRECONDITION`, `ERROR_STATE`, …) are
+  never forwarded: no locator edit can fix them.
 
-Selecting on `ELEMENT_NOT_FOUND` alone used to do both halves of this wrong. It
-forwarded wrong-page failures wearing a locator's label, and it dropped slow and
-obstructed elements — both fixable — because they landed in `TIMEOUT`.
+This is `write_handoff()` in `actions/05_ship.py`, and
+[docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#handoff-criteria) states the same
+rule. Selecting on `ELEMENT_NOT_FOUND` alone used to forward wrong-page failures
+wearing a locator's label.
 
 ---
 
@@ -99,10 +101,12 @@ obstructed elements — both fixable — because they landed in `TIMEOUT`.
 ### Root Cause Categories
 - `ELEMENT_NOT_FOUND` — NoSuchElementException, locator issues (what an LLM answers
   when it has only the error text; the diagnosis engine refines it into the verdicts below)
-- `LOCATOR_STALE` / `NOT_READY` / `TOO_SLOW` / `BLOCKED` — measured, and fixable
+- `LOCATOR_STALE` / `AMBIGUOUS_LOCATOR` — measured, and fixable by a locator edit
 - `WRONG_PAGE` / `PRIOR_STEP_FAILED` / `ERROR_STATE` / `ENV_UNREACHABLE` /
-  `DATA_PRECONDITION` / `FLAKY_TRANSIENT` / `ELEMENT_GONE` — measured, and not fixable
-  by editing a test
+  `DATA_PRECONDITION` / `FLAKY_TRANSIENT` / `ELEMENT_GONE` / `NOT_READY` /
+  `TOO_SLOW` / `BLOCKED` — measured, and not fixable by a locator edit (timing and
+  obstruction need a wait or timeout change a human makes, since the framework's
+  wait budget is global)
 - `TIMEOUT` — TimeoutException, page load waits
 - `ASSERTION_FAILURE` — expected vs actual mismatches
 - `ENVIRONMENT_ISSUE` — API 500 errors, server connectivity
@@ -139,12 +143,13 @@ obstructed elements — both fixable — because they landed in `TIMEOUT`.
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary (default: claude) |
 | `TRIAGING_CLASSIFIER_MODEL` | Claude model for classification (default: claude-opus-4-6) |
 | `TRIAGING_REVIEWER_MODEL` | Claude model for review (default: claude-sonnet-4-6) |
+| `TRIAGING_CLASSIFIER_EFFORT`, `TRIAGING_REVIEWER_EFFORT` | Reasoning effort, `low` / `medium` / `high` (default: medium) |
 | `TRIAGING_MAX_REVIEW_ROUNDS` | Max reviewer/classifier debate rounds (default: 2) |
 | `TRIAGING_SCOUT_LOOKBACK_DAYS` | Days to look back for build tags (default: 7) |
 | `BUILD_TAG` | Direct mode override — skip scout |
 | `STOP_AFTER` | Stop after step: `scout`, `collect`, `classify`, `review` |
 | `TRIAGING_AUTOFIX_QUEUE_DIR` | Path to test-healing-agent queue dir (default: `agents/test-healing-agent/queue` inside repo) |
-| `SLACK_BOT_TOKEN`, `SLACK_NOTIFY_CHANNEL` | Slack notifications |
+| `SLACK_BOT_TOKEN`, `SLACK_NOTIFY_CHANNEL`, `SLACK_ALERT_CHANNEL` | Slack notifications (NEEDS-HUMAN goes to the alert channel) |
 | `SESSION_ID`, `AUDIT_DIR` | Set by run.sh — do not set manually |
 
 ---
@@ -153,14 +158,14 @@ obstructed elements — both fixable — because they landed in `TIMEOUT`.
 
 ```bash
 # Scout mode — agent finds the best unanalyzed build tag
-make run AGENT=test-triaging-agent
+./scripts/run-triaging-agent.sh
 
 # Direct mode — analyze a specific build tag
-make run AGENT=test-triaging-agent BUILD_TAG=ProdSanity-All-Tests-541
+./scripts/run-triaging-agent.sh ProdSanity-All-Tests-541
 
 # Stop at any step for inspection
-STOP_AFTER=collect make run AGENT=test-triaging-agent
-STOP_AFTER=classify make run AGENT=test-triaging-agent BUILD_TAG=ProdSanity-All-Tests-541
+STOP_AFTER=collect ./scripts/run-triaging-agent.sh
+STOP_AFTER=classify ./scripts/run-triaging-agent.sh ProdSanity-All-Tests-541
 
 # View audit trail
 make audit AGENT=test-triaging-agent
@@ -174,7 +179,7 @@ make audit AGENT=test-triaging-agent SESSION=20260328-143022-ProdSanity-All-Test
 1. **Write audit entry before every irreversible action** (Slack messages)
 2. **Classifier and reviewer run as separate subprocess calls** — zero shared context
 3. **No handoff until .verdict=APPROVED** — escalate to Slack if NEEDS-HUMAN
-4. **Handoff targets only ELEMENT_NOT_FOUND + HIGH confidence** — never touch PRODUCT_BUG
+4. **Handoff targets only HIGH-confidence locator failures** (`LOCATOR_STALE`, `AMBIGUOUS_LOCATOR`, `ELEMENT_NOT_FOUND`) — never PRODUCT_BUG
 5. **Exit cleanly after every run** — success or failure. Not a daemon.
 6. **Secrets never logged** — env var names are fine, never their values
 7. **skip-buildtags.json is updated at the end of every run** — prevents re-processing
@@ -193,9 +198,9 @@ Minor disagreements on LOW/MEDIUM confidence tests do NOT require NEEDS-HUMAN.
 
 ## Prompt Templates
 
-Static review prompt sections are loaded from `config/prompts/review.md` at runtime.
-Classification conventions are documented in `config/skills/qa-conventions.md`.
-To change review criteria, edit those files — no Python changes needed.
+Static review prompt sections are loaded from `config/prompts/review.md` at
+runtime — edit that file to change review criteria. The classification rules
+are inline in `build_batch_prompt()` in `actions/03_classify.py`.
 
 ---
 
@@ -203,8 +208,9 @@ To change review criteria, edit those files — no Python changes needed.
 
 When the automation framework captured the page's HTML at the moment of failure
 (`BrowserHelper.captureDomSnapshot` → `{resultsDirectory}/dom/<method>_<time>.html`),
-step 05 copies it into `audit/<session>/dom/<method>.html` and puts that path plus
-the failure URL into the handoff.
+step 02 copies it into `audit/<session>/dom/<method>.html` (along with the trace and
+page baselines) so step 03's diagnosis can read it, and step 05 puts that path plus
+the failure URL into the handoff, filling any gap step 02 left.
 
 Copying rather than referencing matters: CI cleans up the report directory, and
 the handoff has to stay valid until test-healing-agent picks it up. That snapshot
@@ -213,9 +219,9 @@ without replaying the flow, logging in, or reconstructing the test data.
 
 Missing snapshots are never fatal — the fields are simply left empty.
 
-Step 05 also copies the Playwright trace (`traces/<method>_<time>.zip`) when the
-framework recorded one, reads the failing selector straight out of its action
-timeline into `failed_selector`, and references the zip as `trace_path`. Whoever
+The Playwright trace (`traces/<method>_<time>.zip`) is copied the same way when the
+framework recorded one; the failing selector is read straight out of its action
+timeline into `failed_selector`, and the handoff references the zip as `trace_path`. Whoever
 reviews the PR can open that zip in Playwright Trace Viewer and step through the
 whole flow.
 
@@ -235,7 +241,8 @@ only some siblings reach the healing agent. The rest stay red with no explanatio
 One judgement per defect makes that impossible.
 
 Sharing is deliberately restricted. A verdict is only inherited when the category
-is `ELEMENT_NOT_FOUND` or `TIMEOUT` **and** confidence is HIGH or MEDIUM.
+is `ELEMENT_NOT_FOUND`, `TIMEOUT` or a diagnosis verdict **and** confidence is HIGH
+or MEDIUM.
 Assertion failures with identical messages can have unrelated causes, so their
 siblings are marked LOW confidence and flagged for individual review instead.
 

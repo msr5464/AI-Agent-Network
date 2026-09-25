@@ -3,7 +3,8 @@ set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
 # scripts/run-server.sh
-# Boots the qa_agents_server HTTP + SSE wrapper around test-authoring-agent.
+# Boots the qa_agents_server HTTP + SSE wrapper around the agents (authoring,
+# healing, adaptation) that AI-Test-Studio drives.
 # The server is separate from the Makefile CLI entry points — both coexist.
 #
 # Env overrides:

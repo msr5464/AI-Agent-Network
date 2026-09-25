@@ -17,12 +17,15 @@ agent.
 
 **The server seeds these automatically.** On its first boot in a checkout,
 `qa_agents_server` copies each agent's examples into its queue root, and each
-signed-in user gets their own copy the first time they open that queue — see
+signed-in user gets their own copy of the `.txt` queues (authoring, adaptation)
+the first time they open one — healing's `.json` queue is shared, so it is seeded
+once. See
 [`seed_examples.py`](../../../qa_agents_server/seed_examples.py). It never
 overwrites a queued file, never re-creates one already in `processed/`, and skips
 a queue once seeded, so anything you delete stays deleted. `QA_SEED_EXAMPLES=false`
 disables it; deleting a queue directory re-arms it for that queue. The `cp` commands
-below are for putting an example back by hand.
+below are for putting an example back by hand — CLI runs read the queue root
+(`agents/<agent>/queue/`), which is where they copy to.
 
 `test-triaging-agent` takes a CI build tag instead (`make run
 AGENT=test-triaging-agent BUILD_TAG=ProdSanity-541`), or scouts the results
@@ -55,7 +58,7 @@ follow-up calls use an existing record.
 cp docs/examples/queue/test-authoring-agent/saucedemo_api_todos.txt \
    agents/test-authoring-agent/queue/saucedemo.txt
 
-make run AGENT=test-authoring-agent MODULE=saucedemo
+./scripts/run-authoring-agent.sh saucedemo
 ```
 
 Two things worth knowing. `Module:` is the only header that names the module —
@@ -85,10 +88,10 @@ a check is refused whatever the kind.
 cp docs/examples/queue/test-adaptation-agent/saucedemo_cart_details.txt \
    agents/test-adaptation-agent/queue/saucedemo.txt
 
-make run AGENT=test-adaptation-agent MODULE=saucedemo
+./scripts/run-adaptation-agent.sh saucedemo
 
 # propose without writing, for any change note
-ADAPTATION_APPLY=false make run AGENT=test-adaptation-agent MODULE=saucedemo
+ADAPTATION_APPLY=false ./scripts/run-adaptation-agent.sh saucedemo
 ```
 
 Each note names, in `Tests:`, the exact `SauceDemoWebTest` / `SauceDemoApiTest`
@@ -124,27 +127,27 @@ handoff's file name is its `build_tag`, which is how `BUILD_TAG=` finds it.
 | [`saucedemo_rc_92.json`](test-healing-agent/saucedemo_rc_92.json) | `LOCATOR_STALE` | Three failures across two page objects — two independent cause groups, fixed separately. One test is listed in `flaky_tests`, which is how the agent tells an intermittent test from a genuine break |
 
 ```bash
-HANDOFF_FILE=docs/examples/queue/test-healing-agent/saucedemo_sanity_541.json \
-  make run AGENT=test-healing-agent
-
-# or, via the queue:
 cp docs/examples/queue/test-healing-agent/saucedemo_sanity_541.json \
    agents/test-healing-agent/queue/
-make run AGENT=test-healing-agent BUILD_TAG=saucedemo_sanity_541
+./scripts/run-healing-agent.sh saucedemo_sanity_541
 ```
+
+Always copy first. `HANDOFF_FILE=<path>` also works, but the run moves that file
+into `queue/processed/` when it finishes — pointed at this directory, it would
+delete a committed example.
 
 Two caveats when replaying these. The artefact paths (`dom_snapshot`,
 `trace_path`, `screenshot`) point into a triaging audit directory that will not
 exist on your machine — the healing agent tolerates that, but diagnoses without
 DOM evidence and so reaches a weaker verdict than it would on a real handoff.
 And while every test they name is a real `SauceDemoWebTest` method, the breakages
-are staged — against the live site those selectors still resolve, so step 00 will
-not reproduce the failure.
+are staged — against the live site those selectors still resolve, so a replay
+exercises the pipeline rather than a real repair.
 
 To heal a single real test instead, skip the queue entirely — standalone mode
 reproduces the failure and builds its own handoff:
 
 ```bash
-make run AGENT=test-healing-agent \
-  TEST_NAME=automation.saucedemo.SauceDemoWebTest#verifyProductAppearsInCart
+./scripts/run-healing-agent.sh \
+  --test automation.saucedemo.SauceDemoWebTest#verifyProductAppearsInCart
 ```

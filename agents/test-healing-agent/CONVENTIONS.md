@@ -1,5 +1,12 @@
 # Thanos Automation Framework — Conventions for AI Auto-Fix
 
+> **Selenium-era fallback.** The healing fix step reads this file only when the
+> automation repo has none of `REPO_CONTEXT_FILE`, `CONVENTIONS.md`, `CLAUDE.md`,
+> `docs/TESTING.md`, `TESTING.md` or `CONTRIBUTING.md` (see
+> `load_repo_conventions()` in `actions/01_fix.py`). It describes the Selenium
+> "Thanos" framework; for any other repo, give that repo its own `CLAUDE.md`.
+> Section numbers are cited by `shared/edit_guards.py` and `04_adapt.py`, so keep them.
+
 Read this before making any code change. Every rule here reflects existing patterns in this repo.
 Violations will cause test failures or CI failures even if the locator itself is correct.
 

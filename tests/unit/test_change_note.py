@@ -21,11 +21,22 @@ def _load():
     """Load the action by path — it is a script, not an importable module."""
     path = ROOT / "agents" / "test-adaptation-agent" / "actions" / "01_parse_change.py"
     import os
+    # The action reads these at import. Set them only for the import: left in
+    # os.environ they leaked into every later test, and any run.sh a test started
+    # then wrote an analytics row for AUDIT_DIR=/tmp.
+    saved = {k: os.environ.get(k) for k in ("AUDIT_DIR", "INPUT_FILE")}
     os.environ.setdefault("AUDIT_DIR", "/tmp")
     os.environ.setdefault("INPUT_FILE", str(path))
-    spec = importlib.util.spec_from_file_location("parse_change", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec = importlib.util.spec_from_file_location("parse_change", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     return module
 
 

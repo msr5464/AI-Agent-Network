@@ -12,6 +12,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -33,8 +34,6 @@ def diagnosis_stop():
 def fix(tmp_path_factory):
     """Import 01_fix.py with its own `lib` package (both agents ship one)."""
     tmp = tmp_path_factory.mktemp("fix")
-    os.environ.setdefault("AUDIT_DIR", str(tmp))
-    os.environ.setdefault("HANDOFF_FILE", str(tmp / "handoff.json"))
 
     saved_path, saved_modules = list(sys.path), {
         n: m for n, m in sys.modules.items() if n == "lib" or n.startswith("lib.")}
@@ -46,7 +45,11 @@ def fix(tmp_path_factory):
         spec = importlib.util.spec_from_file_location(
             "fix_step", AGENT / "actions" / "01_fix.py")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Set only for the import (the step reads them into module constants); left in
+        # os.environ they leaked into every later test in the session.
+        with mock.patch.dict(os.environ, {"AUDIT_DIR": str(tmp),
+                                          "HANDOFF_FILE": str(tmp / "handoff.json")}):
+            spec.loader.exec_module(module)
         yield module
     finally:
         for name in [n for n in sys.modules if n == "lib" or n.startswith("lib.")]:
@@ -341,3 +344,12 @@ class TestLiveSelectorsMustBeUnique:
         result = {"selectors": {"doLogin": 'button:has-text("Login")'}}
         fix._keep_unique(result, None, {})
         assert result["selectors"] == {"doLogin": 'button:has-text("Login")'}
+
+
+def test_repo_conventions_are_not_cut_mid_file(fix, tmp_path, monkeypatch):
+    """A ~28K CLAUDE.md used to be cut at 16,000 chars, dropping its rule sections."""
+    monkeypatch.setattr(fix, "REPO_CONTEXT_FILE", "")
+    body = "# Guide\n" + ("rule line\n" * 3000)           # ~30K characters
+    (tmp_path / "CLAUDE.md").write_text(body + "## Patterns to Never Use\n")
+    loaded = fix.load_repo_conventions(tmp_path)
+    assert loaded.endswith("## Patterns to Never Use\n")

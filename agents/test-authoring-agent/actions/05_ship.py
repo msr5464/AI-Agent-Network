@@ -653,6 +653,12 @@ def main() -> None:
             # Nothing to ship, not a failure — e.g. a resumed session where
             # this step already committed everything on a prior attempt.
             ship_status = "dry_run"
+        elif not AUTO_PUSH:
+            # A dry run makes no branch on purpose: create_branch_and_commit
+            # wrote the files to the working tree and stopped there. Falling
+            # through to the branch below reported every dry run as a failed
+            # push, so its verdict could never be APPROVED.
+            ship_status = "dry_run"
         else:
             log("Branch creation failed — skipping push")
             # Code generated fine but couldn't even get a local branch/commit

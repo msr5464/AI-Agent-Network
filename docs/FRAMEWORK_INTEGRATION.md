@@ -29,8 +29,11 @@ both implementations of it returned the same Playwright server.
 ## Step 1: write the plugin
 
 Create `shared/frameworks/<name>_plugin.py` implementing the four interfaces in
-`shared/frameworks/base.py`. `shared/frameworks/selenium_plugin.py` is the
-worked example.
+`shared/frameworks/base.py`, plus a `FrameworkPlugin` subclass that exposes them
+as its `telemetry`, `runner`, `diagnostics` and `code` properties.
+`shared/frameworks/selenium_plugin.py` is the worked example. Every
+`@abc.abstractmethod` in `base.py` must be implemented; the lists below cover the
+ones with non-obvious rules.
 
 ### `TelemetryParser`
 Reconstructs what the test did before it failed. The actions that **succeeded**
@@ -56,7 +59,8 @@ Translates your framework's error text into semantics the agents act on.
 
 - `is_ambiguous_locator(message)` — the selector matched several elements. If
   your framework silently takes the first match, return `False` honestly.
-- `is_locator_resolution_failure(message)` — optional; not-found / stale /
+- `is_locator_resolution_failure(message)` — optional and duck-typed (it is not
+  on the base class; only the Selenium engine defines it): not-found / stale /
   not-interactable.
 
 Match the phrasings your framework **actually emits**. The Selenium engine
@@ -69,6 +73,9 @@ The hardest part: parse and generate this repo's locator code.
 - `extract_locators(source)` — every locator declared in a page object.
 - `normalize_selector(raw)` — to plain CSS so it can be evaluated against a
   captured DOM. Return `None` for XPath.
+- `is_dom_selector(raw)`, `remove_framework_suffixes(selector)`,
+  `quote_css_value(value)`, `map_role(role)` — small helpers the locator engine
+  calls; see the docstrings in `base.py`.
 - `emit_locator(**kwargs)` — native code for a locator. Handle at minimum
   `testid`, `role`+`name`, `placeholder`, `label`, `alt`, `title`, `text`,
   `selector`. **Never return an empty snippet**: an unhandled branch that falls
@@ -97,10 +104,14 @@ _BUILDERS = {
 }
 ```
 
-Then teach `shared/frameworks/detect.py` to recognise it, by adding a build-file
-marker:
+Then teach `shared/frameworks/detect.py` about it: a name constant, an entry in
+`SUPPORTED` (the contract tests in `tests/unit/test_frameworks.py` are
+parametrised over it), and a build-file marker:
 
 ```python
+CYPRESS = "cypress"
+SUPPORTED = (PLAYWRIGHT, SELENIUM, CYPRESS)
+
 _BUILD_MARKERS = (
     ...
     (CYPRESS, re.compile(r"\"cypress\"\s*:")),
@@ -111,8 +122,14 @@ _BUILD_MARKERS = (
 or is not a Cypress repo, so asking a human to select it can only be redundant or
 wrong — and it was wrong: `AUTOMATION_FRAMEWORK=selenium` was set against a
 Playwright repo, which silently emptied locator extraction, rejected every trace,
-and disabled ambiguous-locator diagnosis, with no error anywhere. `AUTOMATION_FRAMEWORK`
-still exists as an explicit override, and warns loudly when it contradicts the repo.
+and disabled ambiguous-locator diagnosis, with no error anywhere.
+
+Precedence (`detect.resolve()`): `AUTOMATION_FRAMEWORK` → the repo's build files →
+`config/repo-map.json` → Playwright. `AUTOMATION_FRAMEWORK` is an explicit
+override and warns loudly when it contradicts the repo. Note that the Studio's
+**Agent Settings** page exposes it as an "Automation Framework" dropdown; a value
+saved there is written to `config/.env`, where it then overrides detection for
+every run. Leave it unset unless detection is wrong.
 
 ---
 
@@ -161,6 +178,22 @@ elements a candidate selector matches before any code is edited.
 - Launch the browser **detached**, or it dies with the JVM before anything can
   attach.
 
+### 4. Conventions the agents read — needed for the full feature set
+These are not plugin concerns; the agents read them straight from the target
+repo, whatever the framework. Missing ones degrade a feature rather than break a run.
+
+| What | Where in the target repo | Used by |
+|------|--------------------------|---------|
+| An agent guide (framework APIs, wrappers, naming) | `CLAUDE.md` at the repo root | Authoring (parse/generate/fix) and healing fix — the model's source of truth for the repo's own APIs |
+| One `logStep("…")` per test step, stating action and expected outcome | test classes | Authoring's narration check (`shared/logstep_narration.py`), and adaptation's derived intent contracts |
+| Assertions through a helper, with the message as the last argument (e.g. `AssertHelper.*`) | tests and helpers | `shared/assertion_graph.py` — what a test proves, and whether an edit weakened it |
+| Per-environment properties `parameters/{environment}-{country}.properties` | `src/main/resources/` | Authoring writes URL and credential keys there instead of hard-coding them |
+| Element fingerprint script `locator-capture.js` | `src/main/resources/` | The healing Locate engine (`shared/locator_capture.py`) |
+| Page baselines, written on each successful page load (`baselineDir` in `config.properties`) | `src/main/resources/baselines/` by default | Diagnosis and Locate (`shared/baseline.py`); committed by the ship steps and `scripts/commit_baselines.py` |
+| Authored intent contracts (optional) | `src/test/resources/intents/` | Adaptation (`shared/intent.py`); derived from source when absent |
+
+`Playwright-Automation-Framework` has all of these and is the reference target.
+
 ### Degrading honestly
 Missing artifacts are never fatal — the agents fall back to weaker evidence and
 say so. What matters is that absence is visible rather than silently synthesised.
@@ -175,7 +208,7 @@ anything else, and documents that a non-Playwright run simply loses that channel
 # Contract tests — parametrised over every registered plugin.
 pytest tests/unit/test_frameworks.py
 
-# Detection resolves your repo without an env var.
+# Detection resolves your repo without an env var (prints (framework, source)).
 python3 -c "from shared.frameworks import detect; print(detect.resolve('/path/to/repo'))"
 ```
 
@@ -193,3 +226,20 @@ print(telemetry.format_for_prompt(actions))
 directly and asserts on Playwright syntax, so a non-Playwright plugin fails it by
 construction. Use it to check you have not regressed Playwright, not to grade a
 new plugin.
+
+---
+
+## Known gaps
+
+- **No agent has run end to end against a Selenium repo yet.** What is proven:
+  the plugin contracts (`tests/unit/test_frameworks.py`, parametrised over both
+  plugins), `@FindBy` emission, generated XPath validated against a real DOM,
+  diagnostics against real Selenium exception text, and detection resolving
+  `Selenium-Automation-Framework` from its `pom.xml`. Not yet proven:
+  `detect_command` producing a working Maven invocation, `dom_snapshot.py` parsing
+  a real snapshot, and the locator ladder editing a live `@FindBy` page object.
+- In that repo `AgentTelemetry.recordAction` is only called from
+  `onTestFailure`, so a run there produces a one-line timeline. It needs wiring
+  into the interaction wrappers (work in the target repo, not here).
+- Healing's `00_reproduce.py` classifies errors from a hard-coded list mixing both
+  frameworks' strings instead of going through `DiagnosticEngine`.

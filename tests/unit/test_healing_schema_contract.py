@@ -80,7 +80,7 @@ class TestFixJsonContract:
     def test_the_fix_gate_still_drives_status(self, session, gate, expected):
         d = session()
         (d / ".fix-passed").write_text(gate)
-        assert analytics._healing_status(d) == expected
+        assert analytics._status("test-healing-agent", d, "") == expected
 
     def test_status_vocabulary_has_not_grown(self, session):
         """A new status value would be silently uncounted by the dashboards."""
@@ -93,4 +93,4 @@ class TestAdditionsAreSafe:
         """anchor_state and the locate route are additions; they must not count."""
         d = session(locate_route="took_ownership", anchor_state="hidden")
         assert analytics._healing_outcomes(d)["tests_fixed"] == 1
-        assert analytics._healing_status(d) == "completed"
+        assert analytics._status("test-healing-agent", d, "") == "completed"

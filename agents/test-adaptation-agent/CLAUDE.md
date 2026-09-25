@@ -31,7 +31,8 @@ waits, step order, which pages get visited. The proof is not.
 
 ## The change note
 
-`queue/<module>.txt`, same convention as the authoring agent:
+`queue/<module>.txt` (CLI runs; a run started from the server reads
+`queue/<user-id>/<module>.txt`), same convention as the authoring agent:
 
 ```
 Module: checkout
@@ -245,10 +246,15 @@ Run over the combined diff of one change item, before anything compiles:
 | `validate_fix` | oversized diffs, emptied files, lost methods |
 | `check_changes` | an assertion removed or changed without being declared, or declared but not changed; one changed by a kind that may not; one also made by a test outside the run; one the browser contradicts; any weakened or made conditional — **anywhere in the call graph and in every edited file**. Fails closed when it cannot measure |
 | `no_new_swallowing` | empty catch, `Thread.sleep`, `@Ignore`, `enabled=false`, `assumeTrue`, `SkipException` |
-| `wrapper_compliance` | raw Selenium — `driver.findElement`, `.sendKeys()`, `new WebDriverWait` |
-| `logstep_present` | an interaction added to a test class with no `logStep` |
+| `wrapper_compliance` | raw driver calls — Selenium (`driver.findElement`, `.sendKeys()`, `new WebDriverWait`) and Playwright (`locator.click()/fill()/…`, `page.navigate()`, `page.waitForTimeout()`) |
+| `logstep_present` | an interaction added to a test class with no `logStep` — `Element.*` / BasePage wrapper calls, or a helper/page-object call that is not a pure read |
 | `steps_justified` | an interaction matching nothing exploration observed |
 | `matches_negative` | an anchor that also matches the logged-out or error page — the negatives are the flow map's own inventories for pages whose identity reads as login/error, so this guard finally has data to compare against |
+| `diagnosis_fit` | a selector edit the captured DOM contradicts (the healing guard, per edited file) |
+| `no_hardcoded_url` | a literal URL added to Java — routes belong in `parameters/*.properties` |
+| `wrapper_changed` | an item marked `interaction` whose added code uses none of the observed control types' wrappers |
+| `shared_default_covered` | a changed shared Data/Builder default while some dependent tests are outside the verify set |
+| `cluster_diff_budget`, `total_diff_budget`, `file_budget` | an item over its per-kind line budget, `ADAPTATION_MAX_TOTAL_DIFF_LINES`, or `ADAPTATION_MAX_FILES_PER_RUN` |
 
 The last one is the anti-tautology check: a selector that matches the logged-out
 page is not proof of a successful login.
@@ -290,8 +296,9 @@ authoring in its run.sh. All three now share one implementation,
 whatever URL it was handed into `.git/config`: authoring's leaves the token there
 for the life of the checkout, healing's strips it back out.
 
-**Syncing is a fetch, never a reset.** authoring follows its clone with
-`checkout -f` + `pull`, which is right for an agent that only adds new files and
+**Syncing is a fetch, never a reset.** authoring follows its clone with a forced
+base checkout (`shared.workspace prepare-base --checkout`, i.e. `checkout -f -B`),
+which is right for an agent that only adds new files and
 wrong here: this agent refuses to start on a dirty tree precisely so nobody's
 uncommitted work is swept into its commit, and a force-checkout would destroy
 exactly what that gate protects. So it fetches, reports how far behind the
@@ -324,10 +331,10 @@ same writable `.txt` queue the authoring agent uses.
 **CLI**
 
 ```bash
-make run AGENT=test-adaptation-agent MODULE=checkout
-EXPLORE_ONLY=true make run AGENT=test-adaptation-agent MODULE=checkout
-ADAPTATION_APPLY=false make run AGENT=test-adaptation-agent MODULE=checkout   # propose only
-START_FROM_STEP=4 SESSION_ID=<sid> make run AGENT=test-adaptation-agent  # resume
+./scripts/run-adaptation-agent.sh checkout
+EXPLORE_ONLY=true ./scripts/run-adaptation-agent.sh checkout
+ADAPTATION_APPLY=false ./scripts/run-adaptation-agent.sh checkout   # propose only
+START_FROM_STEP=4 SESSION_ID=<sid> ./scripts/run-adaptation-agent.sh  # resume
 ```
 
 Resume matters more here than anywhere else in this repo: exploration is the
@@ -366,7 +373,7 @@ an agent that may change test *steps* always needs a human, and a branch could
 drift.
 
 **`.skip-reason`** — `infra` (leave the note queued) / `no-work` / `escalate` /
-`unsafe` / `no-session` / `unreachable` / `explore-only`.
+`unsafe` / `no-session` / `unreachable` / `explore-only` / `stuck`.
 
 ## Audit Trail
 

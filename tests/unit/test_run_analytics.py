@@ -57,10 +57,32 @@ def test_authoring_counts_test_sources_not_files_count(tmp_path, store):
         "src/test/java/LoginTest.java", "src/test/java/CartTest.java",
         "src/main/java/Helper.java"]}))
     (d / "05-ship.json").write_text(json.dumps({"files_count": 9}))
+    (d / ".fix-passed").write_text("true")
     _write_metrics(d)
     rec = analytics.build_record(d, agent="test-authoring-agent")
     assert rec["outcomes"]["tests_created"] == 2   # not 9, and not 3
     assert rec["outcomes"]["files_changed"] == 9
+
+
+@pytest.mark.parametrize("gate", ["false", "stuck", None])
+def test_authoring_credits_no_tests_until_the_fix_gate_passes(tmp_path, store, gate):
+    """A generated test that never passed is not a test produced."""
+    d = _session(tmp_path, "test-authoring-agent")
+    (d / "03-generate.json").write_text(json.dumps(
+        {"files_written": ["src/test/java/LoginTest.java"]}))
+    if gate:
+        (d / ".fix-passed").write_text(gate)
+    rec = analytics.build_record(d, agent="test-authoring-agent", status="failed")
+    assert rec["outcomes"]["tests_created"] == 0
+
+
+def test_a_dir_outside_a_real_agent_writes_no_row(tmp_path, store):
+    """Its grandparent's name (once a tmp UUID) must not become an agent."""
+    d = tmp_path / "26d649f1-7c35-452d-88b8-217ce6bfe27c" / "x" / "fake-audit-renamed"
+    d.mkdir(parents=True)
+    assert analytics.build_record(d) is None
+    assert analytics.append_from_session(d) is False
+    assert not store.exists()
 
 
 def test_adaptation_is_not_scored_by_its_always_needs_review_verdict(tmp_path, store):
@@ -118,9 +140,11 @@ def test_spend_counts_for_every_terminal_status(tmp_path, store):
         analytics.append_from_session(d, agent="test-healing-agent", status=status,
                                       started_at=time.time())
     overall = analytics.query("all")["overall"]
-    assert overall["runs"] == 4
+    # Cancelled and interrupted are no verdict on the agent: not runs in the
+    # success rate, but every dollar still counts.
+    assert overall["runs"] == 2
     assert overall["cost_usd"] == 4.0
-    assert (overall["succeeded"], overall["failed"], overall["cancelled"]) == (1, 1, 1)
+    assert (overall["succeeded"], overall["failed"], overall["excluded"]) == (1, 1, 2)
 
 
 def test_duplicate_session_ids_resolve_newest_wins(tmp_path, store):
@@ -200,6 +224,15 @@ def test_healing_gate_skipped_is_diagnosed_not_failed(tmp_path, store):
     assert rec["status"] == "diagnosed"
 
 
+def test_a_diagnosed_run_counts_as_succeeded(tmp_path, store):
+    d = _session(tmp_path, "test-healing-agent")
+    (d / ".fix-passed").write_text("skipped")
+    _write_metrics(d)
+    analytics.append_from_session(d, agent="test-healing-agent", started_at=time.time())
+    overall = analytics.query("all")["overall"]
+    assert (overall["runs"], overall["succeeded"], overall["excluded"]) == (1, 1, 0)
+
+
 def test_healing_crash_marker_wins(tmp_path, store):
     d = _session(tmp_path, "test-healing-agent")
     (d / ".fix-passed").write_text("true")
@@ -262,3 +295,138 @@ def test_cancel_outranks_the_crash_it_causes(tmp_path, store, agent):
     (d / ".cancelled").write_text("true")
     _write_metrics(d)
     assert analytics.build_record(d, agent=agent)["status"] == "cancelled"
+
+
+# ── how a run counts ──────────────────────────────────────────────────────────
+
+def _run(tmp_path, agent, caller="completed", **files):
+    """A session with metrics and the given marker files; returns its record."""
+    d = _session(tmp_path, agent)
+    for name, body in files.items():
+        (d / name).write_text(body if isinstance(body, str) else json.dumps(body))
+    _write_metrics(d)
+    return analytics.build_record(d, agent=agent, status=caller)
+
+
+@pytest.mark.parametrize("agent", ["test-authoring-agent", "test-healing-agent",
+                                   "test-adaptation-agent"])
+def test_a_restart_outranks_the_crash_it_causes(tmp_path, store, agent):
+    rec = _run(tmp_path, agent, caller="failed",
+               **{".crashed": "exit 143", ".interrupted": "true"})
+    assert rec["status"] == "interrupted"
+
+
+@pytest.mark.parametrize("caller", ["completed", "failed"])
+@pytest.mark.parametrize("gate,expected", [("true", "completed"), ("false", "failed"),
+                                           ("stuck", "failed")])
+def test_authoring_is_judged_by_its_gate_not_by_who_launched_it(tmp_path, store, caller,
+                                                                gate, expected):
+    """The CLI passes the exit code, the server passes .verdict — one outcome
+    must not score differently depending on which one wrote last."""
+    assert _run(tmp_path, "test-authoring-agent", caller,
+                **{".fix-passed": gate})["status"] == expected
+
+
+def test_authoring_reproducing_a_documented_defect_is_a_correct_test(tmp_path, store):
+    rec = _run(tmp_path, "test-authoring-agent", "failed", **{
+        ".fix-passed": "defect",
+        "03-generate.json": {"files_written": ["src/test/java/CartTest.java"]}})
+    assert rec["status"] == "diagnosed"
+    assert rec["outcomes"]["tests_created"] == 1
+
+
+def test_authoring_that_never_ran_a_test_is_blocked(tmp_path, store):
+    assert _run(tmp_path, "test-authoring-agent", **{".fix-passed": "skipped"})["status"] == "blocked"
+
+
+def test_authoring_work_that_passed_counts_even_when_the_push_failed(tmp_path, store):
+    """Delivery is not the work: the test passed, and a Ship retry re-sends it."""
+    rec = _run(tmp_path, "test-authoring-agent", **{
+        ".fix-passed": "true", "05-ship.json": {"ship_status": "push_failed"},
+        "03-generate.json": {"files_written": ["src/test/java/CartTest.java"]}})
+    assert rec["status"] == "completed"
+    assert rec["outcomes"]["tests_created"] == 1
+
+
+def test_healing_that_could_not_run_the_test_is_blocked_not_diagnosed(tmp_path, store):
+    rec = _run(tmp_path, "test-healing-agent",
+               **{".fix-passed": "skipped", ".skip-reason": "infra"})
+    assert rec["status"] == "blocked"
+
+
+def test_healing_fixes_count_even_when_the_push_was_rejected(tmp_path, store):
+    """The verified fixes are committed on the local branch; only the push failed."""
+    rec = _run(tmp_path, "test-healing-agent", **{
+        ".fix-passed": "true", "01-fix.json": {"succeeded": 5},
+        "02-ship.json": {"succeeded": 5, "pr_url": None}})
+    assert rec["status"] == "completed"
+    assert rec["outcomes"]["tests_fixed"] == 5
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("no-work", "diagnosed"), ("escalate", "diagnosed"), ("stuck", "failed"),
+    ("unsafe", "failed"), ("infra", "blocked"), ("no-session", "blocked"),
+    ("unreachable", "blocked"), ("explore-only", "explore-only"),
+])
+def test_adaptation_skip_reasons(tmp_path, store, reason, expected):
+    rec = _run(tmp_path, "test-adaptation-agent", **{
+        ".fix-passed": "skipped", ".skip-reason": reason,
+        "05-ship.json": {"ship_status": "dry_run"}})
+    assert rec["status"] == expected
+
+
+def test_adaptation_that_declined_every_item_handed_off_by_design(tmp_path, store):
+    """04_adapt writes gate false for it, but a decline is an escalation."""
+    rec = _run(tmp_path, "test-adaptation-agent", **{
+        ".fix-passed": "false", "05-ship.json": {"ship_status": "dry_run"},
+        "04-adapt.json": {"items": [{"status": "declined"}, {"status": "escalated"}]}})
+    assert rec["status"] == "diagnosed"
+
+
+def test_adaptation_whose_items_failed_is_failed_even_after_shipping(tmp_path, store):
+    rec = _run(tmp_path, "test-adaptation-agent", **{
+        "05-ship.json": {"ship_status": "dry_run"},
+        "04-adapt.json": {"items": [{"status": "failed"}, {"status": "failed"}]}})
+    assert rec["status"] == "failed"
+
+
+def test_only_verdicts_are_runs_but_every_dollar_counts(tmp_path, store):
+    for i, gate in enumerate(("true", "false")):
+        d = _session(tmp_path, "test-healing-agent", name=f"20260828-12000{i}-judged")
+        (d / ".fix-passed").write_text(gate)
+        _write_metrics(d, cost=1.0)
+        analytics.append_from_session(d, agent="test-healing-agent", started_at=time.time())
+    d = _session(tmp_path, "test-healing-agent", name="20260828-120009-blocked")
+    (d / ".fix-passed").write_text("skipped")
+    (d / ".skip-reason").write_text("infra")
+    _write_metrics(d, cost=1.0)
+    analytics.append_from_session(d, agent="test-healing-agent", started_at=time.time())
+    overall = analytics.query("all")["overall"]
+    assert (overall["runs"], overall["succeeded"], overall["failed"], overall["excluded"]) == (2, 1, 1, 1)
+    assert overall["cost_usd"] == 3.0
+
+
+def test_a_run_that_did_nothing_is_ignored(tmp_path, store):
+    """No tokens, no spend, no output: a CLI that answered with nothing."""
+    d = _session(tmp_path, "test-authoring-agent")
+    analytics.append_from_session(d, agent="test-authoring-agent", status="failed",
+                                  started_at=time.time())
+    q = analytics.query("all")
+    assert (q["overall"]["runs"], q["overall"]["excluded"]) == (0, 0)
+    assert q["by_agent"] == {}
+
+
+def test_every_exit_trap_in_an_agent_still_finalizes_metrics():
+    """A `trap ... EXIT` in a run.sh replaces shared/session.sh's finalize_metrics.
+
+    Healing's queue mode did exactly that to release its handoff claim, so every
+    queue-mode run exited without metrics.json or an analytics row.
+    """
+    import re
+    root = Path(__file__).resolve().parents[2]
+    offenders = []
+    for run_sh in sorted((root / "agents").glob("*/run.sh")):
+        for line in run_sh.read_text().splitlines():
+            if re.search(r"^\s*trap\s.*\bEXIT\s*$", line) and "finalize_metrics" not in line:
+                offenders.append(f"{run_sh.parent.name}: {line.strip()}")
+    assert offenders == [], offenders

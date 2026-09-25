@@ -11,8 +11,10 @@ import importlib.util
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -21,13 +23,15 @@ sys.path.insert(0, str(ROOT))
 
 
 def _load():
-    os.environ.setdefault("AUDIT_DIR", str(ROOT / "tests" / "fixtures"))
-    os.environ.setdefault("HANDOFF_FILE", str(ROOT / "tests" / "fixtures" / "none.json"))
     path = ROOT / "agents" / "test-healing-agent" / "actions" / "01_fix.py"
     spec = importlib.util.spec_from_file_location("healing_fix_progress", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["healing_fix_progress"] = mod
-    spec.loader.exec_module(mod)
+    # Set only for the import (the step reads them into module constants); left in
+    # os.environ they leaked into every later test in the session.
+    with mock.patch.dict(os.environ, {"AUDIT_DIR": tempfile.mkdtemp(prefix="fix-progress-"),
+                                      "HANDOFF_FILE": str(ROOT / "tests" / "fixtures" / "none.json")}):
+        spec.loader.exec_module(mod)
     return mod
 
 

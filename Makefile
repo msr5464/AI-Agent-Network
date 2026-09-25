@@ -77,8 +77,8 @@ setup:
 	$(PY) -m pip install -r requirements.txt
 	@echo ""
 	@echo "Setup complete."
-	@echo "Next: copy config/.env.example to config/.env and fill in your credentials."
-	@echo "Then run: make setup-mcp  (configures MCP tools in ~/.claude.json)"
+	@echo "Next: python -m playwright install chromium"
+	@echo "      copy config/.env.example to config/.env and fill in your credentials."
 
 .PHONY: setup-mcp
 setup-mcp: ## Configure MCP tools (GitHub, Slack) in ~/.claude.json
@@ -142,8 +142,12 @@ help:
 	@echo "  AUTO_PUSH=false make run AGENT=test-authoring-agent      Dry-run (generates + tests, no PR)"
 	@echo "  make audit AGENT=test-authoring-agent                    List recent sessions"
 	@echo ""
+	@echo "  make run AGENT=test-adaptation-agent MODULE=checkout      Adapt tests to queue/checkout.txt"
+	@echo "  EXPLORE_ONLY=true make run AGENT=test-adaptation-agent MODULE=checkout   Flow map only"
+	@echo "  ADAPTATION_APPLY=false make run AGENT=test-adaptation-agent MODULE=...   Propose, do not edit"
+	@echo ""
 	@echo "  make setup                                         Install deps + show next steps"
-	@echo "  make setup-mcp                                     Configure MCP tools in ~/.claude.json"
+	@echo "  make setup-mcp                                     Optional: merge GitHub/Slack MCP into ~/.claude.json (backs it up)"
 	@echo "  make dashboard                                     Browse audit sessions at localhost:8888"
 	@echo "  make dashboard PORT=9000                           Use custom port"
 	@echo "  make test                                          Run unit tests"

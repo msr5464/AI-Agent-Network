@@ -393,16 +393,56 @@ _CATCH_OK = re.compile(r"\b(throw|AssertHelper|logFail|logFailToEndExecution|fai
 
 # Raw driver calls. CONVENTIONS.md §1 and config/skills/automation-repo.md both
 # forbid these, and until now nothing checked — the rule lived only in a prompt.
+# Both frameworks: the Selenium list alone let a raw Playwright `locator.click()`
+# through. Only the wrapper classes may make these calls, and edits never land
+# there — `Element.click(...)` is the wrapper itself, hence the exclusion.
 _RAW_DRIVER = (
     (re.compile(r"\bdriver\s*\.\s*findElement"), "driver.findElement"),
     (re.compile(r"\.\s*sendKeys\s*\("), ".sendKeys()"),
     (re.compile(r"\bnew\s+WebDriverWait\b"), "new WebDriverWait"),
     (re.compile(r"\bdriver\s*\.\s*get\s*\("), "driver.get()"),
+    (re.compile(r"(?<!\bElement)\s*\.\s*(?:click|dblclick|fill|press|check|uncheck"
+                r"|selectOption|hover|setInputFiles)\s*\("), "locator.click()/fill()/…"),
+    (re.compile(r"\bpage\s*\.\s*(?:navigate|waitForTimeout)\s*\("), "page.navigate()/waitForTimeout()"),
 )
 
-_INTERACTION = re.compile(
-    r"\bElement\s*\.\s*(click\w*|enterData|clearData|selectBy\w*|hover\w*)\s*\(")
 _LOGSTEP = re.compile(r"\blogStep\s*\(")
+
+# One interaction with the page, as a line of page-object or test code: the
+# Selenium framework's static `Element.*` wrappers, or the Playwright framework's
+# inherited BasePage wrappers, called unqualified (`click(locator, "Next")`).
+_INTERACTION = re.compile(
+    r"\bElement\s*\.\s*(click\w*|enterData|clearData|selectBy\w*|hover\w*)\s*\("
+    r"|(?<![\w.])(?:click|clickForce|clickViaJS|clickUntilNextElementIsLoaded|doubleClick"
+    r"|fillText|typeText|inputOTP|selectOption|selectOptionBySearch|check|uncheck|hover"
+    r"|pressKey|uploadFile|navigateTo|navigateToFeature)\s*\(")
+
+# A call that only reads — data, state, a property — is wiring, not a step.
+_QUERY_CALLEE = re.compile(
+    r"^(?:get|read|load|build|parse|format|is|has|to)(?:[A-Z]|$)"
+    r"|^(?:size|length|equals|contains|stream|map|filter|collect|trim)$")
+_RECEIVER_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*(\w+)\s*\(")
+
+
+def _added_interactions(code: str) -> list:
+    """Statements in `code` that drive the app, in either framework.
+
+    Built on logstep_narration.acting_statements — the same notion of "a step"
+    the narration check uses — minus assertions (a check inside an existing
+    step needs no new narration) and minus pure reads. Selenium tests call
+    `Element.click(...)`; Playwright-framework tests call helpers and page
+    objects (`products.addToCart(...)`), which a wrapper-name list never saw.
+    """
+    from shared.logstep_narration import acting_statements, _ASSERT_CALL, _PLUMBING_RECEIVERS
+    found = []
+    for statement in acting_statements(code):
+        if _ASSERT_CALL.search(statement):
+            continue
+        calls = [(r, c) for r, c in _RECEIVER_CALL.findall(statement)
+                 if r not in _PLUMBING_RECEIVERS]
+        if any(not _QUERY_CALLEE.search(callee) for _r, callee in calls):
+            found.append(statement)
+    return found
 
 
 def no_new_swallowing(before: str, after: str) -> tuple:
@@ -427,7 +467,7 @@ def no_new_swallowing(before: str, after: str) -> tuple:
 
 
 def wrapper_compliance(before: str, after: str) -> tuple:
-    """Reject raw Selenium/WebDriver calls in added code."""
+    """Reject raw driver calls (Selenium or Playwright) in added code."""
     blob = "\n".join(_added_lines(before, after))
     found = [name for pattern, name in _RAW_DRIVER if pattern.search(blob)]
     if found:
@@ -447,7 +487,7 @@ def logstep_present(before: str, after: str, is_test_class: bool) -> tuple:
     if not is_test_class:
         return True, ""
     added = "\n".join(_added_lines(before, after))
-    if _INTERACTION.search(added) and not _LOGSTEP.search(added):
+    if (_INTERACTION.search(added) or _added_interactions(added)) and not _LOGSTEP.search(added):
         return False, ("added an interaction to a test class with no logStep — "
                        "CONVENTIONS.md §10, and the intent contract is derived "
                        "from those strings")

@@ -202,6 +202,9 @@ finalize_metrics() {
   local rc=$?
   flush_step_done
   [[ -z "${AUDIT_DIR:-}" ]] && return $rc
+  # scripts/_run-agent.sh saves the console into the session after the run, and
+  # this is where the session finally landed — triaging renames it mid-run.
+  [[ -n "${QA_AUDIT_DIR_OUT:-}" ]] && printf '%s\n' "$AUDIT_DIR" > "$QA_AUDIT_DIR_OUT"
   METRICS_SUMMARY=$(cd "${REPO_ROOT:-.}" && python3 -m shared.metrics 2>/dev/null || true)
 
   # Durable analytics row. Written here rather than only server-side because a

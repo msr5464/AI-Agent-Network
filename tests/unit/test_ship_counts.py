@@ -11,19 +11,23 @@ The clustering was working; only the reporting hid it.
 import importlib.util
 import os
 import sys
+import tempfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 
 def _load():
-    os.environ.setdefault("AUDIT_DIR", str(ROOT / "tests" / "fixtures"))
     path = ROOT / "agents" / "test-healing-agent" / "actions" / "02_ship.py"
     spec = importlib.util.spec_from_file_location("healing_ship", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["healing_ship"] = mod
-    spec.loader.exec_module(mod)
+    # Set only for the import (the step reads them into module constants); left in
+    # os.environ they leaked into every later test in the session.
+    with mock.patch.dict(os.environ, {"AUDIT_DIR": tempfile.mkdtemp(prefix="ship-counts-")}):
+        spec.loader.exec_module(mod)
     return mod
 
 

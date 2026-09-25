@@ -8,8 +8,10 @@ Loaded at runtime by `load_fix_rules()`, which takes **everything from the first
 text above that heading is documentation and is never sent to the model. If this
 file is missing, `_DEFAULT_FIX_RULES` in `01_fix.py` is used instead.
 
-Domain context (framework patterns, imports, wrapper methods) lives separately in
-`config/skills/automation-repo.md`, which is passed as `--system-prompt-file`.
+Framework-neutral rules live in `config/skills/automation-repo.md`, passed as
+`--system-prompt-file`. The automation repo's own conventions (its `CLAUDE.md` or
+equivalent — see `load_repo_conventions()`, up to 64,000 characters) are part of
+the generated context above the instructions.
 
 ---
 
@@ -27,7 +29,9 @@ Domain context (framework patterns, imports, wrapper methods) lives separately i
 3. Look in the page object files above for the declaration that needs updating —
    an @FindBy annotation, a `By` constant, or a locator assigned in a constructor
 4. If the fix is in a page object file (not the test file), target the page object
-5. **IMPORTANT**: Use the wrapper methods from the base class — do NOT use raw Selenium/RestAssured
+5. **IMPORTANT**: Use the wrapper methods from the base class — do NOT call the
+   browser driver or locator object directly (`locator.click()`, `element.sendKeys()`,
+   `driver.findElement(...)`)
 6. **IMPORTANT**: Follow the project conventions shown above
 7. Do not refactor, rename, or change anything unrelated to the broken locator
 
@@ -37,7 +41,7 @@ Respond with a JSON object ONLY. No prose, no markdown fences around it.
 ```
 {
   "fixable": true | false,
-  "verdict": "LOCATOR_STALE" | "STOP",
+  "verdict": "LOCATOR_STALE" | "AMBIGUOUS_LOCATOR" | "STOP",
   "unfixable_reason": "<reason if fixable=false, else null>",
   "fix_description": "<1-2 sentences: what was broken and what you changed>",
   "target_file": "<absolute path of the file to modify>",
@@ -52,12 +56,16 @@ Respond with a JSON object ONLY. No prose, no markdown fences around it.
 
 Rules for `verdict`:
 - `LOCATOR_STALE` — right page, right state, the element was renamed or moved.
-  **This is the only verdict under which any edit is accepted.**
+- `AMBIGUOUS_LOCATOR` — the selector now matches several elements; narrow it so
+  it matches exactly the intended one.
+- **These two are the only verdicts under which an edit is accepted.**
 - `STOP` — nothing here is fixable by editing this file: the page was never
   reached, the element exists but was covered or arrived late, the environment
   failed, a fixture was stale. Set `fixable: false` and name which.
-- A guard rejects a selector edit whose verdict is not `LOCATOR_STALE`, and one
-  that broadens what it replaces, before the test is ever run.
+- Guards run before the test does. They reject an edit that changes a
+  page-load assertion when the diagnosis is not a stale locator, a replacement
+  selector that matches nothing (or only hidden elements) in the captured DOM,
+  and one that broadens what it replaces.
 
 Rules for `edits`:
 - Keep each edit as small as possible — ideally the single locator line.
@@ -76,7 +84,7 @@ Before setting `fixable: false`, you MUST exhaustively try:
 
 1. Re-read the full execution log and stack trace for the exact failing selector
 2. Check all page object files listed above for the declaration matching the element name
-3. Try alternative locator strategies in priority order: `id` > `name` > `css [data-cy]` > `css` > `xpath`
+3. Try alternative locator strategies in priority order: test id (`[data-cy]`, `[data-testid]`, `[data-test]`) > `#id` > `[name]` > `css` > `xpath`
 4. Check related files for alternative element declarations (inner classes, static strings)
 5. Look for similar working locators in the same page object as a pattern reference
 

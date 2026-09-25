@@ -154,6 +154,25 @@ def test_a_stage_that_ran_then_was_reused_is_not_marked_skipped(audit):
     assert stage["attempts"] == 2
 
 
+def test_a_resumed_session_reports_active_time_not_the_idle_gap(audit):
+    """Attempt 1 at t=1, resumed 10h later: the run took 12 min, not 10h."""
+    metrics.record_stage("parse", "Parse", 1, 1.0, 85.0)
+    metrics.record_stage("parse", "Parse", 1, 0.0, 0.0, skipped=True)
+    metrics.record_stage("generate", "Generate", 2, 36000.0, 36636.0)
+    data = metrics.rollup()
+    assert data["duration_s"] == 720.0
+    assert data["ended_at"] - data["started_at"] == 36635.0   # the span stays visible
+
+
+def test_duration_falls_back_to_the_span_when_no_stage_timed_itself(audit):
+    """Old sessions wrote 0.0 placeholder stage durations."""
+    (audit / "metrics").mkdir(exist_ok=True)
+    (audit / "metrics" / "stages.jsonl").write_text(json.dumps(
+        {"key": "parse", "index": 1, "started_at": 100.0, "ended_at": 113.0,
+         "duration_s": 0.0}) + "\n")
+    assert metrics.rollup()["duration_s"] == 13.0
+
+
 def test_a_stage_only_ever_skipped_stays_skipped(audit):
     metrics.record_stage("scope", "[02/05] Scope", 2, 0.0, 0.0, skipped=True)
     metrics.record_stage("scope", "[02/05] Scope", 2, 0.0, 0.0, skipped=True)

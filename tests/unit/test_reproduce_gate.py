@@ -13,6 +13,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -30,8 +31,6 @@ def reproduce(tmp_path_factory):
     front of the path, and both are restored afterwards so the tests that run
     next are unaffected either way.
     """
-    os.environ.setdefault("AUDIT_DIR", str(tmp_path_factory.mktemp("audit")))
-
     saved_path = list(sys.path)
     saved_modules = {name: module for name, module in sys.modules.items()
                      if name == "lib" or name.startswith("lib.")}
@@ -43,7 +42,10 @@ def reproduce(tmp_path_factory):
         spec = importlib.util.spec_from_file_location(
             "reproduce_step", AGENT / "actions" / "00_reproduce.py")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Set only for the import (the step reads them into module constants); left in
+        # os.environ they leaked into every later test in the session.
+        with mock.patch.dict(os.environ, {"AUDIT_DIR": str(tmp_path_factory.mktemp("audit"))}):
+            spec.loader.exec_module(module)
         yield module
     finally:
         for name in [n for n in sys.modules

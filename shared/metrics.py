@@ -314,13 +314,19 @@ def build_rollup(base: Optional[Path] = None) -> Optional[Dict[str, Any]]:
             started = started or max(0.0, stamps[0] - first_duration)
             ended = ended or stamps[-1]
 
+    # Active time, not the first-to-last span: a resumed session's span includes
+    # the idle gap between attempts (one measured 10h for 12 min of work). The
+    # span stays the answer when no stage recorded a real duration.
+    active = round(sum(float(s.get("duration_s") or 0.0) for s in stages), 3)
+    span = round(ended - started, 3) if (started and ended) else None
+
     return {
         "schema": SCHEMA_VERSION,
         "session_id": base.name,
         "agent": _agent_name(base),
         "started_at": started or None,
         "ended_at": ended or None,
-        "duration_s": round(ended - started, 3) if (started and ended) else None,
+        "duration_s": active or span,
         "totals": totals,
         "by_model": by_model,
         "stages": stages,

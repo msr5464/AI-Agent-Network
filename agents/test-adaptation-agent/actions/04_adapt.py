@@ -61,6 +61,10 @@ TEST_TIMEOUT_S = int(os.environ.get("ADAPTATION_TEST_TIMEOUT_S", "300"))
 COMPILE_CMD = os.environ.get("ADAPTATION_TEST_COMPILE_CMD", "mvn -q test-compile -DskipTests")
 RULES_FILE = REPO_ROOT / "config" / "prompts" / "adapt.md"
 SYSTEM_PROMPT = REPO_ROOT / "config" / "skills" / "automation-repo.md"
+# The automation repo's own CLAUDE.md goes into the prompt: the system prompt is
+# framework-neutral and defers to it for APIs, and without it the model was
+# writing Java for a framework it had never been shown.
+MAX_CONVENTIONS_CHARS = 64000
 
 # Per-edit-class budgets. The kind comes from the change note, so the authority an
 # edit gets is decided by what a human said changed rather than by what the model
@@ -267,6 +271,12 @@ def build_adapt_prompt(item: dict, plan: dict, scope: dict, flow: dict,
         f"- **{t.split('.')[-1]}**: " + "; ".join(c.get("proves") or [])[:500]
         for t, c in list(contracts.items())[:5] if c.get("proves"))
 
+    conventions = repo_conventions(workspace)
+    conventions_section = (
+        "\n## PROJECT CONVENTIONS — the automation repo's CLAUDE.md\n"
+        "Its wrappers, waits, assertions and naming are the only APIs to use.\n\n"
+        f"{conventions}\n" if conventions else "")
+
     page_object_map = flow_map.describe_page_objects(flow) or (
         "_Nothing measured — treat the files below as candidates, not confirmed "
         "matches._")
@@ -304,9 +314,17 @@ What the tests narrate (their logStep lines):
 
 ## Files you may edit
 {files}
-{retry_note}
+{conventions_section}{retry_note}
 {rules}
 """
+
+
+def repo_conventions(workspace: Path) -> str:
+    """The automation repo's CLAUDE.md, or "" when it has none."""
+    try:
+        return (Path(workspace) / "CLAUDE.md").read_text(encoding="utf-8")[:MAX_CONVENTIONS_CHARS]
+    except OSError:
+        return ""
 
 
 def done_section(done: list) -> str:
@@ -758,7 +776,9 @@ def main():
                                     retry_note + done_section(done),
                                     checks=before["checks"])
         call = _call_claude_ex(prompt=prompt, model=MODEL, cwd=str(REPO_ROOT),
-                               timeout=900, log_dir=str(AUDIT_DIR))
+                               timeout=900, log_dir=str(AUDIT_DIR),
+                               system_prompt_file=(str(SYSTEM_PROMPT)
+                                                   if SYSTEM_PROMPT.exists() else None))
         if call.status != "ok":
             # The call did not happen: a usage cap, an API error, a timeout. None
             # of those are the change note's fault, so stop as infra and leave it

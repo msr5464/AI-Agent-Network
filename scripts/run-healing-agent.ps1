@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Run the qa-auto-fix agent (Windows).
+    Run the test-healing-agent (Windows).
 
 .DESCRIPTION
     Usage:
-      .\scripts\run-autofix.ps1                                          # queue mode: picks oldest
-      .\scripts\run-autofix.ps1 -BuildTag ProdSanity-541                 # direct: by build tag
-      .\scripts\run-autofix.ps1 -HandoffFile C:\path\to\handoff.json     # direct: by file path
-      $env:AUTO_PUSH="false"; .\scripts\run-autofix.ps1                  # dry-run (no PR)
+      .\scripts\run-healing-agent.ps1                                          # queue mode: picks oldest
+      .\scripts\run-healing-agent.ps1 -BuildTag ProdSanity-541                 # direct: by build tag
+      .\scripts\run-healing-agent.ps1 -HandoffFile C:\path\to\handoff.json     # direct: by file path
+      $env:AUTO_PUSH="false"; .\scripts\run-healing-agent.ps1                  # dry-run (no PR)
 #>
 
 [CmdletBinding()]
@@ -36,5 +36,5 @@ if ($HandoffFile) {
 
 if ($BuildTag) { $env:BUILD_TAG = $BuildTag }
 
-make run AGENT=qa-auto-fix BUILD_TAG="$BuildTag"
+make run AGENT=test-healing-agent BUILD_TAG="$BuildTag"
 exit $LASTEXITCODE

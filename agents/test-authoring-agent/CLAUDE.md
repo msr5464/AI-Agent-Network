@@ -5,7 +5,7 @@ Read this file first. Every time. Before doing anything else.
 ## What This Agent Does
 
 Takes plain English test steps from a `.txt` file in the queue, generates complete
-framework-compliant Java test code for the Jarvis automation repository, validates
+framework-compliant Java test code for the automation repository (`GITHUB_REPO_AUTOMATION`), validates
 generated web flows by driving a real browser via Playwright MCP, runs the generated test via Maven,
 fixes any failures iteratively, and raises a GitHub PR.
 
@@ -21,7 +21,7 @@ run.sh (orchestrator)
   ├─ 01_parse.py          [Python + Claude]   Plain text → structured generation plan
   ├─ 02_validate_api.py   [Python only]       Real HTTP calls: confirm auth + safe endpoints
   ├─ 02_validate_web.py   [Python + Claude]   Drive browser via Playwright MCP → selector map
-  ├─ 03_generate.py       [Python + Claude]   Write Java files to Thanos-pw repo
+  ├─ 03_generate.py       [Python + Claude]   Write Java files to the automation repo
   ├─ 04_run_and_fix.py    [Python + Claude]   Run mvn test → fix failures → retry loop
   └─ 05_ship.py           [Python only]       Git branch + commit + push + gh pr create
 ```
@@ -32,10 +32,10 @@ run.sh (orchestrator)
 
 | Step | Owns | Does NOT do |
 |------|------|-------------|
-| **01 Parse** | Read plain text, call Claude, produce plan JSON | No file writes to Thanos-pw |
+| **01 Parse** | Read plain text, call Claude, produce plan JSON | No file writes to the automation repo |
 | **02 Validate API** | Real HTTP auth + a real call to every endpoint against `api_base_url` — the input's `curl` where it gave one (run without a shell), no LLM | Never call a path-param endpoint whose value is unknown and has no curl; never treat a body-less POST/PUT/DELETE status as the endpoint's real one |
 | **02 Validate Web** | Drive the browser via Playwright MCP, collect confirmed selectors | No Java codegen |
-| **03 Generate** | Write all Java files to Thanos-pw | No test running |
+| **03 Generate** | Write all Java files to the automation repo | No test running |
 | **04 Run & Fix** | Run mvn test, call Claude to fix failures, retry | No git push |
 | **05 Ship** | Branch + commit + push + PR creation | No AI calls |
 
@@ -175,17 +175,17 @@ the next attempt was shown a DOM captured in a different session.
 ## Data Flow
 
 ```
-queue/<module>.txt  (plain English test steps)
+queue/<module>.txt  (plain English test steps; server runs use queue/<user-id>/<module>.txt)
     ↓
 01-parse.json            (structured generation plan: classes, fields, methods)
     ↓
 02-validate-api.json     (confirmed auth + endpoint shapes, or skipped if not an API test)
 02-validate-web.json     (confirmed DOM selectors, or empty if not a web test)
     ↓
-03-generate.json         (list of Java files written to Thanos-pw)
+03-generate.json         (list of Java files written to the automation repo)
     ↓
 04-run-and-fix.json      (test run results, applied fixes)
-.fix-passed              (gate: true / false / skipped)
+.fix-passed              (gate: true / false / skipped / stuck / defect)
     ↓
 05-ship.json             (PR URL, Slack status)
 .verdict                 (APPROVED / NEEDS-REVIEW)
@@ -197,7 +197,8 @@ queue/processed/<module>.txt  (moved after completion)
 
 ## Input File Format
 
-Plain text file at `queue/<module>.txt`. Claude in step 01 is flexible about exact format.
+Plain text file at `queue/<module>.txt` (CLI runs; a run started from the server reads
+`queue/<user-id>/<module>.txt`). Claude in step 01 is flexible about exact format.
 The minimum required information:
 
 ```
@@ -254,7 +255,7 @@ Web Steps:
 | `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes |
 | `.assertions-frozen.json` | Run & Fix | What the generated test proved before any fix — the conservation baseline |
 | `.fix-history.json` | Run & Fix | Every fix attempt, appended: diagnosis, edits proposed, guards that rejected them. Feeds the next prompt and the stop rule |
-| `.fix-passed` | Run & Fix | Gate: true / false / skipped |
+| `.fix-passed` | Run & Fix | Gate: true / false / skipped / stuck / defect |
 | `05-ship.json` + `.md` | Ship | PR URL, Slack status |
 | `.verdict` | Ship | APPROVED / NEEDS-REVIEW |
 
@@ -266,11 +267,11 @@ Web Steps:
 |----------|---------|---------|
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary | `claude` |
 | `AUTHORING_MODEL` | Claude model for all AI steps | `claude-opus-4-6` |
-| `WORKSPACE_DIR` | Parent directory containing Jarvis | required |
+| `WORKSPACE_DIR` | Parent directory containing the automation repo | required unless `FRAMEWORK_DIR` is set |
 | `FRAMEWORK_DIR` | Absolute path to the checkout, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION` | optional |
 | `GITHUB_TOKEN` | GitHub auth token for PR creation | required |
 | `GITHUB_ORG` | GitHub org/user owning the repo | required |
-| `GITHUB_REPO_AUTOMATION` | Name of the Jarvis repo dir | `Jarvis` |
+| `GITHUB_REPO_AUTOMATION` | Name of the automation repo (directory and GitHub repo) | required |
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs | `main` |
 | `GITHUB_PR_REVIEWERS` | Comma-separated reviewer handles | optional |
 | `AUTHORING_BRANCH_PREFIX` | Branch name prefix | `authoring` |
@@ -308,13 +309,13 @@ cp agents/test-authoring-agent/.env.example agents/test-authoring-agent/.env
 # Edit .env: set WORKSPACE_DIR, GITHUB_TOKEN, GITHUB_ORG at minimum
 
 # Direct mode — process a specific module input file
-make run AGENT=test-authoring-agent MODULE=payments
+./scripts/run-authoring-agent.sh payments
 
 # Queue mode — picks the oldest .txt in the queue
-make run AGENT=test-authoring-agent
+./scripts/run-authoring-agent.sh
 
 # Dry-run — generates, tests, but no PR pushed
-AUTO_PUSH=false make run AGENT=test-authoring-agent MODULE=payments
+AUTO_PUSH=false ./scripts/run-authoring-agent.sh payments
 
 # View audit trail
 make audit AGENT=test-authoring-agent
@@ -333,7 +334,7 @@ prior failed try) is cleared before it re-runs.
 # Re-run step 4 (Run & Fix) and 05 (Ship) for a session that failed there, reusing
 # its 01-parse.json / 02-validate-api.json / 02-validate-web.json / 03-generate.json as-is.
 START_FROM_STEP=4 SESSION_ID=20260330-143022-create-payments \
-  make run AGENT=test-authoring-agent
+  ./scripts/run-authoring-agent.sh
 ```
 
 A resume never takes a `TESTING_MODE` cache hit. Retrying a step means running it
@@ -349,18 +350,19 @@ if the step immediately before `START_FROM_STEP` never actually completed in tha
 
 The same capability is exposed to `qa_agents_server` as
 `POST /agents/test-authoring-agent/sessions/<session_id>/retry` with body
-`{"from_step": 4}` — this is what a "Retry from step N" action in a UI would call; wiring
-up that UI button is a separate change in the AI-Test-Studio frontend, not in this repo.
+`{"from_step": 4}` — the AI-Test-Studio authoring page's "Retry from step N" action calls it.
 
 ---
 
-## Jarvis Framework Conventions
+## Automation Repo Conventions
 
-> **All framework conventions are defined in `Jarvis/CLAUDE.md`** (the single source of truth).
-> The agent scripts read that file directly and inject it into every Claude prompt.
-> Do NOT duplicate framework rules here — update `Jarvis/CLAUDE.md` instead.
+> **All framework conventions are defined in the automation repo's own `CLAUDE.md`**
+> (the single source of truth — in Playwright-Automation-Framework it is titled
+> "Jarvis — AI Agent Guide"). Steps 01, 03 and 04 read `$FRAMEWORK_DIR/CLAUDE.md`
+> directly and inject it into their Claude prompts.
+> Do NOT duplicate framework rules here — update that file instead.
 
-The section below covers **agent-specific generation rules** that are not in `Jarvis/CLAUDE.md`.
+The section below covers **agent-specific generation rules** that are not in the automation repo's `CLAUDE.md`.
 
 ### Package Structure (new module)
 ```
@@ -377,15 +379,15 @@ src/test/java/automation/{feature}/
 ```
 
 All patterns (Data POJO, Builder, API Enum, Helper, Page Object, Test classes, DO/DON'T rules)
-are defined in `Jarvis/CLAUDE.md` and injected into every Claude prompt at runtime.
-Refer to [Jarvis/CLAUDE.md](../../../Jarvis/CLAUDE.md) for the authoritative reference.
+are defined in the automation repo's `CLAUDE.md` and injected into the Claude prompts at
+runtime — that file is the authoritative reference.
 
 ---
 
 ### URLs Are Properties, Never Java Literals
 
 A URL welded into a test, page object or helper pins the module to one environment —
-`Jarvis/CLAUDE.md` has always said so ("Hardcoded URL in test/page → put in properties
+the automation repo's `CLAUDE.md` has always said so ("Hardcoded URL in test/page → put in properties
 file"), but until this guardrail nothing enforced it, and generated modules shipped with
 `private static final String LOGIN_URL = "https://..."` and no matching property.
 
@@ -396,7 +398,7 @@ The rule is enforced at four points, all reading `shared/url_properties.py`:
 | **03 Generate**, before codegen | `collect_urls()` harvests every URL from the plan (`web_base_url`, `api_base_url`, validation steps) and from `02-validate-web.json` — `urls_visited` first, then `steps_passed`. It names a key for each and writes them to `parameters/{environment}-{country}.properties`. The key table goes into the codegen prompt. |
 | **03 Generate**, after codegen | A key the generated code reads that the properties file does not define is **recovered from `urls_visited` or the run aborts** — see "A URL property is not a warning" below. |
 | **03 Generate**, after codegen | Any file still holding a literal URL gets one targeted repair pass, guarded by `validate_fix`. What survives is logged and recorded in `03-generate.json` → `hardcoded_urls`. |
-| **04 Run & Fix** | `ensure_url_properties()` rewrites the keys before the first run (`git checkout -f` in run.sh discards them). `no_hardcoded_url` is a fix guard: a fix that adds a literal URL is rejected before it reaches disk. |
+| **04 Run & Fix** | `ensure_url_properties()` rewrites the keys before the first run (run.sh's forced base checkout, `shared.workspace prepare-base --checkout`, discards them). `no_hardcoded_url` is a fix guard: a fix that adds a literal URL is rejected before it reaches disk. |
 | **05 Ship** | The URL keys are committed — added to HEAD's copy of the properties file, never the working copy, so the run's real credentials in that same file are not committed with them. |
 
 ### `urls_visited` — why the step text was not enough

@@ -93,6 +93,17 @@ MUTATE_INVENTORY = """() => {
 }"""
 
 
+def _settle(p):
+    """Let the app finish rendering before touching its DOM.
+
+    saucedemo is a React app: mutating before it settles is undone by its next
+    render, so the "drifted" page quietly reverted to the original and every
+    heal was scored against an unchanged element (2/6 on 2026-09-24).
+    """
+    p.wait_for_load_state("networkidle")
+    p.wait_for_timeout(1000)
+
+
 def run_page(browser, cfg, name, url, targets, mutate, login=False):
     page = browser.new_page(viewport={"width": 1280, "height": 900})
     page.goto(url, wait_until="domcontentloaded")
@@ -101,6 +112,7 @@ def run_page(browser, cfg, name, url, targets, mutate, login=False):
         page.fill("#password", "secret_sauce")
         page.click("#login-button")
         page.wait_for_url("**/inventory.html", timeout=15000)
+    _settle(page)
 
     # Ground truth first, then baselines, then drift.
     page.evaluate(STAMP_GT, [[t["raw"], t["gt"]] for t in targets.values()])
@@ -114,6 +126,7 @@ def run_page(browser, cfg, name, url, targets, mutate, login=False):
             p.fill("#password", "secret_sauce")
             p.click("#login-button")
             p.wait_for_url("**/inventory.html", timeout=15000)
+        _settle(p)
         p.evaluate(STAMP_GT, [[t["raw"], t["gt"]] for t in targets.values()])
         p.evaluate(mutate)
 

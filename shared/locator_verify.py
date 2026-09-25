@@ -155,21 +155,24 @@ def verify(ctx, selector: str, action: str, el: dict, post=None) -> VerifyResult
                             f"{action} failed: {type(e).__name__}: {str(e).splitlines()[0][:90]}",
                             "action")
 
-    # 5. nothing blew up
+    # 5. post-condition. A caller-supplied check (the test's next assertion) is
+    #    real proof, so it decides — including when what it expects IS an error
+    #    (a login button clicked with empty fields must show "required"). The
+    #    banner heuristic below used to run first and rejected exactly that case.
     banner = error_banner(ctx)
-    if banner:
-        return VerifyResult(False, FAILED, f"error appeared after action: {banner!r}", "postcondition")
-
-    # 6. post-condition. A caller-supplied check (the test's next assertion) is
-    #    real proof; without one we can only report that the action went through.
     if post is not None:
         try:
             good, detail = post(ctx)
         except Exception as e:
             return VerifyResult(False, FAILED, f"post-condition threw {type(e).__name__}", "postcondition")
         if not good:
-            return VerifyResult(False, FAILED, f"post-condition failed: {detail}", "postcondition")
+            extra = f"; error appeared after action: {banner!r}" if banner else ""
+            return VerifyResult(False, FAILED, f"post-condition failed: {detail}{extra}", "postcondition")
         return VerifyResult(True, STRONG, f"action succeeded and post-condition held ({detail})")
+
+    # 6. without one, an error banner is the only evidence the wrong element acted.
+    if banner:
+        return VerifyResult(False, FAILED, f"error appeared after action: {banner!r}", "postcondition")
 
     changed = (ctx.url != before_url) if before_url is not None else False
     return VerifyResult(True, WEAK,

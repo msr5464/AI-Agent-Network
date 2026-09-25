@@ -86,3 +86,14 @@ def test_a_prompt_with_no_contracts_still_builds(tmp_path, monkeypatch):
         {"index": 1, "kind": "locator", "text": "x"}, {"type": "web"}, {},
         {"steps": [], "pages": {}}, tmp_path, rules="", retry_note="")
     assert "_No checks measured._" in prompt
+
+
+def test_the_repos_own_conventions_reach_the_model(tmp_path, monkeypatch):
+    """The adapt call used to see no framework conventions at all."""
+    adapt = _load_adapt(tmp_path, monkeypatch)
+    (tmp_path / "CLAUDE.md").write_text("Use click(locator, name), never locator.click().")
+    prompt = adapt.build_adapt_prompt(
+        {"index": 1, "kind": "locator", "text": "x"}, {"type": "web"}, {},
+        {"steps": [], "pages": {}}, tmp_path, rules="", retry_note="")
+    assert "PROJECT CONVENTIONS" in prompt
+    assert "never locator.click()" in prompt

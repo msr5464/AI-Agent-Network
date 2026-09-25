@@ -103,6 +103,10 @@ MAX_METHOD_CHARS  = 4000
 # keeps every field/constructor regardless and only drops methods to fit.
 MAX_PAGE_OBJ_CHARS   = int(os.environ.get("AUTOFIX_PAGE_OBJECT_CHARS", "8000"))
 MAX_BASE_CLASS_CHARS = 3000
+# The target repo's own conventions file. It was cut at 16,000 characters, which
+# landed mid-way through Playwright-Automation-Framework's CLAUDE.md (~28K) and
+# dropped its wrapper, wait and coding-rule sections — the parts a fix needs.
+MAX_CONVENTIONS_CHARS = 64000
 
 # Persistent domain context for the model, passed as --system-prompt-file.
 SYSTEM_PROMPT_FILE  = REPO_ROOT / "config" / "skills" / "automation-repo.md"
@@ -432,7 +436,10 @@ def load_repo_conventions(workspace: Path) -> str:
             try:
                 content = path.read_text(encoding="utf-8")
                 log(f"Loaded repo conventions from {path} ({len(content)} chars)")
-                return content[:16000]
+                if len(content) > MAX_CONVENTIONS_CHARS:
+                    log(f"Warning: conventions truncated to {MAX_CONVENTIONS_CHARS} chars "
+                        f"— the rest of {path.name} is not shown to the model")
+                return content[:MAX_CONVENTIONS_CHARS]
             except Exception:
                 continue
     log("Warning: no conventions file found — fixes will use Claude's defaults")

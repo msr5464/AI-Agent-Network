@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from qa_agents_server.paths import AGENTS_DIR
 from shared import metrics as _metrics
 from shared import workspace as _workspace
 
@@ -96,8 +97,12 @@ def _authoring_outcomes(d: Path) -> Dict[str, int]:
     # 05-ship.json's files_count is a deduplicated FILE count (generated + fixed),
     # not a test count. Counting test sources written is the closest honest proxy.
     written = gen.get("files_written") or []
+    # A generated test only counts once it passes — or fails exactly as the input
+    # documents the product misbehaving ("defect"). A run whose fix gate failed or
+    # got stuck produced a file nobody can use.
+    passed = (_read_text(d / ".fix-passed") or "").lower() in ("true", "defect")
     tests = sum(1 for f in written
-                if isinstance(f, str) and "src/test/java" in f.replace("\\", "/"))
+                if isinstance(f, str) and "src/test/java" in f.replace("\\", "/")) if passed else 0
     return {"tests_created": tests, "files_changed": int(ship.get("files_count") or 0)}
 
 
@@ -155,48 +160,91 @@ def _read_text(path: Path) -> Optional[str]:
         return None
 
 
-def _healing_status(d: Path) -> str:
-    """Healing's own ladder: the fix gate plus whether a PR was raised."""
-    # Cancelled before crashed: cancelling kills the step, which trips run.sh's
-    # ERR trap into writing .crashed too — the same order shared/session.sh uses.
+# ── How a run counts ──────────────────────────────────────────────────────────
+#
+# completed  the agent's work passed: the test passes, the fix is verified
+# diagnosed  a correct stop: nothing to do, or handed to a human by design
+# failed     tried and did not get there
+# blocked    infrastructure stopped it before it had a fair chance
+# cancelled / interrupted / explore-only
+#
+# Only the first three are a verdict on the agent, so only they are runs in the
+# success rate. Everything still counts toward spend and time.
+#
+# A push or PR that fails after the work passed does not make the run failed:
+# the work survives (a local branch, or the audit trail a Ship retry re-reads),
+# and the run's own history and Slack alert already flag the delivery.
+
+SUCCEEDED = ("completed", "diagnosed")
+JUDGED = SUCCEEDED + ("failed",)
+
+_HANDED_OFF = ("declined", "escalated", "covered")
+_ADAPTATION_SKIPS = {"no-work": "diagnosed", "escalate": "diagnosed",
+                     "stuck": "failed", "unsafe": "failed", "infra": "blocked",
+                     "no-session": "blocked", "unreachable": "blocked"}
+
+
+def _status(agent: str, d: Path, caller: str) -> str:
+    """How this run counts, read from the session's own files.
+
+    Never from the launcher. The caller's status is the exit code (session.sh)
+    or the exit code plus .verdict (the server), so one authoring outcome scored
+    differently from the CLI and the Studio — and adaptation, whose verdict is
+    always NEEDS-REVIEW, scored every run as failed. Only a run with no gate file
+    to go on (triaging, or a crash before the gate) keeps the caller's answer.
+    """
+    # Cancelled and interrupted before crashed: killing a run trips run.sh's ERR
+    # trap into writing .crashed as well. .interrupted is only written for a run
+    # still alive when the server stopped, so it is the real cause.
     if (d / ".cancelled").exists():
         return "cancelled"
-    if (d / ".crashed").exists():
-        return "failed"
     if (d / ".interrupted").exists():
         return "interrupted"
+    if (d / ".crashed").exists():
+        return "failed"
     gate = (_read_text(d / ".fix-passed") or "").lower()
+    why = (_read_text(d / ".skip-reason") or "").lower()
+    if agent == "test-adaptation-agent" and why == "explore-only":
+        return "explore-only"
     if gate == "true":
         return "completed"
-    if gate == "false":
-        return "failed"
-    if gate == "skipped":
-        # The gate stopped it on purpose — not a failure. Reporting a correct
-        # refusal as failed trains people to ignore the runs worth reading.
-        return "diagnosed"
-    return ""
 
+    if agent == "test-authoring-agent":
+        # defect: the test fails exactly where the input says the product
+        # misbehaves today, which is a correct test. skipped: no test could run.
+        return {"defect": "diagnosed", "skipped": "blocked",
+                "false": "failed", "stuck": "failed"}.get(gate, caller)
 
-def _adaptation_status(d: Path) -> str:
-    """Adaptation's own status ladder.
+    if agent == "test-healing-agent":
+        if gate == "skipped":
+            # The test already passes, or the failure is not a locator's: a
+            # correct stop. "infra" means it never got to look.
+            return "blocked" if why == "infra" else "diagnosed"
+        return "failed" if gate == "false" else caller
 
-    05_ship.py asserts verdict == "NEEDS-REVIEW" unconditionally, and both
-    _derive_status and the server's final-status derivation map that to
-    "failed" — so scoring adaptation by verdict makes EVERY adaptation run a
-    failure. A dashboard showing 0% adaptation success is that bug.
-    """
-    # Cancelled before crashed — see _healing_status.
-    if (d / ".cancelled").exists():
-        return "cancelled"
-    if (d / ".crashed").exists():
-        return "failed"
-    if (d / ".interrupted").exists():
-        return "interrupted"
-    ship = _load_json(d / "05-ship.json")
-    if ship:
-        return "failed" if ship.get("ship_status") in ("push_failed", "pr_failed") \
-            else "completed"
-    return "unknown"
+    if agent == "test-adaptation-agent":
+        if gate == "skipped":
+            return _ADAPTATION_SKIPS.get(why, "failed")
+        items = [i.get("status") for i in (_load_json(d / "04-adapt.json").get("items") or [])
+                 if isinstance(i, dict)]
+        # Every item declined or escalated is a hand-off, which this agent treats
+        # as the design working — even though 04_adapt writes gate false for it.
+        handed_off = bool(items) and all(s in _HANDED_OFF for s in items)
+        if gate == "false":
+            return "diagnosed" if handed_off else "failed"
+        # No gate: a resume that re-runs only Ship clears it. Judge by the items.
+        if items:
+            if any(s in ("applied", "partial", "proposed") for s in items):
+                return "completed"
+            return "diagnosed" if handed_off else "failed"
+        # Nothing else to go on but the ship step itself.
+        ship = _load_json(d / "05-ship.json")
+        if ship:
+            return "failed" if ship.get("ship_status") in ("push_failed", "pr_failed") \
+                else "completed"
+        return caller
+
+    return caller
 
 
 # ── Writing ───────────────────────────────────────────────────────────────────
@@ -213,21 +261,14 @@ def build_record(audit_dir: Path, agent: str = "", status: str = "",
         return None
 
     agent = agent or (d.parent.parent.name if d.parent.parent else "")
+    # A stray audit dir (a temp dir, an ad-hoc check) would otherwise report its
+    # grandparent's name — once a tmp UUID — as an agent on the Analytics page.
+    if not (AGENTS_DIR / agent / "run.sh").is_file():
+        return None
     session = _metrics.read_rollup(d) or {}
     totals = session.get("totals") or {}
 
-    # Adaptation's status must come from its OWN ladder, and must override
-    # whatever the caller passed. `_wait_and_reap` passes the server's derived
-    # status, which reads `.verdict` — and 05_ship.py writes NEEDS-REVIEW
-    # unconditionally, which the server maps to "failed". Honouring the caller
-    # here would score every adaptation run as a failure.
-    if agent == "test-adaptation-agent":
-        status = _adaptation_status(d) or status
-    elif agent == "test-healing-agent":
-        # Healing writes no .verdict, and exits 0 whether or not anything was
-        # actually fixed — so the shell exit code cannot distinguish a heal from
-        # a gated no-op. Its own gate file does.
-        status = _healing_status(d) or status
+    status = _status(agent, d, status)
 
     outcomes = {key: 0 for key in _OUTCOME_KEYS}
     extractor = _OUTCOME_EXTRACTORS.get(agent)
@@ -341,24 +382,38 @@ def _dedupe(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _blank_rollup() -> Dict[str, Any]:
-    data = {"runs": 0, "succeeded": 0, "failed": 0, "cancelled": 0, "other": 0,
+    data = {"runs": 0, "succeeded": 0, "failed": 0, "excluded": 0,
             "cost_usd": 0.0, "duration_s": 0.0, "llm_calls": 0, "num_turns": 0,
             "input_tokens": 0, "output_tokens": 0}
     data.update({key: 0 for key in _OUTCOME_KEYS})
     return data
 
 
+def _did_nothing(row: Dict[str, Any]) -> bool:
+    """No tokens, no spend, no output and no success: not an attempt at all.
+
+    A Claude CLI that answered with nothing, a crash before the first step, a
+    cancel before anything started. Counted, they made the success rate read as
+    a measure of setup trouble, and were deleted by hand to fix it.
+    """
+    if row.get("status") in SUCCEEDED:
+        return False
+    outcomes = row.get("outcomes") or {}
+    return (int(row.get("input_tokens") or 0) + int(row.get("output_tokens") or 0) == 0
+            and not float(row.get("cost_usd") or 0.0)
+            and not any(int(outcomes.get(k) or 0)
+                        for k in ("tests_created", "tests_fixed", "items_adapted")))
+
+
 def _accumulate(target: Dict[str, Any], row: Dict[str, Any]) -> None:
-    target["runs"] += 1
     status = row.get("status")
-    if status == "completed":
-        target["succeeded"] += 1
-    elif status == "failed":
-        target["failed"] += 1
-    elif status == "cancelled":
-        target["cancelled"] += 1
+    # Only a verdict on the agent is a run in the success rate. Blocked,
+    # cancelled, interrupted and explore-only runs are "excluded" from it.
+    if status in JUDGED:
+        target["runs"] += 1
+        target["succeeded" if status in SUCCEEDED else "failed"] += 1
     else:
-        target["other"] += 1
+        target["excluded"] += 1
     # Spend is real whether or not the run produced anything, so cost and time
     # accumulate for every status — not just successes.
     target["cost_usd"] = round(target["cost_usd"] + float(row.get("cost_usd") or 0.0), 6)
@@ -398,6 +453,8 @@ def query(window: str = "7d", agent: Optional[str] = None,
         if agent and row.get("agent") != agent:
             continue
         if user_id and _owner_of(row) != user_id:
+            continue
+        if _did_nothing(row):
             continue
         selected.append(row)
 

@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -22,19 +23,18 @@ sys.path.insert(0, str(ROOT))
 
 
 def _load(retry_count="4", max_attempts="12"):
-    os.environ.update({
-        "HEALING_RETRY_COUNT": retry_count, "HEALING_MAX_ATTEMPTS": max_attempts,
-        # A throwaway directory: importing the fix step writes metrics rows into
-        # whatever AUDIT_DIR points at, and this assignment outlives the module —
-        # pointing it at tests/fixtures edits the fixture tree on every run.
-        "AUDIT_DIR": tempfile.mkdtemp(prefix="retry-budget-"),
-        "HANDOFF_FILE": str(ROOT / "tests" / "fixtures" / "none.json"),
-    })
     path = ROOT / "agents" / "test-healing-agent" / "actions" / "01_fix.py"
     spec = importlib.util.spec_from_file_location("healing_fix_budget", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["healing_fix_budget"] = mod
-    spec.loader.exec_module(mod)
+    # Set only for the import (the step reads them into module constants). A
+    # throwaway AUDIT_DIR: importing the fix step writes metrics rows into it.
+    with mock.patch.dict(os.environ, {
+        "HEALING_RETRY_COUNT": retry_count, "HEALING_MAX_ATTEMPTS": max_attempts,
+        "AUDIT_DIR": tempfile.mkdtemp(prefix="retry-budget-"),
+        "HANDOFF_FILE": str(ROOT / "tests" / "fixtures" / "none.json"),
+    }):
+        spec.loader.exec_module(mod)
     return mod
 
 

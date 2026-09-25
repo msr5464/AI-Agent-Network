@@ -128,3 +128,37 @@ def test_claude_picker_survives_an_unusable_reply(monkeypatch):
     for reply in ("", "I could not determine the element.", "[1,2,3]"):
         monkeypatch.setattr(claude, "call_claude", lambda *a, **k: reply)
         assert heal_mod.claude_picker()("prompt") is None
+
+
+class _FakePage:
+    """Just enough of a Playwright page for verify(): one visible element, a banner."""
+
+    class _Loc:
+        def count(self): return 1
+        def is_visible(self): return True
+        def is_enabled(self): return True
+        def click(self, timeout=None): pass
+
+    def __init__(self, banner):
+        self.url, self._banner = "https://app/", banner
+
+    def locator(self, _sel): return self._Loc()
+
+    def evaluate(self, _js, *_a): return self._banner
+
+
+def test_an_expected_error_is_a_passing_post_condition():
+    """Clicking Login with empty fields SHOULD show 'required' — the post-condition
+    says so, and the error-banner heuristic must not overrule it."""
+    from shared import locator_verify as v
+    page = _FakePage("Epic sadface: Username is required")
+    el = {"tag": "input", "type": "submit", "role": "button"}
+    post = lambda ctx: (True, "error text contains 'required'")
+    assert v.verify(page, "#login", "click", el, post=post).ok
+
+
+def test_without_a_post_condition_an_error_banner_still_fails():
+    from shared import locator_verify as v
+    page = _FakePage("Something went wrong")
+    el = {"tag": "button", "role": "button"}
+    assert not v.verify(page, "#login", "click", el).ok

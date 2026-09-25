@@ -1,19 +1,25 @@
 # Locator self-healing — engine test bench
 
-**The engine now lives in `shared/locator_*.py`.** This directory is its test
-bench: the fixture corpus, the evaluation harness and the tests. Keeping them
+**The engine lives in `shared/locator_*.py`.** This directory is its test
+bench: the fixture corpus, the evaluation harness and the tests. In production
+the healing agent's offline **Locate** step (`agents/test-healing-agent/actions/01_locate.py`)
+uses the engine to propose a fix from the failing run's saved evidence; the Fix
+step applies it (when `HEALING_LOCATE_MODE=enforce`) and re-runs the real test. Keeping them
 here and importing from `shared/` is deliberate — a second copy of the engine
 would drift, and the corpus is the only thing that says whether a change to the
 scorer made it better or worse.
 
+`locator-eval/baselines/` is git-ignored; `eval.py` records it from
+`fixtures/v1/app.html` on each run.
+
 ```bash
 V=.venv/bin/python
-$V locator-eval/fixtures/generate.py       # build the v2 corpus + java page objects
+$V locator-eval/fixtures/generate.py       # rebuild the v2 corpus + java page objects
 $V locator-eval/eval.py                    # full accuracy/precision table
 $V locator-eval/eval.py --negatives-only   # must report 0 wrong heals
 $V locator-eval/eval.py --locators         # old -> new locator per heal
 $V locator-eval/eval.py --case tag_swapped --explain     # score breakdown
-$V -m pytest locator-eval/test_*.py -q     # phase G + retry-loop tests
+$V -m pytest locator-eval/ -q             # engine tests — not part of `make test`
 $V locator-eval/live_check.py              # golden case vs real saucedemo.com
 
 # resolve one locator end to end (dry run, then for real)
@@ -25,36 +31,42 @@ $V -m shared.locator_resolve --locator-id LoginPage#loginButton \
 
 ## Current results
 
-**Synthetic corpus — 25 cases**
+Measured 2026-09-25.
+
+**Synthetic corpus — 26 cases**
 
 | | |
 |---|---|
-| **Wrong heals (gating metric)** | **0 / 25** |
-| Top-1 accuracy, positives | 17 / 17 (100%) |
+| **Wrong heals (gating metric)** | **0 / 26** |
+| Top-1 accuracy, positives | 18 / 18 (100%) |
 | Correct refusals, negatives | 8 / 8 (100%) |
-| Verification strength | 17 STRONG (post-condition held), 0 WEAK |
-| Mean latency | ~600 ms/heal end to end |
-| Deterministic path alone | ~56 ms (26 gather + 30 score/rank) |
+| Verification strength | 18 STRONG (post-condition held), 0 WEAK |
+| Mean latency | ~1.1 s/heal end to end |
 | LLM calls | 0 |
 
-7 cases are a **holdout set** written after the weights and thresholds were
-frozen and never tuned against. All landed correctly with no further tuning.
+9 cases are a **holdout set** (`"holdout": true` in `fixtures/manifest.json`),
+written after the weights and thresholds were frozen and never tuned against.
 
 **Live golden case — saucedemo.com, real markup, DOM mutated in-browser**
 
 | | |
 |---|---|
 | Healed to the correct element | **6 / 6** |
-| Page sizes | 20 and 112 scorable elements |
-| Latency | ~1.0–1.4 s/heal (incl. login replay + 2 confirmation runs) |
+| Page sizes | 20 and 114 scorable elements |
 
-Ground truth is stamped on the elements *before* mutation and `capture.py` strips
-`data-gt*`, so the healer cannot see the answer.
+saucedemo is a React app: the harness waits for it to settle (`_settle`) before
+stamping ground truth and mutating the DOM, because a mutation applied earlier is
+undone by the next render — which is how this briefly read 2/6.
 
-**Tests** — 10 passing, covering the paths the corpus cannot reach: minimal
-patching, byte-identical revert, blast-radius collisions, the heal-history
-circuit breaker, R5 with a stub model (including the model refusing), R0 flake
-detection, and the per-run caps.
+Ground truth is stamped on the elements *before* mutation and
+`shared/locator_capture.py` strips `data-gt*`, so the healer cannot see the answer.
+
+**Tests** — 28 in `locator-eval/test_*.py`, all passing, covering the paths the
+corpus cannot reach: capture parity with the framework's script, the Locate step
+end to end, minimal patching, byte-identical revert, blast-radius collisions, the
+heal-history circuit breaker, R5 with a stub model (including the model
+refusing), R0 flake detection, the per-run caps, and a post-condition that
+expects an error (a login clicked with empty fields) passing verification.
 
 ## Pipeline
 
@@ -70,7 +82,6 @@ shared/locator_candidates.py T0 literal repair -> T1 identity -> T2 role+name ->
                             T3 anchored -> T4 full scan -> T5 visual
 shared/locator_score.py     Similo/Similo++ weighted similarity, pure Python, no deps
 shared/locator_decide.py    accept threshold + ambiguity margin + tier priors
-verify.py     resolve -> actionable -> affordance -> execute -> post-condition
 shared/locator_emit.py      getByTestId > getByRole > label/placeholder > text >
                             scoped-by-text > CSS > Robula+ XPath; identity-checked
 shared/locator_verify.py    resolve -> actionable -> affordance -> execute ->
@@ -166,15 +177,14 @@ what a passing test asserts with no failure to justify it, so it goes to a human
   Ours should be tuned against real heal history, not intuition — and we do not
   have that history yet.
 - **No real model has been through R5.** The wiring is proved with a stub. The
-  deterministic path clears all 25 corpus cases and all 6 live ones, so R5 has
-  never been *needed* — which is the shape the research predicts, but it does
-  mean no real prompt/response pair has been exercised. Wire it to this repo's
-  existing `LLM_PROVIDER` routing rather than hardcoding a vendor.
-- **"Rerun the test suite" is still simulated.** Phase G proves the patch by
+  deterministic path clears every corpus case, so R5 has never been *needed* —
+  which is the shape the research predicts, but no real prompt/response pair has
+  been exercised. Model calls in this repo go through `shared/claude.py`.
+- **The bench itself does not run the suite.** Phase G proves a patch by
   re-verifying the locator in fresh contexts (R6) and checking neighbours for
-  collisions. It does not run `mvn test` — that needs the real suite and belongs
-  to the integration pass.
-- **Largest page measured is 112 elements.** Real enterprise pages are 10-50x
+  collisions. The real proof — running the test — happens in the healing agent,
+  whose Fix step applies Locate's proposal and re-runs it.
+- **Largest page measured is 114 elements.** Real enterprise pages are 10-50x
   that. Scoring is O(n) and the deterministic path is ~56 ms at 37 elements, so
   it should hold, but it is unmeasured at scale.
 - **Wayback snapshot validation not done.** The papers' method needs manually

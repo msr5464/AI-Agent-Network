@@ -80,7 +80,7 @@ def draft_note(issue: Dict, evidence: Dict, diagnosis: Dict) -> str:
 # {page} appears to have been rebuilt: its route is unchanged but none of its
 # locators survive. Confirm this was an intended redesign and not an outage,
 # then fill in what actually changed and run:
-#     make run AGENT=test-adaptation-agent MODULE={_module_for(issue.get('test_name',''))}
+#     ./scripts/run-adaptation-agent.sh {_module_for(issue.get('test_name',''))}
 
 Module: {_module_for(issue.get('test_name', ''))}
 Type: web

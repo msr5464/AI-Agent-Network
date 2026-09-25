@@ -475,17 +475,17 @@ def _compute_duration_s(session_id: str, ship_data: Optional[Dict]) -> Optional[
 
 def _duration_with_fallback(session_dir: Path, session_id: str,
                             ship_data: Optional[Dict]) -> Optional[float]:
-    """Ship-timestamp duration, falling back to the metrics rollup.
+    """The metrics rollup's active time, falling back to the ship timestamp.
 
-    The ship-based computation returns None for any run that never shipped —
-    a gated run, a crash, a cancel — which is exactly when knowing how long it
-    ran still matters.
+    Rollup first: the ship-based span runs from the session id's timestamp, so a
+    resumed run counts the idle gap between attempts. The ship span remains for
+    old sessions with no metrics.
     """
-    value = _compute_duration_s(session_id, ship_data)
+    rollup = metrics_reader.read_session_metrics(session_dir)
+    value = (rollup or {}).get("duration_s")
     if value is not None:
         return value
-    rollup = metrics_reader.read_session_metrics(session_dir)
-    return (rollup or {}).get("duration_s")
+    return _compute_duration_s(session_id, ship_data)
 
 
 def _summarise_step(key: str, data: Dict) -> Dict:

@@ -7,11 +7,11 @@ set -Eeuo pipefail
 # which tests it reaches, explores the new flow against the live product, updates
 # the affected tests, verifies them, and opens a PR — always NEEDS-REVIEW.
 #
-#   make run AGENT=test-adaptation-agent MODULE=checkout
-#   make run AGENT=test-adaptation-agent                     # queue: oldest .txt
-#   EXPLORE_ONLY=true make run AGENT=test-adaptation-agent MODULE=checkout
-#   ADAPTATION_APPLY=false make run AGENT=test-adaptation-agent MODULE=checkout
-#   START_FROM_STEP=4 SESSION_ID=<sid> make run AGENT=test-adaptation-agent
+#   ./scripts/run-adaptation-agent.sh checkout
+#   ./scripts/run-adaptation-agent.sh                    # queue: oldest .txt
+#   EXPLORE_ONLY=true ./scripts/run-adaptation-agent.sh checkout
+#   ADAPTATION_APPLY=false ./scripts/run-adaptation-agent.sh checkout
+#   START_FROM_STEP=4 SESSION_ID=<sid> ./scripts/run-adaptation-agent.sh
 #
 # Unlike healing, the expensive step here is exploration, not the edit. So this
 # supports resume (a 30-minute browser run must never be re-paid to retry an
@@ -31,7 +31,7 @@ export REPO_ROOT
 
 source "$REPO_ROOT/shared/session.sh"
 
-USER_ID="${USER_ID:-${USER:-cli}}"
+USER_ID="${USER_ID:-cli}"
 if [[ "$USER_ID" == "default" || "$USER_ID" == "cli" ]]; then
   QUEUE_DIR="$AGENT_DIR/queue"
 else

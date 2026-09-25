@@ -435,7 +435,7 @@ def main():
             "## Handoff",
             "",
             f"Queued for test-healing-agent: `{handoff_path}`",
-            "Run: `make run AGENT=test-healing-agent`",
+            "Run: `./scripts/run-healing-agent.sh`",
         ]
 
     (AUDIT_DIR / "05-ship.md").write_text("\n".join(md_lines) + "\n")

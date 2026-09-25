@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Run the qa-auto-analyse agent (Windows).
+    Run the test-triaging-agent (Windows).
 
 .DESCRIPTION
     Usage:
-      .\scripts\run-analyse.ps1                                          # scout mode, dirs from .env
-      .\scripts\run-analyse.ps1 -BuildTag ProdSanity-541                 # direct mode
-      .\scripts\run-analyse.ps1 -BuildTag ProdSanity-541 -InputDir testdata -OutputDir reports
-      $env:STOP_AFTER="classify"; .\scripts\run-analyse.ps1 -BuildTag ProdSanity-541
+      .\scripts\run-triaging-agent.ps1                                          # scout mode, dirs from .env
+      .\scripts\run-triaging-agent.ps1 -BuildTag ProdSanity-541                 # direct mode
+      .\scripts\run-triaging-agent.ps1 -BuildTag ProdSanity-541 -InputDir testdata -OutputDir reports
+      $env:STOP_AFTER="classify"; .\scripts\run-triaging-agent.ps1 -BuildTag ProdSanity-541
 #>
 
 [CmdletBinding()]
@@ -29,5 +29,5 @@ if ($BuildTag)  { $env:BUILD_TAG   = $BuildTag  }
 if ($InputDir)  { $env:TRIAGING_INPUT_DIR   = $InputDir  }
 if ($OutputDir) { $env:TRIAGING_OUTPUT_DIR  = $OutputDir }
 
-make run AGENT=qa-auto-analyse BUILD_TAG="$BuildTag"
+make run AGENT=test-triaging-agent BUILD_TAG="$BuildTag"
 exit $LASTEXITCODE

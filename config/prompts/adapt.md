@@ -4,8 +4,10 @@ Static half of the adaptation prompt, built by
 `agents/test-adaptation-agent/actions/04_adapt.py → build_adapt_prompt()`.
 
 Loaded by `load_adapt_rules()`, which takes **everything from the first
-`## Instructions` heading onward**. Domain context (framework patterns, wrapper
-methods) is passed separately as `--system-prompt-file`.
+`## Instructions` heading onward**. The call also passes
+`config/skills/automation-repo.md` as `--system-prompt-file` (framework-neutral
+rules), and the prompt carries the automation repo's own `CLAUDE.md` under
+"PROJECT CONVENTIONS" (first 64,000 characters) — the source of truth for its APIs.
 
 ---
 
@@ -76,12 +78,14 @@ new page; add a field to a data builder.
 
 You may not: weaken an assertion or make it conditional; remove or change one
 without declaring it; add `Thread.sleep`; add a `try/catch`
-that swallows a failure; add `@Ignore` or `enabled = false`; use raw Selenium
-(`driver.findElement`, `.sendKeys()`, `new WebDriverWait`) instead of the framework
-wrappers; or regenerate an existing page object wholesale.
+that swallows a failure; add `@Ignore` or `enabled = false`; call the browser
+driver or locator object directly (`locator.click()`, `driver.findElement`,
+`.sendKeys()`, `new WebDriverWait`) instead of the framework's wrappers; or
+regenerate an existing page object wholesale.
 
-Every interaction you add to a **test class** needs a `logStep(testConfig, "…")`
-that states the action and its expected outcome. That is not bookkeeping: the
+Every interaction you add to a **test class** needs a `logStep` call, in the form
+the test class already uses (e.g. `config.logStep("…")`), that states the action
+and its expected outcome. That is not bookkeeping: the
 contract that protects the *next* adaptation is derived from those strings.
 
 ### When the right answer is "no"

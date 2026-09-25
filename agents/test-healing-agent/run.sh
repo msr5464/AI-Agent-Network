@@ -6,10 +6,10 @@ set -Eeuo pipefail
 # Picks a handoff from the queue (or a specific BUILD_TAG), attempts locator
 # fixes, verifies with test runs, and creates a GitHub PR.
 #
-# Usage (via Makefile):
-#   make run AGENT=test-healing-agent                           # queue mode: picks oldest
-#   make run AGENT=test-healing-agent BUILD_TAG=ProdSanity-541  # direct: specific handoff
-#   AUTO_PUSH=false make run AGENT=test-healing-agent           # dry-run: no PR
+# Usage:
+#   ./scripts/run-healing-agent.sh                    # queue mode: picks oldest
+#   ./scripts/run-healing-agent.sh ProdSanity-541     # direct: specific handoff
+#   AUTO_PUSH=false ./scripts/run-healing-agent.sh    # dry-run: no PR
 #
 # Retry loop: if tests fail after fix, re-runs 01_fix.py up to HEALING_RETRY_COUNT.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ QUEUE_DIR="$AGENT_DIR/queue"
 PROCESSED_DIR="$QUEUE_DIR/processed"
 mkdir -p "$PROCESSED_DIR"
 
-# Honour HANDOFF_FILE env var if passed directly (e.g. from run-autofix.sh with a file path)
+# Honour HANDOFF_FILE env var if passed directly (e.g. from run-healing-agent.sh with a file path)
 HANDOFF_FILE="${HANDOFF_FILE:-}"
 TEST_NAME="${TEST_NAME:-${TEST:-}}"
 export TEST_NAME
@@ -94,8 +94,11 @@ else
     exit 0
   fi
   # Whatever happens next, this run must not strand its claim in .claimed/.
+  # This replaces shared/session.sh's EXIT trap, so it has to call
+  # finalize_metrics itself — with the original exit code restored first —
+  # or queue-mode runs would never write metrics.json or their analytics row.
   # shellcheck disable=SC2064
-  trap "[[ -f \"$HANDOFF_FILE\" ]] && mv \"$HANDOFF_FILE\" \"$QUEUE_DIR/\" 2>/dev/null; rmdir \"$CLAIM_DIR\" 2>/dev/null; true" EXIT
+  trap "_rc=\$?; [[ -f \"$HANDOFF_FILE\" ]] && mv \"$HANDOFF_FILE\" \"$QUEUE_DIR/\" 2>/dev/null; rmdir \"$CLAIM_DIR\" 2>/dev/null; (exit \$_rc); finalize_metrics" EXIT
   BUILD_TAG=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['build_tag'])" "$HANDOFF_FILE")
   SAFE_TAG="${BUILD_TAG//\//-}"
   MODE="queue"

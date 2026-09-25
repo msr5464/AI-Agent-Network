@@ -318,3 +318,45 @@ class TestStaleLocatorActedOn:
 
     def test_positional_narrowing_in_the_selector_is_one_element(self):
         assert self._fit("#loginForm button[type='submit'] >> nth=0")[0]
+
+
+class TestPlaywrightShapes:
+    """The guards were written for Selenium; a Playwright repo slipped past them."""
+
+    @pytest.mark.parametrize("added", [
+        '        loginButton.click();\n',
+        '        page.locator("#user").fill("standard_user");\n',
+        '        cartBadge.hover();\n',
+        '        page.waitForTimeout(2000);\n',
+    ])
+    def test_rejects_raw_playwright_calls(self, added):
+        ok, reason = g.wrapper_compliance(BEFORE, BEFORE + added)
+        assert ok is False and "CONVENTIONS" in reason
+
+    @pytest.mark.parametrize("added", [
+        '        click(checkoutButton, "Checkout");\n',
+        '        fillText(zipField, zip, "Zip code");\n',
+        '        Element.click(config, next, "Next");\n',
+        '        workspace = page.locator("[data-test=\'workspace\']");\n',
+        '        items.clear();\n',
+    ])
+    def test_allows_wrappers_and_locator_declarations(self, added):
+        assert g.wrapper_compliance(BEFORE, BEFORE + added)[0] is True
+
+    def test_a_helper_step_in_a_playwright_test_needs_a_logstep(self):
+        after = BEFORE + '        products.addToCart("Sauce Labs Backpack");\n'
+        ok, reason = g.logstep_present(BEFORE, after, is_test_class=True)
+        assert ok is False and "logStep" in reason
+
+    def test_config_logstep_satisfies_it(self):
+        after = BEFORE + ('        config.logStep("Add the backpack to the cart");\n'
+                          '        products.addToCart("Sauce Labs Backpack");\n')
+        assert g.logstep_present(BEFORE, after, is_test_class=True)[0] is True
+
+    def test_reading_data_is_not_a_step(self):
+        after = BEFORE + '        String user = helper.getUsername();\n'
+        assert g.logstep_present(BEFORE, after, is_test_class=True)[0] is True
+
+    def test_an_added_assertion_is_not_a_new_step(self):
+        after = BEFORE + '        AssertHelper.assertEquals(config, badge, "2", "Cart badge");\n'
+        assert g.logstep_present(BEFORE, after, is_test_class=True)[0] is True

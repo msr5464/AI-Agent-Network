@@ -24,14 +24,17 @@ def _load_fix_module():
     It reads AUDIT_DIR and HANDOFF_FILE at import time; neither is touched by the
     pure functions under test, so placeholders are enough.
     """
-    import os
-    os.environ.setdefault("AUDIT_DIR", str(ROOT / "tests" / "fixtures"))
-    os.environ.setdefault("HANDOFF_FILE", str(ROOT / "tests" / "fixtures" / "none.json"))
+    import os, tempfile
+    from unittest import mock
     path = ROOT / "agents" / "test-healing-agent" / "actions" / "01_fix.py"
     spec = importlib.util.spec_from_file_location("healing_fix", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["healing_fix"] = module
-    spec.loader.exec_module(module)
+    # Set only for the import (the step reads them into module constants); left in
+    # os.environ they leaked into every later test in the session.
+    with mock.patch.dict(os.environ, {"AUDIT_DIR": tempfile.mkdtemp(prefix="locate-routing-"),
+                                      "HANDOFF_FILE": str(ROOT / "tests" / "fixtures" / "none.json")}):
+        spec.loader.exec_module(module)
     return module
 
 

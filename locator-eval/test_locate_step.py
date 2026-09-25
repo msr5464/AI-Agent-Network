@@ -71,7 +71,11 @@ def world(tmp_path_factory):
         page.goto(good)
         snap = capture.snapshot(page)
         _, fingerprint = capture.find_by_locator(page, "button#login-button", snap=snap)
+        # Both relative to now: a fixed failure time let this test rot once the
+        # calendar passed it, because the staleness guard (correctly) rejects a
+        # baseline recorded after the failure it is meant to explain.
         recorded_at = (dt.datetime.now() - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        captured_at = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         (baselines / "LoginPage.json").write_text(json.dumps({
             "pageObject": "LoginPage", "recordedAt": recorded_at,
             "urlShape": good, "title": "Swag Shop", "bodyClass": "",
@@ -87,7 +91,7 @@ def world(tmp_path_factory):
         html = dom_dir / "loginTest_120000.html"
         html.write_text(
             f'<!-- qa-agent-network:dom-snapshot test="loginTest" '
-            f'url="{drifted.as_uri()}" capturedAt="2026-09-02T12:00:00" '
+            f'url="{drifted.as_uri()}" capturedAt="{captured_at}" '
             f'fingerprints="{sidecar}" -->\n' + page.content())
         browser.close()
 
@@ -135,9 +139,11 @@ def test_locate_finds_and_proves_the_moved_element(world, tmp_path):
     resolution = payload["resolutions"][0]
     assert resolution["verdict"] == "HEALED"
     assert resolution["locator_id"] == "LoginPage#loginButton"
-    assert resolution["classification"] == "LOCATOR_DRIFT"
-    assert resolution["verification"] in ("STRONG", "WEAK")
-    assert "getByRole" in resolution["new_expression"], resolution["new_expression"]
+    # Locate is offline since it stopped replaying the journey: it proves the
+    # selector unique in the failure capture, and Fix's real test run does the rest.
+    assert resolution["classification"] == "LOCATOR_STALE"
+    assert resolution["verification"] == "unique in the failure capture"
+    assert "login-button" in resolution["new_expression"], resolution["new_expression"]
     assert resolution["score"] >= 0.75
 
 
@@ -146,7 +152,7 @@ def test_locate_writes_a_readable_report(world, tmp_path):
     run_step(world, audit)
     report = (audit / "01-locate.md").read_text()
     assert "LoginPage#loginButton" in report
-    assert "LOCATOR_DRIFT" in report
+    assert "LOCATOR_STALE" in report
 
 
 def test_locate_never_aborts_the_run_on_a_broken_handoff(tmp_path):
@@ -168,13 +174,16 @@ def _load_fix_module(tmp_path, mode, resolutions):
     (audit / "01-locate.json").write_text(json.dumps({"mode": mode,
                                                       "resolutions": resolutions}))
     handoff = tmp_path / "h.json"; handoff.write_text(json.dumps({"automation_issues": []}))
-    os.environ.update({"AUDIT_DIR": str(audit), "HANDOFF_FILE": str(handoff),
-                       "REPO_ROOT": str(REPO), "HEALING_LOCATE_MODE": mode})
     path = REPO / "agents" / "test-healing-agent" / "actions" / "01_fix.py"
     spec = importlib.util.spec_from_file_location(f"fix_{mode}", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    # Set only for the import (the step reads them into module constants); left in
+    # os.environ they leaked into every later test in the session.
+    from unittest import mock
+    with mock.patch.dict(os.environ, {"AUDIT_DIR": str(audit), "HANDOFF_FILE": str(handoff),
+                                      "REPO_ROOT": str(REPO), "HEALING_LOCATE_MODE": mode}):
+        spec.loader.exec_module(module)
     return module
 
 
@@ -219,4 +228,6 @@ def test_located_fix_has_the_same_shape_as_a_model_fix(tmp_path, world):
     assert len(fix_json["edits"]) == 1
     assert "loginButton" in fix_json["edits"][0]["old_string"]
     assert "getByRole" in fix_json["edits"][0]["new_string"]
-    assert "verified by performing the step" in fix_json["fix_description"]
+    # Locate proves uniqueness only; the description must not claim more, and
+    # must say the test run is what verifies the edit.
+    assert "This run is what verifies it" in fix_json["fix_description"]
