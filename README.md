@@ -34,7 +34,7 @@ and opens GitHub PRs against it. Run the agents from the CLI, from CI, or from t
 | `agents/<agent>/CLAUDE.md` | Each agent's full spec, for maintainers |
 
 Feature write-ups on the portfolio site:
-[Test Design](https://msr5464.github.io/feature-test-generation.html) (an AI-Test-Studio feature) ·
+[Test Design](https://msr5464.github.io/feature-test-design.html) (an AI-Test-Studio feature) ·
 [Test Authoring](https://msr5464.github.io/feature-test-authoring.html) ·
 [Test Triaging](https://msr5464.github.io/feature-test-triaging.html) ·
 [Test Healing](https://msr5464.github.io/feature-test-healing.html) ·
@@ -217,7 +217,7 @@ Steps:
 Output: Java files in the automation repo, a PR on branch
 `authoring/<module>-<timestamp>`, and a Slack message.
 
-![Agent 1 run](docs/authoring-run.png)
+![Agent 1 run](docs/authoring-agent-run.png)
 
 ### Agent 2 — Test Triaging
 
@@ -233,7 +233,7 @@ Output: an HTML report in `TRIAGING_OUTPUT_DIR/`, a handoff file in
 `agents/test-healing-agent/queue/<build_tag>.json` when anything is fixable, and
 a Slack message.
 
-![Agent 2 triage report](docs/sample_report.png)
+![Agent 2 triage report](docs/triaging-agent-report.png)
 
 ### Agent 3 — Test Healing
 
@@ -255,7 +255,7 @@ FORCE=true  ./scripts/run-healing-agent.sh --test LoginTest#testLogin    # proce
 Output: a PR on branch `healing/<session-id>` with every fix that passed, and a
 Slack message with the per-test breakdown — partial success still ships.
 
-![Agent 3 run](docs/healing-run.png)
+![Agent 3 run](docs/healing-agent-run.png)
 
 ### Agent 4 — Test Adaptation
 

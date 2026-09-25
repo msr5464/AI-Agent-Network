@@ -18,6 +18,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -955,6 +956,34 @@ def session_metrics(agent: str, session_id: str):
 
 
 # ── Analytics (spans agents, so deliberately not under /agents/<agent>/) ───────
+def _window_range():
+    """(window, since, until) from ?window=&from=&to= (epoch seconds).
+
+    `custom` needs both bounds. Strict because /analytics/clear deletes: an
+    unknown window or a NaN bound (float() accepts "nan", and every comparison
+    with it is False) used to mean "no cutoff" — i.e. delete everything.
+    """
+    window = (request.args.get("window") or "7d").strip()
+    if window != "custom" and window not in analytics.WINDOWS:
+        raise ValueError(f"window must be one of {', '.join(analytics.WINDOWS)}, custom")
+    bounds = []
+    for name in ("from", "to"):
+        raw = (request.args.get(name) or "").strip()
+        try:
+            value = float(raw) if raw else None
+        except ValueError:
+            value = float("nan")
+        if value is not None and not math.isfinite(value):
+            raise ValueError(f"{name} must be epoch seconds")
+        bounds.append(value)
+    since, until = bounds
+    if window == "custom" and (since is None or until is None):
+        raise ValueError("custom window needs from and to")
+    if since is not None and until is not None and since > until:
+        raise ValueError("from must be before to")
+    return window, since, until
+
+
 @qa_bp.route("/analytics/clear", methods=["DELETE"])
 def analytics_clear():
     # This deletes analytics rows, the run registry and audit directories from
@@ -967,14 +996,18 @@ def analytics_clear():
         if caller == ANONYMOUS_USER_ID:
             return jsonify({"error": "forbidden"}), 403
         user_id_param = caller
-    window_param = (request.args.get("window") or "7d").strip()
-    
-    # 1. Clear in-memory / JSON history registry 
+    try:
+        window_param, since, until = _window_range()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    # 1. Clear in-memory / JSON history registry
     from qa_agents_server import storage
-    storage.clear(user_id=user_id_param, window=window_param)
-    
+    storage.clear(user_id=user_id_param, window=window_param, since=since, until=until)
+
     # 2. Clear analytics JSONL
-    removed_sids = analytics.clear_history(user_id=user_id_param, window=window_param)
+    removed_sids = analytics.clear_history(user_id=user_id_param, window=window_param,
+                                           since=since, until=until)
     
     # 3. Clear from runner's in-memory registry
     from qa_agents_server import runner
@@ -994,22 +1027,15 @@ def analytics_clear():
 
 @qa_bp.route("/analytics/summary", methods=["GET"])
 def analytics_summary():
-    """Per-agent and overall rollups over a window: 24h | 7d | 30d | all.
+    """Per-agent and overall rollups over a window: 24h | 7d | 30d | all | custom.
 
     Returns raw counts, cost and duration. Time-saved is applied by the Studio,
     which owns the human-minutes baselines for every flow it reports on.
     """
-    window = (request.args.get("window") or "7d").strip()
-    if window not in analytics.WINDOWS:
-        return jsonify({"error": f"window must be one of "
-                                 f"{', '.join(analytics.WINDOWS)}"}), 400
-
-    def _ts(name):
-        raw = (request.args.get(name) or "").strip()
-        try:
-            return float(raw) if raw else None
-        except ValueError:
-            return None
+    try:
+        window, since, until = _window_range()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     # Note: AI-Test-Studio admin portal enforces auth and passes X-User-ID.
     # Regular users can only see their own analytics; admins can filter by user_id or see all.
@@ -1022,7 +1048,7 @@ def analytics_summary():
     return jsonify(analytics.query(
         window=window,
         agent=(request.args.get("agent") or "").strip() or None,
-        since=_ts("from"), until=_ts("to"),
+        since=since, until=until,
         user_id=query_user_id
     ))
 

@@ -226,8 +226,9 @@ def list_sessions(limit: int = 50, offset: int = 0,
         # vanished from EVERYONE's history (no real user has id "default") while
         # simultaneously appearing in the admin's analytics.
         from qa_agents_server import storage
-        from qa_agents_server.analytics import _owner_of
+        from qa_agents_server.analytics import _owner_of, canonical_user_id
         runs = {r.get("session_id"): _owner_of(r) for r in storage.load_all()}
+        user_id = canonical_user_id(user_id)
         all_sessions = [s for s in all_sessions
                         if runs.get(s["session_id"]) == user_id]
 

@@ -186,6 +186,39 @@ def test_window_filtering_selects_the_right_subset(tmp_path, store):
     assert analytics.query("7d")["overall"]["runs"] == 2
     assert analytics.query("30d")["overall"]["runs"] == 3
     assert analytics.query("all")["overall"]["runs"] == 3
+    # The trend's per-agent days add up to that agent's row.
+    q = analytics.query("all")
+    days = q["series_by_agent"]["test-healing-agent"]
+    assert len(days) == 3
+    for key in ("runs", "cost_usd", "llm_calls"):
+        assert sum(d[key] for d in days) == pytest.approx(q["by_agent"]["test-healing-agent"][key])
+
+
+def test_custom_range_clear_removes_only_rows_inside_it(tmp_path, store):
+    now = time.time()
+    ages = {"recent": now - 3600, "week": now - 3 * 86400, "old": now - 20 * 86400}
+    for i, (label, ts) in enumerate(ages.items()):
+        d = _session(tmp_path, "test-healing-agent", name=f"20260828-1200{i}0-{label}")
+        _write_metrics(d, cost=1.0)
+        analytics.append_from_session(d, agent="test-healing-agent",
+                                      status="completed", started_at=ts)
+    removed = analytics.clear_history(window="custom", since=now - 5 * 86400,
+                                      until=now - 86400)
+    assert removed == ["20260828-120010-week"]
+    assert analytics.query("all")["overall"]["runs"] == 2
+
+
+def test_every_form_of_a_users_id_is_the_same_person(tmp_path, store):
+    """Legacy "default", the md5 hash and the readable `user-<name>` all name
+    the admin; the Studio filters by hash, a member's own view by readable id."""
+    for i, uid in enumerate(("default", "21232f297a57", "user-admin", "13d815eda90a")):
+        d = _session(tmp_path, "test-healing-agent", name=f"20260828-1200{i}0-u{i}")
+        _write_metrics(d, cost=1.0)
+        analytics.append_from_session(d, agent="test-healing-agent", status="completed",
+                                      started_at=time.time(), user_id=uid)
+    assert analytics.query("all", user_id="21232f297a57")["overall"]["runs"] == 3
+    assert analytics.query("all", user_id="user-admin")["overall"]["runs"] == 3
+    assert analytics.query("all", user_id="13d815eda90a")["overall"]["runs"] == 1
 
 
 def test_query_survives_a_missing_store(store):

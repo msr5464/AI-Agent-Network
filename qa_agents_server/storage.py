@@ -112,22 +112,23 @@ def get(session_id: str) -> Optional[Dict]:
     return None
 
 
-def clear(user_id: Optional[str] = None, window: str = "all"):
+def clear(user_id: Optional[str] = None, window: str = "all",
+          since: Optional[float] = None, until: Optional[float] = None):
     import time
     # One definition of who owns an unattributed row, shared with analytics.
     # This logic was duplicated as a bare literal here and twice in analytics.py,
     # free to drift — and history and analytics DID disagree, defaulting missing
     # owners to "default" in one place and to the admin id in the other, so the
     # same run belonged to two different people depending on which asked.
-    from qa_agents_server.analytics import WINDOWS, _owner_of
+    from qa_agents_server.analytics import WINDOWS, _owner_of, canonical_user_id
     now = time.time()
-    since = None
-    if window in WINDOWS and WINDOWS[window] is not None:
+    if since is None and window in WINDOWS and WINDOWS[window] is not None:
         since = now - WINDOWS[window]
+    user_id = canonical_user_id(user_id) if user_id else None
 
     with _lock:
         data = _read_locked()
-        if (not user_id or user_id == "all") and since is None:
+        if (not user_id or user_id == "all") and since is None and until is None:
             _atomic_write([])
         else:
             kept = []
@@ -137,7 +138,7 @@ def clear(user_id: Optional[str] = None, window: str = "all"):
                 if (not user_id or user_id == "all" or r_user == user_id):
                     # Match on user. Check time.
                     ts = float(r.get("started_at") or 0)
-                    if since is not None and ts < since:
+                    if (since is not None and ts < since) or (until is not None and ts > until):
                         kept.append(r)
                     else:
                         pass # delete

@@ -13,6 +13,7 @@ Written from two places, because neither alone is sufficient:
 Duplicate session ids are resolved newest-wins by `query`.
 """
 
+import hashlib
 import json
 import os
 import tempfile
@@ -38,10 +39,26 @@ ADMIN_USER_ID = "21232f297a57"
 _UNATTRIBUTED = ("", "default", "admin", None)
 
 
+def canonical_user_id(uid: Optional[str]) -> Optional[str]:
+    """One id per person: the md5(username)[:12] AI-Test-Studio uses.
+
+    Rows carry whichever form was current when written: none (legacy, the
+    admin's), the hash, or — since routes.current_user_id() went readable —
+    `user-<name>`, which it only returns when md5(name)[:12] IS the caller's
+    hash. Comparing raw values split one person in two: the Studio's user
+    filter sends the hash and missed every `user-admin` run, while a member's
+    own history (readable id) missed their older hash-attributed runs.
+    """
+    if uid in _UNATTRIBUTED:
+        return ADMIN_USER_ID
+    if uid.startswith("user-"):
+        return hashlib.md5(uid[5:].encode()).hexdigest()[:12]
+    return uid
+
+
 def _owner_of(row: Dict[str, Any]) -> str:
     """Who an analytics row belongs to, resolving legacy/unattributed rows."""
-    owner = row.get("user_id")
-    return ADMIN_USER_ID if owner in _UNATTRIBUTED else owner
+    return canonical_user_id(row.get("user_id"))
 
 
 def _atomic_write_rows(rows: List[Dict[str, Any]]) -> None:
@@ -435,6 +452,7 @@ def query(window: str = "7d", agent: Optional[str] = None,
     applies them uniformly across every flow it reports on.
     """
     rows = _dedupe(_read_all())
+    user_id = canonical_user_id(user_id) if user_id else None
     now = time.time()
     if since is None and window in WINDOWS and WINDOWS[window] is not None:
         since = now - WINDOWS[window]
@@ -461,13 +479,16 @@ def query(window: str = "7d", agent: Optional[str] = None,
     overall = _blank_rollup()
     by_agent: Dict[str, Dict[str, Any]] = {}
     series: Dict[str, Dict[str, Any]] = {}
+    # Per agent per day, for the trend's agent picker; each sums to its by_agent row.
+    agent_series: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for row in selected:
         _accumulate(overall, row)
-        slot = by_agent.setdefault(row.get("agent") or "unknown", _blank_rollup())
-        _accumulate(slot, row)
+        name = row.get("agent") or "unknown"
+        _accumulate(by_agent.setdefault(name, _blank_rollup()), row)
         bucket = time.strftime("%Y-%m-%d",
                                time.localtime(float(row.get("started_at") or 0)))
         _accumulate(series.setdefault(bucket, _blank_rollup()), row)
+        _accumulate(agent_series.setdefault(name, {}).setdefault(bucket, _blank_rollup()), row)
 
     produced = (overall["tests_created"] + overall["tests_fixed"]
                 + overall["items_adapted"])
@@ -480,6 +501,8 @@ def query(window: str = "7d", agent: Optional[str] = None,
         "overall": overall,
         "by_agent": by_agent,
         "series": [dict(bucket=b, **v) for b, v in sorted(series.items())],
+        "series_by_agent": {name: [dict(bucket=b, **v) for b, v in sorted(days.items())]
+                            for name, days in agent_series.items()},
     }
 
 
@@ -488,7 +511,9 @@ def _window_label(window: str) -> str:
             "30d": "Last 30 days", "all": "All time"}.get(window, window)
 
 
-def clear_history(user_id: Optional[str] = None, window: str = "all") -> List[str]:
+def clear_history(user_id: Optional[str] = None, window: str = "all",
+                  since: Optional[float] = None,
+                  until: Optional[float] = None) -> List[str]:
     """Drop analytics rows. Returns the session ids removed.
 
     Serialised and atomic, which it was not. Appends come from every run's reap
@@ -499,9 +524,9 @@ def clear_history(user_id: Optional[str] = None, window: str = "all") -> List[st
     this now uses the same one.
     """
     now = time.time()
-    since = None
-    if window in WINDOWS and WINDOWS[window] is not None:
+    if since is None and window in WINDOWS and WINDOWS[window] is not None:
         since = now - WINDOWS[window]
+    user_id = canonical_user_id(user_id) if user_id else None
 
     path = _store_path()
     removed_sessions: List[str] = []
@@ -509,7 +534,7 @@ def clear_history(user_id: Optional[str] = None, window: str = "all") -> List[st
         if not path.exists():
             return removed_sessions
         rows = _read_all()
-        if (not user_id or user_id == "all") and since is None:
+        if (not user_id or user_id == "all") and since is None and until is None:
             removed_sessions = [r.get("session_id") for r in rows if r.get("session_id")]
             _atomic_write_rows([])
             return removed_sessions
@@ -519,7 +544,7 @@ def clear_history(user_id: Optional[str] = None, window: str = "all") -> List[st
             row_user = _owner_of(row)
             if not user_id or user_id == "all" or row_user == user_id:
                 ts = float(row.get("started_at") or 0)
-                if since is not None and ts < since:
+                if (since is not None and ts < since) or (until is not None and ts > until):
                     kept.append(row)
                 elif row.get("session_id"):
                     removed_sessions.append(row.get("session_id"))

@@ -312,16 +312,18 @@ Cross-agent, so not under `/agents/`.
 ```
 GET /analytics/summary?window=7d&agent=&user_id=&from=&to=
 ```
-`window` is `24h`, `7d`, `30d` or `all` (400 otherwise); `from`/`to` are epoch
-seconds. `user_id` is honoured for admins only — everyone else gets their own.
+`window` is `24h`, `7d`, `30d`, `all` or `custom` (400 otherwise); `from`/`to` are
+epoch seconds, required for `custom`, and must be finite with `from <= to`.
+`user_id` is honoured for admins only — everyone else gets their own.
 Returns `{window{from,to,label}, data_since, overall, by_agent, series}` with
 runs, cost, duration and outcome counts. Time-saved is computed by the Studio.
 
 ```
-DELETE /analytics/clear?window=7d&user_id=
+DELETE /analytics/clear?window=7d&user_id=&from=&to=
 ```
 **Irreversible.** Deletes matching analytics rows, run-registry entries **and the
-sessions' audit directories**. Admins may name any user (or none = everyone);
+sessions' audit directories** for runs started in the window (same `window`/`from`/`to`
+rules as the summary). Admins may name any user (or none = everyone);
 members clear only their own; anonymous callers get 403.
 
 ### Agent settings (admin only)
