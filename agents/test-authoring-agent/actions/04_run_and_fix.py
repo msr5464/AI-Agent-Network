@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → pl
 from shared import workspace as workspace_helper
 
 from shared import browser_mode
+from shared.test_runner import _pin_baseline_dir
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR    = Path(os.environ["AUDIT_DIR"])
@@ -221,6 +222,12 @@ def run_maven_test(test_class: str, test_method: str) -> tuple:
         *(f"-D{key}={value}" for key, value in browser_mode.maven_properties().items()),
         "--no-transfer-progress",
     ]
+    # Pin the baseline directory to THIS checkout, as healing and adaptation do.
+    # Without it Baseline.java falls back to HEALING_BASELINE_DIR, which config/.env
+    # points at the main checkout — so a worktree run promoted its fingerprints
+    # there, ship read the worktree, found "none changed" and the PR had none.
+    cmd[2:2] = [f"-D{key}={value}" for key, value in
+                _pin_baseline_dir(cmd, {}, AUTOMATION_FRAMEWORK_DIR).items()]
     # Same build markers the healing agent emits, so the dashboard can fold the
     # build output for either agent with one rule.
     log(f"[build:start] {' '.join(cmd)}")

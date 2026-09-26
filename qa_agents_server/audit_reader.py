@@ -154,9 +154,14 @@ def _step_unfinished(data: Optional[Dict]) -> bool:
     return isinstance(data, dict) and data.get("final_attempt") is False
 
 
-def _step_status(data: Optional[Dict]) -> str:
-    """Chip state for one step's file: running, failed, skipped, or done."""
-    if _step_unfinished(data):
+def _step_status(data: Optional[Dict], finished: bool = False) -> str:
+    """Chip state for one step's file: running, failed, skipped, or done.
+
+    `finished` means the process that writes the file has exited. A snapshot
+    that promised another attempt is then the last word after all — a run
+    cancelled or crashed between attempts otherwise leaves the chip spinning.
+    """
+    if not finished and _step_unfinished(data):
         return "running"
     if _step_has_error(data):
         return "failed"
@@ -381,7 +386,7 @@ def replay_events(session_id: str,
         data = _safe_load_json(session_dir / fname)
         if data is None:
             continue
-        step_status = _step_status(data)
+        step_status = _step_status(data, finished=True)
         emit("step", {
             "key": key,
             "display": display,

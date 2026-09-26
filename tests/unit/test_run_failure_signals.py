@@ -150,6 +150,19 @@ class TestARetriedStepHasNoOutcomeYet:
         data = {"fix_gate": "true", "final_attempt": True}
         assert _step_status(data) == "done"
 
+    def test_a_snapshot_left_by_an_exited_process_is_final(self):
+        # Cancelled or crashed between attempts: no retry is coming, so the
+        # post-exit sweep and replay must not leave the chip spinning.
+        data = {"status": "ok", "final_attempt": False}
+        assert _step_status(data, finished=True) == "done"
+        assert _step_status({"fix_gate": "false", "final_attempt": False},
+                            finished=True) == "failed"
+
+    def test_a_capped_validate_web_is_red(self):
+        # 02_validate_web.py's usage-cap write; it used to be "skipped" (grey)
+        # blamed on missing MCP tools.
+        assert _step_status({"status": "error", "skipped": False}) == "failed"
+
     def test_a_step_that_never_retries_is_unaffected(self):
         # Only 01-fix.json writes final_attempt; every other step's file must
         # keep being judged the moment it appears.

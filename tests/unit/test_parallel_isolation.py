@@ -667,17 +667,31 @@ def test_out_of_tree_baseline_override_hides_a_new_baseline(tmp_path, monkeypatc
     # It must not win: an out-of-tree directory is not committable from here.
     assert baseline.repo_directory(worktree) == worktree / baseline.REPO_SUBPATH
 
-    # And with it dropped — what runner.py now does — the new baseline is found
-    # and reported as differing from HEAD, so ship commits it.
-    monkeypatch.delenv(baseline._DIR_ENV)
+    # And pointed at the worktree — what runner.py now does — the new baseline is
+    # found and reported as differing from HEAD, so ship commits it.
+    monkeypatch.setenv(baseline._DIR_ENV, str(worktree / baseline.REPO_SUBPATH))
     assert "NaukriProfilePage.json" in " ".join(baseline.changed(worktree))
 
 
-def test_runner_drops_the_baseline_override_for_worktree_runs():
-    """The pop must sit with the FRAMEWORK_DIR redirect it belongs to."""
+def test_runner_points_the_baseline_override_at_the_worktree():
+    """Set with the FRAMEWORK_DIR redirect it belongs to, to the worktree's own dir."""
     src = (REPO_ROOT / "qa_agents_server" / "runner.py").read_text()
     block = re.search(r'env\["FRAMEWORK_DIR"\].*?\n\n', src, re.S)
     assert block, "FRAMEWORK_DIR is no longer redirected for worktree runs"
-    assert 'env.pop("HEALING_BASELINE_DIR", None)' in block.group(0), (
-        "HEALING_BASELINE_DIR survives into the worktree run — baselines the run "
+    assert 'env["HEALING_BASELINE_DIR"] = str(Path(worktree_path)' in block.group(0), (
+        "HEALING_BASELINE_DIR is not pointed at the worktree — baselines the run "
         "records will be written outside the tree ship commits from")
+
+
+def test_load_env_restores_an_unset_var_but_keeps_a_set_one(tmp_path):
+    """Why the runner must SET the override rather than drop it: every run.sh
+    sources load_env.sh, which refills an unset variable from config/.env."""
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / ".env").write_text("HEALING_BASELINE_DIR=/main-checkout/baselines\n")
+    script = (f'export REPO_ROOT={tmp_path} AGENT_DIR={tmp_path}/agent; {{}} '
+              f'source {REPO_ROOT}/shared/load_env.sh; echo "$HEALING_BASELINE_DIR"')
+    run = lambda prefix: subprocess.run(["bash", "-c", script.format(prefix)], env={
+        k: v for k, v in os.environ.items() if k != "HEALING_BASELINE_DIR"},
+        capture_output=True, text=True).stdout.strip()
+    assert run("unset HEALING_BASELINE_DIR;") == "/main-checkout/baselines"
+    assert run("export HEALING_BASELINE_DIR=/worktree/baselines;") == "/worktree/baselines"

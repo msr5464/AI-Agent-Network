@@ -1072,11 +1072,16 @@ Begin executing the steps now using the browser tools.
 
     attempts: list = []  # list of (result, parsed_dict)
 
-    def _persist_snapshot() -> None:
+    def _persist_snapshot(final: bool) -> None:
         """Persist the best result seen so far. Called after every attempt, and
         the last of those calls IS the final write — a cancel arriving during
         attempt 2 would otherwise discard attempt 1's fully completed, perfectly
         usable results too, not just attempt 2's.
+
+        `final` is False when a retry follows. The server reads this file the
+        moment it lands; without the flag it judged attempt 1's snapshot as the
+        finished step, painted it green and started Generate while attempt 2
+        was still running — and never re-read it when attempt 2 failed.
 
         Do not add a second call after the loop: every path through the body
         reaches this one, `attempts` cannot change afterwards, so a trailing call
@@ -1099,6 +1104,7 @@ Begin executing the steps now using the browser tools.
             raw_output=p["output"][-3000:] if p["output"] else "",
             attempts=len(attempts),
             urls_visited=list(getattr(r, "navigated_urls", []) or []),
+            final_attempt=final,
         )
 
     attempt_notes = ""
@@ -1107,6 +1113,15 @@ Begin executing the steps now using the browser tools.
             log(f"Retry attempt {attempt_num}/{max_attempts} — re-running the full "
                 f"flow (fresh isolated browser; no mid-flow resume is possible)")
         result = _run_attempt(attempt_notes)
+        if result.status == "usage_limit":
+            # Checked before tool_uses: a capped call never runs a turn, so it
+            # also drove the browser zero times, and was reported as missing
+            # MCP tools. Retrying hits the same cap, so stop and name it.
+            log(f"ERROR: Claude {result.describe()}\n"
+                "       → FIX: re-run this session once the limit resets.")
+            _write_result({}, [], [], status="error", attempts=attempt_num,
+                          reason=f"Claude {result.describe()}")
+            sys.exit(1)
         if result.tool_uses == 0:
             # No browser tool was ever called, so nothing on the page was ever
             # seen. A model handed a browser-driving prompt and no usable tools
@@ -1123,7 +1138,6 @@ Begin executing the steps now using the browser tools.
             sys.exit(1)
         parsed = _parsed(result.stdout)
         attempts.append((result, parsed))
-        _persist_snapshot()
 
         # Report the actual cause rather than guessing. Each of these produces
         # an empty-or-short result for a completely different reason and needs
@@ -1142,7 +1156,9 @@ Begin executing the steps now using the browser tools.
             log("  → FIX: check model availability and that the Playwright MCP server "
                 "connected (look for \"MCP server 'playwright'\" above)")
 
-        if attempt_num < max_attempts and _worth_retrying(result.status, parsed):
+        retrying = attempt_num < max_attempts and _worth_retrying(result.status, parsed)
+        _persist_snapshot(final=not retrying)
+        if retrying:
             if parsed["steps_failed"]:
                 notes = ["\nPRIOR ATTEMPT NOTES — a previous run of this exact flow failed "
                          "on the steps below. Apply the noted fix where relevant, but still "
@@ -1250,7 +1266,7 @@ def _write_result(selectors, steps_passed, steps_failed,
                   skipped=False, reason=None, status="ok", raw_output="",
                   attempts=1, selector_counts=None, steps_unverified=None,
                   selector_visibles=None, rejected_selectors=None,
-                  mechanisms=None, urls_visited=None) -> None:
+                  mechanisms=None, urls_visited=None, final_attempt=True) -> None:
     # Every selector that survives parse_selector_output() was measured at exactly
     # one element, and every hint that survives reconcile_hints() is either backed
     # by one of those or measured itself. Assert it rather than trusting it: this
@@ -1299,6 +1315,9 @@ def _write_result(selectors, steps_passed, steps_failed,
         "mechanisms":        mechanisms or {},
         "page_elements":     page_elements or {},
         "interaction_hints": interaction_hints or [],
+        # False while a retry follows — the server keeps the chip running
+        # instead of judging this snapshot as the step's outcome.
+        "final_attempt":     final_attempt,
     }
     if raw_output:
         data["raw_output_tail"] = raw_output

@@ -241,6 +241,27 @@ class TestFixResponseShapes:
         assert list(edits) == ["A.java"]
 
 
+class TestBaselinesStayInTheRunCheckout:
+    def test_the_test_run_pins_the_baseline_dir_to_its_checkout(self, tmp_path, monkeypatch):
+        """Unpinned, Baseline.java followed HEALING_BASELINE_DIR into the main
+        checkout, ship read the worktree, and authoring PRs carried no baselines."""
+        monkeypatch.setenv("FRAMEWORK_DIR", str(tmp_path / "wt"))
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        seen = {}
+
+        class FakeProc:
+            def __init__(self, cmd, **_):
+                seen["cmd"], self.stdout, self.returncode = cmd, iter([]), 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(mod.subprocess, "Popen", FakeProc)
+        mod.run_maven_test("DemoTest", "demo")
+        expected = (tmp_path / "wt").resolve() / "src/main/resources/baselines"
+        assert f"-Dbaseline.dir={expected}" in seen["cmd"]
+
+
 class TestValidateApiCallsEveryEndpoint:
     def test_curl_runs_as_argv_and_a_bodyless_call_is_reachability_only(self, tmp_path, monkeypatch):
         mod = _load_action("02_validate_api.py", tmp_path, monkeypatch)

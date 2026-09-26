@@ -898,10 +898,14 @@ def start_run(payload: Optional[Dict] = None, agent: str = DEFAULT_AGENT,
             # override and falls back inside the worktree. Ship then finds only
             # the baselines the checkout came with, logs "none changed", and the
             # PR carries a new page object with no baseline for it while the real
-            # one sits untracked in the main checkout forever. Dropping it makes
-            # both halves resolve the framework's own worktree-relative
-            # `baselineDir` instead.
-            env.pop("HEALING_BASELINE_DIR", None)
+            # one sits untracked in the main checkout forever.
+            #
+            # Pointed at the worktree rather than dropped: every run.sh re-sources
+            # config/.env, which restores an unset variable but never overrides one
+            # the caller set — so a pop here was silently undone and both halves
+            # kept writing into the main checkout.
+            from shared import baseline as _baseline
+            env["HEALING_BASELINE_DIR"] = str(Path(worktree_path).resolve() / _baseline.REPO_SUBPATH)
 
         # Captured BEFORE Popen() (not after) — _audit_watcher uses this as the
         # cutoff for "did THIS run's own subprocess actually write this file,
@@ -1377,7 +1381,7 @@ def _wait_and_reap(run: RunState) -> None:
             continue
         _file_path = run.audit_dir / _fname
         if _file_path.exists() and _step_file_is_fresh(run, _idx, _file_path):
-            _step_status_v = _step_status(_safe_load_json(_file_path))
+            _step_status_v = _step_status(_safe_load_json(_file_path), finished=True)
             run.step_progress[_key] = _step_status_v
             _append_event(run, "step", {
                 "key": _key, "display": _display, "status": _step_status_v,

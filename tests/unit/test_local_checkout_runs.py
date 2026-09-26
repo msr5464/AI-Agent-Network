@@ -127,29 +127,28 @@ def test_teardown_never_names_the_developers_checkout():
 
 
 def test_local_run_keeps_its_baseline_dir():
-    """The HEALING_BASELINE_DIR pop exists only because a worktree splits it.
+    """HEALING_BASELINE_DIR is repointed only because a worktree splits it.
 
     In a local run the variable already points inside the checkout being used, so
-    dropping it would send the framework's fingerprints somewhere else.
+    overriding it would send the framework's fingerprints somewhere else.
     """
     tree = ast.parse((REPO_ROOT / "qa_agents_server" / "runner.py").read_text())
-    pops = [n for n in ast.walk(tree)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "pop" and n.args
-            and isinstance(n.args[0], ast.Constant)
-            and n.args[0].value == "HEALING_BASELINE_DIR"]
-    assert pops, "the HEALING_BASELINE_DIR pop is gone entirely"
-    for pop in pops:
+    sets = [n for n in ast.walk(tree)
+            if isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                and t.slice.value == "HEALING_BASELINE_DIR" for t in n.targets)]
+    assert sets, "HEALING_BASELINE_DIR is no longer repointed for worktree runs"
+    for assignment in sets:
         branch = next(n for n in ast.walk(tree)
                       if isinstance(n, ast.If)
-                      and any(pop is c for c in ast.walk(n)))
-        # It must sit under `if local_mode: ... else: <pop>`, never unguarded.
+                      and any(assignment is c for c in ast.walk(n)))
+        # It must sit under `if local_mode: ... else: <set>`, never unguarded.
         assert any(isinstance(t, ast.Name) and t.id == "local_mode"
                    for t in ast.walk(branch.test)), \
-            "HEALING_BASELINE_DIR is dropped without checking local_mode"
-        assert any(pop is c for c in ast.walk(ast.Module(body=branch.orelse,
-                                                         type_ignores=[]))), \
-            "HEALING_BASELINE_DIR is dropped on the local-mode branch"
+            "HEALING_BASELINE_DIR is set without checking local_mode"
+        assert any(assignment is c for c in ast.walk(ast.Module(body=branch.orelse,
+                                                                type_ignores=[]))), \
+            "HEALING_BASELINE_DIR is set on the local-mode branch"
 
 
 # ── Two local runs never share one working tree ───────────────────────────────
