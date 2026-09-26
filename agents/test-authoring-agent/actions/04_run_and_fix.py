@@ -23,7 +23,6 @@ Writes: $AUDIT_DIR/04-run-and-fix.json
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -144,7 +143,7 @@ from shared import diagnosis as _diagnosis
 from shared import failure_context as _failure_context
 from shared.dom_snapshot import (find_snapshot, distill as distill_dom,
                                  format_for_prompt as format_dom)
-from shared.telemetry import (read_actions, failing_action,
+from shared.telemetry import (read_actions, failing_action, discover as discover_traces,
                                      format_for_prompt as format_trace)
 # Mechanical guards, shared with test-healing-agent and test-adaptation-agent.
 # Deliberately NOT imported: validate_diagnosis_fit (rejects any edit touching a
@@ -809,7 +808,7 @@ def gather_runtime_evidence(test_method: str, newer_than: float = 0.0) -> dict:
                     "failing step)\n"
                     "This is the page the test was actually on. A locator that "
                     "matches nothing here is wrong, and one that matches several "
-                    "elements is what raises Playwright's strict-mode violation.\n"
+                    "elements fails, or acts on the wrong one.\n"
                     f"{body}\n"
                 )
             log(f"Evidence: DOM snapshot {snap.name}")
@@ -870,7 +869,7 @@ def gather_runtime_evidence(test_method: str, newer_than: float = 0.0) -> dict:
 
     # ── What the test actually did, selector by selector ──────────────────────
     try:
-        traces = [t for t in sorted((TEST_RESULTS_DIR / "traces").glob(f"{test_method}_*.zip"),
+        traces = [t for t in sorted(discover_traces(TEST_RESULTS_DIR, test_method),
                                     key=lambda f: f.stat().st_mtime, reverse=True)
                   if _fresh(t)]
         if traces:
@@ -879,7 +878,7 @@ def gather_runtime_evidence(test_method: str, newer_than: float = 0.0) -> dict:
             body = format_trace(actions)
             if body.strip():
                 out["trace_section"] = (
-                    "\n## WHAT THE TEST ACTUALLY DID (Playwright trace)\n"
+                    "\n## WHAT THE TEST ACTUALLY DID (execution trace)\n"
                     f"{body}\n"
                 )
             failed = failing_action(actions)
@@ -930,13 +929,14 @@ def classify_failure(output: str, api_base_url: str = "") -> str:
         "No free user available",
     ]
     # A missing {feature}.username/.password property (see try_fix_infra_credentials)
-    # surfaces as a null being handed to a Playwright fill() call — this exact
-    # Playwright-Java error text was confirmed against a real failure caused by
-    # exactly that gap, which two separate Claude fix attempts misdiagnosed as a
-    # locator/timing bug because nothing connected the null value back to its source.
+    # surfaces as a null being handed to an input call — the framework's own error
+    # text for that is its NULL_VALUE_SIGNALS. Two separate Claude fix attempts once
+    # misdiagnosed exactly that gap as a locator/timing bug because nothing connected
+    # the null value back to its source.
+    from shared.frameworks import get_active_plugin
     infra_credentials_signals = [
-        "value: expected string, got undefined",
-    ]
+        signal for signal in get_active_plugin().diagnostics.NULL_VALUE_SIGNALS
+        if signal in output.lower()]
     # Common REST-client phrasings for an auth rejection. Kept multi-word/prefixed
     # (never a bare "401"/"403") so this can't collide with an unrelated line
     # number or byte offset elsewhere in Maven output.
@@ -949,8 +949,7 @@ def classify_failure(output: str, api_base_url: str = "") -> str:
 
     # "Connection refused" is ambiguous — it fires for BOTH a dead local DB and
     # an unreachable REST API. Disambiguate using api_base_url's own host so an
-    # unreachable API is never misrouted into try_fix_infra_db() (which would
-    # attempt to auto-configure a local MySQL — never the right fix here).
+    # unreachable API is never reported as a database problem.
     # Checked before the generic infra_db_signals loop below.
     api_host = _extract_host(api_base_url)
     if api_host and "Connection refused" in output and api_host in output:
@@ -968,122 +967,9 @@ def classify_failure(output: str, api_base_url: str = "") -> str:
     for signal in infra_user_signals:
         if signal in output:
             return "INFRA_USER"
-    for signal in infra_credentials_signals:
-        if signal in output:
-            return "INFRA_CREDENTIALS"
+    if infra_credentials_signals:
+        return "INFRA_CREDENTIALS"
     return "CODE_ERROR"
-
-
-def _find_mysql() -> str:
-    """Return path to mysql binary, or empty string if not found."""
-    for candidate in ["/usr/local/mysql/bin/mysql", "/opt/homebrew/bin/mysql"]:
-        if Path(candidate).exists():
-            return candidate
-    return shutil.which("mysql") or ""
-
-
-def try_fix_infra_db() -> bool:
-    """Auto-configure local MySQL in system.properties if not already set. Returns True if fixed."""
-    mysql_bin = _find_mysql()
-    if not mysql_bin:
-        log("DB auto-repair: mysql binary not found")
-        return False
-
-    result = subprocess.run([mysql_bin, "-u", "root", "-e", "SELECT 1;"],
-                            capture_output=True, text=True, timeout=5)
-    if result.returncode != 0:
-        log("DB auto-repair: could not connect to local MySQL as root (no password)")
-        return False
-
-    sys_props = AUTOMATION_FRAMEWORK_DIR / "parameters" / "system.properties"
-    if not sys_props.exists():
-        sys_props.parent.mkdir(parents=True, exist_ok=True)
-        sys_props.write_text("")
-
-    content = sys_props.read_text()
-    if "<host>" not in content and "db.thanos.url" in content:
-        log("DB auto-repair: system.properties already has a real DB URL — skipping")
-        return False
-
-    # Remove any placeholder lines and append real values
-    lines = [ln for ln in content.splitlines()
-             if not ln.strip().startswith("db.thanos.") or "<host>" not in ln]
-    lines += [
-        "",
-        "# Auto-configured by test-authoring-agent",
-        "db.thanos.url=jdbc:mysql://localhost:3306/thanos",
-        "db.thanos.username=root",
-        "db.thanos.password=",
-    ]
-    sys_props.write_text("\n".join(lines) + "\n")
-    log("DB auto-repair: wrote local MySQL config to system.properties")
-    return True
-
-
-def _mysql_escape(value: str) -> str:
-    """Minimal correct MySQL string escaping for values embedded via the
-    `mysql -e` CLI (no parameterized-query API is available at this layer —
-    the mysql binary itself doesn't support bound parameters).
-
-    Order matters: backslashes MUST be escaped before quotes. The previous
-    .replace("'", "\\'") escaped quotes only — a value ending in a literal
-    backslash (e.g. "foo\\") turned that lone \\' into \\\\' , which MySQL
-    reads as an escaped backslash followed by an UNESCAPED quote, breaking
-    out of the string.
-    """
-    return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-def try_fix_infra_user(plan: dict) -> bool:
-    """Insert demo user into the user pool table if missing. Returns True if action taken."""
-    creds = credentials_from_plan(plan)
-    if not creds.get("username") or not creds.get("password"):
-        log("User auto-repair: no demo_credentials in plan")
-        return False
-
-    mysql_bin = _find_mysql()
-    if not mysql_bin:
-        log("User auto-repair: mysql binary not found")
-        return False
-
-    environment  = os.environ.get("AUTHORING_ENVIRONMENT", "staging")
-    table        = f"users_{environment}"
-    country      = plan.get("country", "SG")
-    feature_enum = plan.get("feature_enum", "CARD")
-    username     = _mysql_escape(creds["username"])
-    password     = _mysql_escape(creds["password"])
-    otp          = _mysql_escape(creds.get("otp", ""))
-
-    def run_mysql(sql: str):
-        return subprocess.run(
-            [mysql_bin, "-u", "root", "thanos", "-e", sql],
-            capture_output=True, text=True, timeout=10
-        )
-
-    # Check if user already exists
-    check = run_mysql(f"SELECT id FROM `{table}` WHERE username='{username}' LIMIT 1;")
-    if check.returncode != 0:
-        log(f"User auto-repair: could not query {table}: {check.stderr[:200]}")
-        return False
-
-    if username in check.stdout:
-        run_mysql(f"UPDATE `{table}` SET usageStatus='FREE', testcaseName=NULL "
-                  f"WHERE username='{username}';")
-        log(f"User auto-repair: reset existing user to FREE: {username}")
-        return True
-
-    sql = (
-        f"INSERT INTO `{table}` "
-        f"(isActive, userType, poolUser, feature, usageStatus, username, password, otp, country) "
-        f"VALUES (1, 'Admin', 'YES', '{feature_enum}', 'FREE', "
-        f"'{username}', '{password}', '{otp}', '{country}');"
-    )
-    result = run_mysql(sql)
-    if result.returncode == 0:
-        log(f"User auto-repair: inserted demo user into {table}: {username}")
-        return True
-    log(f"User auto-repair: INSERT failed: {result.stderr[:200]}")
-    return False
 
 
 def try_fix_infra_credentials(plan: dict) -> bool:
@@ -1311,46 +1197,6 @@ def main() -> None:
 
     failure_class = classify_failure(prev_output, plan_data.get("api_base_url", ""))
     log(f"Failure classified as: {failure_class}")
-
-    if failure_class == "INFRA_DB":
-        log("Detected DB infrastructure error — attempting auto-repair")
-        if try_fix_infra_db():
-            log("DB auto-configured — running test")
-            passed, test_output = run_maven_test(test_class, test_method)
-            if passed:
-                log("Test PASSED after DB auto-repair")
-                _write_gate("true")
-                _write_result({
-                    "attempt": FIX_ATTEMPT,
-                    "test_class": test_class,
-                    "test_method": test_method,
-                    "passed": True,
-                    "test_output": test_output,
-                    "fixes_applied": ["auto:db_config"],
-                    "infra_repair": "INFRA_DB",
-                }, files_written, FIX_ATTEMPT)
-                return
-            failure_class = classify_failure(test_output, plan_data.get("api_base_url", ""))
-
-    if failure_class == "INFRA_USER":
-        log("Detected user pool error — attempting demo user auto-insert")
-        if try_fix_infra_user(plan_data):
-            log("Demo user inserted/reset — running test")
-            passed, test_output = run_maven_test(test_class, test_method)
-            if passed:
-                log("Test PASSED after user auto-repair")
-                _write_gate("true")
-                _write_result({
-                    "attempt": FIX_ATTEMPT,
-                    "test_class": test_class,
-                    "test_method": test_method,
-                    "passed": True,
-                    "test_output": test_output,
-                    "fixes_applied": ["auto:user_insert"],
-                    "infra_repair": "INFRA_USER",
-                }, files_written, FIX_ATTEMPT)
-                return
-            failure_class = classify_failure(test_output, plan_data.get("api_base_url", ""))
 
     if failure_class == "INFRA_CREDENTIALS":
         log("Detected a null-credential error signature — checking the demo-credential property")
@@ -1587,7 +1433,7 @@ or work around the test: return "edits": [], explain the match in root_cause, an
 a wrong URL or any other automation problem is yours to fix normally, with the flag left false.
 """
 
-    static_system_prompt = f"""You are a Java test automation debugging agent for the Jarvis framework.
+    static_system_prompt = f"""You are a test automation debugging agent for the automation repository whose conventions follow.
 
 <framework_conventions>
 {claude_md}

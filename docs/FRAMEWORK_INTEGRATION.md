@@ -48,6 +48,9 @@ matter as much as the one that did not: they establish how far the journey got.
   Consumers index these keys directly, so returning your raw log records will
   raise `KeyError` inside prompt construction.
 - `failing_action(actions)` — the one that broke.
+- `read_network(path)` — optional (defaults to `[]`): HAR-shaped network records
+  if your artifact carries them. `shared/trace_network.py` interprets them.
+- `NOISE_ACTIONS` — optional: action names to drop from the prompt timeline.
 
 ### `TestRunner`
 - `detect_command(workspace, class_simple, method)` — CLI arguments to run one test.
@@ -59,9 +62,13 @@ Translates your framework's error text into semantics the agents act on.
 
 - `is_ambiguous_locator(message)` — the selector matched several elements. If
   your framework silently takes the first match, return `False` honestly.
-- `is_locator_resolution_failure(message)` — optional and duck-typed (it is not
-  on the base class; only the Selenium engine defines it): not-found / stale /
-  not-interactable.
+- `is_locator_resolution_failure(message)` — the locator matched nothing usable:
+  not found, stale, not interactable, timed out waiting for it. Healing's failure
+  classifier and element-name extraction ask this rather than matching exception
+  names themselves.
+- `NULL_VALUE_SIGNALS` — lower-case error text meaning a null reached an input
+  call (almost always an unset credential property), so it is not diagnosed as a
+  locator problem.
 
 Match the phrasings your framework **actually emits**. The Selenium engine
 originally matched `"multiple elements matched"`, a string no Selenium binding
@@ -86,6 +93,11 @@ The hardest part: parse and generate this repo's locator code.
   that is what receives it. Not a BeautifulSoup or jQuery extension.
 - Optionally emit a `findby` key alongside `python`/`java` when the framework
   declares locators as page-object fields rather than inline calls.
+- `ELEMENT_TYPES` — the type names page objects declare elements with.
+- `LOCATOR_CALLS` — the calls whose first string argument is a selector; the edit
+  guards read selectors out of added lines through these.
+- `RAW_DRIVER_CALLS` — `(pattern, label)` pairs for calls that bypass the repo's
+  wrappers; an edit that adds one is rejected.
 
 `tests/unit/test_frameworks.py` enforces most of the above for every registered
 plugin. Add yours to the parametrisation and it is checked automatically.
@@ -126,10 +138,9 @@ and disabled ambiguous-locator diagnosis, with no error anywhere.
 
 Precedence (`detect.resolve()`): `AUTOMATION_FRAMEWORK` → the repo's build files →
 `config/repo-map.json` → Playwright. `AUTOMATION_FRAMEWORK` is an explicit
-override and warns loudly when it contradicts the repo. Note that the Studio's
-**Agent Settings** page exposes it as an "Automation Framework" dropdown; a value
-saved there is written to `config/.env`, where it then overrides detection for
-every run. Leave it unset unless detection is wrong.
+override and warns loudly when it contradicts the repo. There is deliberately no
+Studio setting for it: a dropdown used to write it to `config/.env`, where it
+silently overrode detection for every repo. Set it only to debug detection.
 
 ---
 
@@ -241,5 +252,3 @@ new plugin.
 - In that repo `AgentTelemetry.recordAction` is only called from
   `onTestFailure`, so a run there produces a one-line timeline. It needs wiring
   into the interaction wrappers (work in the target repo, not here).
-- Healing's `00_reproduce.py` classifies errors from a hard-coded list mixing both
-  frameworks' strings instead of going through `DiagnosticEngine`.

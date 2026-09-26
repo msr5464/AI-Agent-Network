@@ -555,7 +555,7 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
         # how an unverified fix gets reported as a verified one.
         "verification": "unique in the failure capture",
         "new_locator": emitted["sel"],
-        "new_expression": emitted.get("java") or f'page.locator("{emitted["sel"]}")',
+        "new_expression": emitted.get("java") or emit_mod.code_for(emitted["sel"])["java"],
         "strategy": emitted.get("strategy"),
         "fragile": emitted.get("fragile"),
     })

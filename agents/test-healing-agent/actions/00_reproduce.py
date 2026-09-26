@@ -80,20 +80,13 @@ PROBE_ENABLED = os.environ.get("DIAGNOSIS_PROBE", "true").strip().lower() != "fa
 # database. Signals are taken from what these frameworks actually emit.
 
 _LOCATOR_SIGNALS = [
-    # The Playwright framework's own wrappers. BasePage.assertPageLoaded raises a
-    # java.lang.AssertionError, so this must be matched BEFORE the assertion
-    # signals below or a genuine broken locator is dismissed as a bad expectation.
+    # Wrapper phrasings automation repos commonly use. A wrapper's page-load check
+    # may raise a plain AssertionError, so this must be matched BEFORE the
+    # assertion signals below or a genuine broken locator is dismissed as a bad
+    # expectation. The framework's own error text is recognised by its plugin.
     "element not visible after timeout",
     "failed to load element",
-    # The Selenium/Thanos wrapper phrasing
     "is not visible", "is not clickable", "is not displayed", "is not present",
-    # Playwright
-    "waiting for locator", "waiting for selector", "strict mode violation",
-    "locator.click", "locator.fill", "locator resolved to",
-    # Selenium
-    "nosuchelementexception", "elementnotinteractableexception",
-    "staleelementreferenceexception", "elementclickinterceptedexception",
-    "unable to locate element",
 ]
 
 # Checked BEFORE the locator signals: a Playwright timeout looks locator-shaped
@@ -104,7 +97,7 @@ _INFRA_SIGNALS = {
     "INFRA_DB": ["communications link failure", "no suitable driver found",
                  "could not connect to database", "jdbc:mysql://<"],
     "INFRA_USER": ["failed to get free user after", "no free user available", "userquery["],
-    "INFRA_CREDENTIALS": ["value: expected string, got undefined"],
+    "INFRA_CREDENTIALS": [],   # the framework's NULL_VALUE_SIGNALS, filled in per call
     "INFRA_API_AUTH": ["401 unauthorized", "403 forbidden", "statuscode=401", "statuscode=403"],
 }
 
@@ -118,8 +111,11 @@ def classify_failure_shape(text: str, trace_selector: str = "",
                            trace_selector_inferred: bool = False) -> tuple:
     """Return (shape, reason). shape is LOCATOR / ASSERTION / INFRA_* / UNKNOWN."""
     blob = (text or "").lower()
+    from shared.frameworks import get_active_plugin
+    diagnostics = get_active_plugin().diagnostics
+    infra_signals = {**_INFRA_SIGNALS, "INFRA_CREDENTIALS": list(diagnostics.NULL_VALUE_SIGNALS)}
 
-    for shape, signals in _INFRA_SIGNALS.items():
+    for shape, signals in infra_signals.items():
         for signal in signals:
             if signal in blob:
                 return shape, f"matched infrastructure signal: {signal!r}"
@@ -135,6 +131,9 @@ def classify_failure_shape(text: str, trace_selector: str = "",
     for signal in _LOCATOR_SIGNALS:
         if signal in blob:
             return "LOCATOR", f"matched locator signal: {signal!r}"
+
+    if diagnostics.is_locator_resolution_failure(blob) or diagnostics.is_ambiguous_locator(blob):
+        return "LOCATOR", "the framework reported a locator that did not resolve"
 
     for signal in _ASSERTION_SIGNALS:
         if signal in blob:

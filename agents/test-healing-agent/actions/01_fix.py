@@ -429,7 +429,6 @@ def load_repo_conventions(workspace: Path) -> str:
         workspace / "docs" / "TESTING.md",
         workspace / "TESTING.md",
         workspace / "CONTRIBUTING.md",
-        AGENT_DIR / "CONVENTIONS.md",          # fallback: bundled conventions inside this agent
     ]
     for path in candidates:
         if path.exists():
@@ -1456,7 +1455,7 @@ def build_fix_prompt(ctx: dict, fix_rules: str) -> str:
         base_class_text = f"""
 ## Project Base Class: {bc['base_class_name']} ({bc['base_class_file']})
 These are the PUBLIC wrapper methods available from the base class.
-**Use these wrappers instead of raw Selenium/RestAssured calls.**
+**Use these wrappers instead of raw browser-driver or HTTP-client calls.**
 ```
 {bc['public_methods']}
 ```
@@ -1496,8 +1495,8 @@ network log and the step timeline — before you were called.
         if verdict["verdict"] == "AMBIGUOUS_LOCATOR":
             diagnosis_text += (
                 "\n**The element is present — the selector just matches more than one "
-                "of them.** Playwright refuses to act on an ambiguous locator, so the "
-                "action never ran. Narrow the existing selector to the one element "
+                "of them.** An action on an ambiguous locator fails or hits the wrong "
+                "element. Narrow the existing selector to the one element "
                 "this step means, using something that distinguishes it from its "
                 "siblings below (a distinguishing class, an accessible name, the "
                 "enclosing form or section). Do NOT reach for `.first()` or `.nth()` "
@@ -1635,7 +1634,7 @@ when the DOM below looks unremarkable.
     trace_text = ""
     if ctx.get("trace_timeline"):
         trace_text = f"""
-## 🔎 WHAT THE TEST ACTUALLY DID (Playwright trace)
+## 🔎 WHAT THE TEST ACTUALLY DID (execution trace)
 Recorded at runtime, so these are the selector strings the framework really used —
 not what the source appears to say.
 
@@ -1678,7 +1677,7 @@ Previous fix did not resolve the test. Different test output:
                            "specific, verified replacement, return `fixable: false` "
                            "and say what you would need to decide.\n")
 
-    return f"""You are fixing a broken locator in a Selenium/RestAssured test automation file.
+    return f"""You are fixing a broken locator in a test automation file.
 Work independently on this test case only.
 {conventions_text}{base_class_text}
 ## Test Case

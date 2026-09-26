@@ -440,6 +440,10 @@ def split_class_members(content: str) -> List[Dict[str, str]]:
     return [m for m in members if m["text"].strip()]
 
 
+
+# A locator's toString, `<Type>@<selector>` (e.g. `Locator@#login`).
+_TO_STRING_PREFIX = re.compile(r"^[A-Z][A-Za-z]*@")
+
 class CodeAnalyzer:
     """Analyzes test code structure and locates test files"""
 
@@ -772,20 +776,18 @@ class CodeAnalyzer:
             element_names.append(f"{page_name}:{field_name}")
             element_names.append(field_name)
 
-        # Pattern 3b: the framework prints the locator itself
+        # Pattern 3b: the framework prints the locator itself, often through a
+        # `<Type>@<selector>` toString:
         #   "Failed to load Element Locator@.product-page-heading in ProductsPage"
         pattern3b = re.compile(
-            r"Locator@(\S+?)\s+in\s+([A-Za-z][\w]*)|"
+            r"\b[A-Z][A-Za-z]*@(\S+?)\s+in\s+([A-Za-z][\w]*)|"
             r"Failed to load Element\s+(\S+?)\s+in\s+([A-Za-z][\w]*)")
         for match in pattern3b.finditer(combined_text):
             selector = match.group(1) or match.group(3)
             owner = match.group(2) or match.group(4)
             if selector:
-                # Playwright's Locator.toString() is "Locator@<selector>"; the bare
-                # selector is what appears in the page object source.
-                selector = selector.strip()
-                if selector.startswith("Locator@"):
-                    selector = selector[len("Locator@"):]
+                # The bare selector is what appears in the page object source.
+                selector = _TO_STRING_PREFIX.sub("", selector.strip())
                 element_names.append(selector)
             if owner and selector:
                 element_names.append(f"{owner}:{selector.strip()}")
@@ -800,17 +802,21 @@ class CodeAnalyzer:
         # handed a prompt with no locator declarations in it.
         pattern3c = re.compile(
             r"Failed to [\w ]{2,30}?element\s+'([^']+)'\s+with locator:\s*"
-            r"Locator@(.+?)(?=:\s*Error|\s*$)", re.MULTILINE)
+            r"(?:[A-Z][A-Za-z]*@)?(.+?)(?=:\s*Error|\s*$)", re.MULTILINE)
         for match in pattern3c.finditer(combined_text):
             element_names.append(match.group(1).strip())
             element_names.append(match.group(2).strip())
 
-        # Pattern 4: Extract from NoSuchElementException or TimeoutException messages
-        pattern4 = re.compile(r"(?:NoSuchElementException|TimeoutException).*?['\"]([^'\"]+)['\"]", re.IGNORECASE)
-        for match in pattern4.finditer(combined_text):
-            locator = match.group(1).strip()
-            if len(locator) > 3 and len(locator) < 100:  # Reasonable length
-                element_names.append(locator)
+        # Pattern 4: the first quoted name on a line the framework itself reports
+        # as a locator that did not resolve.
+        from shared.frameworks import get_active_plugin
+        diagnostics = get_active_plugin().diagnostics
+        for line in combined_text.splitlines():
+            if not diagnostics.is_locator_resolution_failure(line):
+                continue
+            quoted = re.search(r"['\"]([^'\"]+)['\"]", line)
+            if quoted and 3 < len(quoted.group(1).strip()) < 100:  # Reasonable length
+                element_names.append(quoted.group(1).strip())
 
         # Deduplicate and return
         unique_elements = []
@@ -836,9 +842,11 @@ class CodeAnalyzer:
             if not bare:
                 continue
 
-            # A declaration of the element: `private WebElement fooHeader;`,
-            # `private final Locator fooHeader;`, `Locator fooHeader =`, etc.
-            declaration = rf'(?:WebElement|MobileElement|Locator|By|Element)\s+{re.escape(bare)}\s*[;=)]'
+            # A declaration of the element in the framework's own element type
+            # (`private <Type> fooHeader;`, `<Type> fooHeader =`), or a wrapper's `Element`.
+            from shared.frameworks import get_active_plugin
+            types = "|".join(get_active_plugin().code.ELEMENT_TYPES + ("Element",))
+            declaration = rf'(?:{types})\s+{re.escape(bare)}\s*[;=)]'
             if re.search(declaration, content):
                 matches.append(elem_name)
                 continue
@@ -846,7 +854,7 @@ class CodeAnalyzer:
             if ':' in elem_name:
                 page_part, elem_part = elem_name.split(':', 1)
                 if re.search(rf'\bclass\s+{re.escape(page_part)}\b', content, re.IGNORECASE):
-                    if re.search(rf'@FindBy[^;]*{re.escape(elem_part)}', content, re.IGNORECASE) or \
+                    if re.search(rf'@\w+\([^;]*{re.escape(elem_part)}', content, re.IGNORECASE) or \
                        re.search(rf'//.*?{re.escape(elem_part)}', content, re.IGNORECASE):
                         matches.append(elem_name)
                         continue

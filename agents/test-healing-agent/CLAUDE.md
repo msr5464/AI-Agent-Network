@@ -475,7 +475,7 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs (default: main) |
 | `HEALING_BRANCH_PREFIX` | Prefix for fix branches (default: `healing`). Full name: `<prefix>/<session-id>`, e.g. `healing/20260923-111221-fix-saucedemowebtest` — one branch per run, so re-running the same test never collides with an earlier run's branch |
 | `GITHUB_PR_REVIEWERS` | Comma-separated list of PR reviewers |
-| `REPO_CONTEXT_FILE` | Conventions file to show the model (relative to the repo root, or absolute). Unset or missing → the first of `CONVENTIONS.md`, `CLAUDE.md`, `docs/TESTING.md`, `TESTING.md`, `CONTRIBUTING.md` in the automation repo, then this agent's bundled `CONVENTIONS.md`. Up to 64,000 characters are used (`MAX_CONVENTIONS_CHARS`) |
+| `REPO_CONTEXT_FILE` | Conventions file to show the model (relative to the repo root, or absolute). Unset or missing → the first of `CONVENTIONS.md`, `CLAUDE.md`, `docs/TESTING.md`, `TESTING.md`, `CONTRIBUTING.md` in the automation repo; with none, the generic `config/skills/automation-repo.md` rules still apply. Up to 64,000 characters are used (`MAX_CONVENTIONS_CHARS`) |
 | `TEST_RUNNER_CMD` | Override test runner — use `{class}`, `{class_simple}`, `{method}` placeholders. Without it, runners are auto-detected at the repo root and one level down; if none is found, fixes are reported `unverified` |
 | `HEALING_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
 | `HEALING_RETRY_COUNT` | Max **consecutive attempts that made no progress** before the loop gives up (default: 4). An attempt that repairs one locator and uncovers the next does not count |

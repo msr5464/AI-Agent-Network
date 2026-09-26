@@ -149,6 +149,9 @@ class SeleniumTestRunner(TestRunner):
 
 
 class SeleniumDiagnosticEngine(DiagnosticEngine):
+    # A null handed to sendKeys().
+    NULL_VALUE_SIGNALS = ("keys to send should be a not null charsequence",)
+
     # Phrases that actually appear in Selenium/WebDriver failures. The previous
     # implementation matched "multiple elements matched", which no Selenium
     # binding emits, so this returned False for every input and the
@@ -165,6 +168,7 @@ class SeleniumDiagnosticEngine(DiagnosticEngine):
         "staleelementreferenceexception",
         "elementnotinteractableexception",
         "elementclickinterceptedexception",
+        "unabletolocateelement",
     )
 
     def is_ambiguous_locator(self, error_message: str) -> bool:
@@ -177,6 +181,15 @@ class SeleniumDiagnosticEngine(DiagnosticEngine):
 
 
 class SeleniumCodeEngine(CodeEngine):
+    ELEMENT_TYPES = ("WebElement", "MobileElement", "By")
+    LOCATOR_CALLS = ("cssSelector",)
+    RAW_DRIVER_CALLS = (
+        (re.compile(r"\bdriver\s*\.\s*findElement"), "driver.findElement"),
+        (re.compile(r"\.\s*sendKeys\s*\("), ".sendKeys()"),
+        (re.compile(r"\bnew\s+WebDriverWait\b"), "new WebDriverWait"),
+        (re.compile(r"\bdriver\s*\.\s*get\s*\("), "driver.get()"),
+    )
+
     _LOCATOR_PATTERNS = (
         re.compile(r"""(?:(?P<name>\w+)\s*=\s*)?driver\.findElement\s*\(\s*By\s*\.\s*(?P<by>cssSelector|id|xpath|className|name)\s*\(\s*(?P<q>["'])(?P<sel>(?:\\.|(?!(?P=q)).)*)(?P=q)"""),
         re.compile(r"""@FindBy\s*\(\s*(?P<by>css|id|xpath|className|name)\s*=\s*(?P<q>["'])(?P<sel>(?:\\.|(?!(?P=q)).)*)(?P=q)"""),

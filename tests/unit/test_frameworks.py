@@ -96,6 +96,42 @@ def test_diagnostics_recognise_their_own_ambiguity_error(framework):
 
 
 @ALL
+def test_diagnostics_recognise_their_own_locator_failures(framework):
+    """Healing and element-name extraction ask the plugin this
+    instead of matching one framework's exception names themselves."""
+    engine = get_plugin(framework).diagnostics
+    samples = {
+        "playwright": ["TimeoutError: locator.click: Timeout 30000ms exceeded.",
+                       "  - waiting for locator('#login-button')"],
+        "selenium": ["org.openqa.selenium.NoSuchElementException: no such element: "
+                     "Unable to locate element: {\"method\":\"css selector\"}",
+                     "org.openqa.selenium.StaleElementReferenceException: stale element "
+                     "reference: element is not attached to the page document"],
+    }
+    for message in samples[framework]:
+        assert engine.is_locator_resolution_failure(message), message
+    assert not engine.is_locator_resolution_failure("AssertionError: expected [3] but found [2]")
+
+
+@ALL
+def test_code_engine_declares_its_repo_conventions(framework):
+    """Element types, selector-taking calls and raw driver calls come from the
+    plugin, so the edit guards and code analyser name no framework themselves."""
+    code = get_plugin(framework).code
+    assert code.ELEMENT_TYPES and code.LOCATOR_CALLS and code.RAW_DRIVER_CALLS
+    for pattern, label in code.RAW_DRIVER_CALLS:
+        assert pattern.pattern and label
+
+
+@ALL
+def test_optional_telemetry_members_default_safely(framework, tmp_path):
+    """A framework with no network log returns [] rather than raising."""
+    telemetry = get_plugin(framework).telemetry
+    assert telemetry.read_network(tmp_path / "missing") == []
+    assert isinstance(telemetry.NOISE_ACTIONS, frozenset)
+
+
+@ALL
 def test_plugin_exposes_the_four_contract_seams(framework):
     plugin = get_plugin(framework)
     for seam in ("telemetry", "runner", "diagnostics", "code"):

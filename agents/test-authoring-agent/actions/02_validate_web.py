@@ -640,8 +640,8 @@ OUTPUT PROTOCOL — emit these markers on their own lines:
   reporting as STEP_UNVERIFIED, not papering over with a selector that matches
   a hidden node.
   A marker reporting count != 1 is DROPPED — a selector matching several elements
-  kills the generated test at runtime with Playwright's "strict mode violation:
-  resolved to N elements". Narrow it and re-report it with count=1 instead.
+  kills the generated test at runtime (or makes it act on the wrong element).
+  Narrow it and re-report it with count=1 instead.
   A marker with NO count is ALSO DROPPED. Nothing downstream can tell a selector
   you measured from one you eyeballed, so an unmeasured selector is not a
   confirmed one. The batch check in rule 2c gives you every count at once —

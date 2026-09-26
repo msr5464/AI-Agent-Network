@@ -1,4 +1,5 @@
 import abc
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -20,6 +21,9 @@ class TelemetryParser(abc.ABC):
     directly — so a parser returning its raw log records (as the Selenium one
     did) crashed the prompt builder with a KeyError on the first real trace.
     """
+
+    #: Action names that say nothing about locators; dropped from the prompt timeline.
+    NOISE_ACTIONS: frozenset = frozenset()
 
     #: Normalised keys, with the empty value each defaults to.
     ACTION_KEYS = {"action": "", "selector": "", "url": "", "value": "",
@@ -61,6 +65,14 @@ class TelemetryParser(abc.ABC):
         """Find the final failed action in the trace."""
         pass
 
+    def read_network(self, trace_path: Path) -> List[Dict]:
+        """HAR-shaped network records from one artifact, [] when it has none.
+
+        Optional: most frameworks record no network log, and losing that
+        evidence channel is the honest outcome for them.
+        """
+        return []
+
 
 class TestRunner(abc.ABC):
     """Handles framework-specific execution commands and arguments."""
@@ -78,16 +90,35 @@ class TestRunner(abc.ABC):
 
 class DiagnosticEngine(abc.ABC):
     """Interprets framework-specific error messages and semantics."""
+
+    #: Lower-case error text meaning a null value reached an interaction — almost
+    #: always an unset property (a missing credential), not a locator problem.
+    NULL_VALUE_SIGNALS: Tuple[str, ...] = ()
     
     @abc.abstractmethod
     def is_ambiguous_locator(self, error_message: str) -> bool:
         """Return True if the error indicates multiple elements matched a locator."""
         pass
 
+    @abc.abstractmethod
+    def is_locator_resolution_failure(self, error_message: str) -> bool:
+        """Return True if a locator matched nothing usable: not found, stale, not interactable."""
+        pass
+
 
 class CodeEngine(abc.ABC):
     """Handles framework-specific code generation and parsing rules."""
-    
+
+    #: Type names a page object declares its elements with (`Locator foo;`).
+    ELEMENT_TYPES: Tuple[str, ...] = ()
+
+    #: Method names whose first string argument is a selector (`locator("#id")`).
+    LOCATOR_CALLS: Tuple[str, ...] = ()
+
+    #: (pattern, label) for calls that drive the browser directly instead of
+    #: through the repo's wrappers. Edits that add one are rejected.
+    RAW_DRIVER_CALLS: Tuple[Tuple["re.Pattern", str], ...] = ()
+
     @abc.abstractmethod
     def remove_framework_suffixes(self, selector: str) -> str:
         """Strip framework-specific pseudo-classes (e.g. :has-text) from a CSS selector."""

@@ -27,12 +27,6 @@ from typing import Dict, List, Optional
 
 from shared.frameworks import get_active_plugin
 
-# Actions that say nothing about locators; noise in a timeline. Playwright's
-# protocol names, harmless for other frameworks — they simply never match.
-_UNINTERESTING = {"BrowserContext.newPage", "Frame.content", "BrowserContext.close",
-                  "Browser.close", "Page.close", "Tracing.start", "Tracing.stop"}
-
-
 def discover(results_dir: Path, method_name: str) -> List[Path]:
     """Every telemetry artifact the active framework wrote for one test method."""
     return get_active_plugin().telemetry.discover(results_dir, method_name)
@@ -60,7 +54,8 @@ def format_for_prompt(actions: List[Dict], max_actions: int = 40) -> str:
     KeyError here, inside prompt construction, at the point where the evidence
     was about to be used.
     """
-    interesting = [a for a in actions if a.get("action", "") not in _UNINTERESTING]
+    noise = get_active_plugin().telemetry.NOISE_ACTIONS
+    interesting = [a for a in actions if a.get("action", "") not in noise]
     if not interesting:
         return ""
 

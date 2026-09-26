@@ -365,7 +365,7 @@ QA-Agent-Network/
 ├── agents/
 │   ├── test-authoring-agent/   # run.sh, actions/01–05, CLAUDE.md, queue/, audit/
 │   ├── test-triaging-agent/    # run.sh, actions/01–05, lib/, feedback/
-│   ├── test-healing-agent/     # run.sh, actions/00–02, lib/, CONVENTIONS.md, queue/
+│   ├── test-healing-agent/     # run.sh, actions/00–02, lib/, queue/
 │   └── test-adaptation-agent/  # run.sh, actions/01–05, lib/, queue/
 ├── shared/                     # helpers used by every agent (claude, git, diagnosis, locator engine, frameworks/, …)
 ├── qa_agents_server/           # HTTP + SSE server for AI-Test-Studio

@@ -16,9 +16,8 @@ from shared.frameworks.base import (
 
 class PlaywrightTelemetryParser(TelemetryParser):
     
-    # Actions that say nothing about locators; noise in a timeline.
-    _UNINTERESTING = {"BrowserContext.newPage", "Frame.content", "BrowserContext.close",
-                      "Browser.close", "Page.close", "Tracing.start", "Tracing.stop"}
+    NOISE_ACTIONS = frozenset({"BrowserContext.newPage", "Frame.content", "BrowserContext.close",
+                               "Browser.close", "Page.close", "Tracing.start", "Tracing.stop"})
 
     def discover(self, results_dir: Path, method_name: str) -> List[Path]:
         """Playwright's tracing writes one zip per test under traces/."""
@@ -82,6 +81,46 @@ class PlaywrightTelemetryParser(TelemetryParser):
         if errored:
             return errored
         return self._polled_to_death(actions)
+
+    def read_network(self, trace_path: Path) -> List[Dict]:
+        """Every record in the trace's `trace.network` log, flattened. [] for anything unreadable."""
+        if not trace_path:
+            return []
+        path = Path(trace_path)
+        if not path.exists():
+            return []
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = [n for n in archive.namelist() if n.endswith("trace.network")]
+                if not names:
+                    return []
+                raw = archive.read(names[0]).decode("utf-8", errors="ignore")
+        except (zipfile.BadZipFile, OSError, KeyError):
+            return []
+
+        entries = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            snapshot = event.get("snapshot") if isinstance(event, dict) else None
+            if not isinstance(snapshot, dict):
+                continue
+            request = snapshot.get("request") or {}
+            response = snapshot.get("response") or {}
+            entries.append({
+                "url": request.get("url", ""),
+                "method": request.get("method", ""),
+                "status": response.get("status"),
+                "status_text": response.get("statusText", ""),
+                "time_ms": snapshot.get("time"),
+                "started": snapshot.get("startedDateTime", ""),
+            })
+        return entries
 
     def _polled_to_death(self, actions: List[Dict], min_repeats: int = 3) -> Optional[Dict]:
         tail = [a for a in actions if a.get("selector")]
@@ -148,11 +187,35 @@ class PlaywrightTestRunner(TestRunner):
 
 
 class PlaywrightDiagnosticEngine(DiagnosticEngine):
+    # A null handed to fill().
+    NULL_VALUE_SIGNALS = ("value: expected string, got undefined",)
+
+    # What Playwright prints when a locator resolves to nothing usable. A strict
+    # mode violation is included: the locator no longer identifies one element.
+    _RESOLUTION_SIGNALS = (
+        "waiting for locator", "waiting for selector", "locator resolved to",
+        "locator.click", "locator.fill", "strict mode violation",
+    )
+
     def is_ambiguous_locator(self, error_message: str) -> bool:
         return "strict mode violation" in (error_message or "").lower()
 
+    def is_locator_resolution_failure(self, error_message: str) -> bool:
+        text = (error_message or "").lower()
+        return any(signal in text for signal in self._RESOLUTION_SIGNALS)
+
 
 class PlaywrightCodeEngine(CodeEngine):
+    ELEMENT_TYPES = ("Locator",)
+    LOCATOR_CALLS = ("locator", "waitForSelector")
+    # Only the wrapper classes may make these calls. `Element.click(...)` is a
+    # wrapper itself, hence the lookbehind.
+    RAW_DRIVER_CALLS = (
+        (re.compile(r"(?<!\bElement)\s*\.\s*(?:click|dblclick|fill|press|check|uncheck"
+                    r"|selectOption|hover|setInputFiles)\s*\("), "locator.click()/fill()/…"),
+        (re.compile(r"\bpage\s*\.\s*(?:navigate|waitForTimeout)\s*\("), "page.navigate()/waitForTimeout()"),
+    )
+
     _HAS_TEXT_RE = re.compile(r':has-text\([^)]+\)')
     
     _NARROWING_SUFFIX = re.compile(r"\s*>>\s*(nth=-?\d+|first|last|visible=(true|false))\s*$", re.IGNORECASE)

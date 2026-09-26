@@ -412,7 +412,7 @@ class TestFixGuardsInAuthoring:
 
     def test_raw_driver_calls_are_rejected(self, tmp_path, monkeypatch):
         updated = self.ORIGINAL.replace("click(loginButton, \"Login\")",
-                                        "driver.findElement(By.id(\"x\"))")
+                                        "loginButton.click()")
         ok, reason = self._guards(tmp_path, monkeypatch)(self.ORIGINAL, updated, self.REL)
         assert not ok and "raw driver" in reason
 

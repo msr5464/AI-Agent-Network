@@ -205,7 +205,7 @@ def main() -> None:
             existing_context += f"\n--- {path} ---\n{content}\n"
         existing_context += "</existing_module_files>"
 
-    prompt = f"""You are a QA automation planning agent for the Jarvis Java framework.
+    prompt = f"""You are a QA automation planning agent for the automation repository whose conventions follow.
 
 <framework_conventions>
 {claude_md}
@@ -222,9 +222,7 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
   "feature_name": "payments",
   "feature_class": "Payment",
   "test_type": "both",
-  "country": "SG",
   "user_type": "Admin",
-  "feature_enum": "CARD",
   "package_main": "automation.modules.payments",
   "package_test": "automation.payments",
   "existing_module": false,
@@ -321,8 +319,6 @@ Rules:
    "Checkout" — and must NOT describe the scenario. It names the module's shared Helper, Data and
    Builder classes, so a scenario-specific name (e.g. "NaukriProfileSummary") creates a second Helper
    beside the one the module already has.
-2. "feature_enum" must be one of: CARD, BUDGET, CLAIM, DBS_SG, DBS_HK, CC_SG, CALASTONE_SG.
-   Pick the closest match; if unsure use CARD.
 3. "response_only": true for fields set by the server (id, status, createdAt, updatedAt).
 4. Infer "web_steps_for_validation" from the plain English web steps for use in the
    Playwright validation script — list them as simple imperative sentences.

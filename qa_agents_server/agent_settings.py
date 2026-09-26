@@ -60,20 +60,9 @@ _EFFORT_OPTIONS = [
 ]
 
 SETTINGS_SCHEMA: List[Dict[str, Any]] = [
-    {
-        "key": "automation_framework",
-        "env_var": "AUTOMATION_FRAMEWORK",
-        "label": "Automation Framework",
-        "description": "Select the automation framework used in your target repository.",
-        "type": "select",
-        "options": [
-            {"label": "Playwright", "value": "playwright"},
-            {"label": "Selenium", "value": "selenium"}
-        ],
-        "category": "common",
-        "default": "playwright",
-        "sensitive": False,
-    },
+    # No framework setting: it is detected from the target repo's build files
+    # (shared/frameworks/detect.py). AUTOMATION_FRAMEWORK in config/.env remains
+    # as a debugging override.
     # ── test-adaptation-agent ────────────────────────────────────────────────
     {"key": "adaptation_model", "env_var": "ADAPTATION_MODEL", "label": "Adaptation model",
      "description": "Claude model used to classify the change note and write edits.",
@@ -178,7 +167,7 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "description": "Name of the automation repo — the directory under the workspace directory, and the repo name on GitHub. Required even when Automation Repo Path is set.",
         "type": "text",
         "category": "common",
-        "default": "Jarvis",
+        "default": "",
         "sensitive": False,
     },
     {

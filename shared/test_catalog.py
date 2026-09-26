@@ -40,9 +40,6 @@ _WEB_MARKERS = {"webcases", "web"}
 # vocabulary in one place rather than half here and half in the frontend.
 _API_MARKERS = {"apicases", "api"}
 
-# Only used to present a package segment the way the framework spells it.
-_PROJECT_NAMES = ("GitHub", "SauceDemo", "FullSuite")
-
 _TEST_ANNOTATION = re.compile(r'@Test\b')
 _ARG_DESCRIPTION = re.compile(r'description\s*=\s*"((?:[^"\\]|\\.)*)"')
 _ARG_GROUPS = re.compile(r'groups\s*=\s*\{([^}]*)\}')
@@ -96,8 +93,8 @@ def _resolve_groups(raw: str) -> List[str]:
     return groups
 
 
-def module_for_package(package: str) -> str:
-    """The segment after `automation.`, spelled the way the framework spells it.
+def module_for_package(package: str, class_name: str = "") -> str:
+    """The segment after the root package, spelled the way the repo spells it.
 
     `automation.saucedemo.SauceDemoWebTest` → `SauceDemo`. Classes sitting
     directly in the root package have no segment and group under `Other`.
@@ -106,9 +103,8 @@ def module_for_package(package: str) -> str:
     if len(parts) < 2:
         return "Other"
     segment = parts[1]
-    for canonical in _PROJECT_NAMES:
-        if canonical.lower() == segment.lower():
-            return canonical
+    if class_name.lower().startswith(segment.lower()):
+        return class_name[:len(segment)]
     return segment
 
 
@@ -173,7 +169,7 @@ def _class_entry(path: Path, repo: Path) -> Optional[dict]:
 
     methods.sort(key=lambda m: m["name"])
     return {
-        "module": module_for_package(package),
+        "module": module_for_package(package, class_name),
         "package": package,
         "name": class_name,
         "qualified_name": f"{package}.{class_name}" if package else class_name,

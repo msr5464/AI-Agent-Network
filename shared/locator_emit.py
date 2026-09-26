@@ -72,6 +72,22 @@ def _css(value: str) -> str:
     return get_active_plugin().code.quote_css_value(value)
 
 
+def code_for(selector: str) -> dict:
+    """The target repo's code for a plain selector, in its own framework's syntax.
+
+    Accepts our own browser's `xpath=` prefix and drops it: the code gets the
+    bare XPath, which every CodeEngine recognises by its leading slash.
+    """
+    from shared.frameworks import get_active_plugin
+    if selector.startswith("xpath="):
+        selector = selector[len("xpath="):]
+    snippet = get_active_plugin().code.emit_locator(selector=selector)
+    out = {"python": snippet.get("python", ""), "java": snippet.get("java", "")}
+    if snippet.get("findby"):
+        out["findby"] = snippet["findby"]
+    return out
+
+
 def _unique(ctx, sel: str, expect_index: int | None = None, snap: dict | None = None) -> bool:
     """Exactly one match — and, when we know which node we mean, THAT node.
 
@@ -151,8 +167,7 @@ def scoped_by_context(ctx, el: dict, expect_index: int, snap: dict | None) -> di
             seen.add(selector)
             if _unique(ctx, selector, expect_index, snap):
                 return {"strategy": "scoped-by-ancestor", "sel": selector,
-                        "python": f"page.locator({_q(selector)})",
-                        "java": f"page.locator({_q(selector)})"}
+                        **code_for(selector)}
 
     # Still ambiguous: bring in a nearby text that tells the sections apart.
     texts = sorted((t for t in (el.get("neighbor_texts") or []) if t and len(t) <= 60),
@@ -167,10 +182,8 @@ def scoped_by_context(ctx, el: dict, expect_index: int, snap: dict | None) -> di
                 continue
             seen.add(selector)
             if _unique(ctx, selector, expect_index, snap):
-                code_snippet = get_active_plugin().code.emit_locator(selector=selector)
                 return {"strategy": "scoped-by-neighbor", "sel": selector,
-                        "python": code_snippet.get("python", ""),
-                        "java": code_snippet.get("java", "")}
+                        **code_for(selector)}
     return None
 
 
@@ -357,8 +370,7 @@ def emit(ctx, el: dict, vol: Volatility, snap: dict | None = None) -> dict | Non
                     f"structural locator was possible — an aria-label would fix both "
                     f"this and the screen-reader experience")
         return {"strategy": "xpath", "sel": f"xpath={xp}", "fragile": hint,
-                "python": f"page.locator({_q('xpath=' + xp)})",
-                "java": f"page.locator({_q('xpath=' + xp)})"}
+                **code_for(xp)}
     return None
 
 

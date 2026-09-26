@@ -1,10 +1,30 @@
 {
-  "_comment": "Per-repo metadata, keyed by GITHUB_REPO_AUTOMATION. Only `framework` is read (shared/frameworks/detect.py), as a fallback when the repo's build files do not settle it.",
+  "_comment": "Per-repo metadata, keyed by GITHUB_REPO_AUTOMATION. `framework` is a fallback for shared/frameworks/detect.py when the repo's build files do not settle it. `reference_files` are the repo-relative files the authoring agent shows the model as worked examples: one module end to end (data, builder, helper, API client, a page object with its real base-page import block, and a web and an API test). Missing files are skipped; with no list, the model works from the repo's CLAUDE.md alone.",
   "Jarvis": {
-    "framework": "TestNG + Playwright"
+    "framework": "TestNG + Playwright",
+    "reference_files": [
+      "src/main/java/automation/modules/saucedemo/SauceDemoData.java",
+      "src/main/java/automation/modules/saucedemo/SauceDemoBuilder.java",
+      "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
+      "src/main/java/automation/modules/saucedemo/api/SauceDemoApi.java",
+      "src/main/java/automation/modules/saucedemo/web/LoginPage.java",
+      "src/main/java/automation/core/api/ApiHelper.java",
+      "src/test/java/automation/saucedemo/SauceDemoApiTest.java",
+      "src/test/java/automation/saucedemo/SauceDemoWebTest.java"
+    ]
   },
   "Playwright-Automation-Framework": {
-    "framework": "TestNG + Playwright"
+    "framework": "TestNG + Playwright",
+    "reference_files": [
+      "src/main/java/automation/modules/saucedemo/SauceDemoData.java",
+      "src/main/java/automation/modules/saucedemo/SauceDemoBuilder.java",
+      "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
+      "src/main/java/automation/modules/saucedemo/api/SauceDemoApi.java",
+      "src/main/java/automation/modules/saucedemo/web/LoginPage.java",
+      "src/main/java/automation/core/api/ApiHelper.java",
+      "src/test/java/automation/saucedemo/SauceDemoApiTest.java",
+      "src/test/java/automation/saucedemo/SauceDemoWebTest.java"
+    ]
   },
   "Selenium-Automation-Framework": {
     "framework": "TestNG + Selenium"

@@ -154,15 +154,21 @@ _QUOTED = re.compile(r"""(["'])((?:\\.|(?!\1).)+)\1""")
 # Scoping to the call rather than to how the string LOOKS is what keeps a bare tag
 # (page.locator("input"), a real collapse-to-tag broadening) in scope while leaving
 # labels out — a shape-based filter cannot separate those two.
-_LOCATOR_CALL = re.compile(
-    r"""(?:locator|cssSelector|querySelectorAll|querySelector|waitForSelector)\s*"""
-    r"""\(\s*(["'])((?:\\.|(?!\1).)*)\1""",
-    re.I,
-)
+#
+# Which calls take a selector is the framework's business (its CodeEngine's
+# LOCATOR_CALLS); the DOM API's own are the same in every framework.
+_DOM_SELECTOR_CALLS = ("querySelectorAll", "querySelector")
+
+
+def _locator_calls() -> str:
+    """Regex alternation of every call whose first string argument is a selector."""
+    from shared.frameworks import get_active_plugin
+    return "|".join(get_active_plugin().code.LOCATOR_CALLS + _DOM_SELECTOR_CALLS)
 
 
 def _selectors_in(text: str) -> list:
-    return [m.group(2) for m in _LOCATOR_CALL.finditer(text or "")]
+    pattern = re.compile(rf"""(?:{_locator_calls()})\s*\(\s*(["'])((?:\\.|(?!\1).)*)\1""", re.I)
+    return [m.group(2) for m in pattern.finditer(text or "")]
 
 
 def _is_broader(before: str, after: str) -> bool:
@@ -214,14 +220,13 @@ def no_selector_broadening(original: str, updated: str) -> tuple:
 # single match from a locator that is acted on directly.
 _LIST_USE = re.compile(r"\b(\w+)\s*\.\s*(?:first|last|nth|all|count|allTextContents|"
                        r"allInnerTexts|all_text_contents|all_inner_texts)\s*\(")
-_ASSIGNED = re.compile(r"(\w+)\s*=\s*[^=;]*\blocator\s*\(")
 
 
 def _acted_on_as_one(line: str, original: str) -> bool:
     """Whether the locator this edited line assigns must resolve to one element."""
     if "nth=" in line or ":nth-match(" in line:
         return False                     # the selector narrows by position itself
-    field = _ASSIGNED.search(line)
+    field = re.search(rf"(\w+)\s*=\s*[^=;]*\b(?:{_locator_calls()})\s*\(", line)
     # ponytail: usage is read from this file only; a field handed elsewhere and
     # used as a list there is not seen — FORCE=true is the way past that.
     return not (field and field.group(1) in {m.group(1) for m in _LIST_USE.finditer(original)})
@@ -318,9 +323,8 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
                     if result and result[0] > 1:
                         return False, (f"the replacement selector {candidate!r} matches "
                                        f"{result[0]} elements in the DOM captured at "
-                                       f"failure; the test acts on this element and "
-                                       f"Playwright refuses to act on more than one "
-                                       f"(strict mode violation)")
+                                       f"failure; the test acts on this element, so "
+                                       f"the selector must match exactly one")
 
     # 4. A fix for an ambiguous locator has to be unambiguous. Playwright refuses
     #    to act on a selector that resolves to more than one element, so a
@@ -378,7 +382,7 @@ def _added_lines(before: str, after: str) -> list:
 # An edit that makes a failure survivable rather than fixing it. Each of these
 # turns a red test green without changing what the product does.
 _SWALLOW_PATTERNS = (
-    (re.compile(r"\bThread\.sleep\s*\("), "Thread.sleep — CONVENTIONS.md §2 bans it; "
+    (re.compile(r"\bThread\.sleep\s*\("), "Thread.sleep — a fixed sleep is banned; "
      "use the framework's waits"),
     (re.compile(r"@Ignore\b"), "@Ignore — disables the test rather than fixing it"),
     (re.compile(r"\benabled\s*=\s*false"), "enabled=false — disables the test"),
@@ -391,20 +395,9 @@ _SWALLOW_PATTERNS = (
 _CATCH = re.compile(r"\bcatch\s*\([^)]*\)\s*\{")
 _CATCH_OK = re.compile(r"\b(throw|AssertHelper|logFail|logFailToEndExecution|fail)\b")
 
-# Raw driver calls. CONVENTIONS.md §1 and config/skills/automation-repo.md both
-# forbid these, and until now nothing checked — the rule lived only in a prompt.
-# Both frameworks: the Selenium list alone let a raw Playwright `locator.click()`
-# through. Only the wrapper classes may make these calls, and edits never land
-# there — `Element.click(...)` is the wrapper itself, hence the exclusion.
-_RAW_DRIVER = (
-    (re.compile(r"\bdriver\s*\.\s*findElement"), "driver.findElement"),
-    (re.compile(r"\.\s*sendKeys\s*\("), ".sendKeys()"),
-    (re.compile(r"\bnew\s+WebDriverWait\b"), "new WebDriverWait"),
-    (re.compile(r"\bdriver\s*\.\s*get\s*\("), "driver.get()"),
-    (re.compile(r"(?<!\bElement)\s*\.\s*(?:click|dblclick|fill|press|check|uncheck"
-                r"|selectOption|hover|setInputFiles)\s*\("), "locator.click()/fill()/…"),
-    (re.compile(r"\bpage\s*\.\s*(?:navigate|waitForTimeout)\s*\("), "page.navigate()/waitForTimeout()"),
-)
+# Raw driver calls. config/skills/automation-repo.md forbids these, and until
+# now nothing checked — the rule lived only in a prompt. What counts as raw is the
+# framework's business: its CodeEngine's RAW_DRIVER_CALLS.
 
 _LOGSTEP = re.compile(r"\blogStep\s*\(")
 
@@ -467,13 +460,14 @@ def no_new_swallowing(before: str, after: str) -> tuple:
 
 
 def wrapper_compliance(before: str, after: str) -> tuple:
-    """Reject raw driver calls (Selenium or Playwright) in added code."""
+    """Reject raw driver calls, as the active framework defines them, in added code."""
+    from shared.frameworks import get_active_plugin
     blob = "\n".join(_added_lines(before, after))
-    found = [name for pattern, name in _RAW_DRIVER if pattern.search(blob)]
+    found = [name for pattern, name in get_active_plugin().code.RAW_DRIVER_CALLS
+             if pattern.search(blob)]
     if found:
         return False, (f"added raw driver calls ({', '.join(found)}) — the framework "
-                       f"wrappers exist so waits, retries and logging happen; "
-                       f"CONVENTIONS.md §1")
+                       f"wrappers exist so waits, retries and logging happen")
     return True, ""
 
 
@@ -489,8 +483,8 @@ def logstep_present(before: str, after: str, is_test_class: bool) -> tuple:
     added = "\n".join(_added_lines(before, after))
     if (_INTERACTION.search(added) or _added_interactions(added)) and not _LOGSTEP.search(added):
         return False, ("added an interaction to a test class with no logStep — "
-                       "CONVENTIONS.md §10, and the intent contract is derived "
-                       "from those strings")
+                       "every test step must be narrated, and the intent contract "
+                       "is derived from those strings")
     return True, ""
 
 

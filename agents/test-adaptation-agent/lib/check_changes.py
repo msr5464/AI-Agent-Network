@@ -34,6 +34,10 @@ from shared.credential_masking import mask_credential_lines
 CHECK_CHANGING = frozenset({"step_merge", "content_changed", "outcome_changed",
                             "api_contract", "coverage_changed"})
 
+# In the refusal for an item whose kind may not change checks. 04_adapt matches
+# it to retry such an item after the note's check-changing items have landed.
+KIND_MAY_NOT_CHANGE = "may not change what a test checks"
+
 # Kinds whose only possible work is adding interactions. For these, and only
 # these, "exploration saw nothing the tests do not already do" means the change
 # is already applied. `coverage_added` is not one: a note that only adds checks
@@ -375,7 +379,7 @@ def validate(declared, graph: dict, files: dict, kind: str, listed: Dict[str, di
 
     actual, detail = _actual(graph, files)
     if actual and kind not in CHECK_CHANGING:
-        return refuse(f"a `{kind}` item may not change what a test checks, but this "
+        return refuse(f"a `{kind}` item {KIND_MAY_NOT_CHANGE}, but this "
                       f"edit does: {_summary(actual)}. If the expected value really "
                       f"changed, the note needs its own item saying so")
 

@@ -112,6 +112,36 @@ class TestNegativeDocuments:
         assert adapt.negative_documents({"pages": {}, "_inventories": {}}) == []
 
 
+class TestDeferOnce:
+    """A kind-refused item gets one more look once the note's check-changing items
+    have run, so a change another item legitimately made reads as covered, not
+    rejected."""
+    KIND_WHY = ("a `coverage_added` item may not change what a test checks, but this "
+                "edit does: change \"Cart badge should show 1\" at T#m → 2")
+
+    def test_deferred_once_behind_a_check_changing_item(self, tmp_path, monkeypatch):
+        adapt = _load("adapt_defer", "actions/04_adapt.py", tmp_path, monkeypatch)
+        item = {"index": 1, "kind": "coverage_added"}
+        queue, deferred = [{"index": 2, "kind": "coverage_changed"}], set()
+        assert adapt.defer_once(item, self.KIND_WHY, queue, deferred) is True
+        assert queue[-1] is item
+        # Refused again on its second pass: the refusal stands.
+        assert adapt.defer_once(item, self.KIND_WHY, queue, deferred) is False
+
+    def test_not_deferred_without_a_later_check_changing_item(self, tmp_path, monkeypatch):
+        adapt = _load("adapt_defer_none", "actions/04_adapt.py", tmp_path, monkeypatch)
+        item = {"index": 1, "kind": "coverage_added"}
+        assert adapt.defer_once(item, self.KIND_WHY, [{"index": 2, "kind": "coverage_added"}],
+                                set()) is False
+
+    def test_not_deferred_for_any_other_refusal(self, tmp_path, monkeypatch):
+        adapt = _load("adapt_defer_other", "actions/04_adapt.py", tmp_path, monkeypatch)
+        item = {"index": 1, "kind": "coverage_added"}
+        queue = [{"index": 2, "kind": "coverage_changed"}]
+        assert adapt.defer_once(item, "every verified test still fails (5)", queue, set()) is False
+        assert len(queue) == 1
+
+
 class TestCoveringItem:
     """`covered_by` is the model's claim; only a claim Python can check lands.
 

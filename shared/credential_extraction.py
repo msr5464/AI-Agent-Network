@@ -7,8 +7,8 @@ Every step that needs them (01_parse's demo_credentials fallback, 02_validate_we
 agree: a real run with
 
     2. Do login by using the credentials given below:
-    username=ms00000raj@gmail.com
-    password=SingIsKing@1234
+    username=qa.user@example.com
+    password=Sample@Pass123
 
 was rejected with "no credentials found in input file" because both regexes matched
 only `:` or whitespace after the label, while credential_masking.py — which accepts
@@ -90,9 +90,15 @@ def extract_credentials(text: str) -> dict:
             continue
         for match in pattern.finditer(text):
             value = _clean(match.group(1))
-            if value and value.lower() not in _NOT_A_VALUE:
-                found[field] = value
-                break
+            if not value or value.lower() in _NOT_A_VALUE:
+                continue
+            # "every todo has userId 1." names a data field, not a login. A
+            # username stated in prose has letters; a bare number there is a
+            # field value. `User ID: 12345` still extracts via the separated pass.
+            if field == "username" and not any(c.isalpha() for c in value):
+                continue
+            found[field] = value
+            break
 
     return found
 

@@ -54,6 +54,11 @@ class TestNoNewSwallowing:
 
 
 class TestWrapperCompliance:
+    @pytest.fixture(autouse=True)
+    def _selenium(self, monkeypatch):
+        # These are Selenium's raw calls; what counts as raw is the plugin's call.
+        monkeypatch.setenv("AUTOMATION_FRAMEWORK", "selenium")
+
     @pytest.mark.parametrize("added", [
         '        driver.findElement(By.id("x")).click();\n',
         '        field.sendKeys("hello");\n',
@@ -61,7 +66,7 @@ class TestWrapperCompliance:
     ])
     def test_rejects_raw_driver(self, added):
         ok, reason = g.wrapper_compliance(BEFORE, BEFORE + added)
-        assert ok is False and "CONVENTIONS" in reason
+        assert ok is False and "raw driver calls" in reason
 
     def test_allows_framework_wrappers(self):
         after = BEFORE + '        Element.enterData(testConfig, f, "x", "Field");\n'
@@ -331,7 +336,7 @@ class TestPlaywrightShapes:
     ])
     def test_rejects_raw_playwright_calls(self, added):
         ok, reason = g.wrapper_compliance(BEFORE, BEFORE + added)
-        assert ok is False and "CONVENTIONS" in reason
+        assert ok is False and "raw driver calls" in reason
 
     @pytest.mark.parametrize("added", [
         '        click(checkoutButton, "Checkout");\n',

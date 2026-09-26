@@ -3,8 +3,8 @@
 The case these guard: an input file whose steps read
 
     2. Do login by using the credentials given below:
-    username=ms00000raj@gmail.com
-    password=SingIsKing@1234
+    username=qa.user@example.com
+    password=Sample@Pass123
 
 had both lines masked in the run header (credential_masking accepts `:` and `=`)
 and was then rejected by step 02 with "no credentials found in input file",
@@ -27,8 +27,8 @@ Type: web
 Steps:
 1. Navigate to https://www.naukri.com/nlogin/login
 2. Do login by using the credentials given below:
-username=ms00000raj@gmail.com
-password=SingIsKing@1234
+username=qa.user@example.com
+password=Sample@Pass123
 3. Save the profile
 """
 
@@ -37,8 +37,8 @@ class TestSeparators:
     def test_equals_is_a_separator(self):
         """The exact shape that produced the false 'no credentials' error."""
         assert extract_credentials(NAUKRI_INPUT) == {
-            "username": "ms00000raj@gmail.com",
-            "password": "SingIsKing@1234",
+            "username": "qa.user@example.com",
+            "password": "Sample@Pass123",
         }
 
     def test_colon_is_a_separator(self):
@@ -70,6 +70,12 @@ class TestFalsePositives:
 
     def test_no_text_yields_nothing(self):
         assert extract_credentials("") == {}
+
+    def test_a_numeric_user_id_in_an_api_step_is_not_a_username(self):
+        """An API-only input once warned 'names username but no password'
+        because `every todo has userId 1.` read as a login."""
+        assert extract_credentials("13. Verify every todo has userId 1.") == {}
+        assert extract_credentials("User ID: 12345") == {"username": "12345"}
 
 
 class TestLoginReadiness:
@@ -136,14 +142,14 @@ class TestCredentialsFromPlan:
         demo_credentials at all, but the queue file it names has both."""
         plan = {"_input_file": self._input(tmp_path)}
         assert credentials_from_plan(plan) == {
-            "username": "ms00000raj@gmail.com", "password": "SingIsKing@1234"}
+            "username": "qa.user@example.com", "password": "Sample@Pass123"}
 
     def test_a_half_filled_plan_keeps_its_own_value(self, tmp_path):
         plan = {"demo_credentials": {"username": "planned"},
                 "_input_file": self._input(tmp_path)}
         creds = credentials_from_plan(plan)
         assert creds["username"] == "planned"          # the plan wins
-        assert creds["password"] == "SingIsKing@1234"  # the file fills the gap
+        assert creds["password"] == "Sample@Pass123"  # the file fills the gap
 
     def test_a_missing_input_file_is_not_an_error(self, tmp_path):
         plan = {"_input_file": str(tmp_path / "gone.txt")}
@@ -155,7 +161,7 @@ class TestCredentialsFromPlan:
         processed.mkdir()
         (processed / "module.txt").write_text(NAUKRI_INPUT)
         plan = {"_input_file": str(tmp_path / "module.txt")}   # no longer there
-        assert credentials_from_plan(plan)["username"] == "ms00000raj@gmail.com"
+        assert credentials_from_plan(plan)["username"] == "qa.user@example.com"
 
     def test_an_input_file_without_credentials_yields_nothing(self, tmp_path):
         plan = {"_input_file": self._input(tmp_path, "Module: x\nSteps:\n1. Open the page\n")}
@@ -163,4 +169,4 @@ class TestCredentialsFromPlan:
 
     def test_an_explicit_input_file_overrides_the_plans(self, tmp_path):
         plan = {"_input_file": str(tmp_path / "gone.txt")}
-        assert credentials_from_plan(plan, self._input(tmp_path))["username"] == "ms00000raj@gmail.com"
+        assert credentials_from_plan(plan, self._input(tmp_path))["username"] == "qa.user@example.com"

@@ -351,6 +351,25 @@ def done_section(done: list) -> str:
     return "\n".join(parts)
 
 
+def defer_once(item: dict, why: str, queue: list, deferred: set) -> bool:
+    """Retry an item refused only for its kind, once, after the note's later
+    check-changing items.
+
+    A `coverage_added` item whose edit also changes a check is rightly rolled
+    back — but a later item in the same note may be the one allowed to make that
+    change, and once it has, this item may have nothing left to do. Seen again
+    with that item on disk, the model can answer `covered_by`, which
+    covering_item() verifies; otherwise the second answer stands as usual.
+    """
+    if (int(item["index"]) in deferred or check_changes.KIND_MAY_NOT_CHANGE not in (why or "")
+            or not any(q.get("kind") in check_changes.CHECK_CHANGING for q in queue)):
+        return False
+    deferred.add(int(item["index"]))
+    queue.append(item)
+    log(f"  deferred until the items allowed to change checks have run — {why}")
+    return True
+
+
 def covering_item(payload: dict, done: list):
     """The earlier item this one claims already did its work — only if the claim holds.
 
@@ -458,8 +477,8 @@ def run_guards(item: dict, edits_by_file: dict, snapshots: dict, flow: dict,
         found = url_properties.hardcoded_urls(added)
         add("no_hardcoded_url", not found,
             f"added a literal URL {found[0][:60]} — routes belong in "
-            f"parameters/*.properties, which the tests already read "
-            f"(CONVENTIONS.md §13)" if found else "")
+            f"parameters/*.properties, which the tests already read"
+            if found else "")
 
     if kind == "interaction":
         # "A <select> became a combobox" is only an interaction change if the
@@ -760,7 +779,9 @@ def main():
         return
 
     done = []  # items this attempt applied and verified, shown to the items after them
-    for item in actionable:
+    queue, deferred = list(actionable), set()
+    while queue:
+        item = queue.pop(0)
         log(f"Item {item['index']} [{item['kind']}] — {item['text']}")
         try:
             before = check_changes.measure(scope, workspace)
@@ -943,6 +964,8 @@ def main():
                                      "reason": why})
         if not sound:
             txn.rollback(why)
+            if defer_once(item, why, queue, deferred):
+                continue
             record.update({"status": "rolled_back", "reason": why})
             result["items"].append(record)
             continue
@@ -977,6 +1000,7 @@ def main():
             done.append({"index": item["index"], "summary": record["summary"],
                          "diff": record["diff"], "verified": record["verified"]})
 
+    result["items"].sort(key=lambda i: int(i["index"]))
     statuses = {i["status"] for i in result["items"]}
     # What this attempt tried, for the next one to read and for the stop rule at
     # the top to prove that another attempt could bring nothing new.

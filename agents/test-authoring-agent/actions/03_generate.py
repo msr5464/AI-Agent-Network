@@ -138,25 +138,16 @@ from shared.json_extract import extract_json  # noqa: E402
 
 
 def read_reference_files() -> dict:
-    """Read reference implementation files from Jarvis to show Claude the patterns."""
-    ref_paths = [
-        # One module end to end: SauceDemo's helper serves both its API and its web
-        # tests, which is the shape a generated module needs.
-        "src/main/java/automation/modules/saucedemo/SauceDemoData.java",
-        "src/main/java/automation/modules/saucedemo/SauceDemoBuilder.java",
-        "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
-        "src/main/java/automation/modules/saucedemo/api/SauceDemoApi.java",
-        # The only page object here, and it earns its place: without one, the model
-        # has never seen a real `extends BasePage` import block and infers the
-        # package from the directory it is writing into — modules/<f>/web/ became
-        # `import automation.core.web.BasePage`, which does not exist. core/ is flat.
-        # SauceDemo's rather than GitHub's: GitHub's calls Log.step() in a page
-        # object, which CLAUDE.md forbids outside test classes.
-        "src/main/java/automation/modules/saucedemo/web/LoginPage.java",
-        "src/main/java/automation/core/api/ApiHelper.java",
-        "src/test/java/automation/saucedemo/SauceDemoApiTest.java",
-        "src/test/java/automation/saucedemo/SauceDemoWebTest.java",   # shows the CSV credential pattern
-    ]
+    """The worked examples config/repo-map.json lists for this repo, keyed by path.
+
+    Which files make good examples is a property of the target repo, so it lives
+    in config rather than here. Missing files are skipped; no list means none.
+    """
+    from shared.repo_config import load_repo_config
+    ref_paths = load_repo_config().get("reference_files") or []
+    if not ref_paths:
+        log("No reference_files in config/repo-map.json for this repo — "
+            "generating from its CLAUDE.md conventions alone")
     refs = {}
     for rel in ref_paths:
         full = AUTOMATION_FRAMEWORK_DIR / rel
@@ -1096,9 +1087,11 @@ def main() -> None:
     # Build selector hint for page objects
     selector_hint = ""
     if selectors:
+        from shared.locator_emit import code_for
         selector_hint = "\n\nConfirmed DOM selectors from Playwright validation:\n"
         for name, sel in selectors.items():
-            selector_hint += f"  {name} = page.locator(\"{sel}\");\n"
+            code = code_for(sel)
+            selector_hint += f"  {name}: {code.get('findby') or code['java']}\n"
         selector_hint += "\nUse these exact selectors in the page object locators where they match."
     else:
         selector_hint = "\n\nNo selectors were confirmed by Playwright validation. " \
@@ -1258,7 +1251,7 @@ def main() -> None:
 
     # Identical for every batch and repair in this run: written once and sent as the
     # system prompt, so only the per-batch half in build_prompt changes between calls.
-    static_system_prompt = f"""You are a Java test automation code generator for the Jarvis framework.
+    static_system_prompt = f"""You are a test automation code generator for the automation repository whose conventions follow.
 
 <framework_conventions>
 {claude_md}
@@ -1315,8 +1308,8 @@ Rules (MANDATORY — violations will cause compilation failures):
 6c. NAVIGATING AWAY AFTER AN ACTION THAT ITSELF NAVIGATES — mandatory, this is the
    single most common runtime failure in generated web code. Clicking Login/Submit
    starts a navigation. Issuing another navigation while that one is still in
-   flight makes Playwright abort it:
-     (e.g. com.microsoft.playwright.PlaywrightException: net::ERR_ABORTED at <url>)
+   flight makes the browser abort it:
+     (e.g. net::ERR_ABORTED at <url>)
    So let the first navigation settle BEFORE starting the second:
      click(loginButton, "Login button");
      WaitHelper.waitForPageLoad(config);            // let the post-login redirect finish
@@ -1349,8 +1342,8 @@ Rules (MANDATORY — violations will cause compilation failures):
      - test class  -> config.logStep("...")            NEVER Log.step / Log.comment
      - every other class (page objects, helpers, builders)
                    -> Log.comment(config, "...")       NEVER config.logStep / Log.step
-   automation.modules.github.web.LoginPage calls Log.step() in a page object. That is a
-   known violation, not a pattern — copy saucedemo/web/LoginPage.java instead.
+   A reference page object that calls Log.step() is a known violation, not a pattern —
+   follow the rule above, not that file.
 7b. STEP NARRATION — one logStep per step, never one summary line. The run report
    prints ONE LINE PER logStep: a test narrated once produces a one-line report for
    the whole scenario, and when it fails the report cannot say which step broke.
@@ -1474,7 +1467,7 @@ Rules (MANDATORY — violations will cause compilation failures):
 {selector_hint}{mechanism_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
 
 Generate the following files (Java source, plus CSV test data where a test reads data) and return them as a single JSON object where
-keys are relative file paths (from Thanos-pw repo root) and values are the complete
+keys are relative file paths (from the automation repo root) and values are the complete
 file contents as strings, following the Rules in your system prompt.
 
 Files to generate:

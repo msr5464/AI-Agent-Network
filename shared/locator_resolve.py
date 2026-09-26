@@ -580,7 +580,7 @@ def resolve_and_apply(browser, page, baseline: dict, cfg: dict, url: str, *,
         return out
 
     emitted = result.emitted
-    new_expression = emitted.get("java") or f'page.locator("{emitted["sel"]}")'
+    new_expression = emitted.get("java") or emit_mod.code_for(emitted["sel"])["java"]
 
     # R6 — prove it more than once, in fresh contexts, before touching anything.
     ok, note = locator_patch.confirm(

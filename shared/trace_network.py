@@ -1,15 +1,12 @@
-"""Read the network log out of a Playwright trace zip.
+"""Summarise the network log a framework's execution artifact carries.
 
-A trace carries two logs. `trace.trace` holds the action timeline and is parsed
-via `shared/telemetry.py`; `trace.network` holds every HTTP request the page
-made, in HAR-shaped records, and until now was never opened at all.
+Reading the log is the framework plugin's job (`TelemetryParser.read_network`),
+which returns HAR-shaped records; this module only interprets them.
 
-**Playwright-only, on purpose.** This is an enrichment channel rather than a
-required one: no other framework records an equivalent, and there is nothing to
-abstract. For a non-Playwright artefact every function here returns empty —
-a .jsonl action log raises BadZipFile, which is caught below — so a Selenium run
-simply loses this evidence channel rather than failing. That is the honest
-outcome; synthesising one would be worse.
+**Optional, on purpose.** This is an enrichment channel rather than a required
+one: a framework that records no network log returns [] and simply loses this
+evidence channel rather than failing. That is the honest outcome; synthesising
+one would be worse.
 
 That file is the generic evidence channel for a whole family of failures that
 reach the fixer disguised as a missing element: the host was unreachable, the
@@ -22,10 +19,7 @@ Deliberately conservative: anything unreadable yields empty findings, never a
 guess. A trace that cannot be parsed must not manufacture a diagnosis.
 """
 
-import json
-import zipfile
-from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 from urllib.parse import urlsplit
 
 # A request Playwright could not complete is recorded with status 0 or -1.
@@ -36,44 +30,9 @@ _SLOW_MS = 3000
 
 
 def read_entries(trace_path) -> List[Dict]:
-    """Every network record in the trace, flattened. [] for anything unreadable."""
-    if not trace_path:
-        return []
-    path = Path(trace_path)
-    if not path.exists():
-        return []
-    try:
-        with zipfile.ZipFile(path) as archive:
-            names = [n for n in archive.namelist() if n.endswith("trace.network")]
-            if not names:
-                return []
-            raw = archive.read(names[0]).decode("utf-8", errors="ignore")
-    except (zipfile.BadZipFile, OSError, KeyError):
-        return []
-
-    entries = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        snapshot = event.get("snapshot") if isinstance(event, dict) else None
-        if not isinstance(snapshot, dict):
-            continue
-        request = snapshot.get("request") or {}
-        response = snapshot.get("response") or {}
-        entries.append({
-            "url": request.get("url", ""),
-            "method": request.get("method", ""),
-            "status": response.get("status"),
-            "status_text": response.get("statusText", ""),
-            "time_ms": snapshot.get("time"),
-            "started": snapshot.get("startedDateTime", ""),
-        })
-    return entries
+    """Every network record the framework's artifact carries. [] for anything unreadable."""
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().telemetry.read_network(trace_path)
 
 
 def _registrable(host: str) -> str:
