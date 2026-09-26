@@ -362,15 +362,9 @@ def main():
             f"Product Bugs: {product_bugs} | Automation Issues: {auto_issues}",
         ]
         if handoff_path:
-            n = len(classify_data.get("classifications", []))
-            # Count eligible specifically
-            eligible_count = sum(
-                1 for c in classify_data.get("classifications", [])
-                if c.get("classification") == "AUTOMATION_ISSUE"
-                and c.get("confidence") == "HIGH"
-                and c.get("root_cause_category") in actionable
-                and c.get("root_cause_category") not in diagnosis.STOP
-            )
+            # Count what was queued, not a second copy of write_handoff's rule —
+            # that copy lost its `actionable` set and crashed every APPROVED run.
+            eligible_count = len(json.loads(Path(handoff_path).read_text())["automation_issues"])
             lines.append(f":wrench: {eligible_count} automation issue(s) queued for test-healing-agent")
         else:
             lines.append("No automation issues queued for autofix")

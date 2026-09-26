@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → li
 
 from shared.log import log as _log
 from shared import diagnosis
+from shared import workspace as workspace_helper
 from lib.root_cause_groups import (group_failures, pick_representative,
                                     is_groupable, signature as cause_signature)
 def log(msg): _log("classify", msg)
@@ -229,7 +230,7 @@ def apply_category_rules(classifications: list[dict], all_failures: list[dict]) 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def diagnose_failures(failures: list, report_dir: str) -> dict:
+def diagnose_failures(failures: list, workspace) -> dict:
     """Deterministic verdicts for the failures whose evidence supports one.
 
     Runs before the model. Where the engine is confident it is authoritative — it
@@ -240,7 +241,7 @@ def diagnose_failures(failures: list, report_dir: str) -> dict:
     verdicts = {}
     for failure in failures:
         try:
-            evidence = diagnosis.collect(failure, workspace=report_dir or None)
+            evidence = diagnosis.collect(failure, workspace=workspace or None)
             verdict = diagnosis.diagnose(evidence)
         except Exception as e:
             log(f"  Diagnosis failed for {failure.get('full_name')}: {e}")
@@ -327,7 +328,14 @@ def main():
     # The engine measured the page; the classifier can only read the sentence
     # describing it. Where the engine is confident, it is the better answer and
     # the model is not asked at all.
-    diagnosed = diagnose_failures(representatives, collect.get("report_dir", ""))
+    # The automation checkout, not the CI report directory: the page object that
+    # declares a failing selector, its baseline and the test's preconditions all
+    # live in source. The report dir was passed here, so all three looked in the
+    # wrong place and every lookup came back empty.
+    workspace = workspace_helper.find(os.environ.get("WORKSPACE_DIR", ""),
+                                      os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+                                      exclude=REPO_ROOT)
+    diagnosed = diagnose_failures(representatives, workspace)
     if diagnosed:
         log(f"Diagnosed {len(diagnosed)} of {len(representatives)} representative(s) "
             f"from evidence — no model call needed for those")

@@ -2239,7 +2239,13 @@ class ReportGenerator:
         # Use deduplicated and rule-processed classifications
         product_bugs = [c for c in deduplicated_classifications if c.is_product_bug()]
         automation_issues = [c for c in deduplicated_classifications if c.is_automation_issue()]
-        
+        # The Failures card splits summary.failed, which leaves known failures out
+        # (their own card calls them "marked as passed"). Counting them in the split
+        # made it add up to more than the number above it.
+        known = {t.full_name for t in (test_results or []) if t.known_failure}
+        card_bugs = sum(1 for c in product_bugs if c.test_name not in known)
+        card_issues = sum(1 for c in automation_issues if c.test_name not in known)
+
         # Build test_api_map: Extract API endpoints for all classifications using the same method as tables
         # This map will be used in the summary generator to show accurate API endpoint counts
         test_api_map = self.extract_test_api_map(deduplicated_classifications, test_data_cache)
@@ -2311,7 +2317,6 @@ class ReportGenerator:
             <div class="container" data-report-version="{report_version_escaped}">
                 <!-- Header -->
                 <div class="header">
-                    <img src="https://raw.githubusercontent.com/msr5464/Basic-Automation-Framework/refs/heads/master/ThanosLogo.png" alt="Thanos Logo" class="header-logo">
                     <h1 class="report-title">AI-Generated Automation Report</h1>
                     <div class="report-meta" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
                         <strong>{report_name}</strong>
@@ -2336,7 +2341,7 @@ class ReportGenerator:
                     <div class="card danger" style="background: linear-gradient(135deg, #fff5f5 0%, #fecaca 100%); border-left: 4px solid #dc3545;">
                         <div class="metric-label">Failures</div>
                         <div class="metric-value">{summary.failed}</div>
-                        <div class="metric-detail">{len(product_bugs)} Potential Bugs, {len(automation_issues)} Automation Issues</div>
+                        <div class="metric-detail">{card_bugs} Potential Bugs, {card_issues} Automation Issues</div>
                     </div>
                     <div class="card" style="background: linear-gradient(135deg, #f0f9ff 0%, #bae6fd 100%); border-left: 4px solid #17a2b8;">
                         <div class="metric-label">Total Tests</div>

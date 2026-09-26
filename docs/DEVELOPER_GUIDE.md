@@ -95,7 +95,7 @@ Useful while developing healing:
 ```bash
 ./scripts/run-adaptation-agent.sh checkout
 EXPLORE_ONLY=true      ./scripts/run-adaptation-agent.sh checkout   # stop after the flow map
-ADAPTATION_APPLY=false ./scripts/run-adaptation-agent.sh checkout   # propose, do not edit
+ADAPTATION_APPLY=true  ./scripts/run-adaptation-agent.sh checkout   # apply and verify (default: propose only)
 ```
 
 Exploration needs a login session for the app under test; step 03 restores a

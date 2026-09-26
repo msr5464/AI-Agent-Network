@@ -8,7 +8,7 @@
 #   ./scripts/run-adaptation-agent.sh                                   # queue mode: oldest .txt
 #   ./scripts/run-adaptation-agent.sh checkout                          # queue/checkout.txt
 #   EXPLORE_ONLY=true ./scripts/run-adaptation-agent.sh checkout        # flow map only
-#   ADAPTATION_APPLY=false ./scripts/run-adaptation-agent.sh checkout   # propose, do not edit
+#   ADAPTATION_APPLY=true ./scripts/run-adaptation-agent.sh checkout    # apply + verify (default: propose)
 #   START_FROM_STEP=4 SESSION_ID=<sid> ./scripts/run-adaptation-agent.sh   # resume
 # ─────────────────────────────────────────────────────────────────────────────
 exec "$(dirname "${BASH_SOURCE[0]}")/_run-agent.sh" test-adaptation-agent "$@"

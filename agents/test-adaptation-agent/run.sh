@@ -10,7 +10,7 @@ set -Eeuo pipefail
 #   ./scripts/run-adaptation-agent.sh checkout
 #   ./scripts/run-adaptation-agent.sh                    # queue: oldest .txt
 #   EXPLORE_ONLY=true ./scripts/run-adaptation-agent.sh checkout
-#   ADAPTATION_APPLY=false ./scripts/run-adaptation-agent.sh checkout
+#   ADAPTATION_APPLY=true ./scripts/run-adaptation-agent.sh checkout    # default is propose-only
 #   START_FROM_STEP=4 SESSION_ID=<sid> ./scripts/run-adaptation-agent.sh
 #
 # Unlike healing, the expensive step here is exploration, not the edit. So this

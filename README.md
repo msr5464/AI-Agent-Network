@@ -78,10 +78,10 @@ CI test build finishes
                            ▼
 ┌─────────────────────────────────────────────────────┐
 │  Agent 3: test-healing-agent                        │
-│  00 Reproduce → (standalone) run the named test     │
-│  01 Locate    → deterministic selector proposal     │
-│  01 Fix       → diagnose → edit locator → re-run  ↺ │
-│  02 Ship      → branch + PR + Slack                 │
+│  01 Reproduce → (standalone) run the named test     │
+│  02 Locate    → deterministic selector proposal     │
+│  03 Fix       → diagnose → edit locator → re-run  ↺ │
+│  04 Ship      → branch + PR + Slack                 │
 └─────────────────────────────────────────────────────┘
 
 A human learns the product changed (before anything goes red)
@@ -189,8 +189,14 @@ audit trail in `agents/<agent>/audit/<session-id>/`; browse it with
 ## Running the agents
 
 `make help` lists every command. `MODULE` names a file in the agent's queue
-(`agents/<agent>/queue/<MODULE>.txt`); with no `MODULE`/`BUILD_TAG`, an agent
-takes the oldest item in its queue.
+(`agents/<agent>/queue/<MODULE>.txt`). With no `MODULE`/`BUILD_TAG`, authoring,
+healing and adaptation take the oldest item in their queue; triaging has no
+queue and scouts the results database instead.
+
+The screenshots below are real runs of these scripts against the `saucedemo`
+module. Authoring, healing and adaptation ran with `AUTO_PUSH=false`, so none of
+them opened a PR. Build output and some routine lines are folded, and each fold
+says how many lines it hides.
 
 ### Agent 1 — Test Authoring
 
@@ -206,16 +212,20 @@ Input format ([examples](docs/examples/queue/README.md#test-authoring-agent)):
 ```
 Module: payments
 Type: web
+URL: https://app.staging.example.com
 
 Steps:
-1. Navigate to https://app.staging.example.com
-2. Login as Admin user
-3. Click New Payment and fill in recipient + amount
-4. Submit and verify success message appears
+1. Login as Admin user
+2. Click New Payment and fill in recipient + amount
+3. Submit and verify success message appears
 ```
 
 Output: Java files in the automation repo, a PR on branch
 `authoring/<module>-<timestamp>`, and a Slack message.
+
+The Quick Start example, run for real. The browser proves every step and
+selector, a guard splits the test's run-on narration into one `logStep` per step,
+and the generated test passes on its first run:
 
 ![Agent 1 run](docs/authoring-agent-run.png)
 
@@ -232,6 +242,11 @@ STOP_AFTER=classify ./scripts/run-triaging-agent.sh         # stop early for ins
 Output: an HTML report in `TRIAGING_OUTPUT_DIR/`, a handoff file in
 `agents/test-healing-agent/queue/<build_tag>.json` when anything is fixable, and
 a Slack message.
+
+![Agent 2 run](docs/triaging-agent-run.png)
+
+The report from that run, with two failures expanded to show the root cause, its
+likely location and the recommended action:
 
 ![Agent 2 triage report](docs/triaging-agent-report.png)
 
@@ -253,7 +268,11 @@ FORCE=true  ./scripts/run-healing-agent.sh --test LoginTest#testLogin    # proce
 ```
 
 Output: a PR on branch `healing/<session-id>` with every fix that passed, and a
-Slack message with the per-test breakdown — partial success still ships.
+Slack message with the per-test breakdown. Partial success still ships.
+
+A standalone run against two deliberately renamed locators. Repairing the login
+button lets the test reach the broken cart link, and the next attempt repairs that.
+Both are located deterministically, with no model call:
 
 ![Agent 3 run](docs/healing-agent-run.png)
 
@@ -263,9 +282,9 @@ Healing asks "why did this fail?". Adaptation asks "the product changed — what
 should the tests do now?".
 
 ```bash
-./scripts/run-adaptation-agent.sh checkout
-EXPLORE_ONLY=true       ./scripts/run-adaptation-agent.sh checkout   # flow map only
-ADAPTATION_APPLY=false  ./scripts/run-adaptation-agent.sh checkout   # propose, do not edit
+./scripts/run-adaptation-agent.sh checkout                         # propose only (the default)
+ADAPTATION_APPLY=true ./scripts/run-adaptation-agent.sh checkout   # apply, verify, open a PR
+EXPLORE_ONLY=true     ./scripts/run-adaptation-agent.sh checkout   # flow map only
 START_FROM_STEP=4 SESSION_ID=<sid> ./scripts/run-adaptation-agent.sh   # resume
 ```
 
@@ -290,13 +309,21 @@ Output:
   verifying them.
 - An ordered flow map of what a browser actually observed, with every selector
   re-counted in Python rather than taken on the model's word.
-- A PR that is **always NEEDS-REVIEW**, carrying each edit against the observed
-  step that justified it.
+- With `ADAPTATION_APPLY=true`, a PR that is **always NEEDS-REVIEW**, carrying
+  each edit against the observed step that justified it. By default the edits
+  are only proposed. Each one is written, compiled and checked against the frozen
+  intent contracts, then rolled back so a human can review it.
 
 It refuses rather than guesses when the change note does not account for what it
 saw, when the expected *outcome* changed (the spec moved, not the test), when no
 login session can be restored or minted, or when the flow ends in something that
 cannot be undone. See [agents/test-adaptation-agent/CLAUDE.md](agents/test-adaptation-agent/CLAUDE.md).
+
+The `saucedemo_cart_details` example, applied for real. The agent mints a login
+session the way the test does, walks the flow in a browser, adds the missing cart
+checks, and proves them with a test run:
+
+![Agent 4 run](docs/adaptation-agent-run.png)
 
 ---
 
@@ -313,31 +340,33 @@ All four agents post through the Slack Bot API (`chat.postMessage`). Without
 | Event | Channel |
 |-------|---------|
 | Authoring: tests pass, or not run | `SLACK_NOTIFY_CHANNEL` |
-| Authoring: tests failing, stuck, or push/PR failed | `SLACK_ALERT_CHANNEL` |
-| Adaptation: PR created | `SLACK_NOTIFY_CHANNEL` |
+| Authoring: tests failing, stuck, reproducing a known defect, or push/PR failed | `SLACK_ALERT_CHANNEL` |
+| Adaptation: ready for review (a PR, or a proposal) | `SLACK_NOTIFY_CHANNEL` |
 | Adaptation: escalated, or push/PR failed | `SLACK_ALERT_CHANNEL` |
 | Triaging: verdict APPROVED | `SLACK_NOTIFY_CHANNEL` |
 | Triaging: verdict NEEDS-HUMAN | `SLACK_ALERT_CHANNEL` |
 | Healing: all tests fixed | `SLACK_NOTIFY_CHANNEL` |
 | Healing: some or none fixed | `SLACK_ALERT_CHANNEL` |
-| Any run crashed | `SLACK_ALERT_CHANNEL` |
+| Healing or adaptation run crashed | `SLACK_ALERT_CHANNEL` |
 
 With no `SLACK_ALERT_CHANNEL`, alerts go to `SLACK_NOTIFY_CHANNEL`.
 
 Example healing message (partial fix):
 ```
 🟡 QA Auto-Fix — ProdSanity-All-Tests-541
-5/8 tests fixed — 3 need manual attention
+2/5 tests fixed — 3 need manual attention
 
-✅ Fixed (5):
-  • TestLogin.testLoginWithValidCredentials — updated locator [data-cy='submit-btn']
-  • ... and 4 more
-  PR: https://github.com/org/automation-repo/pull/214
+✅ Fixed (2):
+  • LoginTest.testLoginWithValidCredentials — updated locator [data-test='login-button']
+  • CartTest.testAddItemToCart — updated locator [data-test='shopping-cart-link']
 
 ❌ Could not fix (3) — manual review required:
-  • TestCheckout.testCheckoutFlow — fix applied but test still failing
-  • TestPayment.testPaymentWithCard — unfixable: multiple candidate locators, ambiguous
-  • TestLogout.testSessionExpiry — test file not found in workspace
+  • CheckoutTest.testCheckoutFlow — fix applied but test still failing
+  • PaymentTest.testPaymentWithCard — unfixable: multiple candidate locators, ambiguous
+  • LogoutTest.testSessionExpiry — test file not found in workspace
+
+PR: https://github.com/org/automation-repo/pull/214
+Audit: 20260926-143207-fix-ProdSanity-All-Tests-541
 ```
 
 ---

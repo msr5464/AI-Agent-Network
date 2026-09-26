@@ -130,6 +130,19 @@ class TestActingStatements:
     def test_log_calls_never_count_as_work(self):
         assert ln.acting_statements('config.logStep("do the thing");') == []
 
+    def test_fetching_test_data_is_not_an_acting_statement(self):
+        """A row of test data read into a value is wiring, like a property read.
+        A Response, a page object, or a call chained after the getter still is the
+        app being driven."""
+        acting = ln.acting_statements('''
+            Map<String, String> user = sauceDemo.getUser("standard");
+            String expected = data.readValue("price");
+            Response post = api.getPostById(config, 1);
+            ProductsPage products = sauceDemo.doLogin(user);
+            String label = page.getByRole(AriaRole.BUTTON).textContent();
+        ''')
+        assert [s.split(" = ")[0].split()[-1] for s in acting] == ["post", "products", "label"]
+
 
 class TestAudit:
 
@@ -153,6 +166,38 @@ class TestAudit:
         be a guard that fires on correct code."""
         finding = ln.audit(UNDER_NARRATED, ln.expected_from_plan(PLAN))
         assert finding["toggleProfileSummaryDotAndVerify"]["expected"] == 2
+
+    def test_one_call_covering_two_plan_steps_is_not_a_finding(self):
+        """The plan says "navigate" and "log in"; the code does both in one doLogin
+        call, after two test-data reads that drive nothing. A logStep per action is
+        the right granularity. Counting the reads as actions demanded one logStep
+        more than the code has actions, so every such run paid for a narration
+        repair and still ended on a warning."""
+        source = '''
+        public class CartTest extends TestBase {
+            @Test(dataProvider = "getConfig")
+            public void addToCart(Config config)
+            {
+                SauceDemoHelper sauceDemo = new SauceDemoHelper(config);
+                Map<String, String> user = sauceDemo.getUser("standard");
+                Map<String, String> product = sauceDemo.getProduct("backpack");
+
+                config.logStep("Login and land on the Products page");
+                ProductsPage products = sauceDemo.doLogin(user);
+
+                config.logStep("Verify the Products page title");
+                AssertHelper.assertEquals(config, products.getPageTitle(), "Products", "title");
+
+                config.logStep("Add the product to the cart");
+                products.addProductToCart(product.get("slug"));
+            }
+        }'''
+        plan = {"web_test_methods": [{"method_name": "addToCart", "steps": [
+            "navigate to SauceDemo via the doLogin helper",
+            "doLogin with standard_user -> ProductsPage",
+            "verify page title is 'Products'",
+            "addProductToCart on ProductsPage"]}]}
+        assert ln.audit(source, ln.expected_from_plan(plan)) == {}
 
     def test_single_step_test_is_not_a_finding(self):
         source = '''

@@ -20,13 +20,14 @@ Writes: Java files into Thanos-pw repo
         $AUDIT_DIR/03-generate.md
 """
 
+import csv
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import time
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -500,10 +501,19 @@ def _repair_hardcoded_urls(files_map: dict, url_props: dict, feature: str,
 
     Returns (files_map, {rel_path: [url, ...]}) — the second value is what is
     STILL hardcoded afterwards, for the audit and for step 04 to see.
+
+    Only URLs this run added count. One already in an existing file is not this
+    run's to move: repairing it rewrote code the PR had no business touching, and
+    paid a model call on every run that extended that file. Step 04's
+    url_properties.no_hardcoded_url draws the same line.
     """
+    def added_urls(path, content):
+        before = set(url_properties.hardcoded_urls(read_existing_file(path)))
+        return [url for url in url_properties.hardcoded_urls(content) if url not in before]
+
     violations = {path: found for path, content in files_map.items()
                   if path.endswith(".java") and content
-                  and (found := url_properties.hardcoded_urls(content))}
+                  and (found := added_urls(path, content))}
     if not violations:
         return files_map, {}
 
@@ -528,13 +538,15 @@ def _repair_hardcoded_urls(files_map: dict, url_props: dict, feature: str,
 
     key_table = "".join(f'  "{k}" = {v}\n' for k, v in keys.items())
     offending = "".join(
-        f"\n--- {path} ---\n{files_map[path]}\n" for path in violations)
+        f"\n--- {path} (move: {', '.join(violations[path])}) ---\n{files_map[path]}\n"
+        for path in violations)
     prompt = f"""These generated Java files hardcode URLs. Every URL below is already a
 property in parameters/{props_file_name}:
 
 {key_table}
-Rewrite each file so no literal "http://" or "https://" string remains in the code,
-reading the URL from its property instead:
+Rewrite each file so the URLs named after "move:" in its header no longer appear as
+literals in the code, reading each from its property instead. Leave any other URL
+in the file exactly as it is — it was there before this change:
   - In a super(...) call:  super(config, config.getRunTimeProperty("<key>"))
     Inline it there — a `static final` constant cannot read config, and an instance
     field cannot be referenced before the supertype constructor has run.
@@ -559,7 +571,7 @@ contents. No prose.
     for path, content in repaired.items():
         if path not in violations or not (content or "").strip():
             continue
-        still = url_properties.hardcoded_urls(content)
+        still = added_urls(path, content)
         if len(still) >= len(violations[path]):
             log(f"  url-repair did not fix {Path(path).name} — keeping the original")
             continue
@@ -1836,15 +1848,26 @@ def _lost_csv_rows(existing: str, updated: str) -> list:
     """Rows of an existing CSV that the regenerated file no longer contains.
 
     The prompt asks for every existing row back unchanged; this checks it. Where a
-    new row lands is free, so rows are matched as a multiset, not by position.
+    new row lands is free, so rows are matched as a multiset, not by position. A
+    new column at the end is free too: a row survives when its fields still lead
+    some row, which leaves every column other tests read, by name or by index,
+    exactly as it was. Comparing whole lines refused every added column while the
+    test that reads it was written anyway, so step 04 met a null and paid for a fix
+    that wrote back the very file this had refused.
     """
-    remaining = Counter(line.strip() for line in updated.splitlines() if line.strip())
-    lost = []
-    for line in (row.strip() for row in existing.splitlines() if row.strip()):
-        if remaining[line]:
-            remaining[line] -= 1
+    def rows(text):
+        return [[field.strip() for field in row] for row in csv.reader(io.StringIO(text))
+                if any(field.strip() for field in row)]
+
+    pool, lost = rows(updated), []
+    for row in rows(existing):
+        # ponytail: linear scan per row, fine for test-data CSVs; index by leading
+        # fields if one ever grows to thousands of rows.
+        hit = next((i for i, new in enumerate(pool) if new[:len(row)] == row), None)
+        if hit is None:
+            lost.append(",".join(row))
         else:
-            lost.append(line)
+            pool.pop(hit)
     return lost
 
 

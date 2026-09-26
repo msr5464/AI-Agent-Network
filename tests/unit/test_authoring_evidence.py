@@ -370,6 +370,27 @@ class TestCsvTestData:
             "bike_light,staging,sauce-labs-bike-light"]
         assert mod._lost_csv_rows("", "product_key\nonesie\n") == []
 
+    def test_a_rewrite_may_append_a_column(self, tmp_path, monkeypatch):
+        """A new trailing column leaves every value other tests read where it was.
+        Refusing it wrote the test that reads the column without the column, so the
+        test failed on a null and step 04 paid for a fix that wrote this file back."""
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        existing = ("product_key,environment,title\n"
+                    "backpack,staging,Sauce Labs Backpack\n"
+                    "bike_light,staging,Sauce Labs Bike Light\n")
+        assert mod._lost_csv_rows(existing, (
+            "product_key,environment,title,price\n"
+            "backpack,staging,Sauce Labs Backpack,$29.99\n"
+            "bike_light,staging,Sauce Labs Bike Light,$9.99\n")) == []
+        # A column slipped in before an existing one moves it: positional readers break.
+        assert len(mod._lost_csv_rows(existing, (
+            "product_key,price,environment,title\n"
+            "backpack,$29.99,staging,Sauce Labs Backpack\n"
+            "bike_light,$9.99,staging,Sauce Labs Bike Light\n"))) == 3
+        # Renaming a column breaks readers that look it up by name.
+        assert mod._lost_csv_rows(existing, existing.replace("title", "name")) == [
+            "product_key,environment,title"]
+
 
 class TestInterleavedStepLabels:
     def test_api_steps_are_kept_out_of_element_evidence(self, tmp_path, monkeypatch):

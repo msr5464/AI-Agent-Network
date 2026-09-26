@@ -397,7 +397,7 @@ The rule is enforced at four points, all reading `shared/url_properties.py`:
 |-------|--------------|
 | **03 Generate**, before codegen | `collect_urls()` harvests every URL from the plan (`web_base_url`, `api_base_url`, validation steps) and from `02-validate-web.json` — `urls_visited` first, then `steps_passed`. It names a key for each and writes them to `parameters/{environment}-{country}.properties`. The key table goes into the codegen prompt. |
 | **03 Generate**, after codegen | A key the generated code reads that the properties file does not define is **recovered from `urls_visited` or the run aborts** — see "A URL property is not a warning" below. |
-| **03 Generate**, after codegen | Any file still holding a literal URL gets one targeted repair pass, guarded by `validate_fix`. What survives is logged and recorded in `03-generate.json` → `hardcoded_urls`. |
+| **03 Generate**, after codegen | A literal URL the generated code *added* gets one targeted repair pass, guarded by `validate_fix`. One already in an existing file is left alone, as step 04's guard does. What survives is logged and recorded in `03-generate.json` → `hardcoded_urls`. |
 | **04 Run & Fix** | `ensure_url_properties()` rewrites the keys before the first run (run.sh's forced base checkout, `shared.workspace prepare-base --checkout`, discards them). `no_hardcoded_url` is a fix guard: a fix that adds a literal URL is rejected before it reaches disk. |
 | **05 Ship** | The URL keys are committed — added to HEAD's copy of the properties file, never the working copy, so the run's real credentials in that same file are not committed with them. |
 

@@ -144,7 +144,7 @@ help:
 	@echo ""
 	@echo "  make run AGENT=test-adaptation-agent MODULE=checkout      Adapt tests to queue/checkout.txt"
 	@echo "  EXPLORE_ONLY=true make run AGENT=test-adaptation-agent MODULE=checkout   Flow map only"
-	@echo "  ADAPTATION_APPLY=false make run AGENT=test-adaptation-agent MODULE=...   Propose, do not edit"
+	@echo "  ADAPTATION_APPLY=true make run AGENT=test-adaptation-agent MODULE=...    Apply and verify (default: propose only)"
 	@echo ""
 	@echo "  make setup                                         Install deps + show next steps"
 	@echo "  make setup-mcp                                     Optional: merge GitHub/Slack MCP into ~/.claude.json (backs it up)"

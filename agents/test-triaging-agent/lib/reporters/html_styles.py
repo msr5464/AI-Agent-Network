@@ -26,7 +26,6 @@ def get_html_styles(c_success: str, c_warning: str, c_danger: str, c_info: str, 
                 
                 /* Header */
                 .header {{ background: linear-gradient(135deg, #2c3e50 0%, #3498db 100%); color: white; padding: 17px 24px; text-align: center; }}
-                .header-logo {{ height: 35px; width: auto; object-fit: contain; margin-bottom: 10px; display: block; margin-left: auto; margin-right: auto; }}
                 .report-title {{ margin: 0; font-size: 28px; font-weight: 600; line-height: 1.3; }}
                 .report-meta {{ margin-top: 6px; opacity: 0.9; font-size: 16px; line-height: 1.4; word-break: break-word; overflow-wrap: break-word; }}
                 

@@ -61,6 +61,15 @@ _PLUMBING_RECEIVERS = {
     "Thread", "Files", "Paths", "Duration", "LocalDate", "LocalDateTime",
 }
 
+# `Map<String, String> user = helper.getUser("standard");` — a row of test data
+# fetched into a value, which is wiring like reading a property. Only value and
+# collection types qualify: getting a Response or a page object is driving the
+# app, and so is anything chained after the getter.
+_DATA_LOOKUP = re.compile(
+    r"^(?:final\s+)?(?:Map|List|Set|Collection|String|Object|int|long|double|boolean"
+    r"|Integer|Long|Double|Boolean)\b[\w<>,\[\]\s]*?\s\w+\s*=\s*"
+    r"\w+\s*\.\s*(?:get|read|load)\w*\s*\([^()]*\)$")
+
 # A plan step that only sets the test up. It has nothing to show in a report —
 # no user did it, and no failure of it is interesting on its own — so it neither
 # needs a logStep nor counts towards the expected number.
@@ -193,6 +202,8 @@ def acting_statements(body: str) -> List[str]:
             continue
         if _ASSERT_CALL.search(skeleton):
             acting.append(body[start:end].strip())
+            continue
+        if _DATA_LOOKUP.match(skeleton.strip()):
             continue
         for receiver, _callee in _CALL_ON_RECEIVER.findall(skeleton):
             if receiver not in _PLUMBING_RECEIVERS:

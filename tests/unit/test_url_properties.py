@@ -281,6 +281,24 @@ public class NaukriProfileSummaryHelper extends ApiHelper
         assert files[self.PATH] == self.HELPER, "the original must be kept"
         assert remaining[self.PATH], "and the violation must stay visible"
 
+    def test_a_url_already_in_the_file_is_left_alone(self, tmp_path, monkeypatch):
+        """Only what this run added is its to move. Extending a helper that already
+        held a URL constant used to rewrite that constant, at a model call a run."""
+        step03 = self._step03(tmp_path, monkeypatch)
+        existing = tmp_path / "fw" / self.PATH
+        existing.parent.mkdir(parents=True, exist_ok=True)
+        existing.write_text(self.HELPER)
+        calls = []
+        monkeypatch.setattr(step03, "call_claude",
+                            lambda prompt, label="": calls.append(prompt) or "")
+
+        extended = self.HELPER.replace("\n}\n", "\n    public void more() {}\n}\n")
+        files, remaining = step03._repair_hardcoded_urls(
+            {self.PATH: extended}, {}, "naukari", "staging-sg.properties")
+
+        assert calls == [] and remaining == {}
+        assert files[self.PATH] == extended
+
     def test_a_url_the_model_invented_still_gets_a_property(self, tmp_path, monkeypatch):
         """The repair needs a key to point at, even for a URL nothing harvested."""
         step03 = self._step03(tmp_path, monkeypatch)

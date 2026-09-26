@@ -8,7 +8,9 @@ Two failure modes, in opposite directions, both previously live:
     so the healing agent was handed work no selector edit could do.
 """
 
+import contextlib
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -23,10 +25,13 @@ sys.path.insert(0, str(ROOT))
 from shared import diagnosis
 
 
-@pytest.fixture(scope="module")
-def classify(tmp_path_factory):
-    """Import 03_classify with the triaging agent's own `lib` package."""
-    tmp = tmp_path_factory.mktemp("tri")
+@contextlib.contextmanager
+def triaging_step(filename, env):
+    """Import actions/<filename> with the triaging agent's own `lib` package.
+
+    `env` is set only for the import (the step reads it into module constants);
+    left in os.environ it leaked into every later test in the session.
+    """
     saved_path, saved = list(sys.path), {
         n: m for n, m in sys.modules.items() if n == "lib" or n.startswith("lib.")}
     for name in saved:
@@ -35,11 +40,9 @@ def classify(tmp_path_factory):
     sys.path.insert(0, str(AGENT))
     try:
         spec = importlib.util.spec_from_file_location(
-            "classify_step", AGENT / "actions" / "03_classify.py")
+            Path(filename).stem, AGENT / "actions" / filename)
         module = importlib.util.module_from_spec(spec)
-        # Set only for the import (the step reads them into module constants); left in
-        # os.environ they leaked into every later test in the session.
-        with mock.patch.dict(os.environ, {"AUDIT_DIR": str(tmp)}):
+        with mock.patch.dict(os.environ, env):
             spec.loader.exec_module(module)
         yield module
     finally:
@@ -47,6 +50,13 @@ def classify(tmp_path_factory):
             del sys.modules[name]
         sys.modules.update(saved)
         sys.path[:] = saved_path
+
+
+@pytest.fixture(scope="module")
+def classify(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("tri")
+    with triaging_step("03_classify.py", {"AUDIT_DIR": str(tmp)}) as module:
+        yield module
 
 
 class TestCategoryEnum:
@@ -109,3 +119,29 @@ class TestDiagnoseFailures:
 
     def test_a_broken_failure_record_does_not_stop_the_step(self, classify):
         assert classify.diagnose_failures([{"full_name": "x"}], "") == {}
+
+
+class TestShip:
+    def test_an_approved_run_that_queues_a_handoff_ships(self, tmp_path):
+        # TestHandoffEligibility restates the rule; this runs the step. main()
+        # recounted the handoff for Slack with a set only write_handoff defined,
+        # so every APPROVED run that queued work died with a NameError.
+        (tmp_path / ".verdict").write_text("APPROVED")
+        (tmp_path / "02-collect.json").write_text(json.dumps(
+            {"build_tag": "B-1", "summary": {"total": 2, "failed": 2}, "failures": []}))
+        (tmp_path / "03-classify.json").write_text(json.dumps({"classifications": [
+            {"test_name": "a.B.c", "classification": "AUTOMATION_ISSUE",
+             "confidence": "HIGH", "root_cause_category": "ELEMENT_NOT_FOUND"},
+            {"test_name": "a.B.d", "classification": "PRODUCT_BUG",
+             "confidence": "HIGH", "root_cause_category": "ASSERTION_FAILURE"}]}))
+        env = {"AUDIT_DIR": str(tmp_path), "SLACK_NOTIFY_CHANNEL": "#qa",
+               "TRIAGING_AUTOFIX_QUEUE_DIR": str(tmp_path / "queue")}
+        sent = []
+        with triaging_step("05_ship.py", env) as ship, \
+                mock.patch.object(ship, "send_slack", lambda _, text: sent.append(text)), \
+                mock.patch.object(ship, "generate_html_report", lambda *_: None), \
+                mock.patch.object(ship, "record_skip", lambda *_: None):
+            ship.main()
+
+        assert ":wrench: 1 automation issue(s) queued" in sent[0]
+        assert json.loads((tmp_path / "05-ship.json").read_text())["handoff_queued"]

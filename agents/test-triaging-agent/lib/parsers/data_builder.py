@@ -83,7 +83,9 @@ def db_row_to_test_result(db_row: Dict, execution_log: Optional[str] = None, dur
         status = TestStatus.FAIL
     elif status_str in ['ERROR', 'ERRORED']:
         status = TestStatus.ERROR
-    elif status_str in ['SKIP', 'SKIPPED']:
+    elif status_str in ['SKIP', 'SKIPPED', 'ABORTED']:
+        # An aborted test never finished (TestNG reports it as a SkipException).
+        # It fell through to the unknown-status default and counted as a pass.
         status = TestStatus.SKIP
     else:
         # Default to PASS if unknown
