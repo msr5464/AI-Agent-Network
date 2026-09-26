@@ -1,100 +1,155 @@
-# QA Agent Network – Deployment Guide
+# Deployment Guide
 
-This document summarizes the recommended steps for standing up the QA Agent Network on Windows workstations and wiring it into a Jenkins CI job.
+Two ways to run QA Agent Network beyond a laptop:
 
----
+1. **The server**, so a team drives authoring, healing and adaptation from
+   AI-Test-Studio.
+2. **CI**, where triaging (and optionally healing) runs after each automation build.
 
-## Windows Workstation Setup
-
-1. **Prerequisites**
-   - Windows 10/11 with PowerShell 5+ (PowerShell 7 recommended)
-   - Git, Python 3.9+ (“Add to PATH” enabled), and MySQL client access
-   - Ollama for Windows (if running the default local LLM) or an OpenAI API key
-   - `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` (or run scripts with `-ExecutionPolicy Bypass`)
-
-2. **Clone the repo**
-   ```powershell
-   git clone <repo-url>
-   cd QA-Agent-Network
-   ```
-
-3. **Bootstrap dependencies**
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File scripts\windows\setup.ps1
-   ```
-   - Creates/refreshes `venv`
-   - Upgrades `pip` and installs requirements
-   - Copies `config\.env.example` → `config\.env` if needed
-
-4. **Configure environment**
-   - Edit `config\.env` with DB credentials, AI provider (`LLM_PROVIDER`, `OPENAI_*` / `OLLAMA_*`), `INPUT_DIR`, and `OUTPUT_DIR`.
-   - Place automation report folders under `testdata\` (or update `INPUT_DIR`).
-
-5. **Run the agent**
-   ```powershell
-   .\scripts\run.ps1 --input-dir testdata\Regression-Growth-Tests-442 --output-dir reports
-   ```
-   HTML output is written to `reports\AI-Analysis-Report_*.html`.
-
-6. **Optional automation**
-   - Schedule recurring runs via Windows Task Scheduler:
-     ```
-     Action: Start a program
-     Program/script: powershell
-     Arguments: -ExecutionPolicy Bypass -File C:\path\to\QA-Agent-Network\scripts\run.ps1 --input-dir testdata\Regression-Growth-Tests-442 --output-dir reports
-     ```
-   - Redirect logs or archive report artifacts as needed.
+Both need the same host setup.
 
 ---
 
-## Jenkins Integration (Windows Agent)
+## Host setup
 
-1. **Prepare the Jenkins node**
-   - Install Python 3.9+, Git, and (optionally) Ollama on the node.
-   - Ensure the node has network access to your MySQL database and report storage.
-   - Place `QA-Agent-Network` in a stable location (e.g., `C:\jenkins\tools\QA-Agent-Network`) or allow the pipeline to clone it each run.
-   - Create `config\.env` with the same secrets used locally (store it as a Jenkins secret file if necessary).
+A Linux or macOS host (Windows works through Git Bash or WSL — the agents are
+`bash` + `make` underneath; the `.ps1` scripts are thin wrappers) with:
 
-2. **Pipeline stage (example)**
-   Append this stage after your existing automation run:
+- Python 3.10+, Git, the `claude` CLI signed in as the service user
+  (`claude auth login`), `gh`, Node.js 18+ with `npx`, JDK 21 and Maven.
+- Network access to GitHub, the application under test, and (for triaging) the
+  MySQL results database.
 
-   ```groovy
-   stage('QA Agent Network Analysis') {
-       steps {
-           script {
-               def qaAgentHome = "C:\\jenkins\\tools\\QA-Agent-Network"
-               def reportDir = "testdata\\${env.JOB_NAME}-${env.BUILD_NUMBER}"
+```bash
+git clone https://github.com/msr5464/QA-AI-Agent.git QA-Agent-Network
+cd QA-Agent-Network
+./scripts/setup.sh
+.venv/bin/python -m playwright install chromium
+```
 
-               bat """
-                   if not exist "${qaAgentHome}" (
-                       git clone https://github.com/your-org/QA-Agent-Network "${qaAgentHome}"
-                   )
-               """
-
-               bat """
-                   cd /d "${qaAgentHome}"
-                   powershell -ExecutionPolicy Bypass -File scripts\\windows\\setup.ps1
-               """
-
-               bat """
-                   cd /d "${qaAgentHome}"
-                   powershell -ExecutionPolicy Bypass -File .\\scripts\\run.ps1 --input-dir "${reportDir}" --output-dir reports
-               """
-
-   Adjust paths to match wherever Jenkins stores the automation output. If your Gradle job writes reports outside the agent repo, copy them under `testdata\` (or set `INPUT_DIR` accordingly) before calling `scripts\run.ps1`.
-
-3. **Environment secrets**
-   - Store DB passwords and API keys using Jenkins credentials.
-   - You can inject them into `config\.env` during the pipeline via `withCredentials`/`writeFile`.
-
-4. **Parallel suites**
-   - Run multiple report analyses by invoking `scripts\run.ps1` with different `--input-dir` arguments, either sequentially or in parallel stages.
-
-5. **Monitoring**
-   - Archive the generated HTML or publish it via Jenkins “HTML Publisher” to make it easy to view.
-   - Pipe script logs to `QA-Agent-Network\agent.log` for traceability.
+Then fill in `config/.env` — the [README's minimum configuration](../README.md#2-minimum-configuration)
+plus Slack and, for triaging, the `TRIAGING_DB_*` settings. Keep secrets out of
+git: `config/.env` is ignored; in CI, write it from your secret store.
 
 ---
 
-Keep this document updated as your infrastructure evolves (e.g., if you move from MySQL to another datastore or adopt containerized runners).
+## Running the server for AI-Test-Studio
 
+```bash
+bash scripts/run-server.sh
+```
+
+It loads `config/.env`, binds `127.0.0.1:6001` and runs until stopped. Settings
+that matter for a shared host (all in `config/.env`; full table in
+[SERVER_API.md](SERVER_API.md#starting-the-server)):
+
+| Setting | Recommendation |
+|---------|----------------|
+| `QA_AGENT_SERVER_HOST` | Keep `127.0.0.1` and run AI-Test-Studio on the same host. If the Studio is elsewhere, bind the private interface **and** set `QA_AGENT_PROXY_SECRET` |
+| `QA_AGENT_PROXY_SECRET` | A long random string, identical in both repos' `config/.env`. Without it, anyone who can reach the port can act as any user, including admin |
+| `AI_TEST_STUDIO_URL` | The Studio's origin, for CORS |
+| `QA_MAX_CONCURRENT_RUNS` | Default 4. Each run holds a worktree, a browser and a JVM — size for the host |
+| `QA_WORKTREE_TEMP_DIR` | Default `/tmp/qa-runs`. Point it at a disk with room for one checkout per concurrent run |
+| `AUTO_PUSH` | `true` on a shared server. With `false`, runs execute in the server's own checkout of the automation repo, one at a time |
+
+On the Studio side, set `QA_AGENT_NETWORK_URL` (default `http://localhost:6001`)
+and the same `QA_AGENT_PROXY_SECRET` in AI-Test-Studio's `config/.env`.
+
+### As a service (systemd)
+
+```ini
+# /etc/systemd/system/qa-agents.service
+[Unit]
+Description=QA Agent Network server
+After=network-online.target
+
+[Service]
+User=qa
+WorkingDirectory=/opt/QA-Agent-Network
+ExecStart=/bin/bash scripts/run-server.sh
+Restart=on-failure
+# Give running agents time to stop cleanly; the server cancels them on SIGTERM.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The `User` needs its own signed-in `claude` CLI, and `gh`/git credentials (or
+`GITHUB_TOKEN` in `config/.env`).
+
+### State and upgrades
+
+- `qa_agents_server/storage/agent_runs.json` — run registry (last 500 runs).
+  Runs that were active when the server stopped are marked `interrupted` on boot.
+- `qa_agents_server/storage/run_analytics.jsonl` — analytics; append-only, back
+  it up if the Studio's Analytics page matters to you.
+- `agents/<agent>/audit/` — every session's trail. Git-ignored, grows without
+  bound; prune old sessions by age if disk matters (the Studio's
+  *Reset Analytics & History* also deletes them).
+
+To upgrade: stop the service, `git pull`, re-run `./scripts/setup.sh`, start it.
+Settings saved from the Studio's Agent Settings page live in `config/.env` and
+survive upgrades.
+
+---
+
+## CI integration (Jenkins example)
+
+Triaging reads the build's results from MySQL and its HTML reports from
+`TRIAGING_INPUT_DIR/<build-tag>/` (or `TRIAGING_INPUT_DIR` itself, if that folder
+is named after the tag). Run it after the automation job has written both.
+
+```groovy
+stage('QA Agent Network') {
+    steps {
+        withCredentials([file(credentialsId: 'qa-agents-env', variable: 'QA_ENV')]) {
+            sh '''
+                set -e
+                QAN=/opt/QA-Agent-Network
+                cp "$QA_ENV" "$QAN/config/.env"
+                cd "$QAN"
+
+                BUILD_TAG="${JOB_NAME}-${BUILD_NUMBER}"
+                export TRIAGING_INPUT_DIR="$WORKSPACE/test-output/reports"
+                export TRIAGING_OUTPUT_DIR="$WORKSPACE/qa-agent-reports"
+
+                # 1. Classify the failures, write the HTML report, queue locator fixes
+                ./scripts/run-triaging-agent.sh "$BUILD_TAG"
+
+                # 2. Optional: heal what triaging queued, and raise a PR
+                if [ -f "agents/test-healing-agent/queue/${BUILD_TAG}.json" ]; then
+                    ./scripts/run-healing-agent.sh "$BUILD_TAG"
+                fi
+            '''
+        }
+    }
+    post {
+        always {
+            publishHTML(target: [reportDir: 'qa-agent-reports',
+                                 reportFiles: 'AI-Generated-Report_*.html',
+                                 reportName: 'AI Failure Triage'])
+        }
+    }
+}
+```
+
+Notes:
+- The report file is `AI-Generated-Report_<build-tag>.html` in `TRIAGING_OUTPUT_DIR`.
+- Healing needs the automation repo checkout (`WORKSPACE_DIR`/`FRAMEWORK_DIR`)
+  and a browser on the agent. Run it on a node that can execute the test suite.
+- Session trails stay under `agents/*/audit/`; archive them if you want them
+  with the build.
+
+### Keep page baselines fresh
+
+Healing's diagnosis and Locate step compare a failing page with baselines the
+framework records on every green page load. After a **green** suite, commit them
+back so the next failure has something to compare with:
+
+```bash
+python3 scripts/commit_baselines.py "$WORKSPACE" --branch main --push
+```
+
+It only stages the baselines directory, skips files whose fingerprints did not
+change, and never fails the build.

@@ -1,204 +1,129 @@
 # Automation Repository — Skills & Conventions
 
-This file is loaded as a system prompt (`--system-prompt-file`) by test-healing-agent when
-generating locator fixes. It gives Claude persistent domain context about the automation
-framework so it doesn't need to be re-explained in every fix prompt.
+This file is loaded as a system prompt (`--system-prompt-file`) by the
+test-healing-agent's fix step and the test-adaptation-agent's web exploration.
+It holds the rules that hold for any automation repo these agents work on. It
+deliberately names no framework API: the automation repo's own `CLAUDE.md`, and
+the page objects and tests you are shown, are the source of truth for class
+names, method names and signatures. Copy the patterns you see there; never
+invent an API.
 
 ---
 
-## Framework Overview
+## Framework shape
 
-- **Language**: Java
-- **Test framework**: TestNG
-- **Browser automation**: Selenium WebDriver
-- **API testing**: RestAssured via ApiHelper
-- **Build tool**: Maven (run: `mvn test -Dtest=ClassName#methodName`)
-- **Page object pattern**: Custom wrapper classes extending `BasePage`
-
----
-
-## Critical Rule #1: NEVER use raw Selenium — always use framework wrappers
-
-### Clicking
-```java
-// CORRECT
-Element.click(testConfig, element, "description");
-Element.clickWithoutScroll(testConfig, element, "description");
-Element.clickThroughJS(testConfig, element, "description");
-
-// WRONG
-element.click();
-driver.findElement(By.id("x")).click();
-```
-
-### Typing / entering data
-```java
-// CORRECT
-Element.enterData(testConfig, element, textToEnter, "description");
-Element.clearData(testConfig, element, "description");
-
-// WRONG
-element.sendKeys("text");
-```
-
-### Reading text / attributes
-```java
-// CORRECT
-String text = Element.getText(testConfig, element, "description");
-boolean visible = Element.isElementDisplayed(testConfig, element);
-
-// WRONG
-element.getText();
-```
-
-### Dynamic element lookup
-```java
-// CORRECT — use How enum
-WebElement el = Element.getPageElement(testConfig, How.css, "[data-cy='selector']");
-WebElement el = Element.getPageElementWithRetry(testConfig, How.css, "[data-cy='x']");
-```
+- **Language / runner**: Java, TestNG, built and run with Maven.
+- **Browser automation**: whatever the repo uses (Playwright or Selenium), always
+  behind the repo's own wrapper classes.
+- **Page objects**: one class per page, extending the repo's base page class.
+  Navigation methods return the next page object.
+- **Helpers**: orchestrate several page objects; tests call helpers and page
+  objects, then assert.
 
 ---
 
-## Critical Rule #2: NEVER use Thread.sleep — always use WaitHelper
+## Rule 1: never call the browser driver directly — use the repo's wrappers
+
+Every click, fill, read and wait goes through the repo's wrapper methods, which
+log, wait and screenshot consistently. Calling the driver or locator object
+directly is wrong in every framework:
 
 ```java
-// CORRECT
-WaitHelper.waitForElementToBeDisplayed(testConfig, element, "description");
-WaitHelper.waitForElementToBeClickable(testConfig, element, "description");
-WaitHelper.waitForElementToBeHidden(testConfig, element, "description");
-
-// WRONG
-Thread.sleep(3000);
+// WRONG — raw driver / locator calls
+locator.click();                 // Playwright
+element.sendKeys("text");        // Selenium
+driver.findElement(By.id("x"));  // Selenium
 ```
 
-### waitForPageLoad vs waitForElementToBeDisplayed
+Use the equivalent wrapper call exactly as the surrounding code does.
 
-- `WaitHelper.waitForPageLoad(testConfig, element)` — **ONLY inside page object constructors**
-- `WaitHelper.waitForElementToBeDisplayed(testConfig, element, "desc")` — **everywhere else**
+## Rule 2: never use `Thread.sleep` — use the repo's wait helper
+
+Wait on a condition (visible, hidden, page loaded) through the wait helper the
+repo already uses. A fixed sleep is always wrong.
+
+## Rule 3: assertions go through the assertion helper
+
+Use the repo's assertion helper (e.g. `AssertHelper`), never `Assert.*` or a bare
+`assertTrue`. Keep the existing assertion's strength: never replace an equality
+check with a weaker one (`contains`, `isTrue`) to make a test pass.
 
 ---
 
-## Locator Strategy — Priority Order
+## Locator strategy — priority order
 
-1. `id` — highest priority when stable id exists
-2. `name` attribute
-3. `css [data-cy='...']` — most stable CSS in this repo
-4. `css` — meaningful class names (not generated hashes)
-5. `xpath` — only when id/name/css cannot work; use `contains()`, never exact text match
+1. A test id attribute — `[data-cy='…']`, `[data-testid='…']`, `[data-test='…']`
+2. `#id` — a stable, human-meaningful id
+3. `[name='…']`
+4. CSS on meaningful class names (not generated hashes)
+5. XPath — only when nothing above works; use `contains()`, never exact text
 
-**NEVER use:**
-- Positional XPath: `//div[1]/span[2]`
+**Never use:**
+- Positional selectors: `//div[1]/span[2]`, `:nth-child(3)` without an anchor
 - Auto-generated class names (hash-like strings)
-- Exact text XPath: `//button[text()='Submit']` — use `contains()` instead
+- Exact-text XPath: `//button[text()='Submit']` — use `contains()`
+- Escaped double quotes inside a selector string: write `[data-cy='x']` and
+  `button:has-text('Login')`, not `has-text(\"Login\")`. Use double quotes only
+  when the value itself contains an apostrophe.
 
-### @FindBy declaration pattern
-```java
-// Single element
-@FindBy(css = "[data-cy='element-id']")
-private WebElement elementName;
-
-// List of elements
-@FindBy(css = ".el-tabs__item.is-top")
-protected List<WebElement> tabItems;
-
-// Fallback with @FindAll (first match wins)
-@FindAll({
-    @FindBy(css = "[data-cy='preferred-selector']"),
-    @FindBy(xpath = "//fallback/xpath")
-})
-private WebElement elementWithFallback;
-```
+Declare a locator the way the page object already declares its others (inline
+field initialisation, `@FindBy`, …) — match the file, do not introduce a second
+style.
 
 ---
 
-## Page Object Constructor — Mandatory Pattern
+## Logging
 
-```java
-public LoginPage(Config testConfig) {
-    super(testConfig);                                    // 1. call BasePage constructor
-    this.testConfig = testConfig;
-    PageFactory.initElements(testConfig.driver, this);   // 2. initialise @FindBy elements
-    waitForLoaderDisappeared();                           // 3. wait for loading bars/spinners
-    WaitHelper.waitForPageLoad(testConfig, titleElement); // 4. wait for page anchor element
-    verifyPageIsLoaded();                                 // 5. assert page loaded correctly
-}
-```
-
----
-
-## Assertions — Always use AssertHelper
+- **Test classes**: one `logStep` call per step of the scenario, in the form the
+  repo uses (e.g. `config.logStep("…")`).
+- **Page objects and helpers**: the repo's comment-level logger
+  (e.g. `Log.comment(config, "…")`) — never `logStep`.
+- Never `System.out.println`.
+- **One `logStep` per step, never one summary line.** The report prints one line
+  per `logStep`, so a scenario narrated once fails with a report that cannot say
+  which step broke. Each `logStep` goes immediately before the call(s) it
+  describes:
 
 ```java
-// CORRECT
-AssertHelper.assertElementIsDisplayed(testConfig, "description", element);
-AssertHelper.assertElementText(testConfig, "description", expectedText, element);
-AssertHelper.compareEquals(testConfig, "description", expected, actual);
+// WRONG — one line for a four-step scenario
+config.logStep("Login, toggle the trailing dot in the summary, save, and verify it persists");
+String[] result = helper.toggleProfileSummaryDot(username, password);
 
-// WRONG
-Assert.assertEquals(actual, expected);
-assertTrue(condition);
+// RIGHT — one line per step, each in front of the calls that carry it out
+config.logStep("Login and open the profile page");
+ProfilePage profile = helper.loginAndOpenProfile(username, password);
+
+config.logStep("Toggle the trailing dot in Profile Summary and save the change");
+String saved = profile.toggleTrailingDotAndSave();
+
+config.logStep("Verify the summary shown after reload matches the saved value");
+AssertHelper.assertEquals(config, profile.reload().getProfileSummary(), saved,
+    "Profile Summary after reload should match the saved modified summary");
 ```
 
----
+(Illustrative names — use the repo's real classes and methods.)
 
-## Navigation Methods — Return Next Page Object
-
-```java
-// CORRECT — navigation returns next page
-public DashBoardPage clickOnLoginButton() {
-    Element.click(testConfig, loginButton, "Login button");
-    return new DashBoardPage(testConfig);
-}
-
-// WRONG — returns void
-public void clickOnLoginButton() {
-    Element.click(testConfig, loginButton, "Login button");
-}
-```
+Setup lines (reading properties or credentials, constructing a helper) get no
+`logStep`. A helper may encapsulate one step; it must not swallow the whole
+scenario, because then there is nothing left for the test to narrate.
 
 ---
 
-## Logging Scope
-
-- **Test classes only**: `logStep(testConfig, "description")`
-- **Page objects and helpers**: `testConfig.logComment("description")`
-- Never use `System.out.println`
-- Never use `logStep` in page objects or helpers
-
----
-
-## Running a Single Test (for verification)
+## Running a single test (for verification)
 
 ```bash
-# Maven
-mvn test -Dtest=TestLoginFlows#testLoginWith3IncorrectPasswordAttempts
-
-# Gradle
-./gradlew test --tests "Automation.Access.login.web.customer.TestLoginFlows.testLoginWith3IncorrectPasswordAttempts"
+mvn test -Dtest=ClassName#methodName
 ```
+
+The agents pass the repo's own environment properties and browser mode; do not
+add flags of your own.
 
 ---
 
-## Standard Imports for Page Objects
+## Edits
 
-```java
-import java.util.List;
-import org.openqa.selenium.WebElement;
-import org.openqa.selenium.support.FindBy;
-import org.openqa.selenium.support.FindAll;
-import org.openqa.selenium.support.PageFactory;
-import Automation.Utils.AssertHelper;
-import Automation.Utils.BasePage;
-import Automation.Utils.Config;
-import Automation.Utils.Element;
-import Automation.Utils.Element.How;
-import Automation.Utils.WaitHelper;
-```
-
-**Do NOT import raw Selenium:**
-```java
-// WRONG
-import org.openqa.selenium.By;
-import org.openqa.selenium.support.ui.WebDriverWait;
-```
+- Change the minimum: a locator fix edits the locator string, nothing else.
+- Keep imports to what the file already uses; never import raw driver classes
+  (`org.openqa.selenium.By`, `WebDriverWait`, …) to work around a wrapper.
+- Never hard-code a URL or credential in Java — they live in the repo's
+  properties files.

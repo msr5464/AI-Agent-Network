@@ -1,0 +1,376 @@
+"""Locator synthesis.
+
+The element we matched is not the locator we write. Emitting the raw XPath of
+the winning node would "work" and be unmaintainable — and would break again on
+the next reshuffle. Walk a preference ladder from most durable to least, and
+take the first rung that uniquely identifies the element on the live page.
+"""
+from __future__ import annotations
+import re
+
+from shared import locator_capture as capture
+from shared.locator_score import Volatility
+
+# The ARIA-role table lives in the framework plugins (CodeEngine.map_role);
+# this was a duplicate that drifted independently.
+# Text that tends to change on its own: prices, counts, dates, badges. Anchoring
+# a locator on any of it trades one kind of brittleness for another.
+VOLATILE_TEXT = re.compile(
+    r"([$£€¥]\s*[\d,.]+|\b\d[\d,.]*\s*(items?|results?|unread|new)\b|\(\s*\d+\s*\)"
+    r"|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d+\s*(min|sec|hour|day)s?\b)", re.I)
+
+
+def text_stability(t: str) -> float:
+    """Higher is safer to anchor on. Prefers distinctive prose over numbers."""
+    if not t:
+        return -1.0
+    letters = sum(c.isalpha() for c in t)
+    digits = sum(c.isdigit() for c in t)
+    s = letters / max(len(t), 1)                      # alphabetic is good
+    if VOLATILE_TEXT.search(t):
+        s -= 1.0                                      # prices/counts/dates: avoid
+    if digits > letters:
+        s -= 0.5
+    if len(t) < 4:
+        s -= 0.3                                      # too short to be distinctive
+    return s
+
+
+# What the capture normalises into `testid`. The element carries exactly one of
+# them, and which one decides whether getByTestId can find it at all.
+TESTID_ATTRS = ("data-testid", "data-test-id", "data-test", "data-qa", "data-cy")
+
+
+def testid_attribute(el: dict) -> str:
+    """The attribute THIS element spells its test id with. Never a guess."""
+    attrs = el.get("attrs") or {}
+    return next((a for a in TESTID_ATTRS if attrs.get(a) == el.get("testid")),
+                "data-testid")
+
+
+VOLATILE_SELECTOR = re.compile(
+    r"(nth-child|nth-of-type|/html\[|\[\d+\]|css-[0-9a-z]{5,}|jss\d+|sc-[0-9a-z]{6,})", re.I)
+
+
+def _q(s: str) -> str:
+    """Quote for a Java string literal (method arguments)."""
+    return '"' + (s or "").replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def _css(value: str) -> str:
+    """Quote an attribute VALUE inside a CSS selector — single quotes by default.
+
+    The selector ends up inside a Java double-quoted string, so double quotes
+    here would have to be escaped: `img[alt=\\"PencilSimple\\"]`. That is valid
+    Java and valid CSS, and it silently breaks the safety guard in edit_guards,
+    which reads selectors back out of the source text and gets the backslashes
+    with them — the selector then matches nothing and a correct fix is rejected
+    as "a guess". Single quotes need no escaping, and match the convention the
+    repo already uses (img[alt='mukesh']).
+    """
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().code.quote_css_value(value)
+
+
+def code_for(selector: str) -> dict:
+    """The target repo's code for a plain selector, in its own framework's syntax.
+
+    Accepts our own browser's `xpath=` prefix and drops it: the code gets the
+    bare XPath, which every CodeEngine recognises by its leading slash.
+    """
+    from shared.frameworks import get_active_plugin
+    if selector.startswith("xpath="):
+        selector = selector[len("xpath="):]
+    snippet = get_active_plugin().code.emit_locator(selector=selector)
+    out = {"python": snippet.get("python", ""), "java": snippet.get("java", "")}
+    if snippet.get("findby"):
+        out["findby"] = snippet["findby"]
+    return out
+
+
+def _unique(ctx, sel: str, expect_index: int | None = None, snap: dict | None = None) -> bool:
+    """Exactly one match — and, when we know which node we mean, THAT node.
+
+    count()==1 alone is not enough: on a page with three identical product
+    buttons, a selector matching exactly one *sibling* passes the count check
+    while pointing at the wrong element. That is a silent wrong-heal generator.
+    """
+    try:
+        if ctx.locator(sel).count() != 1:
+            return False
+    except Exception:
+        return False
+    if expect_index is None:
+        return True
+    try:
+        n, fp = capture.find_by_locator(ctx, sel, snap=snap)
+    except Exception:
+        return False
+    return n == 1 and fp is not None and fp["index"] == expect_index
+
+
+def scoped_by_context(ctx, el: dict, expect_index: int, snap: dict | None) -> dict | None:
+    """Anchor on a surviving ancestor when the element alone is not unique.
+
+    Real pages repeat a control per section — seven identical edit pencils, one
+    per profile block — so nothing about the element itself distinguishes it, and
+    the thing that does is where it sits. `#profile-section-profile-summary
+    img[alt="PencilSimple"]` is exactly what a human writes here, and it stays
+    readable, which a positional XPath does not.
+
+    Tried in order of how much the reader learns from the result: the element's
+    own identifying attribute inside a stable ancestor first, then a nearby
+    distinguishing text, and only then the bare tag.
+    """
+    tag = el["tag"]
+
+    anchors: list[str] = []
+    for anc in (el.get("ancestor_chain") or [])[:4]:
+        if anc.get("testid"):
+            anchors.append(f'[data-testid={_css(anc["testid"])}]')
+        # An ancestor id is usually the most stable thing in reach and was
+        # missing here: without it, a section-scoped control had no anchor at all
+        # once its utility classes were (correctly) rejected as volatile.
+        if anc.get("id"):
+            anchors.append(f'#{anc["id"]}')
+        for klass in anc.get("classes") or []:
+            anchors.append(f".{klass}")
+        if anc.get("tag") and anc["tag"] not in ("div", "span", "body", "main"):
+            anchors.append(anc["tag"])
+    if not anchors:
+        return None
+
+    inners: list[str] = []
+    if el.get("testid"):
+        inners.append(f'[data-testid={_css(el["testid"])}]')
+    for attribute in ("alt", "aria_label", "name", "placeholder", "title"):
+        value = el.get(attribute)
+        if value:
+            inners.append(f'{tag}[{attribute.replace("_", "-")}={_css(value)}]')
+    # A wrapper that names itself only through its child — the <span> around an
+    # <img alt="PencilSimple">. `:has(> …)` keeps the locator on the wrapper,
+    # which is the element the test clicks and the one verified by index.
+    child = el.get("child") or {}
+    for attribute in ("testid", "alt", "aria_label", "title"):
+        value = child.get(attribute)
+        if value:
+            name = "data-testid" if attribute == "testid" else attribute.replace("_", "-")
+            inners.append(f'{tag}:has(> {child["tag"]}[{name}={_css(value)}])')
+    inners.append(tag)
+
+    seen: set[str] = set()
+    for anchor in anchors:
+        for inner in inners:
+            selector = f"{anchor} {inner}"
+            if selector in seen:
+                continue
+            seen.add(selector)
+            if _unique(ctx, selector, expect_index, snap):
+                return {"strategy": "scoped-by-ancestor", "sel": selector,
+                        **code_for(selector)}
+
+    # Still ambiguous: bring in a nearby text that tells the sections apart.
+    texts = sorted((t for t in (el.get("neighbor_texts") or []) if t and len(t) <= 60),
+                   key=lambda t: -text_stability(t))[:4]
+    from shared.frameworks import get_active_plugin
+    for anchor in anchors:
+        for text in texts:
+            if text_stability(text) < 0:
+                continue
+            selector = get_active_plugin().code.build_has_text_selector(anchor, text, tag)
+            if selector in seen:
+                continue
+            seen.add(selector)
+            if _unique(ctx, selector, expect_index, snap):
+                return {"strategy": "scoped-by-neighbor", "sel": selector,
+                        **code_for(selector)}
+    return None
+
+
+def candidates_for(el: dict, vol: Volatility) -> list[dict]:
+    """The preference ladder, most maintainable first.
+
+    Two different things are produced per candidate, and the distinction is the
+    whole reason this reads the way it does:
+
+      * `sel` is fed to the LIVE BROWSER to check whether the candidate resolves
+        uniquely. That is the agents' own instrument, which is always Playwright
+        whatever the target repo uses, so these stay Playwright selector syntax.
+      * `python` / `java` are CODE WRITTEN INTO THE TARGET REPO, so they come
+        from the active framework's CodeEngine.
+
+    Those were previously both hardcoded Playwright here, while a fully
+    plugin-routed `synthesize()` sat alongside being called by nothing — so the
+    CodeEngine had essentially no effect on emitted locators, and a Selenium
+    repo would have been handed `page.locator(...)` to write into its Java.
+    """
+    from shared.frameworks import get_active_plugin
+    code = get_active_plugin().code
+
+    out: list[dict] = []
+    tag = el["tag"]
+    role, acc = el.get("role"), el.get("accessible_name")
+
+    def add(strategy: str, sel: str, **emit_kwargs) -> None:
+        snippet = code.emit_locator(**emit_kwargs)
+        candidate = {"strategy": strategy, "sel": sel,
+                     "python": snippet.get("python", ""),
+                     "java": snippet.get("java") or None}
+        # Page-object field form, where the framework has one (Selenium's
+        # @FindBy). Absent for frameworks that construct locators inline.
+        if snippet.get("findby"):
+            candidate["findby"] = snippet["findby"]
+        out.append(candidate)
+
+    if el.get("testid"):
+        t = el["testid"]
+        attribute = testid_attribute(el)
+        if attribute == "data-testid":
+            # getByTestId resolves against Playwright's configured
+            # testIdAttribute, which is data-testid unless the repo changed it.
+            add("testid", f'[data-testid={_css(t)}]', testid=t)
+        else:
+            # The element spells it differently — data-test, data-cy, data-qa.
+            # getByTestId would look for data-testid and find nothing, and the
+            # `sel` probe would fail too, so the whole strongest tier silently
+            # dropped out and the ladder fell through to whatever came next. On a
+            # cart link that was its badge count: getByText("2").
+            sel = f'[{attribute}={_css(t)}]'
+            add("testid", sel, selector=sel)
+
+    if role and acc and role not in ("generic", "presentation"):
+        jrole = code.map_role(role)
+        if jrole:
+            add("role+name", f'internal:role={role}[name={_q(acc)}s]',
+                role=jrole, name=acc, exact=True)
+
+    if el.get("placeholder"):
+        v = el["placeholder"]
+        add("placeholder", f'[placeholder={_css(v)}]', placeholder=v)
+
+    if el.get("alt"):
+        v = el["alt"]
+        add("alt", f'[alt={_css(v)}]', alt=v)
+
+    if el.get("title"):
+        v = el["title"]
+        add("title", f'[title={_css(v)}]', title=v)
+
+    _id = el.get("id")
+    if _id and not vol.id_is_generated(_id):
+        add("id", f"#{_id}", selector=f"#{_id}")
+
+    if el.get("name"):
+        n = el["name"]
+        sel = f'{tag}[name={_css(n)}]'
+        add("name", sel, selector=sel)
+
+    text = (el.get("text") or "").strip()
+    # Only text worth anchoring on. `text_stability` already knows a badge count
+    # or a price is not identity — it was consulted when ranking fallbacks and
+    # not when emitting, so a cart link whose text was "2" got
+    # getByText("2", exact) and broke on the next run with a different count.
+    if text and len(text) <= 60 and el["is_interactive"] and text_stability(text) > 0:
+        add("text", f'{tag}:text-is({_css(text)})', text=text, exact=True)
+
+    stable = vol.stable_classes(el.get("class_list"))
+    if stable:
+        sel = tag + "".join(f".{c}" for c in stable)
+        add("css-class", sel, selector=sel)
+
+    return out
+
+
+def robula_xpath(ctx, el: dict, vol: Volatility, expect_index: int | None = None,
+                 snap: dict | None = None) -> str | None:
+    """Robula+-flavoured minimal XPath: start at //*, add the most durable
+    predicate available, climb one ancestor at a time until unique. Last resort —
+    an XPath tells the next reader nothing about intent."""
+    def predicates(d: dict) -> list[str]:
+        p = []
+        if d.get("testid"): p.append(f'@data-testid={_css(d["testid"])}')
+        if d.get("id") and not vol.id_is_generated(d["id"]): p.append(f'@id={_css(d["id"])}')
+        if d.get("name"): p.append(f'@name={_css(d["name"])}')
+        if d.get("aria_label"): p.append(f'@aria-label={_css(d["aria_label"])}')
+        if d.get("type"): p.append(f'@type={_css(d["type"])}')
+        for c in vol.stable_classes(d.get("class_list"))[:1]:
+            p.append(f'contains(@class,{_css(c)})')
+        return p
+
+    base = f'//{el["tag"]}'
+    for pred in predicates(el):
+        xp = f"{base}[{pred}]"
+        if _unique(ctx, f"xpath={xp}", expect_index, snap):
+            return xp
+    text = (el.get("text") or "").strip()
+    if text and len(text) <= 40:
+        xp = f'{base}[normalize-space(.)={_q(text)}]'
+        if _unique(ctx, f"xpath={xp}", expect_index, snap):
+            return xp
+    for anc in el.get("ancestor_chain", [])[:3]:
+        for pred in predicates({"id": anc.get("id"), "testid": anc.get("testid"),
+                                "class_list": anc.get("classes")}):
+            xp = f'//{anc["tag"]}[{pred}]{base}'
+            if _unique(ctx, f"xpath={xp}", expect_index, snap):
+                return xp
+    return None
+
+
+def alternates(ctx, el: dict, vol: Volatility, snap: dict | None = None,
+               n: int = 2, skip: str | None = None) -> list[dict]:
+    """The next-best locators that also uniquely identify this element.
+
+    Stored on the fingerprint so the next drift starts from a richer prior than a
+    single string: if the primary breaks, these are tried before scoring.
+    """
+    out, idx = [], el.get("index")
+    for cand in candidates_for(el, vol):
+        if len(out) >= n:
+            break
+        if cand["sel"] == skip or VOLATILE_SELECTOR.search(cand["sel"]):
+            continue
+        if _unique(ctx, cand["sel"], idx, snap):
+            out.append(_flag(cand))
+    return out
+
+
+def _flag(cand: dict) -> dict:
+    """Mark a locator that matches today but embeds self-changing text.
+
+    Emitting it is still better than the broken one, but the reviewer should see
+    that `getByRole(LINK, "Cart (0 items)")` breaks the next time the cart is not
+    empty.
+    """
+    hit = VOLATILE_TEXT.search(cand["sel"])
+    if hit:
+        cand["fragile"] = (f"embeds self-changing text {hit.group(0)!r} — "
+                           f"consider a stable test id here")
+    return cand
+
+
+def emit(ctx, el: dict, vol: Volatility, snap: dict | None = None) -> dict | None:
+    """First rung of the ladder that uniquely identifies THIS element."""
+    idx = el.get("index")
+    for cand in candidates_for(el, vol):
+        if VOLATILE_SELECTOR.search(cand["sel"]):
+            continue
+        if _unique(ctx, cand["sel"], idx, snap):
+            return _flag(cand)
+    scoped = scoped_by_context(ctx, el, idx, snap) if idx is not None else None
+    if scoped:
+        return _flag(scoped)
+    xp = robula_xpath(ctx, el, vol, idx, snap)
+    if xp:
+        # Reaching XPath means nothing semantic identified this element. Usually
+        # that is an accessibility gap in the app, and saying so is more useful
+        # than silently emitting a structural locator.
+        hint = None
+        if not el.get("accessible_name") and not el.get("testid"):
+            hint = (f"<{el['tag']}> has no accessible name and no test id, so only a "
+                    f"structural locator was possible — an aria-label would fix both "
+                    f"this and the screen-reader experience")
+        return {"strategy": "xpath", "sel": f"xpath={xp}", "fragile": hint,
+                **code_for(xp)}
+    return None
+
+

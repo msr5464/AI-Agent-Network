@@ -12,6 +12,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -26,7 +27,6 @@ from shared import diagnosis
 def classify(tmp_path_factory):
     """Import 03_classify with the triaging agent's own `lib` package."""
     tmp = tmp_path_factory.mktemp("tri")
-    os.environ.setdefault("AUDIT_DIR", str(tmp))
     saved_path, saved = list(sys.path), {
         n: m for n, m in sys.modules.items() if n == "lib" or n.startswith("lib.")}
     for name in saved:
@@ -37,7 +37,10 @@ def classify(tmp_path_factory):
         spec = importlib.util.spec_from_file_location(
             "classify_step", AGENT / "actions" / "03_classify.py")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Set only for the import (the step reads them into module constants); left in
+        # os.environ they leaked into every later test in the session.
+        with mock.patch.dict(os.environ, {"AUDIT_DIR": str(tmp)}):
+            spec.loader.exec_module(module)
         yield module
     finally:
         for name in [n for n in sys.modules if n == "lib" or n.startswith("lib.")]:

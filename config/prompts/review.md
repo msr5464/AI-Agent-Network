@@ -66,6 +66,7 @@ carry `"source": "diagnosis"`. Their categories say what was measured:
 | Verdict | Measured |
 |---|---|
 | `LOCATOR_STALE` | right page — some of the page object's own locators still match, the failing one does not |
+| `AMBIGUOUS_LOCATOR` | right page — the failing selector now matches more than one element |
 | `WRONG_PAGE` | none of them match, and another page object does |
 | `PRIOR_STEP_FAILED` | the last action was an interaction and the page never navigated |
 | `NOT_READY` / `TOO_SLOW` / `BLOCKED` | the element was present or the page still rendering when the wait expired |
@@ -74,5 +75,7 @@ carry `"source": "diagnosis"`. Their categories say what was measured:
 | `ELEMENT_GONE` | right page, and the element was absent on the last passing run too |
 | `FLAKY_TRANSIENT` | nothing structural, and this test has recovered before unaided |
 
-Only `LOCATOR_STALE` authorises an automated fix. Everything else stops with a
-remediation for a human, so misclassifying *into* it is the expensive direction.
+Only `LOCATOR_STALE` and `AMBIGUOUS_LOCATOR` authorise an automated fix (a
+classifier's `ELEMENT_NOT_FOUND` is also handed off, and healing diagnoses it
+again before editing). Everything else stops with a remediation for a human, so
+misclassifying *into* them is the expensive direction.

@@ -1,25 +1,32 @@
 {
-  "_comment": "Central per-repo metadata. Used by test-healing-agent and test-authoring-agent.",
-  "_usage": "shared/repo_config.py load_repo_config(repo_name) — falls back to GITHUB_REPO_AUTOMATION env var",
+  "_comment": "Per-repo metadata, keyed by GITHUB_REPO_AUTOMATION. `framework` is a fallback for shared/frameworks/detect.py when the repo's build files do not settle it. `reference_files` are the repo-relative files the authoring agent shows the model as worked examples: one module end to end (data, builder, helper, API client, a page object with its real base-page import block, and a web and an API test). Missing files are skipped; with no list, the model works from the repo's CLAUDE.md alone.",
   "Jarvis": {
-    "language": "java",
-    "framework": "TestNG + Selenium",
-    "default_branch": "main",
-    "test_runner": {
-      "cmd": ["mvn", "test", "-Dtest={class}#{method}"],
-      "test_dirs": ["src/test/java"],
-      "compile_cmd": ["mvn", "compile", "-q"]
-    },
-    "conventions_file": "CLAUDE.md",
-    "pr_checklist": [
-      "Locator uses id/name/data-cy — not positional XPath or generated class names",
-      "Uses framework wrappers (Element.click, WaitHelper.*) — no raw Selenium",
-      "No Thread.sleep — uses WaitHelper instead",
-      "AssertHelper used for all assertions — no raw TestNG Assert",
-      "Page object constructor follows mandatory pattern (super → PageFactory → waitForLoaderDisappeared → waitForPageLoad)",
-      "Navigation methods return the next page object",
-      "logStep in test classes only, logComment in page objects/helpers",
-      "No commented-out code or System.out.println"
+    "framework": "TestNG + Playwright",
+    "reference_files": [
+      "src/main/java/automation/modules/saucedemo/SauceDemoData.java",
+      "src/main/java/automation/modules/saucedemo/SauceDemoBuilder.java",
+      "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
+      "src/main/java/automation/modules/saucedemo/api/SauceDemoApi.java",
+      "src/main/java/automation/modules/saucedemo/web/LoginPage.java",
+      "src/main/java/automation/core/api/ApiHelper.java",
+      "src/test/java/automation/saucedemo/SauceDemoApiTest.java",
+      "src/test/java/automation/saucedemo/SauceDemoWebTest.java"
     ]
+  },
+  "Playwright-Automation-Framework": {
+    "framework": "TestNG + Playwright",
+    "reference_files": [
+      "src/main/java/automation/modules/saucedemo/SauceDemoData.java",
+      "src/main/java/automation/modules/saucedemo/SauceDemoBuilder.java",
+      "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
+      "src/main/java/automation/modules/saucedemo/api/SauceDemoApi.java",
+      "src/main/java/automation/modules/saucedemo/web/LoginPage.java",
+      "src/main/java/automation/core/api/ApiHelper.java",
+      "src/test/java/automation/saucedemo/SauceDemoApiTest.java",
+      "src/test/java/automation/saucedemo/SauceDemoWebTest.java"
+    ]
+  },
+  "Selenium-Automation-Framework": {
+    "framework": "TestNG + Selenium"
   }
 }

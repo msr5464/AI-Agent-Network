@@ -37,7 +37,7 @@ REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]
 from lib import artifacts
 from lib.settings import Config
 
-INPUT_DIR = os.environ.get("INPUT_DIR", Config.INPUT_DIR)
+TRIAGING_INPUT_DIR = os.environ.get("TRIAGING_INPUT_DIR", Config.TRIAGING_INPUT_DIR)
 TABLE_NAME_OVERRIDE = os.environ.get("TABLE_NAME", "")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -91,15 +91,15 @@ def main():
     report_name = build_tag
     table_name = TABLE_NAME_OVERRIDE or None
 
-    # Resolve input directory: look for a subfolder matching build_tag, else use INPUT_DIR directly
-    input_path = Path(INPUT_DIR)
+    # Resolve input directory: look for a subfolder matching build_tag, else use TRIAGING_INPUT_DIR directly
+    input_path = Path(TRIAGING_INPUT_DIR)
     report_dir = input_path / build_tag
     if not report_dir.exists():
-        # Try INPUT_DIR itself (build_tag matches the root folder name)
-        if Path(INPUT_DIR).exists() and Path(INPUT_DIR).name == build_tag:
+        # Try TRIAGING_INPUT_DIR itself (build_tag matches the root folder name)
+        if Path(TRIAGING_INPUT_DIR).exists() and Path(TRIAGING_INPUT_DIR).name == build_tag:
             report_dir = input_path
         else:
-            # Fall back to INPUT_DIR root and scan for latest
+            # Fall back to TRIAGING_INPUT_DIR root and scan for latest
             report_dir = input_path
     log(f"Input dir: {report_dir}")
 
@@ -131,8 +131,8 @@ def main():
     try:
         recurring = memory.detect_recurring_failures(
             current_failure_names,
-            days=Config.FLAKY_TESTS_LAST_RUNS,
-            min_occurrences=Config.FLAKY_TESTS_MIN_FAILURES,
+            days=Config.TRIAGING_FLAKY_TESTS_LAST_RUNS,
+            min_occurrences=Config.TRIAGING_FLAKY_TESTS_MIN_FAILURES,
             report_name=report_name,
             all_test_names=all_test_names,
             table_name=table_name,

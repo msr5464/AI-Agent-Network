@@ -1,0 +1,35 @@
+Module: saucedemo
+Type: api
+API URL: https://jsonplaceholder.typicode.com
+
+Auth: none. JSONPlaceholder is a public mock API — no token, API key or login call is needed.
+Headers: send "Content-Type: application/json; charset=UTF-8" on every request that has a body (POST, PUT, PATCH).
+Writes are faked: POST, PUT, PATCH and DELETE return realistic responses but save nothing,
+so the id a POST returns cannot be read back. The follow-up calls use the existing todo 1.
+
+Steps:
+1. Create a todo:
+   curl -X POST https://jsonplaceholder.typicode.com/todos \
+     -H "Content-Type: application/json; charset=UTF-8" \
+     -d '{"userId": 1, "title": "Buy Sauce Labs Backpack", "completed": false}'
+2. Verify the response status code is 201.
+3. Verify id is present, and userId, title and completed match the request body.
+4. Fetch todo 1:
+   curl https://jsonplaceholder.typicode.com/todos/1
+5. Verify the response status code is 200, id is 1 and userId is 1.
+6. Replace todo 1:
+   curl -X PUT https://jsonplaceholder.typicode.com/todos/1 \
+     -H "Content-Type: application/json; charset=UTF-8" \
+     -d '{"id": 1, "userId": 1, "title": "Buy Sauce Labs Bike Light", "completed": false}'
+7. Verify the response status code is 200 and title is "Buy Sauce Labs Bike Light".
+8. Mark todo 1 as completed:
+   curl -X PATCH https://jsonplaceholder.typicode.com/todos/1 \
+     -H "Content-Type: application/json; charset=UTF-8" \
+     -d '{"completed": true}'
+9. Verify the response status code is 200, completed is true and title is not empty.
+10. Delete todo 1:
+    curl -X DELETE https://jsonplaceholder.typicode.com/todos/1
+11. Verify the response status code is 200.
+12. List the todos of user 1:
+    curl https://jsonplaceholder.typicode.com/users/1/todos
+13. Verify the response status code is 200, the response contains 20 todos, and every todo has userId 1.

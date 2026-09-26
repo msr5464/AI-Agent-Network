@@ -5,12 +5,12 @@ set -euo pipefail
 # agents/test-triaging-agent/run.sh
 # Orchestrates a full test-triaging-agent session (5 steps).
 #
-# Usage (via Makefile):
-#   make run AGENT=test-triaging-agent                          # scout mode
-#   make run AGENT=test-triaging-agent BUILD_TAG=ProdSanity-541 # direct mode
+# Usage:
+#   ./scripts/run-triaging-agent.sh                   # scout mode
+#   ./scripts/run-triaging-agent.sh ProdSanity-541    # direct mode
 #
 # Stop early:
-#   STOP_AFTER=collect make run AGENT=test-triaging-agent
+#   STOP_AFTER=collect ./scripts/run-triaging-agent.sh
 #   Valid values: scout, collect, classify, review
 #
 # Output: HTML report + agents/test-healing-agent/queue/<tag>.json (if APPROVED)
@@ -50,7 +50,6 @@ log "test-triaging-agent | mode=$MODE"
 [[ -n "$BUILD_TAG" ]] && log "build_tag=$BUILD_TAG"
 log "session=$SESSION_ID"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
 
 # Write session init
 cat > "$AUDIT_DIR/00-session-init.md" << EOF
@@ -85,7 +84,7 @@ declare -a STEP_DURATIONS=()
 
 # ── Step 01 — Scout ────────────────────────────────────────────────────────────
 if [[ "$MODE" == "scout" ]]; then
-  run_step "[01/05] Scout" "python3 '$AGENT_DIR/actions/01_scout.py'"
+  run_step "[01/05] Scout" "python3 '$AGENT_DIR/actions/01_scout.py'" scout
 
   BUILD_TAG=$(cat "$AUDIT_DIR/.selected-buildtag" 2>/dev/null || true)
   if [[ -z "$BUILD_TAG" ]]; then
@@ -122,32 +121,31 @@ fi
 stop_check scout
 
 # ── Step 02 — Collect ─────────────────────────────────────────────────────────
-run_step "[02/05] Collect" "python3 '$AGENT_DIR/actions/02_collect.py'"
+run_step "[02/05] Collect" "python3 '$AGENT_DIR/actions/02_collect.py'" collect
 
 stop_check collect
 
 # ── Step 03 — Classify ────────────────────────────────────────────────────────
-run_step "[03/05] Classify" "python3 '$AGENT_DIR/actions/03_classify.py'"
+run_step "[03/05] Classify" "python3 '$AGENT_DIR/actions/03_classify.py'" classify
 
 stop_check classify
 
 # ── Step 04 — Review ──────────────────────────────────────────────────────────
-run_step "[04/05] Review" "python3 '$AGENT_DIR/actions/04_review.py'"
+run_step "[04/05] Review" "python3 '$AGENT_DIR/actions/04_review.py'" review
 
 stop_check review
 
 # ── Step 05 — Ship ────────────────────────────────────────────────────────────
-run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'"
+run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'" ship
 
 # ── Final summary ─────────────────────────────────────────────────────────────
+flush_step_done
 TOTAL_ELAPSED=$(elapsed_since $SESSION_START)
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log "Done. Total time: $(fmt_duration $TOTAL_ELAPSED)"
 echo ""
-for i in "${!STEP_NAMES[@]}"; do
-  printf "  %-50s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
-done
+print_step_table 50
 echo ""
 log "Audit: $AUDIT_DIR"
 
@@ -156,6 +154,6 @@ SAFE_BT="${BUILD_TAG//\//-}"
 QUEUE_FILE="$REPO_ROOT/agents/test-healing-agent/queue/${SAFE_BT}.json"
 if [[ -f "$QUEUE_FILE" ]]; then
   log "Queued for test-healing-agent: agents/test-healing-agent/queue/${SAFE_BT}.json"
-  log "Run: make run AGENT=test-healing-agent BUILD_TAG=$BUILD_TAG"
+  log "Run: ./scripts/run-healing-agent.sh $BUILD_TAG"
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

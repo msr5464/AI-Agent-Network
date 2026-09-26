@@ -3,25 +3,18 @@
 
   # QA Agent Network
 
-  [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
+  [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 </div>
 
 **🌐 [msr5464.github.io/ai-agent-network](https://msr5464.github.io/ai-agent-network.html)**
 
-*An AI-driven multi-agent system for end-to-end QA automation — authoring tests, triaging failures, and self-healing broken locators.*
+*An AI-driven multi-agent system for end-to-end QA automation — authoring tests, triaging failures, healing broken locators, and adapting tests when the product changes.*
 
----
-
-**📖 Read the feature deep-dives on the portfolio site:**
-
-| Feature | Write-up |
-|---------|----------|
-| Full system overview | [msr5464.github.io/ai-agent-network](https://msr5464.github.io/ai-agent-network.html) |
-| Test Authoring Agent | [feature-test-authoring](https://msr5464.github.io/feature-test-authoring.html) |
-| Test Triaging Agent | [feature-test-triaging](https://msr5464.github.io/feature-test-triaging.html) |
-| Test Healing Agent | [feature-test-healing](https://msr5464.github.io/feature-test-healing.html) |
-| Talk to Tests (RAG Chat) | [feature-rag-chat](https://msr5464.github.io/feature-rag-chat.html) |
+It works on a separate Java automation repo (the *automation repo*, named by
+`GITHUB_REPO_AUTOMATION` — e.g. [Playwright-Automation-Framework](https://github.com/msr5464/Playwright-Automation-Framework))
+and opens GitHub PRs against it. Run the agents from the CLI, from CI, or from the
+[AI-Test-Studio](https://github.com/msr5464/AI-Test-Studio) web UI.
 
 ---
 
@@ -29,17 +22,30 @@
 
 | Doc | Purpose |
 |-----|---------|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, agent responsibilities, data flow, audit structure |
-| [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | Local dev setup, running agents, TESTING_MODE, debugging tips |
-| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common errors and how to fix them, per agent |
-| [SERVER_API.md](docs/SERVER_API.md) | REST + SSE endpoint reference for `qa_agents_server` |
-| [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Windows workstation + Jenkins CI integration |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the agents work: steps, handoffs, diagnosis, server execution model, audit layout |
+| [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | Local setup, running and resuming each agent, tests, debugging |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common errors and fixes, per agent |
+| [SERVER_API.md](docs/SERVER_API.md) | REST + SSE reference for `qa_agents_server` (what AI-Test-Studio calls) |
+| [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Running the server for a team, CI (Jenkins) integration |
+| [FRAMEWORK_INTEGRATION.md](docs/FRAMEWORK_INTEGRATION.md) | What the automation repo must provide; adding a framework plugin |
+| [docs/examples/queue/](docs/examples/queue/README.md) | Worked input examples for every agent |
+| [locator-eval/](locator-eval/README.md) | Offline benchmark for the healing locator engine |
+| [config/prompts/](config/prompts/README.md) | The prompt files the agents load at runtime |
+| `agents/<agent>/CLAUDE.md` | Each agent's full spec, for maintainers |
+
+Feature write-ups on the portfolio site:
+[Test Design](https://msr5464.github.io/feature-test-design.html) (an AI-Test-Studio feature) ·
+[Test Authoring](https://msr5464.github.io/feature-test-authoring.html) ·
+[Test Triaging](https://msr5464.github.io/feature-test-triaging.html) ·
+[Test Healing](https://msr5464.github.io/feature-test-healing.html) ·
+[Test Adaptation](https://msr5464.github.io/feature-test-adaptation.html) ·
+[Talk to Tests](https://msr5464.github.io/feature-rag-chat.html) (an AI-Test-Studio feature)
 
 ---
 
 ## How It Works
 
-Three independent agents, each owning a distinct slice of the QA lifecycle:
+Four independent agents, each owning a distinct slice of the QA lifecycle:
 
 ```
 Plain English test steps
@@ -47,12 +53,13 @@ Plain English test steps
          ▼
 ┌─────────────────────────────────────────────────────┐
 │  Agent 1: test-authoring-agent                      │
-│                                                     │
-│  01 Parse       → plain text → structured plan      │
-│  02 Validate Web→ Playwright headless selector scan │
-│  03 Generate    → write Java files to Jarvis repo   │
-│  04 Run + Fix   → mvn test → Claude fix → retry    │
-│  05 Ship        → branch + PR + Slack               │
+│  01 Parse     → plain text → structured plan        │
+│  02 Validate  → API: real HTTP calls                │
+│                 Web: Claude + Playwright MCP checks │
+│                 every selector in a real browser    │
+│  03 Generate  → write Java into the automation repo │
+│  04 Run + Fix → run the test → Claude fix → retry   │
+│  05 Ship      → branch + PR + Slack                 │
 └─────────────────────────────────────────────────────┘
 
 CI test build finishes
@@ -60,67 +67,64 @@ CI test build finishes
          ▼
 ┌─────────────────────────────────────────────────────┐
 │  Agent 2: test-triaging-agent                       │
-│                                                     │
-│  01 Scout    → pick unanalyzed build tag from DB    │
-│  02 Collect  → DB query + HTML log parse            │
-│  03 Classify → Claude batch-classifies failures     │
+│  01 Scout    → pick an unanalysed build from MySQL  │
+│  02 Collect  → DB query + HTML logs + artefacts     │
+│  03 Classify → failure diagnosis, then Claude       │
 │  04 Review   → adversarial review + verdict gate    │
 │  05 Ship     → HTML report + Slack + handoff JSON   │
 └──────────────────────────┬──────────────────────────┘
                            │  queue/<build_tag>.json
-                           │  (AUTOMATION_ISSUE HIGH ELEMENT_NOT_FOUND only)
+                           │  (locator failures only)
                            ▼
 ┌─────────────────────────────────────────────────────┐
 │  Agent 3: test-healing-agent                        │
-│                                                     │
-│  01 Fix  → Claude generates locator fix per test    │
-│            → applies fix, runs test, rolls back     │
-│              on failure, retries up to N times      │
-│  02 Ship → push branch → GitHub PR → Slack          │
+│  00 Reproduce → (standalone) run the named test     │
+│  01 Locate    → deterministic selector proposal     │
+│  01 Fix       → diagnose → edit locator → re-run  ↺ │
+│  02 Ship      → branch + PR + Slack                 │
+└─────────────────────────────────────────────────────┘
+
+A human learns the product changed (before anything goes red)
+         │
+         ▼
+┌─────────────────────────────────────────────────────┐
+│  Agent 4: test-adaptation-agent                     │
+│  01 Parse Change → 02 Scope → 03 Explore (live app) │
+│  → 04 Adapt → 05 Ship (PR is always NEEDS-REVIEW)   │
 └─────────────────────────────────────────────────────┘
 ```
 
-**Agent 1** takes plain English test steps and generates complete, framework-compliant Java test code, verifies it headlessly, runs it with Maven, fixes failures iteratively, and raises a GitHub PR.
+- **Authoring** turns plain-English steps into framework-compliant Java tests,
+  proves the selectors against the real app, runs the tests, fixes failures, and
+  raises a PR.
+- **Triaging** classifies every CI failure (`PRODUCT_BUG` / `AUTOMATION_ISSUE`),
+  writes an HTML report, and queues only the fixable locator failures for healing
+  ([exact rule](docs/ARCHITECTURE.md#handoff-criteria)).
+- **Healing** fixes broken locators and nothing else. A deterministic engine
+  proposes a selector from fingerprints recorded on the last green run; Claude
+  steps in only when it cannot. Every fix is proven by re-running the real test.
+  A PR ships for whatever passed.
+- **Adaptation** updates tests when the *product* changes, driven by a change
+  note. Because an edit may add or remove steps, "the test passes" is not enough
+  evidence — each test's **intent contract** (what it proves) is frozen before
+  any edit and checked afterwards.
 
-**Agent 2** classifies every CI failure as `PRODUCT_BUG` or `AUTOMATION_ISSUE`, writes an HTML report, and queues only the fixable locator failures for Agent 3.
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
 
-**Agent 3** picks up the queue, fixes broken locators using Claude, verifies each fix by running the test with Maven, and opens a GitHub PR. If only some tests are fixed, it still ships a PR for what passed and alerts on what didn't.
+---
 
-**Example Slack messages from Agent 3:**
+## Prerequisites
 
-All tests fixed → posted to `#qa-reports`
-```
-✅ QA Auto-Fix — ProdSanity-All-Tests-541
-8/8 tests fixed
-
-✅ Fixed (8):
-  • TestLogin.testLoginWithValidCredentials — updated locator [data-cy='submit-btn']
-  • TestDashboard.testDashboardLoadsCorrectly — updated locator #dashboard-header
-  • TestProfile.testEditProfileSaves — @FindBy css updated to [data-testid='save-btn']
-  • ... and 5 more
-  PR: https://github.com/org/automation-repo/pull/214
-
-Audit: 20260329-143022-fix-ProdSanity-All-Tests-541
-```
-
-Partial fix → posted to `#qa-critical`
-```
-🟡 QA Auto-Fix — ProdSanity-All-Tests-541
-5/8 tests fixed — 3 need manual attention
-
-✅ Fixed (5):
-  • TestLogin.testLoginWithValidCredentials — updated locator [data-cy='submit-btn']
-  • TestDashboard.testDashboardLoadsCorrectly — updated locator #dashboard-header
-  • ... and 3 more
-  PR: https://github.com/org/automation-repo/pull/214
-
-❌ Could not fix (3) — manual review required:
-  • TestCheckout.testCheckoutFlow — fix applied but test still failing
-  • TestPayment.testPaymentWithCard — unfixable: multiple candidate locators, ambiguous
-  • TestLogout.testSessionExpiry — test file not found in workspace
-
-Audit: 20260329-143022-fix-ProdSanity-All-Tests-541
-```
+| Tool | Why |
+|------|-----|
+| Python **3.10+** | The agents and server |
+| [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`), signed in (`claude auth login`) | Every model call goes through it |
+| Node.js 18+ with `npx` | The Playwright MCP server (browser validation and exploration) |
+| Chromium for Python Playwright (`python -m playwright install chromium`) | The locator engine |
+| GitHub CLI (`gh`) | Opening PRs (it uses `GITHUB_TOKEN`) |
+| JDK 21 + Maven 3.8+ | Compiling and running the automation repo's tests |
+| MySQL with your CI results | Triaging only |
+| `make` and `bash` | Entry points. On Windows use Git Bash or WSL |
 
 ---
 
@@ -129,30 +133,77 @@ Audit: 20260329-143022-fix-ProdSanity-All-Tests-541
 ### 1. Install
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/msr5464/QA-AI-Agent.git QA-Agent-Network
 cd QA-Agent-Network
 
-./scripts/setup.sh          # macOS / Linux
-.\scripts\setup.ps1         # Windows
+./scripts/setup.sh          # macOS / Linux: .venv, dependencies, config/.env
+.\scripts\setup.ps1         # Windows (no venv; uses the python on PATH)
+
+python -m playwright install chromium
 ```
 
-### 2. Configure
+`setup.sh` creates `config/.env` from `config/.env.example` if it does not exist yet.
+
+### 2. Minimum configuration
+
+Edit `config/.env`. [`config/.env.example`](config/.env.example) documents every
+setting and is the reference; these are the ones you must set:
 
 ```bash
-cp config/.env.example config/.env
+# Where the automation repo lives — one of:
+WORKSPACE_DIR=/path/to/parent          # repo at $WORKSPACE_DIR/$GITHUB_REPO_AUTOMATION (cloned if absent)
+# FRAMEWORK_DIR=/path/to/the/checkout  # or point at the checkout directly
+
+GITHUB_REPO_AUTOMATION=Playwright-Automation-Framework   # required, even with FRAMEWORK_DIR
+GITHUB_ORG=your-org-or-user
+GITHUB_TOKEN=ghp_...                   # repo scope: clone, push, PRs
+GITHUB_DEFAULT_BRANCH=main
+
+AUTO_PUSH=false                        # start with dry runs: no push, no PR
+
+# Optional: Slack (skipped when unset)
+# SLACK_BOT_TOKEN=xoxb-...
+# Triaging only: TRIAGING_DB_HOST / _PORT / _USER / _PASSWORD / _NAME
 ```
 
-Edit `config/.env` and fill in the required values (see Configuration Reference below).
+Anything exported in your shell overrides `config/.env` for that run.
+
+### 3. First run
+
+The seeded examples target the `saucedemo` module that
+Playwright-Automation-Framework already has:
+
+```bash
+cp docs/examples/queue/test-authoring-agent/saucedemo_web_product.txt \
+   agents/test-authoring-agent/queue/saucedemo.txt
+./scripts/run-authoring-agent.sh saucedemo
+```
+
+With `AUTO_PUSH=false` the run works **in your local checkout as it stands**
+(uncommitted changes included), and nothing is pushed. Every run leaves a full
+audit trail in `agents/<agent>/audit/<session-id>/`; browse it with
+`make dashboard`.
 
 ---
 
+## Running the agents
+
+`make help` lists every command. `MODULE` names a file in the agent's queue
+(`agents/<agent>/queue/<MODULE>.txt`); with no `MODULE`/`BUILD_TAG`, an agent
+takes the oldest item in its queue.
+
 ### Agent 1 — Test Authoring
 
-Generates Java test code from a plain English input file and raises a PR on the Jarvis automation repo.
-
 ```bash
-# Create an input file describing what to test
-cat > agents/test-authoring-agent/queue/payments.txt << 'EOF'
+./scripts/run-authoring-agent.sh payments                     # queue/payments.txt
+./scripts/run-authoring-agent.sh                              # oldest file in queue/
+TESTING_MODE=true ./scripts/run-authoring-agent.sh payments   # reuse cached steps 01–02
+START_FROM_STEP=4 SESSION_ID=<id> ./scripts/run-authoring-agent.sh   # resume
+```
+
+Input format ([examples](docs/examples/queue/README.md#test-authoring-agent)):
+
+```
 Module: payments
 Type: web
 
@@ -161,168 +212,149 @@ Steps:
 2. Login as Admin user
 3. Click New Payment and fill in recipient + amount
 4. Submit and verify success message appears
-EOF
-
-# Run (direct mode — process a specific module)
-make run AGENT=test-authoring-agent MODULE=payments
-
-# Queue mode — picks the oldest .txt file in queue/
-make run AGENT=test-authoring-agent
-
-# Dry-run — generates and tests locally, no PR pushed
-AUTO_PUSH=false make run AGENT=test-authoring-agent MODULE=payments
-
-# Testing mode — reuses cached step-01 and step-02 outputs (saves ~3 min per iteration)
-TESTING_MODE=true make run AGENT=test-authoring-agent MODULE=payments
 ```
 
-Outputs:
-- Java files written to the Jarvis automation repo
-- GitHub PR on the Jarvis repo (`feat/qa-autocreate/<module>-<timestamp>`)
-- Slack notification to `SLACK_NOTIFY_CHANNEL`
+Output: Java files in the automation repo, a PR on branch
+`authoring/<module>-<timestamp>`, and a Slack message.
 
-![Agent 1 run](docs/authoring-run.png)
-
----
+![Agent 1 run](docs/authoring-agent-run.png)
 
 ### Agent 2 — Test Triaging
 
-Analyses a CI build, classifies every failure, writes an HTML report, and queues fixable locator failures for Agent 3.
-
 ```bash
-# macOS / Linux
-./scripts/run-analyse.sh                              # auto-selects most recent unanalyzed build
-./scripts/run-analyse.sh ProdSanity-All-Tests-541     # specific build tag
-STOP_AFTER=classify ./scripts/run-analyse.sh          # stop early for inspection
+./scripts/run-triaging-agent.sh                             # scout: most recent unanalysed build
+./scripts/run-triaging-agent.sh ProdSanity-All-Tests-541    # a specific build tag
+STOP_AFTER=classify ./scripts/run-triaging-agent.sh         # stop early for inspection
 
-# Windows
-.\scripts\run-analyse.ps1 -BuildTag ProdSanity-All-Tests-541
+.\scripts\run-triaging-agent.ps1 -BuildTag ProdSanity-All-Tests-541   # Windows
 ```
 
-Outputs:
-- HTML report → `OUTPUT_DIR/`
-- Handoff file → `agents/test-healing-agent/queue/<build_tag>.json` (if fixable issues found)
-- Slack notification → `SLACK_NOTIFY_CHANNEL` or `SLACK_ALERT_CHANNEL`
+Output: an HTML report in `TRIAGING_OUTPUT_DIR/`, a handoff file in
+`agents/test-healing-agent/queue/<build_tag>.json` when anything is fixable, and
+a Slack message.
 
-![Agent 2 triage report](docs/sample_report.png)
-
----
+![Agent 2 triage report](docs/triaging-agent-report.png)
 
 ### Agent 3 — Test Healing
 
-Picks up the handoff from Agent 2, fixes broken locators, verifies with Maven, and raises a PR.
-
 ```bash
-# macOS / Linux
-./scripts/run-autofix.sh                              # process oldest item in queue
-./scripts/run-autofix.sh ProdSanity-All-Tests-541     # specific build tag
-./scripts/run-autofix.sh /path/to/handoff.json        # pass handoff file directly
-AUTO_PUSH=false ./scripts/run-autofix.sh              # dry-run: fix + test locally, no PR
+# From a triaging handoff
+./scripts/run-healing-agent.sh                              # oldest handoff in the queue
+./scripts/run-healing-agent.sh ProdSanity-All-Tests-541     # a specific build tag
+./scripts/run-healing-agent.sh /path/to/handoff.json        # a handoff file
 
-# Windows
-.\scripts\run-autofix.ps1 -BuildTag ProdSanity-All-Tests-541
-.\scripts\run-autofix.ps1 -HandoffFile C:\path\to\handoff.json
+# Standalone: name the broken test, no triaging needed
+./scripts/run-healing-agent.sh --test LoginTest#testLogin
+./scripts/run-healing-agent.sh --test automation.saucedemo.SauceDemoWebTest   # a whole class
+REPAIR=true ./scripts/run-healing-agent.sh --test LoginTest#testLogin    # park the failing browser for live inspection
+FORCE=true  ./scripts/run-healing-agent.sh --test LoginTest#testLogin    # proceed even if it is not a locator failure
+
+.\scripts\run-healing-agent.ps1 -BuildTag ProdSanity-All-Tests-541   # Windows
 ```
 
-Outputs:
-- GitHub PR with all passing fixes on the Jarvis repo (`chore/qa-autofix/<build-tag>`)
-- Slack notification with per-test breakdown
+Output: a PR on branch `healing/<session-id>` with every fix that passed, and a
+Slack message with the per-test breakdown — partial success still ships.
 
-![Agent 3 run](docs/healing-run.png)
+![Agent 3 run](docs/healing-agent-run.png)
 
----
+### Agent 4 — Test Adaptation
 
-## Configuration Reference
+Healing asks "why did this fail?". Adaptation asks "the product changed — what
+should the tests do now?".
 
-### Shared
+```bash
+./scripts/run-adaptation-agent.sh checkout
+EXPLORE_ONLY=true       ./scripts/run-adaptation-agent.sh checkout   # flow map only
+ADAPTATION_APPLY=false  ./scripts/run-adaptation-agent.sh checkout   # propose, do not edit
+START_FROM_STEP=4 SESSION_ID=<sid> ./scripts/run-adaptation-agent.sh   # resume
+```
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `CLAUDE_CLI_PATH` | `claude` | Path to Claude CLI binary |
-| `GITHUB_TOKEN` | | GitHub personal access token (repo scope) |
-| `GITHUB_ORG` | | GitHub org or username owning the automation repo |
-| `GITHUB_REPO_AUTOMATION` | `Jarvis` | Name of the automation repo directory under `WORKSPACE_DIR` |
-| `GITHUB_DEFAULT_BRANCH` | `main` | Base branch for PRs |
-| `GITHUB_PR_REVIEWERS` | | Comma-separated list of PR reviewer handles |
-| `WORKSPACE_DIR` | | Absolute path to the parent directory containing the automation repo. If the repo is absent it is cloned automatically using `GITHUB_TOKEN`. |
-| `SLACK_BOT_TOKEN` | | Slack Bot OAuth token (`xoxb-...`) |
-| `SLACK_NOTIFY_CHANNEL` | `#qa-reports` | Channel for normal results and successful fixes |
-| `SLACK_ALERT_CHANNEL` | `#qa-critical` | Channel for failures needing human attention |
-| `AUTO_PUSH` | `true` | Set `false` to skip PR creation (dry-run mode) |
+Change note, `agents/test-adaptation-agent/queue/<module>.txt`
+([examples](docs/examples/queue/README.md#test-adaptation-agent)):
 
-### Agent 1 — test-authoring-agent
+```
+Module: checkout
+Type: web
+Affects: automation.checkout.*
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `AUTOCREATE_MODEL` | `claude-opus-4-6` | Claude model for all AI steps (parse, validate, generate, fix) |
-| `AUTOCREATE_BRANCH_PREFIX` | `feat/qa-autocreate` | Branch prefix. Full name: `<prefix>/<module>-<timestamp>` |
-| `AUTOCREATE_ENVIRONMENT` | `staging` | Maven `-Denvironment=` value when running generated tests |
-| `AUTOCREATE_COUNTRY` | `SG` | Maven `-Dcountry=` value |
-| `MAX_FIX_ATTEMPTS` | `3` | Max retry cycles if the generated test fails |
-| `TESTING_MODE` | `false` | Set `true` to cache step-01 and step-02 outputs and skip them on reruns |
-| `PLAYWRIGHT_TIMEOUT_MS` | `30000` | Timeout per step in the headless web validation script |
-| `PLAYWRIGHT_HEADLESS` | `true` | Set `false` to run validation browser in headed mode (useful for debugging selectors) |
-| `NODE_PATH` | `node` | Path to Node.js binary |
+What changed:
+1. After login a "Choose workspace" screen now appears before the dashboard.
+2. The 3-step checkout wizard is now 2 steps.
 
-### Agent 2 — test-triaging-agent
+Expected outcome unchanged: an order is placed and a confirmation number is shown.
+```
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `DB_HOST` | `localhost` | MySQL host |
-| `DB_PORT` | `3306` | MySQL port |
-| `DB_USER` | `root` | MySQL user |
-| `DB_PASSWORD` | | MySQL password |
-| `DB_NAME` | `qa_results` | MySQL database name |
-| `CLASSIFIER_MODEL` | `claude-sonnet-4-6` | Claude model for failure classification |
-| `REVIEWER_MODEL` | `claude-sonnet-4-6` | Claude model for adversarial review |
-| `CLASSIFIER_EFFORT` | `medium` | Effort level for classifier (`low` `medium` `high`) |
-| `REVIEWER_EFFORT` | `medium` | Effort level for reviewer |
-| `BUILD_TAG` | | Skip scout and analyse this build directly |
-| `STOP_AFTER` | | Stop pipeline after: `scout` `collect` `classify` `review` |
-| `SCOUT_LOOKBACK_DAYS` | `7` | How far back scout looks for unanalyzed builds |
-| `MAX_REVIEW_ROUNDS` | `2` | Max classifier ↔ reviewer debate rounds |
-| `FLAKY_TESTS_LAST_RUNS` | `10` | Window for flaky test detection |
-| `FLAKY_TESTS_MIN_FAILURES` | `5` | Min failures in window to be flagged as flaky |
-| `INPUT_DIR` | `testdata` | Directory containing HTML test reports |
-| `OUTPUT_DIR` | `reports` | Directory for generated HTML triage reports |
-| `AUTOFIX_QUEUE_DIR` | `agents/test-healing-agent/queue` | Where to write handoff files for Agent 3 |
+Output:
+- A blast radius: the named tests, the tests that pass today but share the changed
+  surface, and what was excluded as framework infrastructure — with the cost of
+  verifying them.
+- An ordered flow map of what a browser actually observed, with every selector
+  re-counted in Python rather than taken on the model's word.
+- A PR that is **always NEEDS-REVIEW**, carrying each edit against the observed
+  step that justified it.
 
-### Agent 3 — test-healing-agent
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `AUTOFIX_MODEL` | `claude-opus-4-6` | Claude model for fix generation |
-| `AUTOFIX_BRANCH_PREFIX` | `chore/qa-autofix` | Branch prefix. Full name: `<prefix>/<build-tag>` |
-| `MAX_FIX_ATTEMPTS` | `2` | Retry cycles if tests still fail after fix |
-| `AUTO_FIX_MAX_FIXES_PER_RUN` | `5` | Max tests to fix per session |
-| `TEST_RUNNER_CMD` | auto-detect | Override test runner. Placeholders: `{class}` `{class_simple}` `{method}` |
-| `REPO_CONTEXT_FILE` | `CONVENTIONS.md` | Path to conventions file (relative to automation repo root, or absolute). Falls back to the bundled `agents/test-healing-agent/CONVENTIONS.md`. |
+It refuses rather than guesses when the change note does not account for what it
+saw, when the expected *outcome* changed (the spec moved, not the test), when no
+login session can be restored or minted, or when the flow ends in something that
+cannot be undone. See [agents/test-adaptation-agent/CLAUDE.md](agents/test-adaptation-agent/CLAUDE.md).
 
 ---
 
 ## Slack Notifications
 
-Both Agent 2 and Agent 3 post to Slack using the **Slack Bot API** (`chat.postMessage`).
+All four agents post through the Slack Bot API (`chat.postMessage`). Without
+`SLACK_BOT_TOKEN`, Slack is skipped silently.
 
-### Setup
-
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → From scratch
+1. [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → From scratch
 2. **OAuth & Permissions** → Bot Token Scopes → add `chat:write`
-3. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-...`)
+3. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-...`) into `SLACK_BOT_TOKEN`
 4. In each target channel, run `/invite @your-bot-name`
-
-### What gets posted
 
 | Event | Channel |
 |-------|---------|
-| Agent 1: PR created for generated tests | `NOTIFY` |
-| Agent 2: analysis complete, verdict APPROVED | `NOTIFY` |
-| Agent 2: analysis complete, verdict NEEDS-HUMAN | `ALERT` |
-| Agent 3: all tests fixed, PR created | `NOTIFY` |
-| Agent 3: some tests fixed, some failed | `ALERT` |
-| Agent 3: no tests could be fixed | `ALERT` |
+| Authoring: tests pass, or not run | `SLACK_NOTIFY_CHANNEL` |
+| Authoring: tests failing, stuck, or push/PR failed | `SLACK_ALERT_CHANNEL` |
+| Adaptation: PR created | `SLACK_NOTIFY_CHANNEL` |
+| Adaptation: escalated, or push/PR failed | `SLACK_ALERT_CHANNEL` |
+| Triaging: verdict APPROVED | `SLACK_NOTIFY_CHANNEL` |
+| Triaging: verdict NEEDS-HUMAN | `SLACK_ALERT_CHANNEL` |
+| Healing: all tests fixed | `SLACK_NOTIFY_CHANNEL` |
+| Healing: some or none fixed | `SLACK_ALERT_CHANNEL` |
+| Any run crashed | `SLACK_ALERT_CHANNEL` |
 
-If `SLACK_ALERT_CHANNEL` is not set, all messages go to `SLACK_NOTIFY_CHANNEL`. If `SLACK_BOT_TOKEN` is not set, Slack is silently skipped.
+With no `SLACK_ALERT_CHANNEL`, alerts go to `SLACK_NOTIFY_CHANNEL`.
+
+Example healing message (partial fix):
+```
+🟡 QA Auto-Fix — ProdSanity-All-Tests-541
+5/8 tests fixed — 3 need manual attention
+
+✅ Fixed (5):
+  • TestLogin.testLoginWithValidCredentials — updated locator [data-cy='submit-btn']
+  • ... and 4 more
+  PR: https://github.com/org/automation-repo/pull/214
+
+❌ Could not fix (3) — manual review required:
+  • TestCheckout.testCheckoutFlow — fix applied but test still failing
+  • TestPayment.testPaymentWithCard — unfixable: multiple candidate locators, ambiguous
+  • TestLogout.testSessionExpiry — test file not found in workspace
+```
+
+---
+
+## HTTP Server (for AI-Test-Studio)
+
+AI-Test-Studio's authoring, healing and adaptation pages drive the agents through
+`qa_agents_server`. CLI users do not need it.
+
+```bash
+bash scripts/run-server.sh      # http://127.0.0.1:6001
+```
+
+It runs several agents in parallel, each in its own git worktree, per user. On
+first boot it seeds each queue from `docs/examples/queue/`. Endpoints, identity,
+configuration and the admin **Agent Settings** page are covered in
+[SERVER_API.md](docs/SERVER_API.md); team deployment in [DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
@@ -331,126 +363,26 @@ If `SLACK_ALERT_CHANNEL` is not set, all messages go to `SLACK_NOTIFY_CHANNEL`. 
 ```
 QA-Agent-Network/
 ├── agents/
-│   ├── test-authoring-agent/      # Agent 1 — generate Java tests from plain English
-│   │   ├── run.sh                 # Orchestrator (steps 01–05)
-│   │   ├── CLAUDE.md              # Full agent spec (read by Claude CLI at runtime)
-│   │   ├── queue/                 # Input .txt files (one per module/feature)
-│   │   └── actions/
-│   │       ├── 01_parse.py        # Plain text → structured generation plan (Claude)
-│   │       ├── 02_validate_web.py # Generate + run headless Playwright → selector map
-│   │       ├── 03_generate.py     # Write Java files to automation repo (Claude)
-│   │       ├── 04_run_and_fix.py  # mvn test → Claude fix → retry loop
-│   │       └── 05_ship.py         # Branch + commit + push + gh pr create
-│   │
-│   ├── test-triaging-agent/       # Agent 2 — classify CI failures, write report
-│   │   ├── run.sh                 # Orchestrator (steps 01–05)
-│   │   ├── CLAUDE.md              # Full agent spec
-│   │   ├── feedback/              # skip-buildtags.json
-│   │   └── actions/
-│   │       ├── 01_scout.py        # Pick unanalyzed build tag from DB
-│   │       ├── 02_collect.py      # DB query + HTML log parse + flaky detection
-│   │       ├── 03_classify.py     # Batch classify failures via Claude
-│   │       ├── 04_review.py       # Adversarial review + .verdict gate
-│   │       └── 05_ship.py         # HTML report + handoff JSON + Slack
-│   │
-│   └── test-healing-agent/        # Agent 3 — fix broken locators, raise PR
-│       ├── run.sh                 # Orchestrator (queue / direct / file-path mode)
-│       ├── CLAUDE.md              # Full agent spec
-│       ├── CONVENTIONS.md         # Fallback conventions file for Claude
-│       ├── queue/                 # Handoff JSON files from Agent 2
-│       ├── feedback/              # known-issues.json (patterns to skip auto-fix)
-│       ├── lib/
-│       │   └── code_analyzer.py   # Static analysis: locate test files, page objects, elements
-│       └── actions/
-│           ├── 01_fix.py          # Build context → Claude fix → apply → mvn verify → commit
-│           └── 02_ship.py         # Push branch → gh pr create → Slack
-│
-├── shared/                        # Shared Python + shell helpers used by all agents
-│   ├── claude.py                  # Claude CLI wrapper
-│   ├── github.py                  # GitHub API helpers
-│   ├── slack.py                   # Slack Bot API helpers
-│   ├── git.py                     # Git command wrappers
-│   ├── log.py                     # Structured logging
-│   ├── audit.py                   # Audit trail helpers
-│   ├── load_env.sh                # .env loader (root → agent override)
-│   └── session.sh                 # Session helpers: log, run_step, fmt_duration
-│
-├── qa_agents_server/              # Thin HTTP + SSE server for UI integration
-│   ├── app.py
-│   ├── routes.py
-│   └── runner.py
-│
-├── config/
-│   ├── .env.example               # All env vars documented with defaults
-│   └── prompts.yaml               # Prompt templates
-│
-├── scripts/
-│   ├── run-analyse.sh / .ps1      # Entry point for Agent 2
-│   ├── run-autofix.sh / .ps1      # Entry point for Agent 3
-│   ├── run-server.sh              # Start the HTTP server
-│   └── setup.sh / .ps1            # Install dependencies
-│
-└── tests/                         # Unit tests
+│   ├── test-authoring-agent/   # run.sh, actions/01–05, CLAUDE.md, queue/, audit/
+│   ├── test-triaging-agent/    # run.sh, actions/01–05, lib/, feedback/
+│   ├── test-healing-agent/     # run.sh, actions/00–02, lib/, queue/
+│   └── test-adaptation-agent/  # run.sh, actions/01–05, lib/, queue/
+├── shared/                     # helpers used by every agent (claude, git, diagnosis, locator engine, frameworks/, …)
+├── qa_agents_server/           # HTTP + SSE server for AI-Test-Studio
+├── config/                     # .env.example, prompts/, skills/, locator.yaml, repo-map.json
+├── connectors/mcp/             # MCP server configs used by scripts/setup-mcp.sh
+├── scripts/                    # setup, run-*, run-server, audit viewer, maintenance tools
+├── docs/                       # these docs + examples/queue/
+├── locator-eval/               # locator engine benchmark
+└── tests/unit/                 # unit tests (make test)
 ```
-
----
-
-## HTTP Server (for UI integration)
-
-The repo ships a thin HTTP + SSE server (`qa_agents_server/`) used by the AI Test Studio "QA Agents" tab to trigger authoring runs and stream live progress. CLI users do not need it.
-
-```bash
-bash scripts/run-server.sh
-# Listens on http://0.0.0.0:8765 by default
-```
-
-Key endpoints (scoped to `test-authoring-agent` for v1):
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET`  | `/health` | Service health + active run id |
-| `GET`  | `/agents/test-authoring-agent/queue` | List feature files in `queue/` |
-| `POST` | `/agents/test-authoring-agent/queue` | Create or update a feature file |
-| `POST` | `/agents/test-authoring-agent/run` | Trigger a run — returns `session_id` |
-| `GET`  | `/agents/test-authoring-agent/run/active` | Active run (for UI re-attach) |
-| `GET`  | `/agents/test-authoring-agent/run/<id>/stream?offset=N` | SSE: live + replay |
-| `POST` | `/agents/test-authoring-agent/run/<id>/cancel` | SIGTERM the run |
-| `GET`  | `/agents/test-authoring-agent/sessions` | Audit history |
-| `GET`  | `/agents/test-authoring-agent/sessions/<id>` | Full session detail |
-| `GET`  | `/settings` | Agent settings schema + current values (secrets masked) |
-| `PUT`  | `/settings` | Save agent settings to `config/.env` |
-
-Environment overrides:
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `QA_AGENT_SERVER_HOST` | `0.0.0.0` | Bind host |
-| `QA_AGENT_SERVER_PORT` | `8765` | Bind port |
-| `AI_TEST_STUDIO_URL` | `http://localhost:5001` | CORS allowlist |
-| `QA_AGENT_RUN_TIMEOUT_SECONDS` | `7200` | SIGKILL after this many seconds |
-| `QA_AGENT_STALE_AFTER_SECONDS` | `900` | Untouched for this long ⇒ treated as abandoned, not running |
 
 ---
 
 ## Troubleshooting
 
-**"Queue is empty — nothing to fix"**
-Run Agent 2 first. Agent 3's queue is only populated when Agent 2 finds `AUTOMATION_ISSUE + HIGH confidence + ELEMENT_NOT_FOUND` failures with an `APPROVED` verdict.
-
-**"Automation repo not found at \<path\>"**
-The automation repo will be cloned automatically if `GITHUB_TOKEN`, `GITHUB_ORG`, and `GITHUB_REPO_AUTOMATION` are set. Check that these are all present in `config/.env`.
-
-**"No test results found in database"**
-Your test runner must insert results into MySQL before running Agent 2. The agent queries by `buildTag` (the directory name of the test report).
-
-**"claude: command not found"**
-Set `CLAUDE_CLI_PATH` in `config/.env` to the full path of the Claude CLI binary.
-
-**PR not created after fix**
-Check `agents/test-healing-agent/audit/<session>/02-ship.md` for the exact reason. Common causes: push failed (check `GITHUB_TOKEN` permissions), no successful fixes to commit, `AUTO_PUSH=false`.
-
-**Generated tests fail during step 04**
-Set `TESTING_MODE=true` and re-run — the cached step-01/02 outputs are reused so you can iterate on generation and fix logic without waiting for parsing and web validation on every run.
+See [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). The first place to look is
+always the session's audit folder: `agents/<agent>/audit/<session-id>/`.
 
 ---
 
@@ -458,41 +390,8 @@ Set `TESTING_MODE=true` and re-run — the cached step-01/02 outputs are reused 
 
 MIT — see [LICENSE](LICENSE)
 
----
-
 ## Creator
 
 **Mukesh Rajput** · [LinkedIn](https://www.linkedin.com/in/mukesh-rajput/)
 
 <div align="center"><strong>Made with ❤️ for the Engineering Team</strong></div>
-
-### Agent Settings (Admin UI)
-
-The operational knobs in `config/.env` — GitHub org/repo/token, Slack channels,
-`WORKSPACE_DIR`, `AUTO_PUSH`, per-agent models, retry budgets, the triaging DB and
-its thresholds — are editable from **🤖 Agent Settings** on the AI-Test-Studio admin
-page, instead of hand-editing the file on the host.
-
-- Schema lives in `qa_agents_server/agent_settings.py`; the admin page renders
-  straight off it, so adding a field there is the only change a new setting needs.
-- `GET`/`PUT /settings` on this server do the work. AI-Test-Studio reaches them via
-  `/api/admin/agent-settings`, which is admin-gated — deliberately not through
-  `/api/agents/*`, which enforces no auth.
-- Saves write `config/.env` **and** the server's own `os.environ`, so a change
-  applies to the next agent run without a restart.
-- Secrets come back partially masked (`ghp**********f9c`). Submitting the mask
-  unchanged preserves the stored value; type a new one to replace it.
-- Per-invocation values (`TEST_NAME`, `BUILD_TAG`, `FORCE`, …) are deliberately not
-  exposed — they are set per run, and pinning them in `config/.env` would apply
-  them to every run.
-- A key also declared in `$REPO_ROOT/.env` or `agents/<agent>/.env` wins at run
-  time (see `shared/load_env.sh`); the page flags those fields rather than letting
-  the save look like it did nothing.
-
-### Agent HTTP API
-
-`qa_agents_server` serves every agent under `/agents/<agent>/*`
-(`test-authoring-agent`, `test-healing-agent`). Adding another means adding an
-`AgentSpec` to `qa_agents_server/agents.py` — the run registry, SSE streaming and
-cancellation are agent-agnostic. One run executes at a time across all agents,
-because they share the automation-repo checkout.

@@ -48,6 +48,16 @@ DASHBOARD_COVERED = snapshot(
     '<header><img class="avatar-user" src="a.png">'
     '<summary aria-label="View profile and more">me</summary></header>')
 
+# The same page with a second element the selector also matches. Modelled on the
+# real capture that prompted the rule: a login form that grew a "Use OTP to Login"
+# button beside "Login", both of them `button[type='submit']`, which is a
+# strict-mode violation rather than an element that failed to appear.
+DASHBOARD_AMBIGUOUS = snapshot(
+    "https://app.example.com/", "Dashboard · Example", "logged-in",
+    '<header><img class="avatar-user" src="a.png">'
+    '<img class="avatar-user" src="b.png">'
+    '<summary aria-label="View profile and more">me</summary></header>')
+
 # The application served an error page in place of the real one.
 ERROR_PAGE = snapshot(
     "https://app.example.com/", "Error · Example", "error",
@@ -140,9 +150,19 @@ def context(page_object="DashboardPage", anchors=None, navigation=None,
 
 def baseline_record(page_object="DashboardPage", coverage=None,
                     url="https://app.example.com/", title="Dashboard · Example",
-                    body_class="logged-in"):
-    """A recorded good-run fingerprint, as automation.core.Baseline writes it."""
-    return {"pageObject": page_object, "recordedAt": "2026-08-01T00:00:00",
+                    body_class="logged-in", last_seen=None):
+    """A recorded good-run fingerprint, as automation.core.Baseline writes it.
+
+    `lastSeen` defaults the way `Baseline.carryForwardLastSeen` fills it on a
+    first promotion: every locator that matched is stamped, and one that matched
+    nothing is simply not there. A caller testing an element that USED to be on
+    the page passes `last_seen` explicitly with the older timestamp — that gap
+    between "matched once" and "matches now" is the whole signal.
+    """
+    counts = coverage if coverage is not None else {"avatarWidget": 1, "userMenu": 1}
+    recorded_at = "2026-08-01T00:00:00"
+    return {"pageObject": page_object, "recordedAt": recorded_at,
             "urlShape": url, "title": title, "bodyClass": body_class,
-            "coverage": coverage if coverage is not None
-                        else {"avatarWidget": 1, "userMenu": 1}}
+            "coverage": counts,
+            "lastSeen": last_seen if last_seen is not None
+                        else {name: recorded_at for name, n in counts.items() if n}}

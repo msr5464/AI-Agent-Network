@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from shared import workspace
 from qa_agents_server.paths import AGENTS_DIR
 
 # (key, step output filename, display name). Display names are mirrored in
@@ -33,10 +34,49 @@ AUTHORING_STEPS: List[Tuple[str, str, str]] = [
 
 # Reproduce only runs in standalone mode; in pipeline mode it stays pending and
 # the UI shows it as skipped rather than stuck.
+# Step order comes from this list, not from the numeric filename prefix. Locate
+# sits between reproduce and fix and keeps its own 01- prefix deliberately:
+# renumbering 01-fix.json would break audit_reader's hardcoded reads and every
+# session already archived, which is a migration bought for nothing.
 HEALING_STEPS: List[Tuple[str, str, str]] = [
     ("reproduce", "00-reproduce.json", "Reproduce"),
+    ("locate", "01-locate.json", "Locate"),
     ("fix", "01-fix.json", "Fix"),
     ("ship", "02-ship.json", "Ship"),
+]
+
+
+# The adaptation pipeline. Step 03 is keyed on the COMBINED summary file, not on
+# either half: keying a shared slot on one half (as authoring does with
+# 02-validate-web.json) means a run that only exercised the other half never
+# completes the step, and the UI's chip stays on "running" until the process exits.
+#
+# The keys below are also `data-step` attributes on #adaptProgressSteps in
+# AI-Test-Studio/frontend/customer/index.html, and the display names are mirrored
+# in that file's STEP_LABELS — so a rename here is a two-repo change.
+ADAPTATION_STEPS: List[Tuple[str, str, str]] = [
+    ("parse_change", "01-parse-change.json", "Parse Change"),
+    ("scope", "02-scope.json", "Scope"),
+    ("explore", "03-explore.json", "Explore"),
+    ("adapt", "04-adapt.json", "Adapt"),
+    ("ship", "05-ship.json", "Ship"),
+]
+
+
+# Step files a run writes that are deliberately NOT in the step list above.
+# They are real artefacts a human wants to read in the session detail view, but
+# they must not become progress-bar steps: authoring's validate_api shares
+# step 02's slot, and adaptation's explore halves both feed the combined
+# 03-explore.json the chip is keyed on. Kept out of *_STEPS so the progress
+# model stays N-step, and surfaced through AgentSpec.extra_artifacts so the
+# session payload can still carry them.
+AUTHORING_EXTRA: List[Tuple[str, str, str]] = [
+    ("validate_api", "02-validate-api.json", "Validate API"),
+]
+
+ADAPTATION_EXTRA: List[Tuple[str, str, str]] = [
+    ("explore_web", "03-explore-web.json", "Explore — Web"),
+    ("explore_api", "03-explore-api.json", "Explore — API"),
 ]
 
 
@@ -64,9 +104,31 @@ class AgentSpec:
     session_prefix: str
     build_env: Callable[[dict], Dict[str, str]]
     describe_run: Callable[[dict], str]
+    # Which family of step files audit_reader should parse this agent's sessions
+    # with. Deliberately required and deliberately not a callable: audit_reader
+    # imports from this module, so it owns the functions and dispatches on this
+    # discriminator. It used to infer the family as "authoring if this is the
+    # default agent, else healing", which meant a third agent silently got
+    # healing's parser and reported empty sessions. Having no default is the
+    # point — a new agent cannot forget to answer this.
+    summary_kind: str
     supports_resume: bool = False
     # Which request field names the run's headline label, for the UI.
     label_field: str = "module"
+    # "txt" — a human-authored queue file the UI may create and edit
+    # (test-authoring-agent's feature specs). "json" — a handoff written by
+    # another agent, read-only over HTTP.
+    queue_kind: str = "json"
+    # Whether GET /agents/<a>/tests should enumerate the automation repo.
+    uses_test_catalog: bool = False
+    # Extra (key, filename, label) triples the session detail view should read
+    # alongside `steps` — see AUTHORING_EXTRA / ADAPTATION_EXTRA above. Not part
+    # of the progress model, so nothing polls these to decide a step is done.
+    extra_artifacts: Tuple[Tuple[str, str, str], ...] = ()
+
+    def detail_artifacts(self) -> List[Tuple[str, str, str]]:
+        """Everything the session detail view reads: steps, then the extras."""
+        return list(self.steps) + list(self.extra_artifacts)
 
     def make_session_id(self, payload: dict) -> str:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -96,12 +158,64 @@ def auto_push_default() -> bool:
     return os.environ.get("AUTO_PUSH", "false").strip().lower() == "true"
 
 
+def effective_auto_push(agent_env: Dict[str, str]) -> bool:
+    """What AUTO_PUSH will actually be inside the run.
+
+    Not `payload["auto_push"]`: _auto_push_env deliberately exports nothing when
+    the caller expressed no preference, and config/.env decides in that case. A
+    reader that checked the payload alone would call a run a dry run on a server
+    configured AUTO_PUSH=true — which now picks where the run executes, not just
+    whether a PR is raised.
+    """
+    raw = agent_env.get("AUTO_PUSH")
+    return auto_push_default() if raw is None else raw == "true"
+
+
+def adapt_apply_default() -> bool:
+    """Same story as AUTO_PUSH, for the adaptation agent's apply/propose switch.
+
+    `_adaptation_env` exports ADAPTATION_APPLY whenever the field is present, and a
+    caller-exported var beats config/.env, so a checkbox that always renders
+    unticked silently turns an admin's ADAPTATION_APPLY=true into propose-only.
+    """
+    return os.environ.get("ADAPTATION_APPLY", "false").strip().lower() == "true"
+
+
+def _base_branch_env(payload: dict) -> Dict[str, str]:
+    """GITHUB_DEFAULT_BRANCH, but only when the caller named a branch.
+
+    Same shape and the same reason as _auto_push_env: blank must stay
+    distinguishable from "main", or a run that expressed no preference would
+    export a value that beats config/.env — see there for what that cost.
+
+    It overrides the existing variable rather than adding a second one so that
+    the branch point and the PR base cannot drift apart. All three ship steps
+    already pass base=GITHUB_DEFAULT_BRANCH to `gh pr create`, so they follow an
+    override with no edit; a separate BASE_BRANCH would need each of them to
+    learn which one wins, and a miss there opens a PR against the wrong base
+    containing the entire delta between two branches.
+    """
+    raw = payload.get("base_branch")
+    if raw is None or not str(raw).strip():
+        return {}
+    try:
+        return {"GITHUB_DEFAULT_BRANCH": workspace.normalise_branch(str(raw))}
+    except ValueError as e:
+        raise AgentConfigError(f"base_branch: {e}")
+
+
+def default_branch() -> str:
+    """What config/.env says, for a UI that seeds its field from the real value."""
+    return os.environ.get("GITHUB_DEFAULT_BRANCH", "main").strip() or "main"
+
+
 def _authoring_env(payload: dict) -> Dict[str, str]:
     module = (payload.get("module") or "").strip()
     if not module:
         raise AgentConfigError("module is required")
     env = {"MODULE": module}
     env.update(_auto_push_env(payload))
+    env.update(_base_branch_env(payload))
     if payload.get("start_from_step", 1) > 1:
         env["START_FROM_STEP"] = str(payload["start_from_step"])
     return env
@@ -121,6 +235,7 @@ def _healing_env(payload: dict) -> Dict[str, str]:
         raise AgentConfigError("pass 'test' or 'build_tag', not both")
 
     env: Dict[str, str] = dict(_auto_push_env(payload))
+    env.update(_base_branch_env(payload))
     if test:
         env["TEST_NAME"] = test
         if payload.get("repair"):
@@ -144,6 +259,9 @@ AGENTS: Dict[str, AgentSpec] = {
         audit_dir=AGENTS_DIR / "test-authoring-agent" / "audit",
         queue_dir=AGENTS_DIR / "test-authoring-agent" / "queue",
         steps=AUTHORING_STEPS,
+        extra_artifacts=tuple(AUTHORING_EXTRA),
+        summary_kind="authoring",
+        queue_kind="txt",
         session_prefix="create",
         build_env=_authoring_env,
         describe_run=lambda p: (p.get("module") or "run"),
@@ -156,6 +274,8 @@ AGENTS: Dict[str, AgentSpec] = {
         audit_dir=AGENTS_DIR / "test-healing-agent" / "audit",
         queue_dir=AGENTS_DIR / "test-healing-agent" / "queue",
         steps=HEALING_STEPS,
+        summary_kind="healing",
+        uses_test_catalog=True,
         session_prefix="fix",
         build_env=_healing_env,
         describe_run=_healing_label,
@@ -163,6 +283,41 @@ AGENTS: Dict[str, AgentSpec] = {
         label_field="test",
     ),
 }
+
+def _adaptation_env(payload: dict) -> Dict[str, str]:
+    module = (payload.get("module") or "").strip()
+    if not module:
+        raise AgentConfigError("module is required")
+    env = {"MODULE": module}
+    env.update(_auto_push_env(payload))
+    env.update(_base_branch_env(payload))
+    if payload.get("start_from_step", 1) > 1:
+        env["START_FROM_STEP"] = str(payload["start_from_step"])
+    # Exploration is the expensive half, so "look but do not touch" is a
+    # first-class request rather than a debug flag.
+    if payload.get("explore_only"):
+        env["EXPLORE_ONLY"] = "true"
+    if payload.get("apply") is not None:
+        env["ADAPTATION_APPLY"] = "true" if payload["apply"] else "false"
+    return env
+
+
+AGENTS["test-adaptation-agent"] = AgentSpec(
+    name="test-adaptation-agent",
+    run_sh=AGENTS_DIR / "test-adaptation-agent" / "run.sh",
+    audit_dir=AGENTS_DIR / "test-adaptation-agent" / "audit",
+    queue_dir=AGENTS_DIR / "test-adaptation-agent" / "queue",
+    steps=ADAPTATION_STEPS,
+    extra_artifacts=tuple(ADAPTATION_EXTRA),
+    summary_kind="adaptation",
+    session_prefix="adapt",
+    build_env=_adaptation_env,
+    describe_run=lambda p: (p.get("module") or "run"),
+    supports_resume=True,
+    label_field="module",
+    queue_kind="txt",
+    uses_test_catalog=True,
+)
 
 DEFAULT_AGENT = "test-authoring-agent"
 

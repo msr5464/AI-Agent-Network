@@ -24,11 +24,17 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
+from shared import workspace as workspace_helper
+
 from shared.log import log as _log
+from shared.log import blocked
+from shared import baseline as baseline_store
+from shared import properties_file
 from shared.slack import send_slack as _send_slack
 from shared.git import run_git as _run_git
 from shared.github import create_pr
 from shared.credential_masking import mask_credentials
+from shared.credential_extraction import credentials_from_plan
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR  = Path(os.environ["AUDIT_DIR"])
@@ -36,15 +42,17 @@ AGENT_DIR  = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1
 REPO_ROOT  = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
 
 WORKSPACE_DIR          = Path(os.environ.get("WORKSPACE_DIR", str(REPO_ROOT.parent)))
-AUTOMATION_FRAMEWORK_DIR          = WORKSPACE_DIR / os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
+AUTOMATION_FRAMEWORK_DIR          = workspace_helper.resolve(
+    WORKSPACE_DIR, os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+    exclude=REPO_ROOT)
 
 AUTO_PUSH              = os.environ.get("AUTO_PUSH", "true").lower() == "true"
 GITHUB_TOKEN           = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_ORG             = os.environ.get("GITHUB_ORG", "")
-GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "Jarvis")
+GITHUB_REPO_AUTOMATION = os.environ.get("GITHUB_REPO_AUTOMATION", "")
 GITHUB_DEFAULT_BRANCH  = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
 GITHUB_PR_REVIEWERS    = [r.strip() for r in os.environ.get("GITHUB_PR_REVIEWERS", "").split(",") if r.strip()]
-BRANCH_PREFIX          = os.environ.get("AUTOCREATE_BRANCH_PREFIX", "feat/qa-autocreate")
+BRANCH_PREFIX          = os.environ.get("AUTHORING_BRANCH_PREFIX", "authoring")
 
 SLACK_BOT_TOKEN      = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_NOTIFY_CHANNEL = os.environ.get("SLACK_NOTIFY_CHANNEL", "")
@@ -108,7 +116,10 @@ def _stage_and_commit(contents: dict, message: str) -> bool:
         return False
     rc, _, err = git(["commit", "-m", message], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
-        log(f"ERROR: Commit failed: {err}")
+        log(blocked(f"commit failed ({err.strip()[:160]})",
+                    "no PR will be raised; the generated files stay in the "
+                    "working tree",
+                    f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
         return False
     return True
 
@@ -123,7 +134,9 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
     individual commits in the PR.  Returns (branch_name, tip_sha) or (None, None).
     """
     if not AUTOMATION_FRAMEWORK_DIR.exists():
-        log(f"ERROR: Automation framework repo not found: {AUTOMATION_FRAMEWORK_DIR}")
+        log(blocked(f"the automation repo was not found at {AUTOMATION_FRAMEWORK_DIR}",
+                    "no PR will be raised",
+                    "set FRAMEWORK_DIR, or WORKSPACE_DIR and GITHUB_REPO_AUTOMATION"))
         return None, None
 
     # Step-03 file contents (saved by 03_generate.py in files_content)
@@ -138,8 +151,44 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
 
     attempts_with_fixes = [a for a in fix_attempts_data if a.get("fix_file_contents")]
 
+    # Read the locator fingerprints step 04's run recorded, BEFORE the branch
+    # checkout below — it is a `checkout -f`, so anything untracked in the working
+    # tree is gone by the time there is a branch to commit onto. This is exactly
+    # how NaukriLoginPage.json kept ending up untracked: the framework wrote it
+    # during the green run, ship reset the tree, and the PR carried the new page
+    # object with no record of what its locators matched when they worked.
+    baseline_contents: dict = {}
+    for path in baseline_store.promoted(AUTOMATION_FRAMEWORK_DIR):
+        try:
+            rel = path.relative_to(AUTOMATION_FRAMEWORK_DIR).as_posix()
+            baseline_contents[rel] = path.read_text()
+        except OSError as exc:
+            log(f"Could not read baseline {path.name} ({exc}) — skipping it")
+
     if not step3_contents and not attempts_with_fixes:
         log("No files to commit")
+        return None, None
+
+    if not AUTO_PUSH:
+        # Dry run: put the files on disk and stop there.
+        #
+        # Branching would mean the `checkout -f` below, which discards whatever
+        # the user has in progress — a rough thing to do to someone who asked
+        # only to skip the PR. Committing would hide the diff they wanted to
+        # read. So the generated code lands in the working tree, uncommitted,
+        # on whatever branch they are on.
+        latest = dict(step3_contents)
+        for attempt in attempts_with_fixes:
+            latest.update(attempt.get("fix_file_contents") or {})
+        # Nothing was reset in this mode, so the baselines are already on disk
+        # where the framework wrote them — no need to rewrite them here.
+        for rel_path, content in latest.items():
+            full = AUTOMATION_FRAMEWORK_DIR / rel_path
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content)
+        log(f"AUTO_PUSH=false — wrote {len(latest)} file(s) to the working tree, "
+            f"uncommitted (no branch, no commit)")
+        log(f"  review with: git -C {AUTOMATION_FRAMEWORK_DIR} status")
         return None, None
 
     # ── Reset to GITHUB_DEFAULT_BRANCH (or stay on current HEAD if blank) ────────
@@ -149,24 +198,41 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
     log(f"Creating branch: {branch_name}")
 
     if GITHUB_DEFAULT_BRANCH:
-        rc, _, err = git(["checkout", "-f", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
-        if rc != 0:
-            log(f"WARNING: checkout -f failed ({err.strip()!r}), trying fetch + retry")
-            git(["fetch", "origin"], AUTOMATION_FRAMEWORK_DIR)
-            rc, _, err = git(["checkout", "-f", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
-            if rc != 0:
-                log(f"ERROR: Could not checkout {GITHUB_DEFAULT_BRANCH}: {err}")
-                return None, None
-        rc, _, err = git(["pull", "origin", GITHUB_DEFAULT_BRANCH], AUTOMATION_FRAMEWORK_DIR)
-        if rc != 0:
-            log(f"ERROR: Pull from origin/{GITHUB_DEFAULT_BRANCH} failed — aborting to avoid stale branch: {err}")
+        # prepare_base makes origin/<base> exist and be current — which the old
+        # `checkout -f` / `fetch origin` / `pull` sequence here could not do for
+        # a branch this checkout had never seen, because a bare `git fetch`
+        # against a single-branch clone never creates the missing ref. It also
+        # always authenticates: the `pull` it replaces passed no token, so on a
+        # checkout cloned by another agent (which strips the token from
+        # .git/config) it hit GIT_TERMINAL_PROMPT=0 and failed on a private repo.
+        prepared = workspace_helper.prepare_base(
+            AUTOMATION_FRAMEWORK_DIR, GITHUB_ORG, GITHUB_REPO_AUTOMATION,
+            GITHUB_TOKEN, GITHUB_DEFAULT_BRANCH, log=log)
+        if not prepared["ok"]:
+            log(blocked(
+                f"could not prepare {GITHUB_DEFAULT_BRANCH} ({prepared['reason'][:160]})",
+                "no PR will be raised; aborting rather than branching from a "
+                "stale base",
+                f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
+            return None, None
+        # Safe to force here, unlike in the other agents: every file below is
+        # rewritten from the audit JSON, so there is no working-tree state to lose.
+        moved = workspace_helper.checkout_base(
+            AUTOMATION_FRAMEWORK_DIR, prepared["branch"], prepared["sha"], log=log)
+        if not moved["ok"]:
+            log(blocked(
+                f"{moved['reason'][:160]}",
+                "no PR will be raised; no branch was created",
+                f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
             return None, None
     else:
         log("GITHUB_DEFAULT_BRANCH not set — branching from current HEAD")
 
     rc, _, err = git(["checkout", "-b", branch_name], AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
-        log(f"ERROR: Could not create branch: {err}")
+        log(blocked(f"could not create {branch_name} ({err.strip()[:160]})",
+                    "no PR will be raised",
+                    f"git -C {AUTOMATION_FRAMEWORK_DIR} status"))
         return None, None
 
     # ── Commit 1: step-03 generated files ────────────────────────────────────────
@@ -174,15 +240,35 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
     test_passed = (fix_attempts_data[-1].get("passed", False)
                    if fix_attempts_data else False)
     test_status = ("tests pass" if test_passed
+                   else "tests reproduce a known product defect" if fix_gate == "defect"
                    else "tests not run" if fix_gate == "skipped"
                    else "tests need review")
 
+    # The URL properties belong in the PR: code that reads {feature}.login.url is
+    # broken for every other checkout if the key never reaches the repo. Credentials
+    # in that same file are the opposite and must NEVER be committed — so the
+    # committed content is built from HEAD's copy plus the URL keys, never from the
+    # working copy, which is where step 03/04 wrote this run's real credentials.
+    url_props = gen_data.get("url_properties") or {}
+    if url_props:
+        props_path = properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR)
+        props_rel  = str(props_path.relative_to(AUTOMATION_FRAMEWORK_DIR))
+        rc, committed, _ = git(["show", f"HEAD:{props_rel}"], AUTOMATION_FRAMEWORK_DIR)
+        updated, filled, appended = properties_file.apply(
+            committed if rc == 0 else "", url_props,
+            f"{gen_data.get('feature', MODULE).capitalize()} URLs "
+            f"(auto-added by test-authoring-agent)")
+        if filled or appended:
+            step3_contents[props_rel] = updated
+            log(f"Committing {len(filled) + len(appended)} URL propert(ies) in "
+                f"{props_rel}: {', '.join(sorted({**filled, **appended}))}")
+
     if step3_contents:
         msg = (
-            f"[Authoring Agent]: First draft for {MODULE}\n\n"
+            f"authoring: generate initial test draft for {MODULE}\n\n"
             f"AI-generated test code — review before merge\n"
-            f"Session: {SESSION_ID}  Files: {len(step3_contents)}\n\n"
-            f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+            f"Files: {len(step3_contents)}\n\n"
+            f"Session: {SESSION_ID}"
         )
         if _stage_and_commit(step3_contents, msg):
             rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
@@ -193,14 +279,39 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
         n            = attempt_data.get("attempt", "?")
         fix_contents = attempt_data.get("fix_file_contents", {})
         msg = (
-            f"[Authoring Agent]: Fix attempt-{n} for {MODULE}\n\n"
-            f"Claude-generated fix — patched: {list(fix_contents.keys())}\n"
-            f"Session: {SESSION_ID}\n\n"
-            f"Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+            f"authoring: apply fix attempt {n} for {MODULE}\n\n"
+            f"Claude-generated fix — patched: {list(fix_contents.keys())}\n\n"
+            f"Session: {SESSION_ID}"
         )
         if _stage_and_commit(fix_contents, msg):
             rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
             log(f"Committed step-04 attempt-{n} ({len(fix_contents)} file(s)): {sha.strip()}")
+
+    # ── Final commit: the locator fingerprints the run recorded ──────────────────
+    #
+    # Last, because they describe the state the test finally reached. Only the
+    # ones whose substance differs from HEAD: the framework rewrites every
+    # baseline it loads with a fresh `recordedAt`, so committing on raw file
+    # change would put an otherwise-empty diff in every single PR.
+    baseline_changed = baseline_store.changed(AUTOMATION_FRAMEWORK_DIR, baseline_contents)
+    if baseline_changed:
+        log(f"Committing {len(baseline_changed)} locator baseline(s): "
+            f"{', '.join(Path(p).name for p in baseline_changed)}")
+        msg = (
+            f"authoring: update {len(baseline_changed)} locator baseline(s) for {MODULE}\n\n"
+            f"Element fingerprints recorded while the generated test ran. They\n"
+            f"describe what each page object locator matched when it worked, so a\n"
+            f"later drift can be diagnosed by comparison rather than by guesswork.\n\n"
+            f"Session: {SESSION_ID}"
+        )
+        if _stage_and_commit(baseline_changed, msg):
+            rc, sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
+            log(f"Committed baselines ({len(baseline_changed)} file(s)): {sha.strip()}")
+    elif baseline_contents:
+        log(f"{len(baseline_contents)} baseline(s) on disk, none changed — nothing to commit")
+    else:
+        log("No locator baselines were recorded by this run")
+    gen_data["baselines_committed"] = sorted(baseline_changed)
 
     rc, final_sha, _ = git(["rev-parse", "--short", "HEAD"], AUTOMATION_FRAMEWORK_DIR)
     return branch_name, final_sha.strip()
@@ -258,7 +369,10 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
 
     rc, _, err = git(["push", "-u", "origin", branch_name], AUTOMATION_FRAMEWORK_DIR, use_token=True)
     if rc != 0:
-        log(f"Push failed: {err}")
+        log(blocked(f"push of {branch_name} was rejected ({err.strip()[:160]})",
+                    "no PR will be raised; the commits are on the local branch",
+                    f"git -C {AUTOMATION_FRAMEWORK_DIR} log --oneline "
+                    f"{GITHUB_DEFAULT_BRANCH}..{branch_name}"))
         return None, "push_failed", err
 
     files_written = gen_data.get("files_written", [])
@@ -270,16 +384,22 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
 
     # PR title
     if test_passed:
-        pr_title = f"Authoring Agent: {feature_class} automation for {MODULE} [done]"
+        pr_title = f"Authoring: Created {feature_class} automated tests [PASSED]"
     else:
-        pr_title = f"Authoring Agent: {feature_class} automation for {MODULE} [needs review]"
+        pr_title = f"Authoring: Created {feature_class} automated tests [NEEDS-REVIEW]"
 
     # Files section — show generated + fixed separately so reviewers can tell what changed
-    all_committed = list(dict.fromkeys(files_written + files_fixed))
+    baselines     = gen_data.get("baselines_committed") or []
+    all_committed = list(dict.fromkeys(files_written + files_fixed + baselines))
     if all_committed:
         gen_lines   = [f"- `{f}`" for f in files_written] or ["_(none)_"]
         fix_lines   = [f"- `{f}` _(auto-fixed)_" for f in files_fixed if f not in files_written]
-        files_lines = gen_lines + fix_lines
+        # Named in the PR rather than left as a silent extra commit: a reviewer
+        # who sees a fingerprint file should know it was recorded by this run,
+        # not hand-written.
+        base_lines  = [f"- `{f}` _(locator baseline recorded by the run)_"
+                       for f in baselines if f not in files_written]
+        files_lines = gen_lines + fix_lines + base_lines
         files_section = "\n".join(files_lines)
     else:
         files_section = "_(none)_"
@@ -287,16 +407,27 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
     # Test result section
     if test_passed:
         test_section = "✅ Generated test was run and passed before this PR was created."
-    elif fix_data.get("stuck"):
-        # Distinct from the infra-skip case below: this test WAS run, repeatedly,
-        # and genuinely failed every time — a fix attempt just had zero effect on
-        # the exact failure location, so the loop stopped early rather than burn
-        # the rest of the budget on a diagnosis that wasn't converging.
+    elif fix_data.get("known_product_defect"):
         test_section = (
-            f"❌ Test is reproducibly failing at the same location after "
-            f"{fix_attempts} fix attempt(s) — the last fix had no effect on it. "
-            "Stopped early rather than retry further; see root_cause in the audit "
-            "trail for what was already tried. Please review manually."
+            "⚠️ The test reproduces the known product defect documented in the test input "
+            f"({(fix_data.get('reason') or '').strip() or 'see root_cause'}). The fix loop "
+            "stopped rather than work around it: merge this as the regression test, and "
+            "expect it to pass once the product is fixed."
+        )
+    elif fix_data.get("stuck"):
+        # Distinct from the infra-skip case below: this test genuinely failed rather
+        # than never getting a fair shot. The loop stopped short of its budget because
+        # a further attempt could not have differed from one already made — the exact
+        # reason varies (the same failure location after a fix, the same guard rejecting
+        # twice, or the model reporting it has no fix to offer), so quote the one the
+        # fix step actually recorded rather than assuming which it was.
+        why = (fix_data.get("reason") or "").strip()
+        test_section = (
+            f"❌ Test is reproducibly failing after {fix_attempts} fix attempt(s), and "
+            f"the fix loop stopped early rather than spend the rest of its budget: "
+            f"{why or 'no further fix was available'}. "
+            "See root_cause and .fix-history.json in the audit trail for everything "
+            "already tried. Please review manually."
         )
     elif fix_data.get("skipped"):
         test_section = "⚠️ Test could not be run (Maven not available or infra issue)."
@@ -319,8 +450,8 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
             plan = {}
         raw_case = _read_original_test_case(plan)
         if raw_case.strip():
-            masked_case = mask_credentials(raw_case, plan.get("demo_credentials", {}))
-            test_case_section = f"""### Test Case
+            masked_case = mask_credentials(raw_case, credentials_from_plan(plan))
+            test_case_section = f"""### 🎯 Request / Context
 <details open>
 <summary>Original request (credentials masked)</summary>
 
@@ -331,33 +462,66 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
 
 """
 
-    pr_body = f"""## QA Auto-Create — {feature_class}
+    # What the browser could not confirm. Split by who asked for it, because the
+    # two need opposite things from a reviewer: one is a finding about the product,
+    # the other is a note that the pipeline stopped short of inventing a test.
+    kept_unverified = gen_data.get("kept_unverified_checks") or []
+    dropped_checks  = gen_data.get("dropped_unverified_checks") or []
+    checks_section = ""
+    if kept_unverified:
+        checks_section += (
+            "### ⚠️ Asked for, but never seen on the page\n\n"
+            "The test input asks for these, and step 02 could not observe any of "
+            "them in the live UI. The assertions are generated at full strength, "
+            "so **this test fails on purpose** — it is reporting that the product "
+            "does not do what was asked. Decide whether this is a product bug or a "
+            "test-case correction; do not fix it by weakening the assertion.\n\n"
+            + "".join(f"- {c}\n" for c in kept_unverified) + "\n")
+    if dropped_checks:
+        checks_section += (
+            "### Checks not generated\n\n"
+            "These were added by the pipeline rather than requested, and the browser "
+            "never saw the elements they assert on — so no locator, accessor or "
+            "assertion was generated for them. If one of these is actually wanted, "
+            "say so in the test input and re-run.\n\n"
+            + "".join(f"- {c}\n" for c in dropped_checks) + "\n")
 
-{test_case_section}### Summary
-| | Value |
+    status_tag = "PASSED" if test_passed else "NEEDS-REVIEW"
+    status_summary = ("Generated test was verified and passed locally."
+                      if test_passed
+                      else "Generated test requires manual review.")
+
+    pr_body = f"""## 🤖 Test Authoring Agent — {feature_class}
+
+> Status: **{status_tag}** — {status_summary}
+
+### 📋 Overview
+| Property | Value |
 |---|---|
-| Module | {feature_class} |
-| Test type | {test_type} |
-| Files generated | {len(files_written)} |
-| Fix attempts | {fix_attempts} |
-| Test result | {'✅ Passed' if test_passed else '❌ Needs review'} |
+| **Agent** | `test-authoring-agent` |
+| **Target** | `{feature_class}` |
+| **Test Type** | `{test_type}` |
+| **Status** | `{'✅ Passed' if test_passed else '⚠️ Needs Review'}` |
+| **Files Changed** | `{len(all_committed)}` |
+| **Fix Attempts** | `{fix_attempts}` |
+| **Session ID** | `{SESSION_ID}` |
 
-### Generated Files
+{test_case_section}{checks_section}### 🛠️ Changes Applied
 
 {files_section}
 
-### Validation
+### 🧪 Validation & Test Results
 
 {test_section}
 
-### How to review
+### 🔍 How to Review
 1. Verify locators match the actual DOM (check `[data-cy='...']` attributes)
 2. Confirm `allocateUser()` uses the correct `Module` enum value for this module
 3. Ensure the API endpoint paths match the actual backend routes
 4. Run locally: `mvn test -Dtest={gen_data.get('test_class', '')}#{gen_data.get('test_method', '')} -Denvironment=staging`
 
-> Audit trail: `{AUDIT_DIR.name}`
-> 🤖 Generated by test-authoring-agent
+---
+> 🤖 Generated by **test-authoring-agent** · Audit Session: `{AUDIT_DIR.name}`
 """
 
     log("Creating PR...")
@@ -371,7 +535,10 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
         reviewers=GITHUB_PR_REVIEWERS,
     )
     if not pr_url:
-        log(f"PR creation failed: {pr_err}")
+        log(blocked(f"PR creation failed ({str(pr_err).strip()[:160]})",
+                    f"no PR will be raised; {branch_name} is pushed and can be "
+                    f"opened by hand",
+                    f"https://github.com/{full_repo}/pull/new/{branch_name}"))
         return None, "pr_failed", pr_err
     log(f"PR created: {pr_url}")
     return pr_url, "shipped", ""
@@ -395,13 +562,21 @@ def build_slack_message(gen_data: dict, fix_data: dict, pr_url: Optional[str], f
         what    = "push to GitHub" if ship_status == "push_failed" else "PR creation"
         status  = (f"generated and tests {'pass' if test_passed else 'ran'}, but {what} FAILED — "
                    "code is stuck on a local branch, needs manual intervention")
+    elif fix_gate == "defect":
+        # A failing test, so the alert channel — but a finding about the product,
+        # not about the generated code.
+        channel = SLACK_ALERT_CHANNEL or SLACK_NOTIFY_CHANNEL
+        icon    = ":warning:"
+        status  = "generated — test reproduces the known product defect, needs review"
     elif fix_gate == "stuck":
         # This is a genuine, reproducible failure — must go to the alert channel
         # like any other failure, not the "generated (test not run)" notify-only
         # path, which would hide a known-broken test from whoever watches alerts.
         channel = SLACK_ALERT_CHANNEL or SLACK_NOTIFY_CHANNEL
         icon    = ":warning:"
-        status  = "generated but stuck — test reproducibly failing, fix attempts stopped early, needs review"
+        _why = (fix_data.get("reason") or "").strip()
+        status  = ("generated but stuck — test reproducibly failing, fix attempts stopped "
+                   "early, needs review" + (f" ({_why})" if _why else ""))
     elif fix_gate == "skipped":
         channel = SLACK_NOTIFY_CHANNEL
         icon    = ":large_yellow_circle:"
@@ -478,6 +653,12 @@ def main() -> None:
             # Nothing to ship, not a failure — e.g. a resumed session where
             # this step already committed everything on a prior attempt.
             ship_status = "dry_run"
+        elif not AUTO_PUSH:
+            # A dry run makes no branch on purpose: create_branch_and_commit
+            # wrote the files to the working tree and stopped there. Falling
+            # through to the branch below reported every dry run as a failed
+            # push, so its verdict could never be APPROVED.
+            ship_status = "dry_run"
         else:
             log("Branch creation failed — skipping push")
             # Code generated fine but couldn't even get a local branch/commit
@@ -500,7 +681,30 @@ def main() -> None:
     # exists but nobody can see or review it — that's never APPROVED,
     # regardless of whether the test itself passed.
     ship_failed = ship_status in ("push_failed", "pr_failed")
-    verdict = "APPROVED" if ((test_passed or fix_gate == "skipped") and not ship_failed) else "NEEDS-REVIEW"
+    # A run that could not observe something the input asked for is never
+    # APPROVED, even if the suite is green — green here means the pipeline
+    # declined to assert on it, which is precisely the thing a human has to look
+    # at. Same for a fix that was rejected for weakening a test.
+    weakening_rejected = [r for r in (fix_data.get("fix_rejections") or [])
+                          if "assertion_conservation" in str(r.get("reason", ""))]
+    kept_unverified = gen_data.get("kept_unverified_checks") or []
+    honest = not kept_unverified and not weakening_rejected
+    # `fix_gate == "skipped"` means no test ever ran (an infra failure). That was
+    # treated as APPROVED, which reads as "verified" for something never executed.
+    ran_and_passed = test_passed
+    verdict = ("APPROVED" if (ran_and_passed and honest and not ship_failed)
+               else "NEEDS-REVIEW")
+    (AUDIT_DIR / ".verdict").write_text(verdict)
+    if kept_unverified:
+        log(f"NEEDS-REVIEW: {len(kept_unverified)} requested check(s) could not be "
+            f"observed in the UI — the test asserts them and fails on purpose.")
+    if weakening_rejected:
+        log(f"NEEDS-REVIEW: {len(weakening_rejected)} fix attempt(s) were rejected "
+            f"for weakening an assertion.")
+    if fix_gate == "defect":
+        log("NEEDS-REVIEW: the test reproduces the known product defect the input documented.")
+    if fix_gate == "skipped":
+        log("NEEDS-REVIEW: no test ever ran (infrastructure) — nothing was verified.")
     (AUDIT_DIR / ".verdict").write_text(verdict)
     log(f"Verdict: {verdict}")
     if ship_failed:
@@ -540,7 +744,7 @@ def main() -> None:
         f"| Branch | `{branch_name or 'N/A'}` |",
         f"| Commit | `{commit_sha or 'N/A'}` |",
         f"| PR | {pr_url or 'Not created'} |",
-        f"| Test result | {'✅ Passed' if test_passed else '⚠️ Not run' if fix_gate == 'skipped' else '❌ Failed'} |",
+        f"| Test result | {'✅ Passed' if test_passed else '⚠️ Known defect reproduced' if fix_gate == 'defect' else '⚠️ Not run' if fix_gate == 'skipped' else '❌ Failed'} |",
         f"| Ship status | {ship_status} |",
         f"| Slack | {'Sent' if slack_sent else 'Skipped'} |",
     ]

@@ -21,7 +21,7 @@ from tests import fixtures as fx
 
 def _setup(tmp_path, snapshot, page_objects, *, context=None, baseline=None,
            execution_log="", failed_selector="img[class*='avatar'] >> nth=0",
-           flaky=None, page_object="DashboardPage"):
+           flaky=None, page_object="DashboardPage", baseline_not_after=""):
     """Lay artefacts out the way the framework does, then diagnose."""
     dom = tmp_path / "dom"
     dom.mkdir(exist_ok=True)
@@ -38,6 +38,8 @@ def _setup(tmp_path, snapshot, page_objects, *, context=None, baseline=None,
                      failed_selector=failed_selector, page_object=page_object)
     if flaky is not None:
         issue["flaky_tests"] = flaky
+    if baseline_not_after:
+        issue["baseline_not_after"] = baseline_not_after
     evidence = diagnosis.collect(issue, workspace=tmp_path, page_objects=page_objects)
     return diagnosis.diagnose(evidence), evidence
 
@@ -92,11 +94,46 @@ class TestElementGone:
         verdict, _ = _setup(
             tmp_path, fx.DASHBOARD_RENAMED, _page_objects(),
             context=fx.context(coverage=self.RIGHT_PAGE),
-            # The baseline records userMenu present and the avatar never present,
-            # so nothing that used to work has gone missing.
-            baseline=fx.baseline_record(coverage={"userMenu": 1, "avatarWidget": 0}))
+            # The avatar matched in an earlier run and matches nothing now, and
+            # the last good run already found nothing: it was on the page once
+            # and has since been taken off it.
+            baseline=fx.baseline_record(
+                coverage={"userMenu": 1, "avatarWidget": 0},
+                last_seen={"userMenu": "2026-08-01T00:00:00",
+                           "avatarWidget": "2026-05-04T00:00:00"}))
         assert verdict["verdict"] == "ELEMENT_GONE"
         assert verdict["actionable"] is False
+
+    def test_a_selector_that_never_matched_is_a_locator_fix_not_a_removal(self, tmp_path):
+        """The bug this pins: a passing test promotes counts for every locator on
+        every page it loaded, including ones it never went near. A selector that
+        has simply always been wrong was therefore written down as matching
+        nothing on a run that passed, and read back as proof the element had been
+        removed from the product — "confirm with the team before changing the
+        test", for a one-word typo in a selector. Never having matched is what
+        separates the two, and `lastSeen` is where that lives.
+        """
+        verdict, _ = _setup(
+            tmp_path, fx.DASHBOARD_RENAMED, _page_objects(),
+            context=fx.context(coverage=self.RIGHT_PAGE),
+            baseline=fx.baseline_record(
+                coverage={"userMenu": 1, "avatarWidget": 0},
+                last_seen={"userMenu": "2026-08-01T00:00:00"}))
+        assert verdict["verdict"] == "LOCATOR_STALE"
+        assert verdict["actionable"] is True
+
+    def test_a_baseline_older_than_lastseen_abstains(self, tmp_path):
+        """Baselines written before the framework recorded `lastSeen` cannot tell
+        removal from a selector that never worked, so the verdict that stops a
+        locator edit must not rest on them. The next green run writes the history
+        and the verdict becomes available again.
+        """
+        record = fx.baseline_record(coverage={"userMenu": 1, "avatarWidget": 0})
+        record.pop("lastSeen")
+        verdict, _ = _setup(
+            tmp_path, fx.DASHBOARD_RENAMED, _page_objects(),
+            context=fx.context(coverage=self.RIGHT_PAGE), baseline=record)
+        assert verdict["verdict"] != "ELEMENT_GONE"
 
     def test_near_miss_it_was_present_on_the_last_good_run(self, tmp_path):
         # Present before, absent now, everything else unchanged: a renamed element.
@@ -104,6 +141,34 @@ class TestElementGone:
             tmp_path, fx.DASHBOARD_RENAMED, _page_objects(),
             context=fx.context(coverage=self.RIGHT_PAGE),
             baseline=fx.baseline_record(coverage={"userMenu": 1, "avatarWidget": 1}))
+        assert verdict["verdict"] == "LOCATOR_STALE"
+        assert verdict["actionable"] is True
+
+    def test_a_baseline_written_after_the_failure_is_not_the_last_good_run(self, tmp_path):
+        """The bug this pins: a fix landed, a sibling test went green, and the
+        baseline it promoted recorded every locator on the page — including the
+        broken one it never touched. The next attempt read that zero as proof
+        the element had been removed. Pinning the cutoff to the ORIGINAL failure
+        makes a record written during the repair inadmissible.
+        """
+        verdict, evidence = _setup(
+            tmp_path, fx.DASHBOARD_RENAMED, _page_objects(),
+            context=fx.context(coverage=self.RIGHT_PAGE),
+            baseline=fx.baseline_record(coverage={"userMenu": 1, "avatarWidget": 0}),
+            # The baseline is stamped 2026-08-01; the run began before that.
+            baseline_not_after="2026-07-01T00:00:00")
+        assert evidence["baseline"]["available"] is False
+        assert verdict["verdict"] != "ELEMENT_GONE"
+
+    def test_a_baseline_that_never_measured_the_element_will_not_guess(self, tmp_path):
+        # The rule used to fire when `vanished` was merely absent — and it is
+        # absent whenever no per-locator counts could be compared, which is the
+        # common case. "Absent on the last good run too" has to be read off that
+        # run, not inferred from the silence.
+        verdict, _ = _setup(
+            tmp_path, fx.DASHBOARD_RENAMED, _page_objects(),
+            context=fx.context(coverage=self.RIGHT_PAGE),
+            baseline=fx.baseline_record(coverage={"userMenu": 1}))
         assert verdict["verdict"] == "LOCATOR_STALE"
         assert verdict["actionable"] is True
 

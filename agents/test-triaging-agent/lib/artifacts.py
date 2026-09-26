@@ -18,7 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from shared.dom_snapshot import find_snapshot, parse_header
-from shared.playwright_trace import read_actions, failing_action
+from shared.telemetry import read_actions, failing_action
+from shared import baseline as _baseline
 from shared import failure_context as _failure_context
 
 
@@ -45,7 +46,12 @@ def attach_dom_snapshot(issue: dict, report_dir: Path, method_name: str,
         preserved.write_text(text, encoding="utf-8")
 
         issue["dom_snapshot"] = str(preserved)
-        issue["failure_url"] = parse_header(text).get("url", "")
+        header = parse_header(text)
+        issue["failure_url"] = header.get("url", "")
+        # Where it came from and when it was taken, so the failure context can be
+        # matched to *this* snapshot rather than picked independently.
+        issue["_snapshot_source"] = str(snapshot)
+        issue["_snapshot_captured_at"] = header.get("capturedAt", "")
         log(f"  DOM snapshot attached for {method_name} "
             f"({len(text) // 1024}KB) → {preserved.name}")
     except Exception as e:
@@ -65,13 +71,20 @@ def attach_trace(issue: dict, report_dir: Path, method_name: str,
     if not report_dir or not method_name:
         return
     try:
-        traces = [p for p in Path(report_dir).rglob(f"traces/{method_name}_*.zip")]
+        # The framework knows where it writes its own telemetry; this used to
+        # glob for Playwright's traces/*.zip regardless of which framework
+        # produced the run.
+        from shared.frameworks import get_active_plugin
+        traces = get_active_plugin().telemetry.discover(Path(report_dir), method_name)
         if not traces:
             return
         trace = max(traces, key=lambda p: p.stat().st_mtime)
         trace_dir = audit_dir / "traces"
         trace_dir.mkdir(parents=True, exist_ok=True)
-        preserved = trace_dir / f"{method_name}.zip"
+        # Keep the original extension: a Selenium repo's telemetry is a .jsonl
+        # action log, not a zip, and CI cleans up report_dir before the healing
+        # agent reads the handoff — so this copy is what has to stay valid.
+        preserved = trace_dir / f"{method_name}{trace.suffix}"
         preserved.write_bytes(trace.read_bytes())
 
         issue["trace_path"] = str(preserved)
@@ -97,7 +110,22 @@ def attach_failure_context(issue: dict, report_dir: Path, method_name: str,
     if not report_dir or not method_name:
         return
     try:
-        found = _failure_context.find(report_dir, method_name)
+        # Located beside the snapshot this session preserved, not picked from the
+        # report directory on its own. Both lookups take "the newest file named
+        # for this method", and run independently they can pair a snapshot and a
+        # context from different builds — which then arrive at the healing agent
+        # looking like one coherent account of a single failure.
+        source = issue.get("_snapshot_source") or ""
+        if source:
+            context = _failure_context.for_failure(
+                source, test_name=method_name,
+                captured_at=issue.get("_snapshot_captured_at", ""))
+            found = Path(context["path"]) if context.get("path") else None
+            if not found and context.get("rejected"):
+                log(f"  Failure context for {method_name} ignored — "
+                    f"{context['rejected']}")
+        else:
+            found = _failure_context.find(report_dir, method_name)
         if not found:
             return
         context_dir = audit_dir / "dom"
@@ -156,19 +184,12 @@ def attach_baselines(issues: list, workspace: Path, audit_dir: Path, log=print) 
     if not workspace or not issues:
         return
     try:
-        source = Path(os.environ.get("BASELINE_DIR") or (Path(workspace) / "baselines"))
-        if not source.exists():
-            return
+        source = Path(os.environ.get("HEALING_BASELINE_DIR") or (Path(workspace) / "baselines"))
         preserved = audit_dir / "baselines"
-        preserved.mkdir(parents=True, exist_ok=True)
-        copied = 0
-        for record in source.glob("*.json"):
-            (preserved / record.name).write_text(
-                record.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
-            copied += 1
+        copied = _baseline.preserve(source, preserved)
         if copied:
             for issue in issues:
-                issue["baseline_dir"] = str(preserved)
+                issue["healing_baseline_dir"] = str(preserved)
             log(f"  {copied} baseline(s) preserved for the session")
     except Exception as e:
         log(f"  Could not preserve baselines: {e}")

@@ -6,12 +6,12 @@ set -Eeuo pipefail
 # Picks a handoff from the queue (or a specific BUILD_TAG), attempts locator
 # fixes, verifies with test runs, and creates a GitHub PR.
 #
-# Usage (via Makefile):
-#   make run AGENT=test-healing-agent                           # queue mode: picks oldest
-#   make run AGENT=test-healing-agent BUILD_TAG=ProdSanity-541  # direct: specific handoff
-#   AUTO_PUSH=false make run AGENT=test-healing-agent           # dry-run: no PR
+# Usage:
+#   ./scripts/run-healing-agent.sh                    # queue mode: picks oldest
+#   ./scripts/run-healing-agent.sh ProdSanity-541     # direct: specific handoff
+#   AUTO_PUSH=false ./scripts/run-healing-agent.sh    # dry-run: no PR
 #
-# Retry loop: if tests fail after fix, re-runs 01_fix.py up to MAX_FIX_ATTEMPTS.
+# Retry loop: if tests fail after fix, re-runs 01_fix.py up to HEALING_RETRY_COUNT.
 # ─────────────────────────────────────────────────────────────────────────────
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,7 +34,7 @@ QUEUE_DIR="$AGENT_DIR/queue"
 PROCESSED_DIR="$QUEUE_DIR/processed"
 mkdir -p "$PROCESSED_DIR"
 
-# Honour HANDOFF_FILE env var if passed directly (e.g. from run-autofix.sh with a file path)
+# Honour HANDOFF_FILE env var if passed directly (e.g. from run-healing-agent.sh with a file path)
 HANDOFF_FILE="${HANDOFF_FILE:-}"
 TEST_NAME="${TEST_NAME:-${TEST:-}}"
 export TEST_NAME
@@ -69,13 +69,36 @@ elif [[ -n "$BUILD_TAG" ]]; then
   MODE="direct"
 
 else
-  # Queue mode — pick the oldest .json file in queue/
-  HANDOFF_FILE=$(ls -t "$QUEUE_DIR"/*.json 2>/dev/null | tail -1 || true)
+  # Queue mode — claim the oldest .json file in queue/.
+  #
+  # Claiming, not just picking: `ls | tail -1` gave two concurrent healing runs
+  # the same handoff, so both fixed the same test, raced on the same files, and
+  # both then tried to move one handoff to processed. `mv` within a filesystem
+  # is atomic and fails for the loser, which makes it the claim.
+  CLAIM_DIR="$QUEUE_DIR/.claimed/$$"
+  mkdir -p "$CLAIM_DIR"
+  HANDOFF_FILE=""
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    if mv "$candidate" "$CLAIM_DIR/" 2>/dev/null; then
+      HANDOFF_FILE="$CLAIM_DIR/$(basename "$candidate")"
+      break
+    fi
+    log "Handoff $(basename "$candidate") was claimed by another run — trying the next"
+  done < <(ls -tr "$QUEUE_DIR"/*.json 2>/dev/null || true)
+
   if [[ -z "$HANDOFF_FILE" ]]; then
+    rmdir "$CLAIM_DIR" 2>/dev/null || true
     log "Queue is empty — nothing to fix."
     log "Run test-triaging-agent first to populate the queue."
     exit 0
   fi
+  # Whatever happens next, this run must not strand its claim in .claimed/.
+  # This replaces shared/session.sh's EXIT trap, so it has to call
+  # finalize_metrics itself — with the original exit code restored first —
+  # or queue-mode runs would never write metrics.json or their analytics row.
+  # shellcheck disable=SC2064
+  trap "_rc=\$?; [[ -f \"$HANDOFF_FILE\" ]] && mv \"$HANDOFF_FILE\" \"$QUEUE_DIR/\" 2>/dev/null; rmdir \"$CLAIM_DIR\" 2>/dev/null; (exit \$_rc); finalize_metrics" EXIT
   BUILD_TAG=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['build_tag'])" "$HANDOFF_FILE")
   SAFE_TAG="${BUILD_TAG//\//-}"
   MODE="queue"
@@ -98,7 +121,6 @@ log "build_tag=$BUILD_TAG"
 log "handoff=$HANDOFF_FILE"
 log "session=$SESSION_ID"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
 
 # Write session init
 cat > "$AUDIT_DIR/00-session-init.md" << EOF
@@ -111,7 +133,7 @@ Handoff File: $HANDOFF_FILE
 Started: $(date +%Y-%m-%dT%H:%M:%S)
 
 ## Env Snapshot (keys only)
-$(env | grep -E '^(GITHUB_|SLACK_|MAX_|AUTO_|AUTOFIX_|CLAUDE_|WORKSPACE_|REPO_CONTEXT_|TEST_RUNNER_)' | sed 's/=.*/=<set>/' | sort)
+$(env | grep -E '^(GITHUB_|SLACK_|MAX_|AUTO_|AUTOFIX_|CLAUDE_|WORKSPACE_|REPO_CONTEXT_|TEST_RUNNER_|PLAYWRIGHT_|LOCATE_)' | sed 's/=.*/=<set>/' | sort)
 EOF
 
 declare -a STEP_NAMES=()
@@ -119,13 +141,14 @@ declare -a STEP_DURATIONS=()
 
 # ── Step 00 — Reproduce (standalone mode only) ────────────────────────────────
 if [[ "$MODE" == "local" ]]; then
-  run_step "[00/02] Reproduce" "python3 '$AGENT_DIR/actions/00_reproduce.py'"
+  run_step "[01/04] Reproduce" "python3 '$AGENT_DIR/actions/00_reproduce.py'" reproduce
 
   if [[ ! -f "$AUDIT_DIR/00-handoff.json" ]]; then
     # A passing test or a non-locator failure. Both are legitimate outcomes, and
     # step 00 has already written the explanation — there is nothing to fix, so
     # running the fix and ship steps would only produce noise.
     log "Nothing to fix — see $AUDIT_DIR/00-reproduce.md"
+    flush_step_done
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     sed -n '3,12p' "$AUDIT_DIR/00-reproduce.md" 2>/dev/null || true
@@ -176,22 +199,47 @@ PYALERT
 }
 trap 'on_error $LINENO' ERR
 
-# ── Step 01 — Fix (with retry loop) ──────────────────────────────────────────
-MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-2}"
+# ── Steps 01 + 02 — Locate, then Fix, once per attempt ───────────────────────
+# One broken locator hides the next: the test cannot reach locator #2 until #1 is
+# repaired and it is re-run. So Locate runs inside the loop, working each time
+# from the artifacts the last verification run wrote — that is what makes every
+# link of a chain deterministic instead of only the first. It never edits a file
+# (01_fix decides what to do with the result) and costs about a second, which is
+# nothing beside the test run it precedes.
+#
+# The loop stops when 01_fix says so. The budget it applies counts attempts that
+# made NO progress: an edit that repairs one locator and uncovers the next leaves
+# the run red but is not a failed retry, and charging it as one meant a long chain
+# could never finish. See retry_verdict in 01_fix.py.
+HEALING_RETRY_COUNT="${HEALING_RETRY_COUNT:-4}"
+if [[ -n "${MAX_FIX_ATTEMPTS:-}" ]]; then
+  log "NOTE: MAX_FIX_ATTEMPTS is set but no longer read — use HEALING_RETRY_COUNT (currently $HEALING_RETRY_COUNT)"
+fi
 FIX_ATTEMPT=1
 
 while true; do
-  run_step "[01/02] Fix (attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS)" \
-    "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_fix.py'"
-
-  FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
-
-  if [[ "$FIX_RESULT" == "true" || "$FIX_RESULT" == "skipped" ]]; then
-    break
+  LOCATE_LABEL="[02/04] Locate"
+  if [[ "$FIX_ATTEMPT" -gt 1 ]]; then
+    LOCATE_LABEL="[02/04] Locate (attempt $FIX_ATTEMPT)"
   fi
+  # Exported before EACH step, not once per pass: run_step unsets it on the way
+  # out, so a single export at the top of the loop reached Locate and left Fix
+  # recording every attempt as attempt 1 — which is what attributes the spend.
+  export STEP_ATTEMPT="$FIX_ATTEMPT"
+  run_step "$LOCATE_LABEL" \
+    "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_locate.py'" locate
 
-  if [[ "$FIX_ATTEMPT" -ge "$MAX_FIX_ATTEMPTS" ]]; then
-    log "Fixes still failing after $FIX_ATTEMPT attempt(s) — proceeding to ship (will escalate)"
+  export STEP_ATTEMPT="$FIX_ATTEMPT"
+  run_step "[03/04] Fix (attempt $FIX_ATTEMPT)" \
+    "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/01_fix.py'" fix
+
+  # Missing means the step never got far enough to decide — stop rather than
+  # loop on a file nobody wrote.
+  RETRY_VERDICT=$(tr -d '\n' < "$AUDIT_DIR/.fix-retry" 2>/dev/null || echo "stop: no verdict written")
+  if [[ "$RETRY_VERDICT" != "retry" ]]; then
+    if [[ "$RETRY_VERDICT" == stop:* ]]; then
+      log "${RETRY_VERDICT#stop: }"
+    fi
     break
   fi
 
@@ -200,7 +248,7 @@ while true; do
 done
 
 # ── Step 02 — Ship (PR + Slack) ───────────────────────────────────────────────
-run_step "[02/02] Ship" "python3 '$AGENT_DIR/actions/02_ship.py'"
+run_step "[04/04] Ship" "python3 '$AGENT_DIR/actions/02_ship.py'" ship
 
 # ── Mark handoff as processed ─────────────────────────────────────────────────
 # An infra skip (no GitHub token, workspace missing) means nothing was attempted.
@@ -215,6 +263,11 @@ fi
 if [[ "$MODE" == "local" ]]; then
   log "Standalone run — handoff kept with the session: $HANDOFF_FILE"
 elif [[ "$SKIP_REASON" == "infra" ]]; then
+  # Return the claim to the queue so another run (or a retry) picks it up.
+  if [[ -n "${CLAIM_DIR:-}" && -f "$HANDOFF_FILE" ]]; then
+    mv "$HANDOFF_FILE" "$QUEUE_DIR/" 2>/dev/null || true
+    HANDOFF_FILE="$QUEUE_DIR/$(basename "$HANDOFF_FILE")"
+  fi
   log "Infra skip — leaving handoff queued for retry: $HANDOFF_FILE"
 else
   mv "$HANDOFF_FILE" "$PROCESSED_DIR/$(basename "$HANDOFF_FILE")"
@@ -222,14 +275,19 @@ else
 fi
 
 # ── Final summary ─────────────────────────────────────────────────────────────
+flush_step_done
 TOTAL_ELAPSED=$(elapsed_since $SESSION_START)
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log "Done. Total time: $(fmt_duration $TOTAL_ELAPSED)"
 echo ""
-for i in "${!STEP_NAMES[@]}"; do
-  printf "  %-50s %s\n" "${STEP_NAMES[$i]}" "$(fmt_duration ${STEP_DURATIONS[$i]})"
-done
+print_step_table 50
+
+# Roll up now so the spend is on screen with the timings rather than only in
+# metrics.json. The EXIT trap re-runs this; a rollup is idempotent.
+_METRICS=$(cd "${REPO_ROOT:-.}" && python3 -m shared.metrics 2>/dev/null || true)
+[[ -n "$_METRICS" ]] && log "Spend: $_METRICS"
+
 
 # What each attempt actually changed. The step logs interleave this with the
 # build output, so by the end you would have to scroll through several minutes
@@ -252,18 +310,34 @@ for a in history:
     if not a.get("entries"):
         print(f"    attempt {n}: nothing applied")
         continue
+    # One edit is recorded once per failing test it covers, so a locator three
+    # tests shared printed its description and diff three times over. Group on
+    # the change itself; the verdicts below it say which test got which result,
+    # which was the only thing that ever differed between those copies.
+    groups = {}
     for e in a["entries"]:
-        verdict = e.get("outcome", "?")
-        if e.get("reverted"):
-            verdict += ", reverted"
         tgt = Path(e["target_file"]).name if e.get("target_file") else "-"
-        print(f"    attempt {n}: {tgt} — {verdict}")
         why = e.get("fix_description") or e.get("unfixable_reason") or ""
+        diff = "\n".join(l for l in (e.get("fix_diff") or "").splitlines()
+                         if l.startswith(("+", "-")) and not l.startswith(("+++", "---")))
+        verdict = e.get("outcome", "?") + (", reverted" if e.get("reverted") else "")
+        tests = e.get("test_names") or [e.get("test_name")]
+        groups.setdefault((tgt, why, diff), {}).setdefault(verdict, []).extend(
+            t.rsplit(".", 1)[-1] for t in tests if t)
+
+    for (tgt, why, diff), verdicts in groups.items():
+        head = f"    attempt {n}: {tgt}"
+        if len(verdicts) == 1:
+            head += f" — {next(iter(verdicts))}"
+        print(head)
         if why:
             print(f"      {why[:150]}")
-        for line in (e.get("fix_diff") or "").splitlines():
-            if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
-                print(f"      {line[:150]}")
+        for line in diff.splitlines():
+            print(f"      {line[:150]}")
+        for verdict, tests in verdicts.items():
+            label = f"{verdict}: " if len(verdicts) > 1 else ""
+            if label or len(tests) > 1:
+                print(f"      {label}{', '.join(tests)}"[:150])
 PYSUM
 fi
 echo ""

@@ -1,62 +1,41 @@
 # Developer Guide
 
-This guide covers local development, testing, and debugging after you have run the initial setup.
+Local development, testing and debugging. For first-time install and the
+minimum configuration, follow the [README Quick Start](../README.md#quick-start)
+first; for how the pieces fit together, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
-## Prerequisites Checklist
-
-Before your first run, verify:
+## Prerequisites check
 
 ```bash
-# Python 3.9+
-python3 --version
-
-# Claude CLI (must be logged in)
-claude --version
-claude whoami
-
-# GitHub CLI (for PR creation)
-gh auth status
-
-# Node.js (Agent 1 only — Playwright web validation)
-node --version
+python3 --version                    # 3.10+
+claude --version && claude auth status   # Claude Code CLI, signed in
+gh --version                         # GitHub CLI (PRs; it reads GITHUB_TOKEN)
+node --version && npx --version      # Playwright MCP (authoring, healing, adaptation)
+java -version && mvn -version        # JDK 21 + Maven, for the automation repo
+python3 -c "import playwright"       # Python Playwright; also run: python -m playwright install chromium
 ```
 
-If Claude CLI is not installed:
-```bash
-npm install -g @anthropic-ai/claude-code
-claude login
-```
+Claude CLI missing? `npm install -g @anthropic-ai/claude-code`, then `claude auth login`.
+(`scripts/setup.sh` tries the npm install for you.)
+
+`make setup-mcp` is **optional** — PRs use the `gh` CLI and Slack uses the Bot
+API directly. It merges GitHub/Slack MCP servers (for connectors whose token is
+set) into the `mcpServers` block of `~/.claude.json`, keeping servers you added
+yourself, and saves a backup to `~/.claude.json.bak` first.
 
 ---
 
-## Initial Setup
+## Running agents
 
-```bash
-git clone <repo-url>
-cd QA-Agent-Network
-
-./scripts/setup.sh          # macOS / Linux
-.\scripts\setup.ps1         # Windows
-
-# Edit config/.env with your credentials (see config/.env.example for all options)
-cp config/.env.example config/.env
-```
-
-Configure MCP tools (GitHub + Slack — needed for PR creation and notifications):
-```bash
-make setup-mcp
-```
-
----
-
-## Running Agents
+`make help` lists everything. Queue files for authoring and adaptation live in
+`agents/<agent>/queue/` — a git-ignored live inbox; each run moves its input to
+`queue/processed/`. Worked examples are in [`docs/examples/queue/`](examples/queue/README.md).
 
 ### Agent 1 — Test Authoring
 
 ```bash
-# Create an input file
 cat > agents/test-authoring-agent/queue/payments.txt << 'EOF'
 Module: payments
 Type: web
@@ -68,179 +47,190 @@ Steps:
 3. Verify success message appears
 EOF
 
-# Run it
-make run AGENT=test-authoring-agent MODULE=payments
+./scripts/run-authoring-agent.sh payments
+AUTO_PUSH=false ./scripts/run-authoring-agent.sh payments   # dry run: your checkout, no PR
+```
 
-# Dry-run (no GitHub PR created)
-AUTO_PUSH=false make run AGENT=test-authoring-agent MODULE=payments
+Minimum input: `Module:` (decides the Java package; matched literally),
+`Type: web | api | both`, `URL:` for web tests, and numbered `Steps:`. The
+declared `Type:` is a hint — step 01 resolves the real type from the steps.
+
+To re-run a processed input, copy it back:
+```bash
+cp agents/test-authoring-agent/queue/processed/payments.txt agents/test-authoring-agent/queue/
 ```
 
 ### Agent 2 — Test Triaging
 
 ```bash
-# Auto-select most recent unanalysed build from MySQL
-make run AGENT=test-triaging-agent
-
-# Analyse a specific build tag
-make run AGENT=test-triaging-agent BUILD_TAG=ProdSanity-All-Tests-541
-
-# Stop early (useful for inspecting intermediate outputs)
-STOP_AFTER=classify make run AGENT=test-triaging-agent BUILD_TAG=ProdSanity-All-Tests-541
+./scripts/run-triaging-agent.sh                                        # scout: newest unanalysed build
+./scripts/run-triaging-agent.sh ProdSanity-All-Tests-541
+STOP_AFTER=classify ./scripts/run-triaging-agent.sh <build_tag>        # scout | collect | classify | review
 ```
 
-`STOP_AFTER` accepts: `scout`, `collect`, `classify`, `review`.
+Triaging records every analysed build in `feedback/skip-buildtags.json`, so a
+second run on the same tag needs the tag passed explicitly (direct mode). `make clear-feedback
+AGENT=test-triaging-agent` makes every build eligible again.
 
 ### Agent 3 — Test Healing
 
 ```bash
-# Process oldest item in queue (populated by Agent 2)
-make run AGENT=test-healing-agent
+./scripts/run-healing-agent.sh                               # oldest handoff in queue/
+./scripts/run-healing-agent.sh ProdSanity-All-Tests-541
+./scripts/run-healing-agent.sh /tmp/handoff.json             # the file is moved to processed/ afterwards
 
-# Fix a specific build tag
-make run AGENT=test-healing-agent BUILD_TAG=ProdSanity-All-Tests-541
+./scripts/run-healing-agent.sh --test LoginTest#testLogin    # standalone: reproduce, then fix
+REPAIR=true ./scripts/run-healing-agent.sh --test ...        # park the failing browser (CDP) for live repair
+FORCE=true  ./scripts/run-healing-agent.sh --test ...        # proceed on a non-locator failure / stop verdict
+```
 
-# Dry-run (fix + test locally, no PR)
-AUTO_PUSH=false make run AGENT=test-healing-agent
+Useful while developing healing:
+- `DIAGNOSIS_MODE=shadow` logs what the diagnosis *would* have stopped without
+  stopping; `scripts/diagnosis_soak.py` measures shadow verdicts against outcomes.
+- `HEALING_LOCATE_MODE=shadow` keeps Locate's proposal in `01-locate.md` without
+  applying it.
+
+### Agent 4 — Test Adaptation
+
+```bash
+./scripts/run-adaptation-agent.sh checkout
+EXPLORE_ONLY=true      ./scripts/run-adaptation-agent.sh checkout   # stop after the flow map
+ADAPTATION_APPLY=false ./scripts/run-adaptation-agent.sh checkout   # propose, do not edit
+```
+
+Exploration needs a login session for the app under test; step 03 restores a
+saved one or mints one from the framework's own properties
+(`scripts/mint_session.py` does the same by hand).
+
+### Resuming a session
+
+Authoring and adaptation can restart an existing session from step 2–5,
+reusing the earlier steps' output:
+
+```bash
+START_FROM_STEP=4 SESSION_ID=20260924-101500-create-payments ./scripts/run-authoring-agent.sh
+```
+
+Healing has no resume; it retries internally.
+
+---
+
+## Speeding up iterations
+
+### TESTING_MODE (authoring, adaptation)
+
+Caches the slow early steps — authoring 01–02, adaptation 01–03 — and restores
+them on the next run with the same input. Editing the input file invalidates the
+cache.
+
+```bash
+TESTING_MODE=true ./scripts/run-authoring-agent.sh payments   # first run fills the cache
+TESTING_MODE=true ./scripts/run-authoring-agent.sh payments   # later runs skip to 03
+rm -rf agents/test-authoring-agent/cache/cli/payments/        # clear it
+```
+
+The cache is per user: `agents/<agent>/cache/<user-id>/<module>/`, where CLI
+runs use `cli`.
+
+### STOP_AFTER (triaging)
+
+```bash
+STOP_AFTER=collect ./scripts/run-triaging-agent.sh MyBuild-123
+# edit 03_classify.py, then re-run with the real data
+```
+
+### Common dev settings
+
+| Variable | Purpose | Dev value |
+|----------|---------|-----------|
+| `AUTO_PUSH` | `false`: run in your checkout, no push, no PR | `false` |
+| `TESTING_MODE` | Cache early steps (authoring, adaptation) | `true` |
+| `STOP_AFTER` | Stop triaging after a step | `collect` / `classify` |
+| `AUTHORING_FIX_RETRY_COUNT`, `HEALING_RETRY_COUNT`, `ADAPTATION_RETRY_COUNT` | Retry budgets | `1` for faster feedback |
+| `HEADLESS_BROWSER` | `false` shows every browser any agent starts, including Maven test runs | `false` |
+| `CLAUDE_CLI_PATH` | Full path to `claude` | set if not on PATH |
+
+Everything else: [`config/.env.example`](../config/.env.example).
+
+---
+
+## Reading audit trails
+
+Every run writes `agents/<agent>/audit/<session-id>/`. The layout, marker files
+and session-ID patterns are in [ARCHITECTURE.md](ARCHITECTURE.md#session-and-audit-structure).
+The short version for debugging:
+
+- `NN-<step>.md` — each step's human-readable report. Start here.
+- `claude-<timestamp>.log` — the full prompt and raw response of one Claude call.
+  Open these to debug model behaviour.
+- `.fix-passed`, `.verdict`, `.skip-reason` — how the run ended.
+
+```bash
+make audit AGENT=test-healing-agent                 # list recent sessions
+make audit AGENT=test-healing-agent SESSION=<id>    # one session
+make dashboard                                      # web UI, http://localhost:8888 (PORT=9000 to change)
 ```
 
 ---
 
-## Speeding Up Development Iterations
-
-### TESTING_MODE (Agent 1)
-
-Steps 01 (Parse) and 02 (Validate Web) are slow — 1–2 minutes each. Enable `TESTING_MODE` to cache their outputs and skip them on re-runs:
+## Tests
 
 ```bash
-# First run — runs all steps and saves cache
-TESTING_MODE=true make run AGENT=test-authoring-agent MODULE=payments
-
-# Subsequent runs — skips 01 and 02, goes straight to Generate
-TESTING_MODE=true make run AGENT=test-authoring-agent MODULE=payments
-
-# Clear cache for a module
-rm -rf agents/test-authoring-agent/cache/payments/
+make test         # every unit test in tests/unit/ (all agents, shared/, the server)
+make test-cov     # same run, coverage for the triaging lib only
+python -m pytest locator-eval/     # locator engine tests — not part of make test
 ```
 
-Cache is stored at `agents/test-authoring-agent/cache/<module>/`.
-
-### STOP_AFTER (Agent 2)
-
-Run only the steps you're working on:
-```bash
-# Only collect data, don't classify
-STOP_AFTER=collect make run AGENT=test-triaging-agent BUILD_TAG=MyBuild-123
-# Now edit 03_classify.py and re-run from scratch with the real data
-```
+`tests/conftest.py` pins the framework plugin, so results do not depend on your
+`AUTOMATION_FRAMEWORK`. `tests/unit/test_prompt_files.py` fails if a file in
+`config/prompts/` has no loader.
 
 ---
 
-## Reading Audit Trails
-
-Every run creates a session folder. This is where to look when something goes wrong.
+## Working on the server
 
 ```bash
-# List recent sessions
-make audit AGENT=test-triaging-agent
-
-# Inspect a specific session
-make audit AGENT=test-triaging-agent SESSION=20260507-143000-ProdSanity-All-Tests-541
+bash scripts/run-server.sh     # http://127.0.0.1:6001, loads config/.env
+curl -s localhost:6001/health
 ```
 
-Or use the web dashboard:
-```bash
-make dashboard            # opens at http://localhost:8888
-make dashboard PORT=9000  # custom port
-```
-
-### Session folder layout
-
-```
-agents/<agent>/audit/<session-id>/
-├── 01-*.json         # Step output (structured data)
-├── 02-*.json
-├── ...
-├── *.md              # Claude prompt + response for each AI call (read these to debug LLM issues)
-├── .verdict          # APPROVED or NEEDS-HUMAN
-└── .fix-passed       # true / false / skipped
-```
-
-To debug a bad Claude response, open the `.md` files — they contain the full prompt that was sent and the raw response received.
+Without AI-Test-Studio in front, requests carry no identity headers, so you act
+as the anonymous user `default` (queue root, non-admin). See
+[SERVER_API.md](SERVER_API.md) for headers and endpoints. Server-started runs
+stream their console to `audit/<session>/stdout.log`.
 
 ---
 
-## Running Unit Tests
+## Scripts
 
-```bash
-make test               # runs tests/unit/ with pytest -v
-make test-cov           # with coverage report for Agent 2 lib
-```
+| Script | Use |
+|--------|-----|
+| `scripts/run-{authoring,triaging,healing,adaptation}-agent.sh` | One per agent: live console in the terminal, saved to `<session>/stdout.log` afterwards so History and `make dashboard` replay CLI runs too. Usage in each file's header. Windows: `run-triaging-agent.ps1`, `run-healing-agent.ps1` |
+| `scripts/run-server.sh` | Start `qa_agents_server` |
+| `scripts/audit_viewer.py` | The `make dashboard` UI |
+| `scripts/blast_radius.py` | Which tests a change reaches (`--affects <glob>`, `--test <Class#method>`, `--module <name>`) and the cost to verify them — adaptation step 02 on its own |
+| `scripts/mint_session.py` | Mint a login session for exploration |
+| `scripts/commit_baselines.py` | Commit refreshed page baselines after a green run (CI) |
+| `scripts/diagnosis_soak.py` | Score shadow-mode diagnosis verdicts before switching to `enforce` |
+| `scripts/setup.sh` / `.ps1`, `setup-mcp.sh` | Install; optional MCP registration |
 
-Tests cover Agent 2's library (database queries, HTML parser, report generator, classifier, memory).
-
----
-
-## Adding a New Input File (Agent 1)
-
-Input files live in `agents/test-authoring-agent/queue/`. Claude is flexible about exact formatting — the minimum required fields are:
-
-```
-Module: <name>
-Type: web | api | both
-URL: https://...            # for web tests
-
-Steps:
-1. ...
-2. ...
-```
-
-After a successful run the file is moved to `queue/processed/`. To re-run the same module, copy it back:
-```bash
-cp agents/test-authoring-agent/queue/processed/payments.txt \
-   agents/test-authoring-agent/queue/payments.txt
-```
+Each script's docstring or header has its options.
 
 ---
 
-## Extending a Shared Helper
+## Extending
 
-Code shared across agents lives in `shared/`. When adding a new helper:
+- **Shared helpers** live in `shared/`; import them from an action, no
+  registration needed. Promote code there only when two or more agents need it.
+- **Prompts** live in `config/prompts/` and must each have a loader
+  ([README](../config/prompts/README.md)).
+- **A new framework** — see [FRAMEWORK_INTEGRATION.md](FRAMEWORK_INTEGRATION.md).
+- **A new server agent** — see [SERVER_API.md](SERVER_API.md#adding-an-agent).
 
-1. Add the Python module to `shared/` (e.g. `shared/testrail.py`)
-2. Import it in the agent action that needs it — no registration required
-3. Shell helpers (`load_env.sh`, `session.sh`) are sourced by each `run.sh` directly
+## Feedback files
 
-Agent-specific logic stays inside `agents/<agent-name>/`. Only promote to `shared/` if two or more agents need it.
-
----
-
-## Skipping Builds or Known Issues
-
-To permanently skip a build tag from Agent 2's scout:
-```bash
-# Add to skip-buildtags.json
-make feedback AGENT=test-triaging-agent
-# Edit agents/test-triaging-agent/feedback/skip-buildtags.json directly
-```
-
-To mark a test pattern as un-fixable by Agent 3 (won't attempt auto-fix):
-```bash
-# Edit agents/test-healing-agent/feedback/known-issues.json
-```
-
----
-
-## Environment Variable Quick Reference
-
-The most commonly tweaked variables during development:
-
-| Variable | Purpose | Dev default |
-|----------|---------|-------------|
-| `AUTO_PUSH` | Skip GitHub PR creation | `false` |
-| `TESTING_MODE` | Cache Agent 1 steps 01+02 | `true` |
-| `STOP_AFTER` | Stop Agent 2 at a specific step | `collect` or `classify` |
-| `MAX_FIX_ATTEMPTS` | Retry budget for Agent 1+3 | `1` (faster feedback) |
-| `PLAYWRIGHT_HEADLESS` | Show browser during Agent 1 web validation | `false` |
-| `CLAUDE_CLI_PATH` | Full path to claude binary | _(set if not on PATH)_ |
-
-Full variable reference: `config/.env.example`.
+- `agents/test-triaging-agent/feedback/skip-buildtags.json` — builds scout skips
+  (written automatically; add known-bad builds by hand). `make feedback
+  AGENT=test-triaging-agent` prints it.
+- `agents/test-healing-agent/feedback/known-issues.json` — test patterns healing
+  must never auto-fix.
