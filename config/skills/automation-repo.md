@@ -70,6 +70,13 @@ Declare a locator the way the page object already declares its others (inline
 field initialisation, `@FindBy`, …) — match the file, do not introduce a second
 style.
 
+**Elements inside iframes.** A selector written
+`A >> internal:control=enter-frame >> B` is element `B` inside the iframe that `A`
+matches (several hops mean nested iframes). It is never one plain selector string:
+enter each frame the way the repo does (its `CLAUDE.md` shows how — a frame-scoped
+locator in a Playwright repo, a frame switch through the wrapper in a Selenium
+repo), keep every hop as given, and never replace a hop with a position.
+
 ---
 
 ## Logging

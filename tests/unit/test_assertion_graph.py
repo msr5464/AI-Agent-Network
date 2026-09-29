@@ -596,3 +596,119 @@ class TestSameNamedClasses:
         assert len({c["id"] for c in checks}) == 2
         assert ag.delta(checks, checks[:1])["removed"] == checks[1:], (
             "dropping one page's check must not read as the other's")
+
+
+class TestSanctionedRelax:
+    """`conserved(sanction=…)` — the one assertion a measured value mismatch names
+    may change its comparator, and nothing else may change with it.
+
+    Name and phone are the real pair from the payment-gateway run: two checks that
+    differ only in their message, which the fingerprint leaves out, so they share
+    one — the case that paired the name check's relaxation with the phone check.
+    """
+
+    NAME = ('"Customer name in order details overlay should match the name entered '
+            'in the checkout form"')
+    PHONE = ('AssertHelper.assertEquals(config, overlay.getCustomerPhone(), '
+             'data.getPhone(), "phone should match");')
+    SANCTION = {"message": NAME.strip('"'), "relation": "words"}
+
+    @staticmethod
+    def _fps(body):
+        import hashlib
+        out, seen = {"asserts": {}, "unresolved": []}, {}
+        for info in ag.asserts_in(body, "PaymentGatewayWebTest#completeCreditCardPayment"):
+            base = hashlib.sha1(info.pop("raw").encode()).hexdigest()[:16]
+            seen[base] = seen.get(base, 0) + 1
+            out["asserts"][f"{base}_{seen[base]}"] = info
+        return out
+
+    def _conserved(self, body, sanction=SANCTION):
+        before = self._fps("AssertHelper.assertEquals(config, overlay.getCustomerName(), "
+                           f"data.getName(),\n    {self.NAME});\n{self.PHONE}")
+        return ag.conserved(before, self._fps(body), sanction=sanction)
+
+    @pytest.mark.parametrize("name_check", [
+        "AssertHelper.assertContains(config, overlay.getCustomerName(), data.getName(), {m});",
+        "AssertHelper.assertEquals(config, helper.norm(overlay.getCustomerName()), "
+        "helper.norm(data.getName()), {m});",
+        "AssertHelper.assertTrue(config, helper.parseAmount(overlay.getCustomerName()) == "
+        "helper.parseAmount(data.getName()), {m});",
+    ])
+    def test_a_comparator_change_on_the_named_assertion_is_relaxed(self, name_check):
+        report = self._conserved(name_check.format(m=self.NAME) + self.PHONE)
+        assert report["ok"], report["reason"]
+        assert len(report["relaxed"]) == 1 and "(words)" in report["relaxed"][0]
+        assert "relaxed as sanctioned" in ag.describe(report)
+
+    def test_without_a_sanction_it_is_still_a_weakening(self):
+        report = self._conserved("AssertHelper.assertContains(config, overlay.getCustomerName(), "
+                                 f"data.getName(), {self.NAME});{self.PHONE}", sanction=None)
+        assert not report["ok"] and report["weakened"]
+
+    @pytest.mark.parametrize("body", [
+        # stopped comparing anything
+        "AssertHelper.assertTrue(config, true, {m});" + PHONE,
+        # relaxed the phone check instead of the named one
+        "AssertHelper.assertEquals(config, overlay.getCustomerName(), data.getName(), {m});"
+        "AssertHelper.assertContains(config, overlay.getCustomerPhone(), data.getPhone(), "
+        '"phone should match");',
+        # now runs only when it would pass
+        "if (x) {{ AssertHelper.assertContains(config, overlay.getCustomerName(), "
+        "data.getName(), {m}); }}" + PHONE,
+        # a different check: the message changed with it
+        'AssertHelper.assertContains(config, overlay.getCustomerName(), data.getName(), '
+        '"name shown");' + PHONE,
+    ])
+    def test_anything_beyond_that_one_change_is_refused(self, body):
+        assert not self._conserved(body.format(m=self.NAME))["ok"]
+
+    def test_an_untouched_assertion_is_not_reported_relaxed(self):
+        report = self._conserved("AssertHelper.assertEquals(config, overlay.getCustomerName(), "
+                                 f"data.getName(), {self.NAME});{self.PHONE}")
+        assert report["ok"] and report["relaxed"] == []
+
+    def test_an_expected_literal_must_survive_the_relax(self):
+        before = self._fps('AssertHelper.assertEquals(config, page.getTitle(), "Products", "title");')
+        kept = self._fps('AssertHelper.assertContains(config, page.getTitle(), "Products", "title");')
+        dropped = self._fps('AssertHelper.assertContains(config, page.getTitle(), "P", "title");')
+        sanction = {"message": "title", "relation": "words"}
+        assert ag.conserved(before, kept, sanction=sanction)["ok"]
+        assert not ag.conserved(before, dropped, sanction=sanction)["ok"]
+
+    def test_a_freeze_without_argument_text_cannot_be_relaxed(self):
+        before = self._fps("AssertHelper.assertEquals(config, overlay.getCustomerName(), "
+                           f"data.getName(), {self.NAME});")
+        for info in before["asserts"].values():
+            info.pop("args")
+        after = self._fps("AssertHelper.assertContains(config, overlay.getCustomerName(), "
+                          f"data.getName(), {self.NAME});")
+        assert not ag.conserved(before, after, sanction=self.SANCTION)["ok"]
+
+
+class TestCastsAreNotChanges:
+    """A step-04 compile fix cast both sides of an assertEquals to (int), because the
+    framework has no long overload, and conservation rejected it as a removed
+    assertion — twice, which stopped the loop. A cast changes a type, not the check."""
+
+    @staticmethod
+    def _fps(body):
+        return TestSanctionedRelax._fps(body)
+
+    def test_a_cast_on_each_side_is_the_same_assertion(self):
+        before = self._fps('AssertHelper.assertEquals(config, helper.parseAmount(bank.getAmount()), '
+                           'helper.parseAmount(discounted), "bank amount");')
+        after = self._fps('AssertHelper.assertEquals(config, (int) helper.parseAmount(bank.getAmount()), '
+                          '(int) helper.parseAmount(discounted), "bank amount");')
+        report = ag.conserved(before, after)
+        assert report["ok"], report["reason"]
+
+    def test_wrapping_an_operand_in_a_call_is_still_a_change(self):
+        before = self._fps('AssertHelper.assertEquals(config, page.getName(), data.getName(), "name");')
+        after = self._fps('AssertHelper.assertEquals(config, first(page.getName()), '
+                          'first(data.getName()), "name");')
+        assert not ag.conserved(before, after)["ok"]
+
+    def test_uncast_leaves_calls_alone(self):
+        assert ag._uncast("_,(_)_._(_._()),(_)_._(_),@") == "_,_._(_._()),_._(_),@"
+        assert ag._uncast("_,_(_),@") == "_,_(_),@"

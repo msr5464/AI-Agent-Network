@@ -25,6 +25,7 @@ as *unevaluable*, never as *unmatched*. Confusing the two would invent evidence.
 import re
 from typing import Dict, List, Optional
 
+from shared import frames
 from shared.dom_snapshot import parse_header
 
 # Playwright suffixes that narrow an already-valid CSS selector. Dropping them
@@ -171,10 +172,37 @@ def normalize_selector(raw: str) -> Optional[str]:
 
 def _compile_ok(soup, selector: str) -> bool:
     try:
-        soup.select(selector, limit=1)
-        return True
+        return select(soup, selector, limit=1) is not None
     except Exception:
         return False
+
+
+def in_frame(soup, selector: str):
+    """(document, the element's own selector) for a selector that may enter iframes.
+
+    The document is None when this capture cannot answer — a hop matching several
+    iframes, where Playwright refuses to act and no count is honest, or a frame
+    the capture does not hold — and False when a hop matches no iframe at all,
+    which is a real absence.
+    """
+    path, inner = frames.split(selector)
+    doc = soup
+    for hop in path:
+        hosts = doc.select(hop)
+        if not hosts:
+            return False, inner
+        doc = getattr(hosts[0], "qa_frame", None) if len(hosts) == 1 else None
+        if doc is None:
+            return None, inner
+    return doc, inner
+
+
+def select(soup, selector: str, limit: int = 0):
+    """soup.select() that follows an iframe chain. None when it cannot say."""
+    doc, inner = in_frame(soup, selector)
+    if doc is None:
+        return None
+    return doc.select(inner, limit=limit) if doc is not False else []
 
 
 def page_facts(snapshot_text: str, soup=None) -> Dict:
@@ -223,8 +251,21 @@ def page_facts(snapshot_text: str, soup=None) -> Dict:
 
 
 def parse(snapshot_text: str):
-    """Parse a snapshot once so callers can share the tree. None on failure."""
-    if not snapshot_text:
+    """Parse a snapshot once so callers can share the tree. None on failure.
+
+    The iframes captured beside it — a `frames` sidecar named in the header — are
+    parsed too and hung on their <iframe> tags (`qa_frame`, with that frame's own
+    element capture as `qa_prints`), so select() can follow a frame chain. A
+    snapshot without the sidecar parses exactly as it always did.
+    """
+    soup = _soup(snapshot_text)
+    if soup is not None:
+        _attach_frames(soup, snapshot_text)
+    return soup
+
+
+def _soup(text: str):
+    if not text:
         return None
     try:
         from bs4 import BeautifulSoup
@@ -232,10 +273,30 @@ def parse(snapshot_text: str):
         return None
     for parser in ("lxml", "html.parser"):
         try:
-            return BeautifulSoup(snapshot_text, parser)
+            return BeautifulSoup(text, parser)
         except Exception:
             continue
     return None
+
+
+def _attach_frames(soup, snapshot_text: str) -> None:
+    import json
+    from pathlib import Path
+    sidecar = parse_header(snapshot_text[:2000]).get("frames") or ""
+    try:
+        records = json.loads(Path(sidecar).read_text(encoding="utf-8")) if sidecar else []
+    except (OSError, ValueError):
+        return
+    docs = {0: soup}
+    for record in records or []:               # a parent is always written before its children
+        parent, child = docs.get(record.get("parent")), _soup(record.get("html") or "")
+        hosts = parent.find_all(["iframe", "frame"]) if parent is not None else []
+        ordinal = record.get("ordinal", -1)
+        if child is None or not 0 <= ordinal < len(hosts):
+            continue
+        child.qa_prints = record.get("fingerprints") or {}
+        hosts[ordinal].qa_frame = child
+        docs[record.get("index")] = child
 
 
 def extract_locators(source: str) -> List[Dict[str, str]]:
@@ -268,7 +329,7 @@ def locator_coverage(locators: List[Dict[str, str]], soup) -> Dict:
 
         if selector and _compile_ok(soup, selector):
             try:
-                nodes = soup.select(selector, limit=_MATCH_LIMIT * 8)
+                nodes = select(soup, selector, limit=_MATCH_LIMIT * 8)
                 if wanted:
                     nodes = [n for n in nodes if _has_accessible_name(n, wanted)]
                 entry["count"] = len(nodes[:_MATCH_LIMIT])

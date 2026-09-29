@@ -337,3 +337,28 @@ class TestPerStepSpend:
     def test_a_run_that_needed_no_model_says_that_rather_than_zeroes(self):
         assert metrics.format_summary({"totals": {"cost_usd": 0.0, "llm_calls": 0}}) == (
             "$0.0000 · no model calls")
+
+
+class TestResumedStepSpend:
+    """A resume runs the same label again. Last night's cancelled Validate Web
+    ($2.48) was printed on this morning's line, which cost $0.50."""
+
+    def test_each_attempt_is_charged_only_for_calls_in_its_own_window(self, audit, monkeypatch):
+        import time
+        monkeypatch.setenv("AUDIT_DIR", str(audit))
+        (audit / "metrics").mkdir(exist_ok=True)
+        label = "[02/05] Validate Web"
+        (audit / "metrics" / "stages.jsonl").write_text("\n".join(json.dumps(s) for s in [
+            {"key": "validate_web", "label": label, "started_at": 1000, "ended_at": 2800},
+            {"key": "validate_web", "label": label, "started_at": 50000, "ended_at": 50312},
+        ]) + "\n")
+        stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        (audit / "metrics" / "llm-calls.jsonl").write_text("\n".join(json.dumps(c) for c in [
+            {"stage": "validate_web", "stage_label": label, "cost_usd": 2.48,
+             "output_tokens": 45400, "ts": stamp(2700)},
+            {"stage": "validate_web", "stage_label": label, "cost_usd": 0.5,
+             "output_tokens": 9369, "ts": stamp(50300)},
+        ]) + "\n")
+        lines = metrics.format_table(audit).splitlines()
+        assert "$2.4800" in lines[0] and "$0.5000" in lines[1]
+        assert metrics.format_stage(None, "validate_web", label, 50000).startswith("$0.5000")

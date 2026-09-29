@@ -42,7 +42,10 @@ AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 INPUT_FILE = Path(os.environ["INPUT_FILE"])
 MODULE = os.environ.get("MODULE", "")
-MODEL = os.environ.get("ADAPTATION_MODEL", "claude-opus-5")
+# Set in config/.env, no default here: run.sh stops the run when it is missing.
+MODEL = os.environ.get("ADAPTATION_MODEL", "")
+# Set in config/.env. Empty → --effort is not passed and the runner's own effortLevel applies.
+EFFORT = os.environ.get("ADAPTATION_EFFORT") or None
 
 # What a change item can be. The kind selects the edit budget and the guards, so
 # it is a closed set — an unrecognised kind escalates rather than defaulting to
@@ -241,7 +244,7 @@ def main():
     try:
         call = _call_claude_ex(prompt=classify_prompt(headers.get("module", MODULE),
                                                       items, note),
-                               model=MODEL, cwd=str(REPO_ROOT), timeout=600,
+                               model=MODEL, effort=EFFORT, cwd=str(REPO_ROOT), timeout=600,
                                log_dir=str(AUDIT_DIR))
         if call.status != "ok":
             # No classification at all — a usage cap, an API error, a timeout.

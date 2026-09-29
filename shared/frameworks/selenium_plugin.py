@@ -4,12 +4,14 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from shared import frames
 from shared.frameworks.base import (
     CodeEngine,
     DiagnosticEngine,
     FrameworkPlugin,
     TelemetryParser,
     TestRunner,
+    literal_is_assembled,
 )
 
 
@@ -183,6 +185,7 @@ class SeleniumDiagnosticEngine(DiagnosticEngine):
 class SeleniumCodeEngine(CodeEngine):
     ELEMENT_TYPES = ("WebElement", "MobileElement", "By")
     LOCATOR_CALLS = ("cssSelector",)
+    TYPING_CALLS = ("enterData", "sendKeys")
     RAW_DRIVER_CALLS = (
         (re.compile(r"\bdriver\s*\.\s*findElement"), "driver.findElement"),
         (re.compile(r"\.\s*sendKeys\s*\("), ".sendKeys()"),
@@ -250,7 +253,8 @@ class SeleniumCodeEngine(CodeEngine):
                         name = field.group(1)
                         
                 found.append({"name": name, "raw": raw, "kind": "css" if by != "xpath" else "xpath",
-                              "value": "", "approx": False,
+                              "value": "",
+                              "approx": literal_is_assembled(source, match.end(), raw),
                               "selector": self.normalize_selector(css_selector) or ""})
         return found
 
@@ -328,6 +332,12 @@ class SeleniumCodeEngine(CodeEngine):
         """
         def _q(s: str) -> str:
             return '"' + (s or "").replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+        # A By cannot enter an iframe — Selenium switches into it first — so a
+        # frame-scoped locator has no single-expression form here. Empty code is
+        # the honest answer; a plain By would search the wrong document.
+        if kwargs.get("frame_path") or frames.scoped(kwargs.get("selector") or ""):
+            return {"python": "", "java": "", "findby": ""}
 
         def css(selector: str) -> Dict[str, str]:
             return {

@@ -48,15 +48,24 @@ _lock = threading.Lock()
 #   options     - list of {"value": ..., "label": ...} for type=select
 #   min / max   - for type=number
 #
+# Models and efforts have an empty default on purpose: config/.env is the one place
+# they are set, and a default here would show a value no run actually uses.
+#
 # Deliberately NOT exposed: per-invocation vars the server sets on each run
 # (TEST_NAME, FORCE, REPAIR, BUILD_TAG, MODULE, SESSION_ID, AUDIT_DIR,
 # AGENT_DIR, REPO_ROOT, HANDOFF_FILE, INPUT_FILE, FIX_ATTEMPT, START_FROM_STEP).
 # Writing those into config/.env would pin every run to one test.
 
+# "Not set" is a real choice, and the first one: a select with no option matching
+# the stored value renders its first option, so without it an unset effort would
+# show as "Low" and be saved as low on the next save.
 _EFFORT_OPTIONS = [
+    {"value": "", "label": "Not set"},
     {"value": "low", "label": "Low"},
     {"value": "medium", "label": "Medium"},
     {"value": "high", "label": "High"},
+    {"value": "xhigh", "label": "Extra high"},
+    {"value": "max", "label": "Max"},
 ]
 
 SETTINGS_SCHEMA: List[Dict[str, Any]] = [
@@ -64,16 +73,21 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
     # (shared/frameworks/detect.py). AUTOMATION_FRAMEWORK in config/.env remains
     # as a debugging override.
     # ── test-adaptation-agent ────────────────────────────────────────────────
-    {"key": "adaptation_model", "env_var": "ADAPTATION_MODEL", "label": "Adaptation model",
-     "description": "Claude model used to classify the change note and write edits.",
-     "type": "text", "category": "adaptation", "default": "claude-opus-5", "sensitive": False},
-    {"key": "adaptation_apply", "env_var": "ADAPTATION_APPLY", "label": "Apply edits",
+    {"key": "adaptation_model", "env_var": "ADAPTATION_MODEL", "label": "Claude Model",
+     "description": "Claude model used to classify the change note and write edits. Required.",
+     "type": "text", "category": "adaptation", "default": "", "sensitive": False},
+    {"key": "adaptation_effort", "env_var": "ADAPTATION_EFFORT", "label": "Reasoning Effort",
+     "description": "Reasoning effort for classifying the change note and writing edits. "
+                    "Exploration uses the shared Browser Effort instead.",
+     "type": "select", "category": "adaptation", "default": "", "sensitive": False,
+     "options": _EFFORT_OPTIONS},
+    {"key": "adaptation_apply", "env_var": "ADAPTATION_APPLY", "label": "Apply Edits",
      "description": "Off = propose-only: full diffs and guard results are recorded "
                     "but nothing is written. Turn on once the proposals are being "
                     "accepted verbatim.",
      "type": "boolean", "category": "adaptation", "default": False, "sensitive": False},
     {"key": "adaptation_verify_policy", "env_var": "ADAPTATION_VERIFY_POLICY",
-     "label": "Verification scope",
+     "label": "Verification Scope",
      "description": "named_only re-runs the tests the change note named; tiered adds "
                     "the shared surface. The verify set holds the single global run "
                     "slot, so 'all' can make the platform single-tasked for an hour.",
@@ -84,43 +98,43 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
          {"value": "all", "label": "all"}
      ], "sensitive": False},
     {"key": "adaptation_explore_timeout_s", "env_var": "ADAPTATION_EXPLORE_TIMEOUT_S",
-     "label": "Exploration budget (s)",
+     "label": "Exploration Budget (s)",
      "description": "Wall-clock limit for one browser exploration.",
      "type": "number", "category": "adaptation", "default": 1800, "min": 60, "max": 7200, "sensitive": False},
     {"key": "adaptation_explore_attempts", "env_var": "ADAPTATION_EXPLORE_ATTEMPTS",
-     "label": "Extra exploration attempts",
+     "label": "Extra Exploration Attempts",
      "description": "Full re-runs on a recoverable failure. Each one restarts the "
                     "flow in a fresh browser — there is no mid-flow resume.",
      "type": "number", "category": "adaptation", "default": 1, "min": 0, "max": 3, "sensitive": False},
     {"key": "adaptation_retry_count", "env_var": "ADAPTATION_RETRY_COUNT",
-     "label": "Adapt retry count",
+     "label": "Adapt Retry Count",
      "description": "Re-runs of the adapt step when verification fails. Each attempt is "
                     "handed the previous one's unapplied items, so a second failure on the "
                     "same item is evidence the approach is wrong.",
      "type": "number", "category": "adaptation", "default": 2, "min": 1, "max": 10, "sensitive": False},
     {"key": "adaptation_max_files", "env_var": "ADAPTATION_MAX_FILES_PER_RUN",
-     "label": "Max files per run",
+     "label": "Max Files Per Run",
      "description": "Exceeding this flips the run to propose-only rather than "
                     "truncating the work.",
      "type": "number", "category": "adaptation", "default": 6, "min": 1, "max": 20, "sensitive": False},
     {"key": "adaptation_max_total_diff", "env_var": "ADAPTATION_MAX_TOTAL_DIFF_LINES",
-     "label": "Max changed lines per run",
+     "label": "Max Changed Lines Per Run",
      "description": "Total across all files. A reviewer has to read this.",
      "type": "number", "category": "adaptation", "default": 200, "min": 20, "max": 1000, "sensitive": False},
     {"key": "adaptation_blast_max_tests", "env_var": "ADAPTATION_BLAST_MAX_TESTS",
-     "label": "Max tests in scope",
+     "label": "Max Tests in Scope",
      "description": "Above this the change is bigger than one agent run and escalates.",
      "type": "number", "category": "adaptation", "default": 40, "min": 1, "max": 500, "sensitive": False},
     {"key": "adaptation_hub_threshold", "env_var": "ADAPTATION_HUB_THRESHOLD",
-     "label": "Hub threshold",
+     "label": "Hub Threshold",
      "description": "A class referenced by more files than this is shared "
                     "infrastructure and does not propagate the blast radius.",
      "type": "number", "category": "adaptation", "default": 8, "min": 2, "max": 100, "sensitive": False},
     {"key": "adaptation_branch_prefix", "env_var": "ADAPTATION_BRANCH_PREFIX",
-     "label": "Branch prefix",
+     "label": "Branch Prefix",
      "description": "Branch name is <prefix>/<module>-<timestamp>.",
      "type": "text", "category": "adaptation", "default": "adaptation", "sensitive": False},
-    {"key": "adaptation_sandbox", "env_var": "ADAPTATION_SANDBOX", "label": "Sandbox environment",
+    {"key": "adaptation_sandbox", "env_var": "ADAPTATION_SANDBOX", "label": "Sandbox Environment",
      "description": "Assert the target environment is disposable, allowing "
                     "exploration to walk a destructive final step. Requires "
                     "ADAPTATION_SANDBOX_NOTE, which is reproduced in the PR body.",
@@ -266,6 +280,20 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "sensitive": False,
     },
     {
+        "key": "browser_effort",
+        "env_var": "BROWSER_EFFORT",
+        "label": "Browser Effort",
+        "description": "Reasoning effort for every Claude call that drives a browser: "
+                       "authoring's Validate Web, adaptation's Explore and "
+                       "healing's live DOM inspection. These run 20-40 turns "
+                       "and pay the effort on each one.",
+        "type": "select",
+        "category": "common",
+        "default": "",
+        "sensitive": False,
+        "options": _EFFORT_OPTIONS,
+    },
+    {
         "key": "testing_mode",
         "env_var": "TESTING_MODE",
         "label": "Testing Mode (cache steps)",
@@ -281,11 +309,35 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "key": "authoring_model",
         "env_var": "AUTHORING_MODEL",
         "label": "Claude Model",
-        "description": "Model used for all AI steps: parse, validate, generate, fix",
+        "description": "Model used for all AI steps: parse, validate, generate, fix. Required.",
         "type": "text",
         "category": "authoring",
-        "default": "claude-opus-4-6",
+        "default": "",
         "sensitive": False,
+    },
+    {
+        "key": "authoring_effort",
+        "env_var": "AUTHORING_EFFORT",
+        "label": "Reasoning Effort",
+        "description": "Reasoning effort for parse and fix. Validate uses the shared Browser "
+                       "Effort, and codegen uses Codegen Effort",
+        "type": "select",
+        "category": "authoring",
+        "default": "",
+        "sensitive": False,
+        "options": _EFFORT_OPTIONS,
+    },
+    {
+        "key": "generate_effort",
+        "env_var": "GENERATE_EFFORT",
+        "label": "Codegen Effort",
+        "description": "Reasoning effort for generating the test code. Kept lower because "
+                       "hidden thinking otherwise dominates the step",
+        "type": "select",
+        "category": "authoring",
+        "default": "",
+        "sensitive": False,
+        "options": _EFFORT_OPTIONS,
     },
     {
         "key": "authoring_branch_prefix",
@@ -349,11 +401,23 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "key": "healing_model",
         "env_var": "HEALING_MODEL",
         "label": "Claude Model",
-        "description": "Model used to generate locator fixes",
+        "description": "Model used to generate locator fixes. Required.",
         "type": "text",
         "category": "healing",
-        "default": "claude-opus-4-6",
+        "default": "",
         "sensitive": False,
+    },
+    {
+        "key": "healing_effort",
+        "env_var": "HEALING_EFFORT",
+        "label": "Reasoning Effort",
+        "description": "Reasoning effort for locator fixes. Live DOM inspection uses the "
+                       "shared Browser Effort",
+        "type": "select",
+        "category": "healing",
+        "default": "",
+        "sensitive": False,
+        "options": _EFFORT_OPTIONS,
     },
     {
         "key": "healing_max_fixes_per_run",
@@ -445,6 +509,29 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
     },
     # ── Test Triaging ────────────────────────────────────────────────────────
     {
+        "key": "triaging_model",
+        "env_var": "TRIAGING_MODEL",
+        "label": "Claude Model",
+        "description": "Model used to classify each failure's root cause and to review "
+                       "those verdicts. The review is a separate call with no shared "
+                       "context, which is what keeps it independent. Required.",
+        "type": "text",
+        "category": "triaging",
+        "default": "",
+        "sensitive": False,
+    },
+    {
+        "key": "triaging_effort",
+        "env_var": "TRIAGING_EFFORT",
+        "label": "Reasoning Effort",
+        "description": "Reasoning effort for the classification and review passes",
+        "type": "select",
+        "category": "triaging",
+        "default": "",
+        "sensitive": False,
+        "options": _EFFORT_OPTIONS,
+    },
+    {
         "key": "triaging_db_host",
         "env_var": "TRIAGING_DB_HOST",
         "label": "DB Host",
@@ -495,48 +582,6 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "category": "triaging",
         "default": "qa_results",
         "sensitive": False,
-    },
-    {
-        "key": "triaging_classifier_model",
-        "env_var": "TRIAGING_CLASSIFIER_MODEL",
-        "label": "Classifier Model",
-        "description": "Model used to classify each failure's root cause",
-        "type": "text",
-        "category": "triaging",
-        "default": "claude-opus-4-6",
-        "sensitive": False,
-    },
-    {
-        "key": "triaging_classifier_effort",
-        "env_var": "TRIAGING_CLASSIFIER_EFFORT",
-        "label": "Classifier Effort",
-        "description": "Reasoning effort for the classification pass",
-        "type": "select",
-        "category": "triaging",
-        "default": "medium",
-        "sensitive": False,
-        "options": _EFFORT_OPTIONS,
-    },
-    {
-        "key": "triaging_reviewer_model",
-        "env_var": "TRIAGING_REVIEWER_MODEL",
-        "label": "Reviewer Model",
-        "description": "Model used to review and challenge the classifier's verdicts",
-        "type": "text",
-        "category": "triaging",
-        "default": "claude-sonnet-4-6",
-        "sensitive": False,
-    },
-    {
-        "key": "triaging_reviewer_effort",
-        "env_var": "TRIAGING_REVIEWER_EFFORT",
-        "label": "Reviewer Effort",
-        "description": "Reasoning effort for the review pass",
-        "type": "select",
-        "category": "triaging",
-        "default": "medium",
-        "sensitive": False,
-        "options": _EFFORT_OPTIONS,
     },
     {
         "key": "triaging_scout_lookback_days",
@@ -785,6 +830,11 @@ def set_many(updates: Dict[str, Any]) -> None:
 def _validate(env_by_key: Dict[str, str]) -> Dict[str, str]:
     """Return {key: message} for values that would break the agents."""
     errors: Dict[str, str] = {}
+
+    # A model has no default anywhere else, and every run.sh stops without one.
+    for key, value in env_by_key.items():
+        if key.endswith("_model") and not value.strip():
+            errors[key] = "A model is required — runs stop without one."
 
     workspace = env_by_key.get("workspace_dir")
     if workspace is not None:

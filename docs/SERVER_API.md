@@ -27,7 +27,7 @@ bash scripts/run-server.sh
 | `QA_MAX_CONCURRENT_RUNS` | `4` | Runs executing at once; the rest queue |
 | `QA_WORKTREE_TEMP_DIR` | `/tmp/qa-runs` | Where each run's git worktree is created. Unsafe roots (`/`, `/tmp`, `$HOME`-level dirs) fall back to the default |
 | `QA_AGENT_RUN_TIMEOUT_SECONDS` | `7200` | Kill a whole run after this long |
-| `QA_AGENT_STALE_AFTER_SECONDS` | `900` | A session untouched this long is reported as `interrupted`, not running (legacy alias `QA_HEALING_STALE_AFTER_SECONDS`) |
+| `QA_AGENT_STALE_AFTER_SECONDS` | `900` | A session untouched this long is reported as `interrupted`, not running |
 | `QA_SEED_EXAMPLES` | `true` | Seed queues from `docs/examples/queue/` (see [Example seeding](#example-seeding)) |
 | `RUN_ANALYTICS_FILE` | `qa_agents_server/storage/run_analytics.jsonl` | Append-only analytics store |
 

@@ -115,6 +115,20 @@ class TestStepO2Parsers:
             "SELECTOR_FOUND: loginButton = button.blue-btn")
         assert selectors == {} and counts == {}
 
+    def test_one_name_is_one_element(self, tmp_path, monkeypatch):
+        """Three pages each asked for `amountDisplay`; the last report won and all
+        three got the success screen's amount. A name the plan uses on several
+        pages is asked for per page, and a repeat never replaces the first."""
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        pages = [{"class_name": "PopupPage", "locators_needed": ["amountDisplay", "payButton"]},
+                 {"class_name": "BankPage", "locators_needed": ["amountDisplay", "otpField"]}]
+        assert mod.qualified_locator_names(pages) == [
+            "PopupPage.amountDisplay", "payButton", "BankPage.amountDisplay", "otpField"]
+        selectors, _, _, _ = mod.parse_selector_output(
+            "SELECTOR_FOUND: amountDisplay=.header-amount|count=1|visible=1\n"
+            "SELECTOR_FOUND: amountDisplay=#txn_amount|count=1|visible=1")
+        assert selectors == {"amountDisplay": ".header-amount"}
+
     def test_a_selector_containing_a_pipe_survives(self, tmp_path, monkeypatch):
         """The count is read from the END of the line, so a literal | in the
         selector is safe — the same trap that forced INTERACTION_HINT onto JSON."""
@@ -791,6 +805,18 @@ class TestStaleTestMethodIsCorrected:
         mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
         assert mod.resolve_test_method("NoSuchTest", "recorded", []) == "recorded"
 
+    def test_a_resume_restores_step_03_output_into_a_fresh_checkout(self, tmp_path, monkeypatch):
+        """A resumed run's worktree is cut fresh from base; step 03's files are only
+        in 03-generate.json. Unrestored, maven ran zero tests."""
+        (tmp_path / "fw").mkdir()
+        rel = "src/test/java/automation/x/FooTest.java"
+        body = "public class FooTest {\n  @Test\n  public void generated(Config c) {}\n}\n"
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        assert mod.restore_generated_files({rel: body, "../escape.java": "x"}) == [rel]
+        assert (tmp_path / "fw" / rel).read_text() == body
+        assert not (tmp_path / "escape.java").exists()
+        assert mod.restore_generated_files({rel: body}) == []
+
 
 class TestSharedTestMethodExtraction:
     def test_it_is_comment_aware(self):
@@ -1166,10 +1192,24 @@ class TestUnverifiedCheckMatrix:
 
         assert out["dropped"] == []
         assert out["kept_unverified"] == [REAL_CHECK]
+        assert out["kept_unmeasured"] == []
         page = plan["web_pages"][0]
         assert page["locators_needed"] == ["profileSummaryDisplayText", "saveButton",
                                            "successToast"]
         assert len(plan["web_test_methods"][0]["steps"]) == 3
+
+    def test_a_pass_with_no_selector_is_not_blamed_on_the_product(self, tmp_path, monkeypatch):
+        """Step 02 downgrades a pass that came with no selector, and step 03 used to
+        report every kept check as "the product did not do this" — including an
+        amount the model had just read off the page inside an iframe."""
+        validate = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        _, downgraded = validate.enforce_verification_evidence([REAL_CHECK], [], {})
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        out = mod.prune_unverified_checks(
+            self._plan(), {"selectors": {}, "steps_unverified": downgraded}, NAUKRI_INPUT)
+
+        assert out["kept_unverified"] == [REAL_CHECK]
+        assert out["kept_unmeasured"] == [REAL_CHECK]
 
     def test_nothing_is_touched_when_everything_was_observed(self, tmp_path, monkeypatch):
         mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
@@ -1435,3 +1475,532 @@ class TestWhereTheBrowserActuallyWent:
         self._feed(decoder, "mcp__playwright__browser_navigate", {"url": "   "})
         self._feed(decoder, "browser_navigate", {"url": None})
         assert decoder.navigated_urls == []
+
+
+class TestValuesObservedAndAsserted:
+    """Vague English checks ("the name matches the one we filled") decided from what
+    step 02 saw rather than from the word "matches". Values are the real ones from a
+    checkout run."""
+
+    OUTPUT = "\n".join([
+        "INPUT_USED: nameField|Test User",
+        "INPUT_USED: phoneField|081234567890",
+        "INPUT_USED: nameField|second report ignored",
+        "STEP_PASSED: Validate the customer name in the overlay matches the name entered",
+        "VALUE_CHECK: Validate the customer name in the overlay matches the name entered"
+        "|customerNameLabel|Test User|input:nameField|Test User",
+        "STEP_PASSED: Validate the phone matches — +6281234567890",
+        "VALUE_CHECK: Validate the phone matches|customerPhoneLabel|+6281234567890"
+        "|input:phoneField|081234567890",
+        "STEP_PASSED: Validate the recorded amount matches the expected purchase amount",
+        "VALUE_CHECK: Validate the recorded amount matches the expected purchase amount"
+        "|PaymentPage.amountDisplay|Rp20.000|literal|Rp 490.909",
+    ])
+
+    def test_step_02_records_what_it_typed_and_compared(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        assert mod.parse_inputs_used(self.OUTPUT) == {"nameField": "Test User",
+                                                      "phoneField": "081234567890"}
+        relations = [c["relation"] for c in mod.parse_value_checks(self.OUTPUT)]
+        assert relations == ["equal", "phone", ""]
+
+    def test_a_comparison_whose_values_do_not_match_is_downgraded(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        passed, _, _ = mod.parse_step_results(self.OUTPUT)
+        kept, unverified = mod.enforce_value_checks(passed, [], mod.parse_value_checks(self.OUTPUT))
+        assert unverified == ["Validate the recorded amount matches the expected purchase amount"]
+        assert len(kept) == 2, "a step text with a trailing observation still matches its check"
+
+    UNVERIFIED_PHONE = "\n".join([
+        "INPUT_USED: phoneField|08123456789",
+        "STEP_UNVERIFIED: Validate the customer phone matches the phone entered"
+        "|exact match of \"08123456789\"|element shows \"+628123456789\"",
+        "VALUE_CHECK: Validate the customer phone matches the phone entered"
+        "|customerPhoneLabel|+628123456789|input:phoneField|08123456789",
+    ])
+
+    def test_an_unverified_comparison_whose_values_match_is_promoted(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        passed, _, unverified = mod.parse_step_results(self.UNVERIFIED_PHONE)
+        checks = mod.parse_value_checks(self.UNVERIFIED_PHONE)
+        inputs = mod.parse_inputs_used(self.UNVERIFIED_PHONE)
+        kept, still = mod.promote_matched_values(
+            passed, unverified, checks, {"customerPhoneLabel": "#phone"}, inputs)
+        assert (kept, still) == (["Validate the customer phone matches the phone entered"], []), (
+            "a country-code prefix is the same phone: the relation is measured, and a "
+            "run judged it a mismatch in prose")
+
+    def test_promotion_needs_a_measured_element_and_a_traced_expected_side(self, tmp_path,
+                                                                          monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        _, _, unverified = mod.parse_step_results(self.UNVERIFIED_PHONE)
+        checks = mod.parse_value_checks(self.UNVERIFIED_PHONE)
+        assert mod.promote_matched_values([], unverified, checks, {},
+                                          {"phoneField": "08123456789"}) == ([], unverified), (
+            "no confirmed selector for the element: nothing was measured")
+        assert mod.promote_matched_values([], unverified, checks, {"customerPhoneLabel": "#p"},
+                                          {"phoneField": "0899"}) == ([], unverified), (
+            "the expected side is not what INPUT_USED recorded as typed")
+
+    def test_step_03_is_told_the_shape_and_the_comparison(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        web = {"inputs_used": {"nameField": "Test User"},
+               "value_checks": [
+                   {"check": "amount", "element": "amountDisplay", "rendered": "Rp20.000",
+                    "source": "element:cartTotal", "expected": "20,000", "relation": "numeric"},
+                   {"check": "unmatched", "element": "x", "rendered": "a", "source": "literal",
+                    "expected": "b", "relation": ""}]}
+        hint = mod.value_contracts_hint(web)
+        assert "nameField = 'Test User'  (2 words)" in hint
+        assert "Never one token" in hint and "never a whole-name generator" in hint
+        assert "plain number text" in hint and "element:cartTotal" in hint
+        assert "string equality assertion" in hint, (
+            "a parsed long/double has no equality overload in every assertion helper")
+        assert "unmatched" not in hint, "a check with no relation has no contract"
+        assert mod.value_contracts_hint({}) == ""
+
+    def test_an_invented_expected_value_is_untraced(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        files = {
+            "src/test/resources/pg/csvFiles/pg-data.csv":
+                "data_key,expected_amount,promo_text,environment\n"
+                "checkout,Rp 490.909,Promo Flash Sale (Credit-Card),staging\n",
+            "src/test/java/automation/pg/PgWebTest.java":
+                'class PgWebTest { void t(Config config) {\n'
+                '  AssertHelper.assertEquals(config, page.getAmount(), "20,000", "amount");\n'
+                '  AssertHelper.assertContains(config, home.getMsg(), testData.get("thank_you"), "msg");\n'
+                '}}\n'}
+        raw = "5. validate amount on top of page is same as we passed earlier"
+        web = {"steps_passed": ["Read and record the amount — Rp20.000"]}
+        assert mod.untraced_expected_values(files, raw, web) == {
+            "src/test/resources/pg/csvFiles/pg-data.csv": ["Rp 490.909"]}
+
+
+class TestValueMismatchTriage:
+    """Step 04 on this run's real failure: the demo appended a default last name."""
+
+    FAILURE = ("✘ FAIL: Customer name in order details overlay should match the name "
+               "entered in the checkout form | Expected: 'User_orrju' | Actual: "
+               "'User_orrju sample_last_name'")
+    TEST = ("public class PaymentGatewayWebTest {\n"
+            "  @Test\n  public void completeCreditCardPayment(Config config) {\n"
+            "    AssertHelper.assertEquals(config, overlay.getCustomerName(), data.getName(),\n"
+            '        "Customer name in order details overlay should match the name entered '
+            'in the checkout form");\n'
+            "    AssertHelper.assertEquals(config, overlay.getCustomerPhone(), data.getPhone(),\n"
+            '        "Customer phone in order details overlay should match");\n'
+            "  }\n}\n")
+
+    def _frozen(self, tmp_path, monkeypatch):
+        rel = "src/test/java/automation/paymentgateway/PaymentGatewayWebTest.java"
+        path = tmp_path / "fw" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.TEST)
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        mod.freeze_assertions("PaymentGatewayWebTest", "completeCreditCardPayment")
+        return mod, rel
+
+    def test_it_is_triaged_and_the_prompt_names_both_fixes(self, tmp_path, monkeypatch):
+        mod, _ = self._frozen(tmp_path, monkeypatch)
+        mismatch = mod.triage_value_mismatch(self.FAILURE)
+        assert (mismatch["relation"], mismatch["expected"]) == ("words", "User_orrju")
+        section = mod.value_mismatch_section(mismatch, {"nameField": "Test User"})
+        assert "nameField = 'Test User'" in section
+        assert "(a) If the test typed data of a different shape" in section
+        assert "CONTAINS" in section
+        assert "Never add interactions" in section
+
+    def test_the_sanctioned_relax_passes_conservation_and_is_recorded(self, tmp_path, monkeypatch):
+        mod, rel = self._frozen(tmp_path, monkeypatch)
+        mismatch = mod.triage_value_mismatch(self.FAILURE)
+        sanction = {"message": mismatch["message"], "relation": mismatch["relation"]}
+        patched, _, rejections = mod.apply_fix({}, {rel: [{
+            "old_string": "AssertHelper.assertEquals(config, overlay.getCustomerName()",
+            "new_string": "AssertHelper.assertContains(config, overlay.getCustomerName()"}]},
+            "PaymentGatewayWebTest", "completeCreditCardPayment", sanction)
+        assert patched == [rel] and rejections == []
+        assert sanction["relaxed"] and "assertContains" in sanction["relaxed"][0]
+
+    def test_relaxing_the_other_check_is_still_rejected(self, tmp_path, monkeypatch):
+        mod, rel = self._frozen(tmp_path, monkeypatch)
+        mismatch = mod.triage_value_mismatch(self.FAILURE)
+        sanction = {"message": mismatch["message"], "relation": mismatch["relation"]}
+        patched, _, rejections = mod.apply_fix({}, {rel: [{
+            "old_string": "AssertHelper.assertEquals(config, overlay.getCustomerPhone()",
+            "new_string": "AssertHelper.assertContains(config, overlay.getCustomerPhone()"}]},
+            "PaymentGatewayWebTest", "completeCreditCardPayment", sanction)
+        assert patched == [] and "assertion_conservation" in rejections[-1]["reason"]
+
+    def test_a_different_value_is_not_triaged(self, tmp_path, monkeypatch):
+        mod, _ = self._frozen(tmp_path, monkeypatch)
+        assert mod.triage_value_mismatch(
+            self.FAILURE.replace("'User_orrju sample_last_name'", "'Budi'")) == {}
+
+
+class TestLiteralValueMismatch:
+    """The page rendered a quoted message without the space after its first sentence.
+    The fix belongs in the literal: offered a comparator, a fix wrapped both sides in
+    `.replaceAll("\\\\s+", "").toLowerCase()`."""
+
+    FAILURE = ("✘ FAIL: Thank you message should be displayed after successful payment | "
+               "Expected: 'Thank you for your purchase. Get a nice sleep.' | "
+               "Actual: 'Thank you for your purchase.Get a nice sleep.'")
+    REL = "src/test/java/automation/paymentgateway/PaymentGatewayWebTest.java"
+    TEST = ("public class PaymentGatewayWebTest {\n  @Test\n  public void pay(Config config) {\n"
+            "    AssertHelper.assertEquals(config, landing.getThankYouMessageText(),\n"
+            '        "Thank you for your purchase. Get a nice sleep.",\n'
+            '        "Thank you message should be displayed after successful payment");\n'
+            "  }\n}\n")
+
+    def _frozen(self, tmp_path, monkeypatch):
+        path = tmp_path / "fw" / self.REL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.TEST)
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        mod.freeze_assertions("PaymentGatewayWebTest", "pay")
+        return mod
+
+    def test_it_is_fixed_in_the_literal(self, tmp_path, monkeypatch):
+        mod = self._frozen(tmp_path, monkeypatch)
+        mismatch = mod.triage_value_mismatch(self.FAILURE)
+        assert (mismatch["relation"], mismatch["literal"]) == ("formatting", True)
+        section = mod.value_mismatch_section(mismatch, {"nameField": "Test User"})
+        assert ("replace 'Thank you for your purchase. Get a nice sleep.' with exactly "
+                "'Thank you for your purchase.Get a nice sleep.'") in section
+        assert "compare with" not in section, "no comparator is offered"
+
+    def test_the_literal_edit_passes_conservation_without_a_sanction(self, tmp_path, monkeypatch):
+        mod = self._frozen(tmp_path, monkeypatch)
+        patched, _, rejections = mod.apply_fix({}, {self.REL: [{
+            "old_string": '"Thank you for your purchase. Get a nice sleep.",',
+            "new_string": '"Thank you for your purchase.Get a nice sleep.",'}]},
+            "PaymentGatewayWebTest", "pay", None)
+        assert patched == [self.REL] and rejections == []
+
+    def test_a_normalising_comparator_is_rejected(self, tmp_path, monkeypatch):
+        mod = self._frozen(tmp_path, monkeypatch)
+        patched, _, rejections = mod.apply_fix({}, {self.REL: [{
+            "old_string": ('landing.getThankYouMessageText(),\n'
+                           '        "Thank you for your purchase. Get a nice sleep.",'),
+            "new_string": ('landing.getThankYouMessageText().replaceAll("\\\\s+", "").toLowerCase(),\n'
+                           '        "Thank you for your purchase. Get a nice sleep.".replaceAll("\\\\s+", "").toLowerCase(),')}]},
+            "PaymentGatewayWebTest", "pay", None)
+        assert patched == [] and "assertion_conservation" in rejections[-1]["reason"]
+
+
+class TestRetryAfterTimeout:
+    """Attempt 1 of the 21:54 run timed out after confirming 19 selectors and 21 of 25
+    steps; its retry was told it "produced no usable output" and started over."""
+
+    STEPS = ["Navigate to https://demo.midtrans.com/",
+             "Click the Buy Now button to open the shopping cart checkout form",
+             "Validate the home page displays the message 'Thank you for your purchase.'"]
+
+    def test_the_retry_reuses_what_was_confirmed_and_names_what_is_left(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        parsed = {"selectors": {"buyNowButton": "a.btn.buy"},
+                  "steps_passed": ["Navigate to https://demo.midtrans.com/",
+                                   "Click the Buy Now button to open the shopping cart "
+                                   "checkout form — form visible"]}
+        notes = "\n".join(mod.progress_notes("timed out after 1800s", parsed, self.STEPS))
+        assert "no usable output" not in notes
+        assert "buyNowButton=a.btn.buy" in notes and "do NOT search" in notes
+        assert notes.split("Not yet confirmed:")[1].strip() == (
+            "- Validate the home page displays the message 'Thank you for your purchase.'")
+
+    def test_nothing_confirmed_keeps_the_old_note(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        notes = mod.progress_notes("timed out", {"selectors": {}, "steps_passed": []}, self.STEPS)
+        assert "produced no usable output" in notes[0]
+
+
+class TestKnownSelectors:
+    """A retry used to rediscover all 19 selectors an earlier run had confirmed."""
+
+    def _run(self, root, name, host, selectors, status="ok", final=True, age=0):
+        import os, time
+        d = root / name
+        d.mkdir(parents=True)
+        (d / "01-parse.json").write_text(json.dumps({"web_base_url": f"https://{host}/"}))
+        f = d / "02-validate-web.json"
+        f.write_text(json.dumps({"selectors": selectors, "status": status,
+                                 "final_attempt": final}))
+        stamp = time.time() - age
+        os.utime(f, (stamp, stamp))
+
+    def test_the_newest_finished_run_on_the_same_site_wins(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        root = tmp_path / "audit"
+        self._run(root, "old-ok", "demo.midtrans.com", {"a": "#old"}, age=300)
+        self._run(root, "new-ok", "demo.midtrans.com", {"a": "#new"}, age=200)
+        self._run(root, "newest-timeout", "demo.midtrans.com", {"a": "#partial"},
+                  status="timeout", final=False, age=10)
+        self._run(root, "other-site", "www.saucedemo.com", {"a": "#other"}, age=0)
+        assert mod.known_selectors({"web_base_url": "https://demo.midtrans.com"},
+                                   roots=[root]) == ("new-ok", {"a": "#new"})
+
+    def test_nothing_known_is_nothing(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        assert mod.known_selectors({"web_base_url": "https://x.test"}, roots=[tmp_path]) == ("", {})
+        assert mod.known_selectors({}, roots=[tmp_path]) == ("", {})
+
+
+def test_an_unverified_action_is_not_a_check(tmp_path, monkeypatch):
+    """A run counted a payment tab after clicking it and invented a step for the
+    selector it could not report. Kept as a check, it made
+    step 04 stop on the `defect` gate when the tab's guessed locator failed."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    unverified = [
+        "Select Credit Card as the payment method (locator report)|checked "
+        "a.list[href='#/credit-card'] after navigation|element no longer present",
+        "Verify the amount decreases after applying the promo|compared before and after"
+        "|amount stayed at Rp19.000",
+        "The bank amount is the same as the cart total|compared|Rp19.000 vs Rp20.000",
+    ]
+    kept = mod.drop_unverified_actions(unverified)
+    assert [u.split("|")[0] for u in kept] == [
+        "Verify the amount decreases after applying the promo",
+        "The bank amount is the same as the cart total"], (
+        "a comparison is a claim even without a verifying verb")
+
+
+def test_a_literal_read_off_the_page_is_not_a_check(tmp_path, monkeypatch):
+    """The same session reported `Record the amount ...|literal|20,000`, and step 03
+    generated assertEquals(amount, "20,000") from it."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    output = "\n".join([
+        "VALUE_CHECK: Record the amount displayed on the order form before checkout"
+        "|OrderFormPage.amountText|20,000|literal|20,000",
+        "VALUE_CHECK: Verify the message is displayed|thankYouMessage"
+        "|Thank you for your purchase.|literal|Thank you for your purchase.",
+        "VALUE_CHECK: Verify the total|totalText|Rp 5.000|literal|Rp 5.000",
+        "VALUE_CHECK: Verify the top amount matches the order form"
+        "|topAmountText|Rp20.000|element:OrderFormPage.amountText|20,000",
+    ])
+    steps = ["Record the amount displayed on the order form before checkout",
+             "Verify the message 'Thank you for your purchase.' is displayed",
+             "Verify the total is 5,000"]
+    kept = mod.drop_untraced_sources(mod.parse_value_checks(output), steps, {})
+    assert [c["element"] for c in kept] == ["thankYouMessage", "totalText", "topAmountText"], (
+        "a literal quoted by the test case stays, in any number format; an element source "
+        "is not a literal")
+
+
+def test_a_field_is_something_that_takes_typing(tmp_path, monkeypatch):
+    """The plan's `amountField` was matched to a cart's read-only total,
+    `td.amount`. It counted 1/1, and the model reported
+    `INPUT_USED: amountField|20,000` for a value it had only read."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    found = {"nameField": "tr:nth-child(1) input", "amountField": "td.amount",
+             "cardField": "#card", "otpField": "#otp"}
+    counts, visibles, rejected = {k: 1 for k in found}, {k: 1 for k in found}, {}
+    inputs = {"nameField": "Test User", "amountField": "20,000", "cardField": "4111",
+              "otpField": "112233"}
+    rows = [
+        # What page.qa.check writes (Playwright's isEditable) and what a harvest writes.
+        {"checks": {"tr:nth-child(1) input": {"total": 1, "visible": 1, "editable": True},
+                    "td.amount": {"total": 1, "visible": 1, "editable": False}}},
+        {"checks": {"td.amount": {"total": 1, "visible": 1, "tag": "td"},
+                    "#card": {"total": 1, "visible": 1, "tag": "input"}}},
+    ]
+    kept = mod.enforce_typed_fields(inputs, found, counts, visibles, rejected, rows)
+    assert kept == {"nameField": "Test User", "cardField": "4111", "otpField": "112233"}, (
+        "an input by tag is typeable, and one never measured keeps the model's word")
+    assert "amountField" not in found and "amountField" not in counts
+    assert "takes no typing" in rejected["amountField"]
+    checks = [{"check": "Verify the popup amount matches the cart amount", "element": "x",
+               "rendered": "Rp20.000", "source": "input:amountField", "expected": "20,000",
+               "relation": "numeric"}]
+    assert mod.drop_untraced_sources(checks, [], kept) == [], (
+        "a contract must not compare with test data nothing was typed into")
+
+
+def test_an_input_used_must_be_something_the_browser_saw_typed(tmp_path, monkeypatch):
+    """The helpers record every value typed into any field. A claim none of them
+    matches is dropped; the field's selector stays, since only the claim is wrong."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    found = {"nameField": "#name", "cardField": "#card", "pwdField": "#pwd",
+             "amountField": "input.text-right"}
+    counts, visibles, rejected = {k: 1 for k in found}, {k: 1 for k in found}, {}
+    inputs = {"nameField": "Test User", "cardField": "4111111111111111",
+              "pwdField": "s3cret", "amountField": "20,000"}
+    rows = [{"typed": {"sel": "#name", "value": "Test User", "password": False}},
+            {"typed": {"sel": "#card", "value": "4111 1111 1111 1111", "password": False}},
+            {"typed": {"sel": "#pwd", "value": None, "password": True}}]
+    kept = mod.enforce_typed_fields(inputs, found, counts, visibles, rejected, rows)
+    assert kept == {"nameField": "Test User", "cardField": "4111111111111111",
+                    "pwdField": "s3cret"}, "a field that formats what it is given still counts"
+    assert "amountField" in found and not rejected, "the claim is dropped, not the field"
+    assert mod.enforce_typed_fields({"nameField": "x"}, {"nameField": "#name"}, {}, {}, {},
+                                    []) == {"nameField": "x"}, (
+        "no recording at all keeps the model's word")
+
+
+def test_page_qa_scopes_a_whole_frame_and_counts_before_acting(tmp_path):
+    """`scope: '#pay >> internal:control=enter-frame'` went to querySelector unsplit, so
+    every harvest inside an embedded checkout was a SyntaxError; so did Playwright's
+    `:visible` in a scope."""
+    import shutil, subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    from shared.mcp_config import INIT_PAGE
+    script = """
+const init = require(%s).default;
+let present = true;
+const harvest = at => async (fn, arg) => [{ tag: 'div', sel: '.x', total: 1, visible: 1, at,
+  inner: Array.isArray(arg) ? arg[0] : undefined },
+  // A field whose own selector is shared, with the text beside it.
+  { tag: 'input', type: 'text', sel: "input[type='text']", total: 3, visible: 3,
+    near: 'Name', box: 'tr', within: 'div.cart' }];
+// Only the main frame has the scope: Playwright resolves it, so `:visible` works.
+const scopeIn = n => () => ({ count: async () => n, first: () => ({ elementHandle: async () => 'ROOT' }) });
+const main = { url: () => 'https://shop.test/', parentFrame: () => null, evaluate: harvest('main'),
+  locator: scopeIn(1) };
+const pay = { url: () => 'https://pay.test/', parentFrame: () => main, evaluate: harvest('pay'),
+  locator: scopeIn(0), frameElement: async () => ({ evaluate: async () => '#pay' }) };
+const loc = () => ({ count: async () => (present ? 1 : 0),
+  nth: () => ({ isVisible: async () => present }),
+  first: () => ({ innerText: async () => 'Tab', isEditable: async () => { throw new Error('not an <input>'); },
+    isChecked: async () => true }) });
+const page = { on() {}, url: () => 'https://shop.test/', frames: () => [main, pay],
+  waitForTimeout: async () => {}, locator: loc, frameLocator: () => ({ locator: loc }) };
+(async () => {
+  await init({ page });
+  const whole = await page.qa.harvest('#pay >> internal:control=enter-frame', {});
+  const none = await page.qa.harvest('#other >> internal:control=enter-frame', {});
+  const scoped = await page.qa.harvest('div.cart:visible', {});
+  const out = await page.qa.step(async () => { present = false; },
+    { before: { tab: '#tab' }, check: { tab: '#tab' }, harvest: false, quietMs: 0 });
+  console.log(JSON.stringify({ whole, none, scoped, before: out.before, check: out.check }));
+})().catch(e => { console.error(e); process.exit(1); });
+""" % json.dumps(str(INIT_PAGE))
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    got = json.loads(done.stdout)
+    assert [(f["frame"], f["result"][0]["inner"], f["result"][0]["sel"]) for f in got["whole"]] == [
+        ("https://pay.test/", None, "#pay >> internal:control=enter-frame >> .x")]
+    assert "no frame is reached by #other" in got["none"][0]["result"]
+    assert [(f["frame"], f["result"][0]["inner"]) for f in got["scoped"]] == [
+        ("https://shop.test/", "ROOT")], "the scope is resolved by Playwright, in its own frame"
+    assert got["scoped"][0]["result"][1]["sel"] == "div.cart tr:has-text('Name') input[type='text']", (
+        "a field with only a shared selector is anchored on its label and counted")
+    assert got["before"]["tab"]["total"] == 1 and got["check"]["tab"]["total"] == 0
+    assert got["before"]["tab"]["editable"] is False, "isEditable throws on a non-field"
+    assert got["before"]["tab"]["checked"] is True, "a selected option says so in the same count"
+
+
+def test_step_02_calls_the_helpers_instead_of_carrying_code():
+    source = (ROOT / "agents" / "test-authoring-agent" / "actions" / "02_validate_web.py").read_text()
+    assert "page.qa.step(" in source and "page.qa.check(" in source
+    assert "ONE browser_run_code_unsafe PER STEP" in source
+    assert "const ATTRS = [" not in source, "the harvest snippet is preloaded, not pasted"
+
+
+def test_only_a_sameness_claim_is_refuted_by_different_values(tmp_path, monkeypatch):
+    """The 10:18 run downgraded "the amount has decreased" (its sides differ on
+    purpose) and "the order ID is not null" (no second value at all)."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    checks = [{"check": c, "relation": ""} for c in (
+        "Validate the displayed amount has decreased after applying the promo",
+        "Validate the captured order ID from the success page is not null",
+        "Validate the recorded amount matches the expected purchase amount")]
+    passed = [c["check"] for c in checks]
+    kept, unverified = mod.enforce_value_checks(passed, [], checks)
+    assert unverified == ["Validate the recorded amount matches the expected purchase amount"]
+    assert len(kept) == 2
+
+
+def test_a_real_difference_on_test_data_shows_what_step_02_typed(tmp_path, monkeypatch):
+    """'Alica Bednar MD' vs 'Alica Bednar' is no relation — not something to loosen —
+    but the expected side is test data whose shape drifted from 'Test User'."""
+    mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+    failure = ("✘ FAIL: Customer name should match | Expected: 'Alica Bednar MD' | "
+               "Actual: 'Alica Bednar'")
+    section = mod.typed_shape_section(failure, {"nameField": "Test User"})
+    assert "'Alica Bednar MD' (3 words)" in section
+    assert "nameField = 'Test User' (2 words)" in section
+    assert mod.typed_shape_section("Failed to load Element", {"nameField": "x"}) == ""
+    assert mod.typed_shape_section(failure, {}) == ""
+
+
+def test_selector_found_is_held_to_what_the_helpers_measured(tmp_path, monkeypatch):
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    found = {"buyNow": "a.btn.buy", "name": "tr input", "toast": ".toast"}
+    counts = {k: 1 for k in found}
+    visibles = {k: 1 for k in found}
+    rows = [{"checks": {"a.btn.buy": {"total": 1, "visible": 1},
+                        "tr input": {"total": 4, "visible": 4}}},
+            {"known": [{"selector": "a.btn.buy", "total": 0, "visible": 0}]}]
+    found, counts, visibles, rejected, stats = mod.verify_with_evidence(
+        found, counts, visibles, {}, rows)
+    assert set(found) == {"buyNow", "toast"}, "claimed 1/1, measured 4/4: dropped"
+    assert "measured 4 match(es)" in rejected["name"]
+    assert stats == {"live": 1, "claimed": 1, "dropped": 1}
+
+
+def test_the_test_cases_own_values_reach_the_browser_run():
+    """Step 01 rewrote "fill dummy data … Address: Bangalore, India" as "fill the
+    fields with dummy data", and step 02 typed an address it made up. Step 02 now
+    reads the values from the test case itself."""
+    from shared.test_case import given_values, is_given
+    text = "\n".join([
+        "Module: PaymentGateway",
+        "Type: web",
+        "URL: https://shop.test/",
+        "Steps:",
+        "1. Navigate to https://shop.test/",
+        "3. Fill dummy data in all the fields and click Checkout:",
+        "     Amount: 50000",
+        "     Address: Bangalore, India",
+        "     Enter card number: 4111 1111 1111 1111",
+        "Open https://shop.test/help",
+        "Validate the popup and everything else it says about the order: fine",
+    ])
+    assert given_values(text) == [("Amount", "50000"), ("Address", "Bangalore, India"),
+                                      ("Enter card number", "4111 1111 1111 1111")], (
+        "header fields, numbered step lines, a URL split at its scheme and a sentence "
+        "with a colon are not values")
+    assert is_given("4111111111111111", text) and not is_given("4811111111111114", text), (
+        "a field's own formatting is the same value; another card is not")
+
+
+def test_an_email_and_an_otp_are_credentials_only_in_a_flow_that_logs_in():
+    from shared.credential_extraction import mentions_login
+    assert mentions_login("2. Login as Admin user") and mentions_login("Sign in with email")
+    assert not mentions_login("Fill the checkout form\nEmail: a@b.test\nEnter Bank OTP: 112233")
+
+
+def test_a_value_the_test_case_gives_is_used_as_written(tmp_path, monkeypatch):
+    """Told to randomise every typed field inside its shape, step 03 replaced the
+    test case's card number and address with generated ones."""
+    mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+    web = {"inputs_used": {"addressField": "Bangalore, India", "phoneField": "081234567890",
+                           "cardNumberField": "4111 1111 1111 1111"}}
+    raw = ("3. Fill the form and click Checkout:\n   Address: Bangalore, India\n"
+           "   Enter card number: 4111 1111 1111 1111\n")
+    hint = mod.value_contracts_hint(web, raw)
+    assert "addressField = 'Bangalore, India'  (2 words)  GIVEN BY THE TEST CASE" in hint
+    assert "cardNumberField = '4111 1111 1111 1111'  (4 words)  GIVEN BY THE TEST CASE" in hint
+    assert "phoneField = '081234567890'  (1 word)\n" in hint, "a made-up value keeps the shape rule"
+    assert "Test data for the other fields keeps that SHAPE" in hint
+
+
+def test_a_clicked_locator_nobody_reported_is_confirmed_from_the_click(tmp_path, monkeypatch):
+    """A run clicked a page's main button and never reported it, and step 03 guessed
+    a `button` for what was a link. The browser records every click; the rows below
+    are what it recorded for a link, a clickable div and a span inside a button."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    rows = [{"clicked": {"sel": "a.btn.buy", "total": 1, "visible": 1, "text": "BUY NOW"}},
+            {"clicked": {"sel": "div.cart-checkout", "total": 1, "visible": 1, "text": "CHECKOUT"}},
+            {"clicked": {"sel": "button.pay", "total": 1, "visible": 1, "text": "Pay now"}},
+            {"clicked": {"sel": "a.promo", "total": 2, "visible": 2, "text": "Details"}}]
+    found, counts, visibles = {"payButton": "button.pay"}, {"payButton": 1}, {"payButton": 1}
+    recovered = mod.recover_clicked_locators(
+        found, counts, visibles, rows,
+        ["LandingPage.buyNowButton", "checkoutButton", "continueButton", "detailsIcon", "payButton"])
+    assert recovered == ["LandingPage.buyNowButton", "checkoutButton"]
+    assert found["LandingPage.buyNowButton"] == "a.btn.buy", (
+        "two shared words beat the one `now` shares with 'Pay now'")
+    assert "continueButton" not in found, "a click whose text does not name it is not it"
+    assert "detailsIcon" not in found, "a click on an element that was not unique confirms nothing"

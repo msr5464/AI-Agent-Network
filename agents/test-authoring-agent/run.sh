@@ -38,6 +38,9 @@ export MODULE AGENT_DIR REPO_ROOT
 # ── Session helpers (log, run_step, fmt_duration, elapsed_since) ──────────────
 source "$REPO_ROOT/shared/session.sh"
 
+# The model has no default in code — config/.env sets it.
+require_settings AUTHORING_MODEL
+
 # ── Testing-mode cache helpers ────────────────────────────────────────────────
 # When TESTING_MODE=true, step-01 and step-02 outputs are cached under
 # agents/test-authoring-agent/cache/<module>/ so they are reused on every
@@ -436,9 +439,6 @@ fi
 # it wants a smaller number. One shared knob meant setting healing's budget silently set
 # this one as well.
 AUTHORING_FIX_RETRY_COUNT="${AUTHORING_FIX_RETRY_COUNT:-2}"
-if [[ -n "${MAX_FIX_ATTEMPTS:-}" ]]; then
-  log "NOTE: MAX_FIX_ATTEMPTS is set but no longer read — use AUTHORING_FIX_RETRY_COUNT (currently $AUTHORING_FIX_RETRY_COUNT)"
-fi
 
 if [[ "$START_FROM_STEP" -gt 4 ]]; then
   log "✓ [04/05] Run & Fix — reused from resumed session"

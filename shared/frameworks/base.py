@@ -105,6 +105,35 @@ class DiagnosticEngine(abc.ABC):
         """Return True if a locator matched nothing usable: not found, stale, not interactable."""
         pass
 
+    #: How a failed value assertion prints its two sides, first match wins: the
+    #: repo's own `Expected: '…' | Actual: '…'` (and its unquoted int form), and
+    #: TestNG's `expected [..] but found [..]`.
+    VALUE_MISMATCH_PATTERNS: Tuple["re.Pattern", ...] = (
+        re.compile(r"Expected: '(?P<expected>.*?)' \| Actual: '(?P<actual>.*)'[ \t]*$", re.M),
+        re.compile(r"Expected: (?P<expected>-?\d+) \| Actual: (?P<actual>-?\d+)"),
+        re.compile(r"expected \[(?P<expected>.*?)\] but found \[(?P<actual>.*?)\]"),
+    )
+
+    def value_mismatch(self, error_message: str) -> Optional[Tuple[str, str]]:
+        """(expected, actual) from the first failed value assertion, or None."""
+        for pattern in self.VALUE_MISMATCH_PATTERNS:
+            match = pattern.search(error_message or "")
+            if match:
+                return match.group("expected"), match.group("actual")
+        return None
+
+
+# A selector literal that is only the start of what the code builds:
+# `page.locator("#item-" + id)`, or a format template. Counted as it stands it
+# matches nothing, and reading it as the locator reported a working one as broken.
+_JOINED_AFTER = re.compile(r"\s*\+")
+_PLACEHOLDER = re.compile(r"%[sdf]|\{\d*\}")
+
+
+def literal_is_assembled(source: str, end: int, raw: str) -> bool:
+    """Whether the selector literal whose closing quote ends at `end` is assembled."""
+    return bool(_JOINED_AFTER.match(source or "", end)) or bool(_PLACEHOLDER.search(raw or ""))
+
 
 class CodeEngine(abc.ABC):
     """Handles framework-specific code generation and parsing rules."""
@@ -118,6 +147,10 @@ class CodeEngine(abc.ABC):
     #: (pattern, label) for calls that drive the browser directly instead of
     #: through the repo's wrappers. Edits that add one are rejected.
     RAW_DRIVER_CALLS: Tuple[Tuple["re.Pattern", str], ...] = ()
+
+    #: Calls that type into an element, wrapper or raw: `fillText(field, …)` or
+    #: `field.fill(…)`. The element a call like this names must be a field.
+    TYPING_CALLS: Tuple[str, ...] = ()
 
     @abc.abstractmethod
     def remove_framework_suffixes(self, selector: str) -> str:
@@ -154,9 +187,23 @@ class CodeEngine(abc.ABC):
         """Map an ARIA role to the framework's native role enum."""
         pass
 
+    def frame_chains(self, source: str) -> List[Tuple[int, int, str]]:
+        """(start, end, chain) for each locator in `source` that enters an iframe.
+
+        `chain` is written the shared/frames.py way. The default finds none, which
+        is right for a framework that switches frames imperatively rather than
+        expressing them in the locator.
+        """
+        return []
+
     @abc.abstractmethod
     def emit_locator(self, **kwargs) -> Dict[str, str]:
-        """Emit the native code snippet for a synthesized locator."""
+        """Emit the native code snippet for a synthesized locator.
+
+        `frame_path=[...]`, or a `selector` written as a shared/frames.py chain,
+        asks for a locator inside those iframes. A framework that cannot express
+        one in a single locator returns empty code rather than a wrong one.
+        """
         pass
 
 

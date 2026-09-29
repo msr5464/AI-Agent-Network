@@ -97,3 +97,59 @@ def test_the_repos_own_conventions_reach_the_model(tmp_path, monkeypatch):
         {"steps": [], "pages": {}}, tmp_path, rules="", retry_note="")
     assert "PROJECT CONVENTIONS" in prompt
     assert "never locator.click()" in prompt
+
+
+def test_a_measured_relation_is_offered_as_a_relax(tmp_path, monkeypatch):
+    adapt = _load_adapt(tmp_path, monkeypatch)
+    check = {"id": "c1", "message": "Customer name should match", "site": "WebTest#b",
+             "callee": "AssertHelper.assertEquals", "display": [], "via": ""}
+    flow = {"steps": [], "pages": {},
+            "value_checks": [{"check": "c1", "element": "name", "source": "input:name",
+                              "rendered": "User_x sample_last_name", "expected": "User_x",
+                              "relation": "words"}]}
+    prompt = adapt.build_adapt_prompt(
+        {"index": 1, "kind": "outcome_changed", "text": "the overlay shows the full name"},
+        {"type": "web"}, {}, flow, tmp_path, rules="", retry_note="", checks=[check])
+    assert "relation **words**" in prompt and "User_x sample_last_name" in prompt
+    assert "`relax` one listed with a relation" in prompt
+
+
+def test_a_verify_failure_that_is_only_rendering_is_named(tmp_path, monkeypatch):
+    adapt = _load_adapt(tmp_path, monkeypatch)
+    checks = [{"id": "c1", "message": "Customer name should match"},
+              {"id": "c2", "message": "Phone should match"}]
+    failed = [("m.WebTest#b", "failed",
+               "✘ FAIL: Customer name should match | Expected: 'User_x' | "
+               "Actual: 'User_x sample_last_name'"),
+              ("m.WebTest#c", "failed",
+               "✘ FAIL: Phone should match | Expected: '0811' | Actual: 'Budi'")]
+    assert adapt.value_mismatches(failed, checks) == [
+        {"check": "c1", "message": "Customer name should match", "expected": "User_x",
+         "actual": "User_x sample_last_name", "relation": "words"}]
+
+
+def test_the_explorer_counts_the_page_objects_exact_locators(tmp_path, monkeypatch):
+    """Every exact locator of every page object in scope is handed to the browser
+    helpers to count live; one assembled at runtime is left out, because counting
+    its approximation would report a working locator as broken."""
+    monkeypatch.setenv("AUDIT_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    is_lib = lambda n: n == "lib" or n.startswith("lib.")
+    for name in [n for n in sys.modules if is_lib(n)]:
+        monkeypatch.delitem(sys.modules, name)
+    spec = importlib.util.spec_from_file_location(
+        "explore_03", ROOT / "agents/test-adaptation-agent/actions/03_explore_web.py")
+    explore = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(explore)
+    for name in [n for n in sys.modules if is_lib(n)]:
+        del sys.modules[name]
+    source = ('public class ProductsPage extends BasePage {\n'
+              '  private final Locator title = page.locator(".title");\n'
+              '  private final Locator cart = page.locator("[data-test=\'shopping-cart-link\']");\n'
+              '  Locator item(String n) { return page.locator("#item-" + n); }\n}\n')
+    known = explore.known_locators([{"path": "src/web/ProductsPage.java", "snippet": source}])
+    assert {(k["owner"], k["name"], k["selector"]) for k in known} >= {
+        ("ProductsPage", "title", ".title"),
+        ("ProductsPage", "cart", "[data-test='shopping-cart-link']")}
+    assert all(k["path"] == "src/web/ProductsPage.java" for k in known)
+    assert not any(k["selector"].startswith("#item-") for k in known)

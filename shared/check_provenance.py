@@ -45,6 +45,13 @@ ACTION = "action"
 USER = "user"
 INFERRED = "inferred"
 
+# Step 02's note on a verification the model reported as passed but never measured
+# a selector for. It must read differently from a check the model looked for and
+# did not find. That one is a finding about the product. This one is a gap in the
+# evidence: the model may well have seen it, in a screenshot or inside an iframe
+# it could not count in. Step 03 and step 05 tell the two apart by this text.
+UNMEASURED = "reported as passed, but no selector was measured for it"
+
 # A step is a proof when a verifying verb appears anywhere in it, not just at the
 # front: the user's own last step reads "go again to the profile page and validate
 # that the profile is updated", where the proof rides on the tail of an action.

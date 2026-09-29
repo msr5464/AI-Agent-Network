@@ -18,15 +18,20 @@ from shared.credential_extraction import LABELS
 # are never extracted but must never be printed either.
 #
 # Bare "user" is in neither list: it would false-positive on "Admin user".
-_EXTRA_SECRET_LABELS = r"token|secret|authorization"
+# Card details too: a test case's card number and CVV were printed in the run
+# header while the bank OTP beside them was masked.
+_EXTRA_SECRET_LABELS = (r"token|secret|authorization"
+                        r"|card\s*(?:number|no)|cvv2?|cvc2?|expiry(?:\s*date)?|expiration(?:\s*date)?")
 # Every `label: value` pair, not one per line: a one-line curl carries several
 # (`-H "Authorization: Bearer …" -H "x-api-key: …" -d '{"password": "…"}'`), and
 # the line-anchored form masked only the last. The optional quote handles JSON
 # keys, and a Bearer/Basic scheme word is skipped so the token itself is masked.
+# A value in digit groups (`4111 1111 1111 1111`, `01/35`) is one value: taken
+# a token at a time, only its first group was masked.
 _CREDENTIAL_LINE_RE = re.compile(
     r"(?i)(\b(?:"
     + "|".join(list(LABELS.values()) + [_EXTRA_SECRET_LABELS])
-    + r")\b[\"']?\s*[:=]\s*[\"']?(?:(?:bearer|basic)\s+)?)(\S+)"
+    + r")\b[\"']?\s*[:=]\s*[\"']?(?:(?:bearer|basic)\s+)?)(\d[\d \-/]*\d|\S+)"
 )
 
 

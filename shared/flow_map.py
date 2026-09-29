@@ -29,9 +29,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from shared.baseline import url_shape
+from shared import frames, value_match
 from shared.page_identity import normalize_selector
 
 SCHEMA_VERSION = 1
@@ -60,7 +62,7 @@ CATEGORIES = ("selector_not_found", "login_failed", "timeout", "overlay_blocking
               "destructive_refused", "other")
 
 _MARKER = re.compile(r"^(FLOW_STEP|PAGE_STATE|PAGE_ENTER|SELECTOR_COUNT|"
-                     r"OUTCOME_OBSERVED|REFUSED|UNREACHABLE_STATE|"
+                     r"OUTCOME_OBSERVED|VALUE_CHECK|REFUSED|UNREACHABLE_STATE|"
                      r"STEP_PASSED|STEP_FAILED|SELECTOR_FOUND):\s*(.*)$")
 
 # Selector grammar we can honestly evaluate against an element inventory. Anything
@@ -158,7 +160,10 @@ def count_in_inventory(selector: str, elements: List[Dict]) -> Optional[int]:
     "it matches nothing", and treating them alike is how an unverifiable guess
     gets recorded as a verified absence.
     """
-    normalized = normalize_selector(selector or "")
+    # Inside an iframe, only that iframe's inventory entries are candidates.
+    path, selector = frames.split(selector or "")
+    elements = [e for e in elements or [] if frames.prefix_path(e.get("frame") or "") == path]
+    normalized = normalize_selector(selector)
     if not normalized:
         return None
     match = _SIMPLE_SELECTOR.match(normalized.strip())
@@ -246,8 +251,8 @@ def parse_markers(stdout: str) -> Dict:
     """
     flow: Dict = {
         "schema_version": SCHEMA_VERSION, "steps": [], "pages": {},
-        "unreachable": [], "refusals": [], "outcomes": [], "notes": [],
-        "legacy_selectors": {},
+        "unreachable": [], "refusals": [], "outcomes": [], "value_checks": [],
+        "notes": [], "legacy_selectors": {},
     }
     inventories: Dict[str, List[Dict]] = {}
     page_enters: Dict[str, Dict] = {}
@@ -289,6 +294,11 @@ def parse_markers(stdout: str) -> Dict:
             elif kind == "OUTCOME_OBSERVED":
                 invariant, seen = (payload.split("|", 1) + [""])[:2]
                 flow["outcomes"].append({"invariant": invariant, "observed": seen})
+            elif kind == "VALUE_CHECK":
+                # Both sides of a comparison; the relation is measured in Python.
+                check = value_match.parse_value_check(payload)
+                if check:
+                    flow["value_checks"].append(check)
             elif kind == "REFUSED":
                 index, target, rule = (payload.split("|", 2) + ["", ""])[:3]
                 flow["refusals"].append({"index": index, "target": target,
@@ -315,6 +325,109 @@ def parse_markers(stdout: str) -> Dict:
     for page_id, enter in page_enters.items():
         flow["pages"][page_id] = facts_from_markers(enter, inventories.get(page_id, []))
     flow["_inventories"] = inventories
+    return flow
+
+
+def _unique(counted: Optional[Dict]) -> bool:
+    return bool(counted) and counted.get("total") == 1 and counted.get("visible") == 1
+
+
+def _merge_known(before: Optional[List[Dict]], now: List[Dict]) -> List[Dict]:
+    """One page's known-locator counts across its states, best reading kept.
+
+    A locator that resolved in any state of the page resolves on it: a toast
+    counted while it showed is not broken because the last state came after it
+    closed.
+    """
+    rank = lambda e: (2 if _unique(e) else 1 if e.get("total") else 0)
+    best = {(e.get("owner"), e.get("name"), e.get("selector")): e for e in before or []}
+    for entry in now:
+        key = (entry.get("owner"), entry.get("name"), entry.get("selector"))
+        if key not in best or rank(entry) > rank(best[key]):
+            best[key] = entry
+    return list(best.values())
+
+
+def read_evidence(path) -> List[Dict]:
+    """The rows page.qa wrote to its evidence file, one JSON object per line.
+
+    [] when there is no file. A torn last line — a run killed mid-write — is
+    skipped, like a malformed marker.
+    """
+    rows: List[Dict] = []
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except (OSError, TypeError):
+        return rows
+    for line in text.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def apply_evidence(flow: Dict, rows: List[Dict]) -> Dict:
+    """Fold what the browser helpers measured into a parsed flow map.
+
+    Measured, not reported: an inventory here was read from the page by
+    page.qa, and a count was counted by it. Three things come of that.
+
+      * A page is inventoried whether or not the model typed a PAGE_STATE for
+        it — 30 of 87 explorer selectors were unverifiable only because it had
+        not. The model's own inventory, when there is one, is kept alongside.
+      * A selector the helpers counted on a page has a live count there
+        (`_live`), which verify_selectors prefers to a recount against a
+        25-element sample — and which covers what a recount cannot evaluate:
+        :has-text(), role=, frame chains.
+      * The repo's own locators, counted on every page state (`_known`), say
+        which page object each page is and which of its locators broke.
+
+    A row names its page by the id the model gave the step; an untagged row is
+    placed by URL.
+    """
+    if not rows:
+        return flow
+    inventories = flow.setdefault("_inventories", {})
+    pages = flow.setdefault("pages", {})
+    live = flow.setdefault("_live", {})
+    known = flow.setdefault("_known", {})
+    by_url = {page.get("url"): pid for pid, page in pages.items() if page.get("url")}
+    grown = set()
+    for row in rows:
+        page_id = row.get("page") or by_url.get(row.get("url"))
+        if not page_id:
+            continue
+        if page_id not in pages:
+            pages[page_id] = facts_from_markers(
+                {"id": page_id, "url": row.get("url", ""), "title": ""}, [])
+            by_url.setdefault(row.get("url"), page_id)
+        seen = {json.dumps(e, sort_keys=True) for e in inventories.get(page_id, [])}
+        for element in row.get("inventory") or []:
+            key = json.dumps(element, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                inventories.setdefault(page_id, []).append(element)
+                grown.add(page_id)
+        counts = live.setdefault(page_id, {})
+        measured = [(sel, c) for sel, c in (row.get("checks") or {}).items()
+                    if isinstance(c, dict) and "total" in c]
+        if row.get("known"):
+            known[page_id] = _merge_known(known.get(page_id), row["known"])
+            measured +=[(e["selector"], {"total": e["total"], "visible": e.get("visible")})
+                         for e in row["known"] if e.get("selector") and "total" in e]
+        for selector, counted in measured:
+            # One page, several states: a selector unique in one of them is
+            # unique, so a later state where it is gone never overwrites that.
+            if not _unique(counts.get(selector)) or _unique(counted):
+                counts[selector] = counted
+    for page_id in grown:
+        page = pages[page_id]
+        pages[page_id] = facts_from_markers(
+            {"id": page_id, "url": page.get("url", ""), "title": page.get("title", "")},
+            inventories[page_id])
     return flow
 
 
@@ -346,6 +459,15 @@ def verify_selectors(flow: Dict) -> Dict:
         if not candidate:
             check.update({"match_count": None, "counted_against": "none",
                           "unique": None})
+            continue
+        # Counted on the live page by the helpers: proof, where a recount against
+        # the inventory is only "consistent with unique".
+        counted = (flow.get("_live") or {}).get(page_id, {}).get(candidate)
+        if counted is not None:
+            total, visible = counted.get("total"), counted.get("visible")
+            check.update({"match_count": total, "visible_count": visible,
+                          "counted_against": "live",
+                          "unique": total == 1 and visible == 1})
             continue
         if elements is None:
             check.update({"match_count": None, "counted_against": "none",
@@ -386,9 +508,14 @@ def detect_refusals(flow: Dict) -> Dict:
     return flow
 
 
-def build(stdout: str) -> Dict:
-    """The whole pipeline: markers in, verified ordered flow map out."""
-    flow = detect_refusals(verify_selectors(attach_identity(parse_markers(stdout))))
+def build(stdout: str, evidence: Optional[List[Dict]] = None) -> Dict:
+    """The whole pipeline: markers in, verified ordered flow map out.
+
+    `evidence` — the rows the browser helpers measured (read_evidence) — is
+    folded in before identity and selector verification, so both use it.
+    """
+    flow = apply_evidence(parse_markers(stdout), evidence or [])
+    flow = detect_refusals(verify_selectors(attach_identity(flow)))
     flow["status"] = ("unsafe" if flow.get("violations")
                       else "partial" if flow.get("unreachable")
                       else "ok" if flow.get("steps") else "empty")
@@ -438,6 +565,15 @@ def pages_without_inventory(flow: Dict) -> List[str]:
     """
     inventories = flow.get("_inventories") or {}
     return sorted(p for p in (flow.get("pages") or {}) if not inventories.get(p))
+
+
+def pages_acted_on(flow: Dict) -> set:
+    """Ids of the pages a flow step acted on, as opposed to pages only passed through."""
+    ids = set()
+    for step in flow.get("steps") or []:
+        ref = step.get("page")
+        ids.add(ref.get("id") if isinstance(ref, dict) else ref)
+    return ids - {None, ""}
 
 
 def score(flow: Dict, status: str) -> tuple:
@@ -581,7 +717,15 @@ def measure_page_objects(flow: Dict, page_objects: List[Dict]) -> Dict:
     from shared.page_identity import page_object_coverage, parse as parse_html
 
     inventories = flow.get("_inventories") or {}
+    known = flow.get("_known") or {}
     for page_id, page in (flow.get("pages") or {}).items():
+        # The repo's own locators, counted on this page live: exact, where the
+        # inventory reconstruction below is a sample ("zero means not observed").
+        if known.get(page_id):
+            page["page_objects"], page["best_page_object"] = _live_page_objects(
+                known[page_id])
+            page["measured_sampled"] = False
+            continue
         elements = inventories.get(page_id) or []
         page["measured_sampled"] = True
         if not elements or not page_objects:
@@ -614,12 +758,53 @@ def measure_page_objects(flow: Dict, page_objects: List[Dict]) -> Dict:
     return flow
 
 
+def _live_page_objects(entries: List[Dict]) -> Tuple[List[Dict], Optional[Dict]]:
+    """Rank page objects by how many of their locators resolve on a page, live.
+
+    Broken locators (no match) are named, because which of an existing page
+    object's locators stopped resolving is the question an adaptation run exists
+    to answer. Those matching several are listed too, but as `several`, not as a
+    fault: a page object's list locator (`.row`, counted) is meant to.
+    """
+    owners: Dict[str, Dict] = {}
+    for entry in entries or []:
+        owner = entry.get("owner") or "?"
+        report = owners.setdefault(owner, {
+            "name": owner, "path": entry.get("path", ""), "matched": 0,
+            "evaluable": 0, "broken": [], "several": []})
+        if "total" not in entry:
+            continue
+        report["evaluable"] += 1
+        if entry["total"] >= 1:
+            report["matched"] += 1
+        name = entry.get("name") or entry.get("selector") or "?"
+        if entry["total"] == 0:
+            report["broken"].append(name)
+        elif entry["total"] > 1:
+            report["several"].append(name)
+    reports = []
+    for report in owners.values():
+        ratio = round(report["matched"] / report["evaluable"], 3) if report["evaluable"] else 0.0
+        reports.append({**report, "total": report["evaluable"], "ratio": ratio,
+                        "sampled": False, "live": True})
+    reports.sort(key=lambda r: (-r["ratio"], -r["matched"], r["name"]))
+    best = next((r for r in reports if r["evaluable"] and r["matched"]), None)
+    return reports, ({key: best[key] for key in ("name", "path", "matched", "evaluable",
+                                                 "ratio", "broken", "several",
+                                                 "sampled", "live")} if best else None)
+
+
 def describe_page_objects(flow: Dict) -> str:
     """The measured page↔page-object mapping, as markdown."""
     rows = []
     for page_id, page in sorted((flow.get("pages") or {}).items()):
         best = page.get("best_page_object")
-        if best:
+        if best and best.get("live"):
+            broken = ", ".join(best.get("broken") or [])
+            rows.append(f"| `{page_id}` | `{best['name']}` | "
+                        f"{best['matched']}/{best['evaluable']} locators resolve live"
+                        + (f"; broken: {broken}" if broken else "") + " |")
+        elif best:
             rows.append(f"| `{page_id}` | `{best['name']}` | "
                         f"{best['matched']}/{best['evaluable']} locators matched |")
         elif page.get("page_objects") is not None:
@@ -627,8 +812,17 @@ def describe_page_objects(flow: Dict) -> str:
                         f"{len(page.get('page_objects') or [])} candidate(s) checked |")
     if not rows:
         return ""
+    pages = (flow.get("pages") or {}).values()
+    live = [p for p in pages if (p.get("best_page_object") or {}).get("live")]
+    note = ("Every locator of every candidate page object was counted on the live "
+            "page: one that resolves nowhere is broken, not unobserved."
+            if live and len(live) == len(rows) else
+            "Rows marked \"resolve live\" were counted on the live page; the rest are "
+            "measured against the elements exploration reported, a bounded sample — "
+            "enough to say which page object fits best, not to prove one is absent."
+            if live else
+            "Measured against the elements exploration reported, which is a bounded "
+            "sample of each page — enough to say which page object fits best, not "
+            "enough to prove one is absent.")
     return ("\n| Observed page | Page object | Measured |\n|---|---|---|\n"
-            + "\n".join(rows)
-            + "\n\nMeasured against the elements exploration reported, which is a "
-              "bounded sample of each page — enough to say which page object fits "
-              "best, not enough to prove one is absent.\n")
+            + "\n".join(rows) + "\n\n" + note + "\n")

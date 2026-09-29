@@ -47,7 +47,7 @@ def log(msg): _log("locate", msg)
 import yaml
 
 from shared import baseline as baseline_store
-from shared import dom_snapshot, failure_context, locator_assertions, page_identity
+from shared import dom_snapshot, failure_context, frames, locator_assertions, page_identity
 from shared import locator_capture as capture
 from shared import locator_emit as emit_mod
 from shared import workspace as workspace_helper
@@ -228,7 +228,8 @@ def _failure_capture(issue: dict) -> tuple[dict, dict]:
         return header, {}
 
 
-def _emit_offline(el: dict, vol: Volatility, soup, prints: dict) -> dict | None:
+def _emit_offline(el: dict, vol: Volatility, soup, prints: dict,
+                  frame_path: list | None = None) -> dict | None:
     """The first selector on the ladder that matches THIS element and only it.
 
     `locator_emit.emit` asks a live page the same question with `count()`.
@@ -241,15 +242,20 @@ def _emit_offline(el: dict, vol: Volatility, soup, prints: dict) -> dict | None:
     spells the attribute `data-test`. That candidate scores (0, 0) and the ladder
     moves on, exactly as the live count used to make it.
     """
-    for cand in emit_mod.candidates_for(el, vol):
+    for cand in emit_mod.candidates_for(el, vol, frame_path=frame_path):
         if emit_mod.VOLATILE_SELECTOR.search(cand["sel"]):
+            continue
+        # A framework that cannot put this rung inside an iframe emits no code for
+        # it; a top-document locator in its place would search the wrong page.
+        if frame_path and not cand.get("java"):
             continue
         if dom_snapshot.selector_visibility(cand["sel"], soup, prints) == (1, 1):
             return emit_mod._flag(cand)
     return None
 
 
-def _resolve_offline(baseline: dict, prints: dict, soup, cfg: dict, vol: Volatility):
+def _resolve_offline(baseline: dict, prints: dict, soup, cfg: dict, vol: Volatility,
+                     frame: tuple = (None, None)):
     """Rank every captured element against the baseline, then write a locator.
 
     Returns (emitted, candidate, decision). `emitted` is None when the decision
@@ -257,8 +263,11 @@ def _resolve_offline(baseline: dict, prints: dict, soup, cfg: dict, vol: Volatil
     outcomes the caller must keep apart, which is why the decision comes back too.
     """
     base_el = baseline["element"]
+    # Inside an iframe the replacement is one of that frame's elements, so rank
+    # the frame's own capture; the page's would offer the wrong document.
+    frame_path, frame_prints = frame
     cands = []
-    for el in capture.scorable(prints.get("elements") or []):
+    for el in capture.scorable((frame_prints or prints).get("elements") or []):
         c = Candidate(index=el["index"], el=el)
         # The tier the live search would have assigned by querying the page for
         # the baseline's own identity attributes. It is what lets `decide` accept
@@ -280,7 +289,7 @@ def _resolve_offline(baseline: dict, prints: dict, soup, cfg: dict, vol: Volatil
     pool = [c for c in ranked[:cfg["budgets"]["candidates_to_verify"]]
             if decision.top.score - c.score < cfg["thresholds"]["margin"]]
     for cand in pool:
-        emitted = _emit_offline(cand.el, vol, soup, prints)
+        emitted = _emit_offline(cand.el, vol, soup, prints, frame_path)
         if emitted:
             return emitted, cand, decision
     return None, None, decision
@@ -508,8 +517,21 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
                             + "; ".join((comparison.get("mismatches") or ["identity differs"])[:2]))
         return record
 
+    # A locator inside an iframe is resolved in that iframe. The capture has to
+    # hold the frame; one that does not is missing evidence, not a verdict.
+    frame_path, _inner = frames.split(raw)
+    frame = (None, None)
+    if frame_path:
+        doc = page_identity.in_frame(soup, raw)[0]
+        if doc in (None, False):
+            record["verdict"] = "NO_CAPTURE"
+            record["reason"] = (f"{raw!r} lives inside an iframe the failure capture "
+                                f"does not hold — nothing to search")
+            return record
+        frame = (frame_path, getattr(doc, "qa_prints", None) or {})
+
     started = time.time()
-    emitted, cand, decision = _resolve_offline(baseline, prints, soup, cfg, vol)
+    emitted, cand, decision = _resolve_offline(baseline, prints, soup, cfg, vol, frame)
     record["elapsed_ms"] = int((time.time() - started) * 1000)
     record["rejected"] = [
         {"tag": r.el["tag"], "name": r.el.get("accessible_name"),

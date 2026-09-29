@@ -56,3 +56,18 @@ def isolated_run_analytics(monkeypatch, tmp_path):
     The variable is inherited by the subprocesses those tests start.
     """
     monkeypatch.setenv("RUN_ANALYTICS_FILE", str(tmp_path / "run_analytics.jsonl"))
+
+
+@pytest.fixture(autouse=True)
+def isolated_worktree_root(monkeypatch, tmp_path):
+    """Keep every test away from the real /tmp/qa-runs.
+
+    runner.reconcile_on_boot() removes each worktree there whose session is not
+    running in the store, and create_app() calls it. A test's store is a fake, so
+    once any earlier test had put the automation repo's location in the
+    environment, that sweep deleted the worktrees of runs the real server had in
+    flight: a live authoring run lost its checkout mid-Generate while the suite
+    ran, and failed with "no POM in this directory". Tests that are about the
+    worktree root set their own.
+    """
+    monkeypatch.setenv("QA_WORKTREE_TEMP_DIR", str(tmp_path / "qa-runs"))

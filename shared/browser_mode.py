@@ -1,10 +1,10 @@
 """One switch for whether the browsers this network starts are visible.
 
-`PLAYWRIGHT_HEADLESS` was read by whichever step happened to want it — the
+The headless switch used to be read by whichever step happened to want it — the
 authoring agent's web validation and Maven run, the healing agent's DOM
 inspection, the adaptation explorer — each with its own copy of
 `os.environ.get(...).lower() != "false"`. Every other browser ignored it. So
-`PLAYWRIGHT_HEADLESS=false` opened a window for one step of one agent while the
+setting it false opened a window for one step of one agent while the
 reproduce run, the verification runs, the confirmation probes, the locate step's
 live replay and the session mint all stayed invisible, which is precisely when
 someone is watching: you set it because you want to see what the browser sees.
@@ -14,7 +14,7 @@ knob to resolve against it first — a per-step override reintroduces exactly th
 "I set it false and one step stayed headless" surprise this module exists to
 remove. Two ranks, no exceptions:
 
-  1. `PLAYWRIGHT_HEADLESS`
+  1. `HEADLESS_BROWSER`
   2. the caller's own default
 
 Rank 2 is why `maven_properties()` returns nothing when the switch is unset,
@@ -36,14 +36,11 @@ _FALSE = {"false", "0", "no", "off"}
 
 #: The switch every agent honours. Named for the library, not for one step.
 ENV_VAR = "HEADLESS_BROWSER"
-LEGACY_ENV_VAR = "PLAYWRIGHT_HEADLESS"
 
 # Standardised across agents: the boolean flag parsed from the environment
 def _read_env() -> Optional[bool]:
     """Parse the raw env var. None if missing or empty."""
     val = os.environ.get(ENV_VAR)
-    if not val:
-        val = os.environ.get(LEGACY_ENV_VAR)
     if not val:
         return None
     val = val.strip().lower()

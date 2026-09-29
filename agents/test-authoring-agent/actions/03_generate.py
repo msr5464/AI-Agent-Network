@@ -45,7 +45,8 @@ AUTOMATION_FRAMEWORK_DIR    = workspace_helper.resolve(
     WORKSPACE_DIR, os.environ.get("GITHUB_REPO_AUTOMATION", ""),
     exclude=REPO_ROOT)
 
-MODEL = os.environ.get("AUTHORING_MODEL", "claude-opus-4-6")
+# Set in config/.env, no default here: run.sh stops the run when it is missing.
+MODEL = os.environ.get("AUTHORING_MODEL", "")
 # Wall-clock budget per codegen call. Batching (below) keeps each call short, so
 # this is a per-batch budget rather than one for the whole step.
 GENERATE_TIMEOUT = int(os.environ.get("GENERATE_TIMEOUT_S", "900"))
@@ -56,6 +57,10 @@ GENERATE_TIMEOUT = int(os.environ.get("GENERATE_TIMEOUT_S", "900"))
 # discards every file. Small batches turn that into short, independently
 # retryable calls. 0 = no batching, request everything in one call.
 GENERATE_BATCH_SIZE = int(os.environ.get("GENERATE_BATCH_SIZE", "2"))
+# Thinking effort for every codegen call, set in config/.env. Left unset, `claude -p`
+# inherits the runner's own effortLevel ("high"), and hidden thinking became ~90% of
+# the step: the Helper batch spent 18k thinking tokens to write 1.8k tokens of code.
+GENERATE_EFFORT = os.environ.get("GENERATE_EFFORT") or None
 # Diff budget for the URL repair pass. Swapping a literal for a property lookup is
 # a handful of lines per URL; anything past this is the model rewriting a file it
 # was asked only to de-hardcode.
@@ -75,6 +80,11 @@ COMPILE_TIMEOUT_S = int(os.environ.get("GENERATE_COMPILE_TIMEOUT_S", "180"))
 # symbol: each is a line. Anything past this is a rewrite wearing a fix's clothes.
 COMPILE_REPAIR_MAX_DIFF_LINES = int(
     os.environ.get("COMPILE_REPAIR_MAX_DIFF_LINES", "60"))
+# Diff budget for the untraced-expected-value repair pass. Reading an expected
+# value from where the check contract says it comes from, instead of a literal,
+# is a few lines per check.
+VALUE_REPAIR_MAX_DIFF_LINES = int(
+    os.environ.get("VALUE_REPAIR_MAX_DIFF_LINES", "60"))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -119,6 +129,10 @@ def call_claude(prompt: str, label: str = "") -> str:
         # the prompt, and every tool definition is system-prompt tokens paid per call.
         tools="",
         disable_slash_commands=True,
+        effort=GENERATE_EFFORT,
+        # No user settings: with no tools, their permission allows buy nothing, and
+        # their plugins' SessionStart hooks were injecting a persona into codegen.
+        setting_sources="project,local",
         # Conventions, references and rules are identical for every call in this run,
         # so main() writes them once and every batch and repair sends that file as the
         # system prompt. Picked up here rather than passed in, so no call site — and no
@@ -270,8 +284,10 @@ from shared.test_catalog import test_methods_in  # noqa: E402
 # the key names — except that URLs are not secrets, so 05_ship.py commits them.
 from shared import properties_file, url_properties  # noqa: E402
 from shared.edit_guards import validate_fix  # noqa: E402
-from shared import check_provenance  # noqa: E402
+from shared import check_provenance, test_case  # noqa: E402
 from shared import logstep_narration  # noqa: E402
+from shared import assertion_graph, value_match  # noqa: E402
+from shared.code_analyzer import without_comments  # noqa: E402
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -353,32 +369,42 @@ def prune_unverified_checks(plan: dict, web_data: dict, raw_input: str) -> dict:
     Only ever drops. An unverified check the user DID ask for is left completely
     alone, because the point is that the test still proves what they wanted.
 
-    Returns {"dropped": [...], "kept_unverified": [...]} for the audit trail.
+    Returns {"dropped": [...], "kept_unverified": [...], "kept_unmeasured": [...]}
+    for the audit trail. kept_unmeasured is the part of kept_unverified that step 02
+    reported as passed without measuring a selector for it.
     """
     unverified = web_data.get("steps_unverified") or []
     if not unverified:
         return {"dropped": [], "kept_unverified": []}
 
-    dropped, kept = [], []
+    dropped, kept, unmeasured = [], [], []
     for entry in unverified:
         step = entry.split("|", 1)[0].strip()
         if check_provenance.droppable(step, raw_input):
             dropped.append(step)
+            continue
+        kept.append(step)
+        # Seen but never measured is a gap in step 02's evidence, not a finding
+        # about the product, and must not be reported as one.
+        if check_provenance.UNMEASURED in entry:
+            unmeasured.append(step)
+            log(f"UNVERIFIED but asked for — keeping the assertion for {step!r}. Step "
+                f"02 reported it as passed but measured no selector for it, so its "
+                f"locator is a guess: if the test fails here, suspect the locator "
+                f"before the product.")
         else:
-            kept.append(step)
-
-    for step in kept:
-        log(f"UNVERIFIED but asked for — keeping the assertion for {step!r}. The "
-            f"generated test WILL fail here: the product did not do this.")
+            log(f"UNVERIFIED but asked for — keeping the assertion for {step!r}. The "
+                f"generated test WILL fail here: the product did not do this.")
 
     if not dropped:
-        return {"dropped": [], "kept_unverified": kept}
+        return {"dropped": [], "kept_unverified": kept, "kept_unmeasured": unmeasured}
 
     # What to remove: the locator names and accessor names whose subject matches a
     # dropped check. `successToast` and `isSuccessToastVisible` both share "toast"
     # with "Verify a success confirmation toast appears".
     subjects = [check_provenance.subject_words(s) for s in dropped]
-    confirmed = set(web_data.get("selectors") or {})
+    # Page-qualified (`IssuingBankPage.amountDisplay`, see step 02) or not.
+    confirmed = {n.rsplit(".", 1)[-1] for n in web_data.get("selectors") or {}}
 
     def serves_dropped(name: str) -> bool:
         # A name backed by a confirmed selector is real whatever it is called.
@@ -422,7 +448,7 @@ def prune_unverified_checks(plan: dict, web_data: dict, raw_input: str) -> dict:
         "assertion against it would produce a test that fails for a reason no "
         "one owns.")
 
-    return {"dropped": dropped, "kept_unverified": kept,
+    return {"dropped": dropped, "kept_unverified": kept, "kept_unmeasured": unmeasured,
             "removed_locators": removed_locators,
             "removed_actions": removed_actions,
             "removed_steps": removed_steps}
@@ -442,7 +468,9 @@ def unconfirmed_locators(web_pages, selectors, interaction_hints, mechanisms) ->
     covered = confirmed | set(mechanisms or {})
     gaps = {}
     for page in web_pages:
-        missing = [n for n in (page.get("locators_needed") or []) if n not in covered]
+        cls = page.get("class_name", "?")
+        missing = [n for n in (page.get("locators_needed") or [])
+                   if n not in covered and f"{cls}.{n}" not in covered]
         if missing:
             gaps[page.get("class_name", "?")] = missing
     if gaps:
@@ -475,7 +503,8 @@ def _warn_page_coverage(web_pages, selectors, interaction_hints) -> list:
     uncovered = []
     for page_def in web_pages:
         needed = page_def.get("locators_needed", [])
-        if needed and not (confirmed & set(needed)):
+        cls = page_def.get("class_name", "?")
+        if needed and not (confirmed & ({*needed} | {f"{cls}.{n}" for n in needed})):
             uncovered.append((page_def.get("class_name", "?"), needed))
 
     if uncovered:
@@ -587,6 +616,177 @@ contents. No prose.
         else:
             remaining.pop(path, None)
     return files_map, remaining
+
+
+# ── What step 02 typed and compared ───────────────────────────────────────────
+
+def value_contracts_hint(web_data: dict, raw_input: str = "") -> str:
+    """The prompt section built from what step 02 typed and compared.
+
+    "" when it recorded neither — a run from before the markers existed
+    generates exactly as it always did.
+
+    A typed value the test case itself states is the test's data, used as it is.
+    Only the rest was made up, and is randomised inside its shape: told to
+    randomise every field, a run replaced the card number and address the test
+    case gave with generated ones.
+    """
+    inputs = web_data.get("inputs_used") or {}
+    checks = [c for c in web_data.get("value_checks") or [] if c.get("relation")]
+    given = {f for f, v in inputs.items() if test_case.is_given(v, raw_input)}
+    out = ""
+    if inputs:
+        out += ("\n\nVALIDATED INPUTS — step 02 typed exactly these, and the checks below "
+                "held for them:\n")
+        for field, value in inputs.items():
+            words = len(str(value).split())
+            out += (f"  {field} = {value!r}  ({words} word{'' if words == 1 else 's'})"
+                    + ("  GIVEN BY THE TEST CASE" if field in given else "") + "\n")
+        if given:
+            out += ("A value marked GIVEN BY THE TEST CASE is the test's own data: make it "
+                    "that field's default in the Builder or data file exactly as written, "
+                    "never randomised and never swapped for another value.\n")
+        out += (("Test data for the other fields" if given else "Test data for these fields")
+                + " keeps that SHAPE: EXACTLY the same number of "
+                "words, the same kinds of characters, the same prefix. Randomise only "
+                "inside it, composing the value from single-word parts — a random first "
+                "name + ' ' + a random last name for a two-word name. Never one token "
+                "such as a prefix plus random letters, and never a whole-name generator: "
+                "those add titles and suffixes ('Dr.', 'MD'), and a product that keeps "
+                "two words showed 'Alica Bednar' for 'Alica Bednar MD'. Data of another "
+                "shape is a flow step 02 never saw.\n")
+    if checks:
+        out += ("\n\nCHECK CONTRACTS — how the live page rendered each compared value. "
+                "Assert every one of these checks with exactly the comparison given; it "
+                "replaces the comparison the plan's wording implies, which was chosen "
+                "before anything was observed:\n")
+        for c in checks:
+            out += (f"  - {c['check']}\n"
+                    f"      {c['element']} showed {c['rendered'][:120]!r}; the other side "
+                    f"({c['source']}) was {c['expected'][:120]!r}\n"
+                    f"      → assert with {value_match.ASSERT_WITH[c['relation']]}\n")
+        out += ("The expected side always comes from the source named: `input:<field>` "
+                "is the test-data value the test typed into that field, `element:<name>` "
+                "is a value the test reads from that element earlier in the flow, and "
+                "`literal` is text quoted in the test case. Never write a new literal as "
+                "an expected value.\n")
+    return out
+
+
+def _observed_texts(raw_input: str, web_data: dict) -> str:
+    """Everything an expected value may legitimately come from: the test case,
+    and what step 02 typed, read and reported."""
+    parts = [raw_input or ""]
+    parts += [str(v) for v in (web_data.get("inputs_used") or {}).values()]
+    for c in web_data.get("value_checks") or []:
+        parts += [c.get("rendered", ""), c.get("expected", "")]
+    parts += [str(h.get("text", "")) for h in web_data.get("interaction_hints") or []]
+    parts += [str(s) for s in web_data.get("steps_passed") or []]
+    return "\n".join(p for p in parts if p)
+
+
+def expected_literals(files_map: dict) -> dict:
+    """{path: [value, ...]} — each string a generated file compares against.
+
+    An assertion's expected argument when it is a whole string literal (never one
+    nested in a call: `testData.get("amount")` names a column, not a value), and
+    every cell of a CSV column whose header starts with `expected`.
+    """
+    found = {}
+    for path, content in files_map.items():
+        values = []
+        if path.endswith(".csv"):
+            rows = list(csv.reader(io.StringIO(content or "")))
+            columns = [i for i, header in enumerate(rows[0] if rows else [])
+                       if header.strip().lower().startswith("expected")]
+            values = [row[i].strip() for row in rows[1:] for i in columns
+                      if i < len(row) and row[i].strip()]
+        elif path.endswith(".java"):
+            for info in assertion_graph.asserts_in(without_comments(content or ""), path):
+                parts = assertion_graph.check_parts(info)
+                values += [shown[1:-1] for shown, top in zip(parts["display"], parts["top"])
+                           if top and shown.startswith('"') and len(shown) > 2]
+        if values:
+            found[path] = values
+    return found
+
+
+def untraced_expected_values(files_map: dict, raw_input: str, web_data: dict) -> dict:
+    """{path: [value, ...]} — expected values the test case never states and step 02
+    never saw. `Rp 490.909` was one: a javadoc example in the helper batch that the
+    next batch reused as the CSV's expected amount, while the page showed Rp20.000."""
+    observed = _observed_texts(raw_input, web_data)
+    out = {}
+    for path, values in expected_literals(files_map).items():
+        missing = [v for v in values if not value_match.appears_in(v, observed)]
+        if missing:
+            out[path] = missing
+    return out
+
+
+def _repair_untraced_expected_values(files_map: dict, raw_input: str,
+                                     web_data: dict) -> tuple:
+    """One targeted pass that takes invented expected values out of the code.
+
+    The generated test classes go in with the offending files: a CSV value is read
+    by a test, and replacing it with a value captured on the page is an edit to
+    that test as much as to the CSV. The pass is kept only if it leaves fewer
+    untraced values than it found, with every changed file inside validate_fix.
+    Returns (files_map, still untraced).
+    """
+    violations = untraced_expected_values(files_map, raw_input, web_data)
+    if not violations:
+        return files_map, {}
+
+    log(f"GUARD: {len(violations)} generated file(s) expect a value that neither the "
+        f"test case nor step 02 ever showed — repairing:")
+    for path, values in violations.items():
+        log(f"  {Path(path).name}: {', '.join(repr(v) for v in values)}")
+
+    editable = list(violations) + [p for p in files_map if p not in violations
+                                   and p.endswith(("Test.java", "Tests.java"))]
+    offending = "".join(
+        f"\n--- {path}"
+        + (f" (untraced: {', '.join(repr(v) for v in violations[path])})"
+           if path in violations else " (reads the values above)")
+        + f" ---\n{files_map[path]}\n" for path in editable)
+    prompt = f"""These generated files compare against expected values that appear nowhere in
+the test case and were never seen on the live page. They were invented, and a test
+built on one fails on a value nobody asked for.
+
+The test case:
+{raw_input or "(unavailable)"}
+{value_contracts_hint(web_data, raw_input) or chr(10) + "(step 02 recorded no compared values)" + chr(10)}
+Rewrite the files so every value named after "untraced:" is gone. Take each expected
+side from where it really comes from: the value the test typed, a value the test reads
+from the page earlier in the flow, or text quoted in the test case. If a CSV column
+existed only to hold an invented value, remove the column and the code that reads it.
+
+Change NOTHING else: same methods, same signatures, same locators, same comments.
+{offending}
+Return ONLY a JSON object mapping each file path you changed to its complete corrected
+contents. No prose.
+"""
+    repaired = extract_json(call_claude(prompt, label=" [value-repair]")) or {}
+    candidate = dict(files_map)
+    for path, content in repaired.items():
+        if path not in editable or not (content or "").strip():
+            continue
+        ok, reason = validate_fix(files_map[path], content, Path(path).name,
+                                  VALUE_REPAIR_MAX_DIFF_LINES)
+        if not ok:
+            log(f"  value-repair REJECTED for {Path(path).name} — {reason}")
+            return files_map, violations
+        candidate[path] = content
+
+    remaining = untraced_expected_values(candidate, raw_input, web_data)
+    before = sum(map(len, violations.values()))
+    after = sum(map(len, remaining.values()))
+    if after >= before:
+        log("  value-repair removed no untraced value — keeping the files as generated")
+        return files_map, violations
+    log(f"  value-repair applied to {', '.join(Path(p).name for p in repaired if p in editable)}")
+    return candidate, remaining
 
 
 # ── The compile gate ──────────────────────────────────────────────────────────
@@ -1104,7 +1304,8 @@ def main() -> None:
         for name, sel in selectors.items():
             code = code_for(sel)
             selector_hint += f"  {name}: {code.get('findby') or code['java']}\n"
-        selector_hint += "\nUse these exact selectors in the page object locators where they match."
+        selector_hint += ("\nUse these exact selectors in the page object locators where they match. "
+                          "A name written Page.name is for that page object only.")
     else:
         selector_hint = "\n\nNo selectors were confirmed by Playwright validation. " \
                         "Infer locators using [data-cy='...'] attribute naming convention " \
@@ -1134,20 +1335,29 @@ def main() -> None:
             "holds. For `enter_key`: press Enter in the field. For `form_submit`: "
             "submit the form. Never Thread.sleep().\n")
 
-    # A check the user asked for that the browser could not observe. It stays in
-    # the test at full strength and the test fails — the model needs to be told
-    # that on purpose, or it will "helpfully" soften it.
+    # What step 02 typed and how the page rendered each compared value. The plan
+    # says "assertEquals" because English said "matches"; the page is what decides.
+    value_hint = value_contracts_hint(web_data, raw_input)
+
+    # A check the user asked for that the browser could not confirm. It stays in
+    # the test at full strength — the model needs to be told that on purpose, or
+    # it will "helpfully" soften it.
     kept_unverified_hint = ""
     if pruned.get("kept_unverified"):
+        unmeasured = set(pruned.get("kept_unmeasured") or [])
         kept_unverified_hint = (
-            "\n\nCHECKS THAT WILL FAIL, ON PURPOSE — step 02 could not observe "
-            "these on the live page, but the test input explicitly asked for them:\n"
-            + "".join(f"  - {s}\n" for s in pruned["kept_unverified"])
+            "\n\nCHECKS STEP 02 COULD NOT CONFIRM — the test input explicitly asked "
+            "for them:\n"
+            + "".join(f"  - {s}  " + ("[reported as passing, but no locator was "
+                                       "measured: build it from the DOM context]"
+                                       if s in unmeasured else
+                                       "[never seen on the live page: expected to fail]")
+                      + "\n" for s in pruned["kept_unverified"])
             + "Generate these assertions at FULL STRENGTH anyway. Do not soften "
               "them, do not wrap them in a condition, do not turn one into a log "
-              "line or a warning, and do not leave one out. The test failing here "
-              "is the correct and intended outcome: it reports that the product "
-              "does not do what was asked. A human decides what happens next.\n")
+              "line or a warning, and do not leave one out. If one fails, a human "
+              "decides whether the product or the locator is at fault; it is never "
+              "a reason to weaken the assertion.\n")
 
     # Build rich DOM context from live page inspection. page_elements is keyed
     # by the STEP DESCRIPTION active when the snapshot was taken (usually the
@@ -1476,7 +1686,7 @@ Rules (MANDATORY — violations will cause compilation failures):
 <generation_plan>
 {json.dumps(plan, indent=2)}
 </generation_plan>
-{selector_hint}{mechanism_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
+{selector_hint}{mechanism_hint}{value_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
 
 Generate the following files (Java source, plus CSV test data where a test reads data) and return them as a single JSON object where
 keys are relative file paths (from the automation repo root) and values are the complete
@@ -1502,6 +1712,13 @@ Return ONLY a JSON object, no prose:
     failed_batches: list = []
     for i, batch_files in enumerate(batches, 1):
         tag = f"[batch {i}/{len(batches)}]"
+        # A page batch often writes the next page too (submitOtp() returns
+        # PaymentSuccessPage), so asking for it again is a call whose output is
+        # discarded by the re-emit guard below.
+        batch_files = [f for f in batch_files if f not in files_map]
+        if not batch_files:
+            log(f"  {tag} already produced by an earlier batch — skipping")
+            continue
         log(f"  {tag} {', '.join(Path(f).name for f in batch_files)}")
         # Later layers must call the REAL method and locator names the earlier
         # ones just got, not names re-invented from the plan — batching without
@@ -1570,6 +1787,15 @@ Return ONLY a JSON object, no prose:
     if under_narrated:
         log(f"WARNING: {len(under_narrated)} test class(es) still narrate several "
             f"steps in one logStep after repair — recorded in 03-generate.json")
+
+    # Every expected value has to come from somewhere: the test case, or what step
+    # 02 saw. One that came from neither was invented, and the test would fail on
+    # it in step 04 — where the fix loop may not change an expected value at all.
+    files_map, untraced_values = _repair_untraced_expected_values(
+        files_map, raw_input, web_data)
+    if untraced_values:
+        log(f"WARNING: {len(untraced_values)} file(s) still expect a value nobody "
+            f"stated or saw — recorded in 03-generate.json")
 
     # The mirror-image failure: code that reads a URL property nobody ever wrote.
     # getRunTimeProperty returns null, navigation goes nowhere, and step 04 sees a
@@ -1721,10 +1947,12 @@ Return ONLY a JSON object, no prose:
         "unconfirmed_locators": locator_gaps,
         # Checks step 02 could not observe: what was dropped because nobody asked
         # for it, and what was kept because someone did (those tests fail on
-        # purpose — 05 puts them in the PR body).
+        # purpose — 05 puts them in the PR body). kept_unmeasured_checks is the
+        # subset step 02 reported as passing but never measured a selector for.
         "dropped_unverified_checks": pruned.get("dropped") or [],
         "resurrected_dropped_names": resurrected,
         "kept_unverified_checks": pruned.get("kept_unverified") or [],
+        "kept_unmeasured_checks": pruned.get("kept_unmeasured") or [],
         # Locators generated that cannot match a real DOM. Empty is the normal
         # case; non-empty tells step 04 exactly where to look first.
         "unusable_locators": unusable_by_file,
@@ -1747,6 +1975,9 @@ Return ONLY a JSON object, no prose:
             path: {name: {k: v for k, v in f.items() if k != "narration"}
                    for name, f in methods.items()}
             for path, methods in under_narrated.items()},
+        # Expected values neither the test case states nor step 02 saw, left after
+        # the repair pass. Empty is the normal case.
+        "untraced_expected_values": untraced_values,
     }
     (AUDIT_DIR / "03-generate.json").write_text(json.dumps(result, indent=2))
 

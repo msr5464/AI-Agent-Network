@@ -43,13 +43,17 @@ def log(msg): _log("explore-web", msg)
 from shared import browser_mode, entry_path, flow_map, mint_session, session_state
 from shared.code_analyzer import read_source
 from shared.claude import call_claude_ex
-from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools
+from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools, CAPTURE_RULES
 
 from lib import check_changes
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
-MODEL = os.environ.get("ADAPTATION_MODEL", "claude-opus-5")
+# Set in config/.env, no default here: run.sh stops the run when it is missing.
+MODEL = os.environ.get("ADAPTATION_MODEL", "")
+# This step drives a browser, so it takes the effort every agent's browser step
+# shares; empty, it falls back to ADAPTATION_EFFORT.
+EFFORT = os.environ.get("BROWSER_EFFORT") or os.environ.get("ADAPTATION_EFFORT") or None
 TIMEOUT_S = int(os.environ.get("ADAPTATION_EXPLORE_TIMEOUT_S", "1800"))
 ATTEMPTS = int(os.environ.get("ADAPTATION_EXPLORE_ATTEMPTS", "1"))
 HEADLESS = browser_mode.headless()
@@ -71,6 +75,28 @@ def load_explore_rules() -> str:
         marker = re.search(r"^## Instructions\s*$", text, re.MULTILINE)
         return text[marker.start():] if marker else text
     return "## Instructions\nExplore the flow and emit FLOW_STEP markers.\n"
+
+
+def known_locators(sources: list) -> list:
+    """Every exact locator the in-scope page objects declare, as
+    `{owner, path, name, selector}` — what the browser helpers count live.
+
+    An approximated one (a selector assembled at runtime) is left out: counting
+    the approximation would report a working locator as broken.
+    """
+    from shared.frameworks import get_active_plugin
+    code = get_active_plugin().code
+    out = []
+    for source in sources:
+        owner = Path(source["path"]).stem
+        for loc in code.extract_locators(source["snippet"]) or []:
+            if loc.get("selector") and not loc.get("approx"):
+                out.append({"owner": owner, "path": source["path"],
+                            # An inline locator (`page.locator(".row").count()`)
+                            # has no field name; its selector is what names it.
+                            "name": loc.get("name") or loc["selector"],
+                            "selector": loc["selector"]})
+    return out
 
 
 def checks_section(scope: dict) -> str:
@@ -128,12 +154,18 @@ The browser is already signed in through a saved session.
 {plan.get('expected_outcome') or '(not stated — record what the flow does)'}
 {checks_section(scope)}{destructive_note}{attempt_notes}
 {rules}
+## Frames and brief screens
+{CAPTURE_RULES}
 """
 
 
 def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
-                stop_before: str, scope: dict = None) -> tuple:
-    """One exploration. Returns (flow, status, raw_stdout)."""
+                stop_before: str, scope: dict = None, evidence_path: Path = None) -> tuple:
+    """One exploration. Returns (flow, status, raw_stdout).
+
+    The flow map is built from the model's markers AND what the browser helpers
+    measured (`evidence_path`): inventories and live counts it never had to type.
+    """
     seen = {"steps": 0}
 
     def on_output(_label, line):
@@ -141,7 +173,7 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
         if text.startswith("FLOW_STEP:"):
             seen["steps"] += 1
             log(f"    step {seen['steps']}")
-        elif text.startswith(("REFUSED:", "UNREACHABLE_STATE:")):
+        elif text.startswith(("REFUSED:", "UNREACHABLE_STATE:", "VALUE_CHECK:")):
             log(f"    {text[:110]}")
         # What the browser is actually doing, whether its server ever came up, and
         # whether the API is making us wait. Without these, half an hour of
@@ -155,14 +187,17 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
     log("  Sending to Claude for exploration...")
     result = call_claude_ex(
         prompt=build_prompt(plan, rules, notes, stop_before, scope),
-        model=MODEL, cwd=str(REPO_ROOT), timeout=TIMEOUT_S,
+        model=MODEL, effort=EFFORT, cwd=str(REPO_ROOT), timeout=TIMEOUT_S,
         on_output=on_output, log_dir=str(AUDIT_DIR),
         allowed_tools=mcp_allowed_tools(),
         mcp_config=str(mcp_path), strict_mcp_config=True,
         stream_json=True,
         system_prompt_file=str(SYSTEM_PROMPT) if SYSTEM_PROMPT.exists() else None,
     )
-    flow = flow_map.build(result.stdout or "")
+    evidence = flow_map.read_evidence(evidence_path) if evidence_path else []
+    if evidence:
+        log(f"  {len(evidence)} measured page state(s) from the browser helpers")
+    flow = flow_map.build(result.stdout or "", evidence)
     if result.status != "ok" and flow["status"] == "ok":
         flow["status"] = "partial"
     return flow, result.status, (result.stdout or "")
@@ -266,20 +301,47 @@ def main():
             log(f"Flow ends in '{stop_before}' — exploration will stop before it "
                 f"and the terminal step will be escalated, not adapted")
 
-    # .mcp.json goes in the audit dir: the repo root is shared mutable state, and
-    # the server can be running another agent against it at the same time.
-    mcp_path = write_mcp_config(AUDIT_DIR, headless=HEADLESS,
-                                           storage_state=session.get("path"))
-    log(f"Playwright MCP: {browser_mode.label(HEADLESS)}, "
-        f"config {mcp_path.name}, "
-        + ("storage-state reused (no credential in the prompt)"
-           if session.get("path") else "no session — this flow does not sign in"))
+    # Every page object in scope, not just the ones step 02's noun filter
+    # nominated: measurement is cheap, and narrowing it to the guess would leave a
+    # page whose page object the guess missed with nothing to match against.
+    by_path = {c["path"]: c for c in (scope.get("edit_candidates") or [])
+               if c.get("role") == "page_object"}
+    for candidate in (scope.get("page_object_candidates") or []):
+        by_path.setdefault(candidate["path"], candidate)
+    sources = []
+    for candidate in by_path.values():
+        snippet = read_source(workspace / candidate["path"])
+        if snippet:
+            sources.append({"path": candidate["path"], "snippet": snippet})
+
+    # Their locators, for the browser helpers to count live on every page state:
+    # which still resolve and which broke is the question this agent answers.
+    known_path = AUDIT_DIR / "03-known-locators.json"
+    known = known_locators(sources)
+    known_path.write_text(json.dumps(known, indent=2))
+    log(f"{len(known)} locator(s) from {len(sources)} page object(s) will be counted live "
+        f"on every page")
 
     rules = load_explore_rules()
     best, best_score, notes = None, None, ""
     for attempt in range(1, ATTEMPTS + 2):
         log(f"Exploration attempt {attempt}/{ATTEMPTS + 1} (budget {TIMEOUT_S}s)")
-        flow, status, raw = run_attempt(plan, rules, notes, mcp_path, stop_before, scope)
+        # A retry is a fresh browser: its measurements go in a file of their own.
+        evidence_path = AUDIT_DIR / f"03-explore-evidence-{attempt}.jsonl"
+        evidence_path.unlink(missing_ok=True)
+        # .mcp.json goes in the audit dir: the repo root is shared mutable state,
+        # and the server can be running another agent against it at the same time.
+        mcp_path = write_mcp_config(AUDIT_DIR, headless=HEADLESS,
+                                    storage_state=session.get("path"),
+                                    evidence_file=evidence_path,
+                                    known_locators_file=known_path)
+        if attempt == 1:
+            log(f"Playwright MCP: {browser_mode.label(HEADLESS)}, "
+                f"config {mcp_path.name}, "
+                + ("storage-state reused (no credential in the prompt)"
+                   if session.get("path") else "no session — this flow does not sign in"))
+        flow, status, raw = run_attempt(plan, rules, notes, mcp_path, stop_before, scope,
+                                        evidence_path)
         if status == "usage_limit":
             # An empty flow map here would be read as "the flow could not be
             # walked", which is a finding about the product. This is a finding
@@ -292,11 +354,17 @@ def main():
             sys.exit(1)
         score = flow_map.score(flow, status)
         log(f"  → {len(flow['steps'])} step(s), status {flow['status']}")
-        uninventoried = flow_map.pages_without_inventory(flow)
-        if uninventoried:
-            log(f"  WARNING: no PAGE_STATE for {', '.join(uninventoried)} — "
-                f"selectors there cannot be recounted and no page object can be "
-                f"matched to them")
+        missing = flow_map.pages_without_inventory(flow)
+        if missing:
+            log(f"  WARNING: no inventory for {', '.join(missing)} — no "
+                f"page.qa.step call named that page and no PAGE_STATE described it, "
+                f"so its selectors cannot be verified and no page object matched")
+        # Only a page a step acted on is worth a retry. One the run passed through
+        # (the start page, with a saved session) has no selector to verify, and a
+        # whole second attempt was spent on exactly that.
+        uninventoried = [p for p in missing if p in flow_map.pages_acted_on(flow)]
+        if missing and not uninventoried:
+            log("  not retrying for it — no step acted on that page")
         if best is None or score > best_score:
             best, best_score = flow, score
             # Persist after every attempt: a cancel during attempt 2 must not
@@ -330,12 +398,12 @@ def main():
             # however complete it looked.
             notes += ("\n## You skipped the inventory\nYou emitted PAGE_ENTER for "
                       + ", ".join(uninventoried)
-                      + " but no PAGE_STATE. Emit a PAGE_STATE for every page you "
-                        "enter, before the first FLOW_STEP on it, with the full "
-                        "element list — including each element's id and class, and "
-                        "the containers, header and title that identify the page. "
-                        "Without it the selectors you report cannot be verified and "
-                        "the page cannot be matched to its page object.\n")
+                      + " but never measured them. Make every step one "
+                        "page.qa.step(action, { page: '<pageId>' }) call, with the "
+                        "pageId of the page the step lands on — the helpers inventory "
+                        "that page and count its selectors for you. Without it the "
+                        "selectors you report cannot be verified and the page cannot "
+                        "be matched to its page object.\n")
 
     # Guess -> measure -> edit. Step 02 nominated page objects by name
     # similarity; now that the pages have actually been looked at, measure which
@@ -343,27 +411,15 @@ def main():
     # agent applies to a failure DOM. Step 04 then edits against the measurement
     # rather than the guess.
     flow = result["flow"]
-    # Measure against EVERY page object in scope, not just the ones step 02's
-    # noun filter nominated. Measurement is cheap, and narrowing it to the guess
-    # would mean a page whose page object the guess missed has nothing to match
-    # against — which is the failure this whole step exists to remove.
-    by_path = {c["path"]: c for c in (scope.get("edit_candidates") or [])
-               if c.get("role") == "page_object"}
-    for candidate in (scope.get("page_object_candidates") or []):
-        by_path.setdefault(candidate["path"], candidate)
-
-    sources = []
-    for candidate in by_path.values():
-        snippet = read_source(workspace / candidate["path"])
-        if snippet:
-            sources.append({"path": candidate["path"], "snippet": snippet})
     if sources and flow.get("pages"):
         flow_map.measure_page_objects(flow, sources)
         for page_id, page in sorted(flow["pages"].items()):
             best = page.get("best_page_object")
+            broken = ", ".join((best or {}).get("broken") or [])
             log(f"  page {page_id} → "
-                + (f"{best['name']} ({best['matched']}/{best['evaluable']} "
-                   f"locators matched)" if best
+                + (f"{best['name']} ({best['matched']}/{best['evaluable']} locators "
+                   + ("resolve live" if best.get("live") else "matched") + ")"
+                   + (f"; broken: {broken}" if broken else "") if best
                    else "no candidate page object matched what was reported"))
         write(result)
 

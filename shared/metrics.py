@@ -389,7 +389,8 @@ def format_summary(data: Optional[Dict[str, Any]]) -> str:
             f"({turns} turns) · {out_tokens:,} output tokens")
 
 
-def format_stage(data: Optional[Dict[str, Any]], key: str, label: str = "") -> str:
+def format_stage(data: Optional[Dict[str, Any]], key: str, label: str = "",
+                 since: float = 0.0) -> str:
     """One stage's spend, for the `✓ Stage` line run.sh prints as it ends.
 
     Cost belongs on that line rather than on a second one the GUI appends when
@@ -399,10 +400,12 @@ def format_stage(data: Optional[Dict[str, Any]], key: str, label: str = "") -> s
     # With a label, answer for THAT attempt. The rollup's per-stage entry sums
     # every attempt of the stage, so attempt 2's ✓ line was reporting attempt 1's
     # money as well as its own.
+    # A resumed session reuses the label, so `since` (when the step started) is
+    # what keeps last night's cancelled attempt out of this morning's line.
     if label:
         base = audit_dir()
         if base is not None:
-            return _spent(_spend_by_label(Path(base) / "metrics").get(label))
+            return _spent(_spend_by_label(Path(base) / "metrics", since).get(label))
     for stage in (data or {}).get("stages") or []:
         if stage.get("key") != key:
             continue
@@ -420,7 +423,8 @@ def format_stage(data: Optional[Dict[str, Any]], key: str, label: str = "") -> s
     return ""
 
 
-def _spend_by_label(directory: Path) -> Dict[str, dict]:
+def _spend_by_label(directory: Path, since: float = 0.0,
+                    until: Optional[float] = None) -> Dict[str, dict]:
     """What each step spent, keyed by its printed label.
 
     The label is the key because it already distinguishes the attempts —
@@ -431,6 +435,13 @@ def _spend_by_label(directory: Path) -> Dict[str, dict]:
     """
     spend: Dict[str, dict] = {}
     for row in _read_jsonl(directory / "llm-calls.jsonl"):
+        # A call is stamped when it returns, so it belongs to the attempt whose
+        # window holds that stamp (a second of slack either side for rounding).
+        stamp = _epoch(row.get("ts"))
+        if since and stamp and stamp < since - 1:
+            continue
+        if until and stamp and stamp > until + 1:
+            continue
         slot = spend.setdefault(row.get("stage_label") or row.get("stage") or "",
                                 {"cost_usd": 0.0, "calls": 0, "output_tokens": 0})
         slot["cost_usd"] += float(row.get("cost_usd") or 0.0)
@@ -471,7 +482,6 @@ def format_table(base: Optional[Path] = None) -> str:
     if not directory.is_dir():
         return ""
 
-    spend = _spend_by_label(directory)
     rows = _read_jsonl(directory / "stages.jsonl")
     if not rows:
         return ""
@@ -482,6 +492,12 @@ def format_table(base: Optional[Path] = None) -> str:
     lines = []
     for row in rows:
         label = row.get("label") or row.get("key") or ""
+        # Each attempt's own window: a resumed session runs the same label again,
+        # and summing by label printed the first attempt's spend on every row.
+        # A row with no window (an older one) falls back to the label alone.
+        started, ended = float(row.get("started_at") or 0), float(row.get("ended_at") or 0)
+        spend = (_spend_by_label(directory, started, ended) if started and ended
+                 else _spend_by_label(directory))
         detail = _spent(spend.get(label)) or "no model call"
         lines.append(
             f"  {label:<{width}} {_duration(row.get('duration_s')):>8}   {detail}")
@@ -500,7 +516,8 @@ if __name__ == "__main__":
         _data = rollup()
         if len(_sys.argv) > 2 and _sys.argv[1] == "--stage":
             _line = format_stage(_data, _sys.argv[2],
-                                 _sys.argv[3] if len(_sys.argv) > 3 else "")
+                                 _sys.argv[3] if len(_sys.argv) > 3 else "",
+                                 float(_sys.argv[4]) if len(_sys.argv) > 4 else 0.0)
         else:
             _line = format_summary(_data)
     if _line:

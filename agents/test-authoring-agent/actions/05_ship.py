@@ -409,7 +409,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
         test_section = "✅ Generated test was run and passed before this PR was created."
     elif fix_data.get("known_product_defect"):
         test_section = (
-            "⚠️ The test reproduces the known product defect documented in the test input "
+            "⚠️ The test reproduces a product defect "
             f"({(fix_data.get('reason') or '').strip() or 'see root_cause'}). The fix loop "
             "stopped rather than work around it: merge this as the regression test, and "
             "expect it to pass once the product is fixed."
@@ -466,9 +466,11 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
     # two need opposite things from a reviewer: one is a finding about the product,
     # the other is a note that the pipeline stopped short of inventing a test.
     kept_unverified = gen_data.get("kept_unverified_checks") or []
+    unmeasured      = gen_data.get("kept_unmeasured_checks") or []
+    never_seen      = [c for c in kept_unverified if c not in unmeasured]
     dropped_checks  = gen_data.get("dropped_unverified_checks") or []
     checks_section = ""
-    if kept_unverified:
+    if never_seen:
         checks_section += (
             "### ⚠️ Asked for, but never seen on the page\n\n"
             "The test input asks for these, and step 02 could not observe any of "
@@ -476,7 +478,15 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
             "so **this test fails on purpose** — it is reporting that the product "
             "does not do what was asked. Decide whether this is a product bug or a "
             "test-case correction; do not fix it by weakening the assertion.\n\n"
-            + "".join(f"- {c}\n" for c in kept_unverified) + "\n")
+            + "".join(f"- {c}\n" for c in never_seen) + "\n")
+    if unmeasured:
+        checks_section += (
+            "### ⚠️ Asked for, reported as seen, but no locator was measured\n\n"
+            "Step 02 reported these as passing but never measured a locator for "
+            "them, so each assertion runs against a guessed locator. If one fails, "
+            "suspect the locator before the product. Fix the locator; do not weaken "
+            "the assertion.\n\n"
+            + "".join(f"- {c}\n" for c in unmeasured) + "\n")
     if dropped_checks:
         checks_section += (
             "### Checks not generated\n\n"
@@ -697,12 +707,13 @@ def main() -> None:
     (AUDIT_DIR / ".verdict").write_text(verdict)
     if kept_unverified:
         log(f"NEEDS-REVIEW: {len(kept_unverified)} requested check(s) could not be "
-            f"observed in the UI — the test asserts them and fails on purpose.")
+            f"confirmed in the UI — the test asserts them at full strength.")
     if weakening_rejected:
         log(f"NEEDS-REVIEW: {len(weakening_rejected)} fix attempt(s) were rejected "
             f"for weakening an assertion.")
     if fix_gate == "defect":
-        log("NEEDS-REVIEW: the test reproduces the known product defect the input documented.")
+        log("NEEDS-REVIEW: the test reproduces a product defect — the input documented it, "
+            "or step 02 never saw the product do what the input asked.")
     if fix_gate == "skipped":
         log("NEEDS-REVIEW: no test ever ran (infrastructure) — nothing was verified.")
     (AUDIT_DIR / ".verdict").write_text(verdict)

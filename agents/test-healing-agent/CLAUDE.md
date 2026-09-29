@@ -356,6 +356,30 @@ hook). The healing agent then falls back to tier 3 (re-opening the page) or 4.
 
 ---
 
+## Elements inside iframes
+
+A locator inside an iframe fails with a chain in its message —
+`Locator@#checkout >> internal:control=enter-frame >> #amount`, which is what
+`page.frameLocator("#checkout").locator("#amount")` compiles to — and every step
+reads it as one selector (`shared/frames.py`):
+
+- the framework writes each iframe's HTML and element capture to a `.frames.json`
+  sidecar named in the snapshot header, and fingerprints a frame element in its
+  own frame (`LocatorCapture.frames`, `Baseline.collect`);
+- `page_identity.parse` hangs each frame's document on its `<iframe>`, and
+  `page_identity.select` / `dom_snapshot.selector_visibility` follow the chain;
+- Locate ranks the failing frame's own capture and emits the replacement with the
+  same hops (`candidates_for(..., frame_path=)`), so the page object gets
+  `page.frameLocator(...).locator(...)` back, never a top-document locator;
+- the guards read a frame fix as one chain, so a correct one is no longer rejected
+  as "matches nothing".
+
+A hop that matches several iframes, or a frame the capture does not hold, is
+unevaluable rather than absent: Playwright counts through the first matching
+iframe and then refuses to act, so no count through it is honest. A framework
+that cannot put a locator inside a frame in one expression (Selenium switches
+frames) gets no code rather than a wrong one, and Locate refuses the heal.
+
 ## Locator baselines are committed with the fix
 
 `src/main/resources/baselines/<PageObject>.json` is the framework's record of what each
@@ -450,7 +474,9 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | Variable | Purpose |
 |---|---|
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary (default: claude) |
-| `HEALING_MODEL` | Claude model for fix generation (default: `claude-opus-5`) |
+| `HEALING_MODEL` | Claude model for fix generation (required — set in `config/.env`, no default in code; run.sh stops without it) |
+| `HEALING_EFFORT` | Thinking effort for those calls: `low`, `medium`, `high`, `xhigh`, `max` (set in `config/.env`; empty — the runner's `effortLevel` in `~/.claude/settings.json`) |
+| `BROWSER_EFFORT` | Thinking effort for the live DOM inspections, shared with every agent's browser-driving calls (set in `config/.env`; empty — `HEALING_EFFORT`) |
 | `HEALING_INSPECT_DOM` | Read the failing page in a real browser before fixing (default: true) |
 | `HEALING_BASE_URL` | Page URL for DOM inspection, overriding whatever is recovered from the execution log |
 | `AUTOFIX_DOM_TIMEOUT_S` | Wall-clock budget for one browser inspection (default: 600) |

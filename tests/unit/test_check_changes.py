@@ -313,3 +313,81 @@ class TestExploreList:
                                      {"test": "m.Api#a", "is_web": False}]}}
         listed = cc.explore_checks(scope)
         assert [c["tests"] for c in listed] == [["m.W#b"]]
+
+
+NAME = ('        AssertHelper.assertEquals(config, overlay.getCustomerName(), data.getName(), '
+        '"Customer name should match");\n')
+NAME_CONTAINS = NAME.replace("assertEquals", "assertContains")
+PHONE = ('        AssertHelper.assertEquals(config, overlay.getCustomerPhone(), data.getPhone(), '
+         '"Customer phone should match");\n')
+
+
+class TestRelax:
+    """A declared relax: the one weakening allowed, and only on a measurement."""
+
+    BEFORE = _java(NAME, PHONE)
+
+    def _relax(self, after, kind="outcome_changed", relation="words", values=None,
+               recorded=None, declared=None):
+        b, a = _checks(self.BEFORE), _checks(after)
+        cid = next(c["id"] for c in b if c["message"] == "Customer name should match")
+        graph = ag.delta(b, a)
+        return cc.validate(
+            declared if declared is not None else
+            [{"check": cid, "action": "relax", "relation": relation, "why": "full name"}],
+            graph, ag.delta(b, a), kind, {c["id"]: c for c in b}, {}, {},
+            found_values=values if values is not None else {
+                cid: {"check": cid, "relation": "words",
+                      "rendered": "User_x sample_last_name"}},
+            recorded=recorded)
+
+    def test_a_confirmed_relax_passes_and_is_listed(self):
+        ok, why, rows = self._relax(_java(NAME_CONTAINS, PHONE))
+        assert (ok, why) == (True, "")
+        row = next(r for r in rows if r["action"] == "relax")
+        assert (row["relation"], row["before"], row["after"], row["evidence"]) == (
+            "words", ["assertEquals"], ["assertContains"], "confirmed")
+        table = "\n".join(cc.render_table(rows))
+        assert "comparison relaxed to **words**" in table and "sample_last_name" in table
+
+    def test_a_verify_run_can_confirm_it_too(self):
+        ok, why, _ = self._relax(
+            _java(NAME_CONTAINS, PHONE), values={},
+            recorded=[{"message": "Customer name should match", "relation": "words",
+                       "actual": "User_x sample_last_name"}])
+        assert (ok, why) == (True, "")
+
+    def test_an_unmeasured_relax_is_refused(self):
+        ok, why, _ = self._relax(_java(NAME_CONTAINS, PHONE), values={})
+        assert not ok and "neither shows it" in why
+
+    def test_a_relation_other_than_the_measured_one_is_refused(self):
+        ok, why, _ = self._relax(_java(NAME_CONTAINS, PHONE), relation="numeric")
+        assert not ok and "neither shows it" in why
+
+    def test_an_undeclared_weakening_is_still_refused(self):
+        ok, why, _ = self._relax(_java(NAME_CONTAINS, PHONE), declared=[])
+        assert not ok and "weakened" in why
+
+    def test_a_kind_that_may_not_change_checks_cannot_relax(self):
+        ok, why, _ = self._relax(_java(NAME_CONTAINS, PHONE), kind="locator")
+        assert not ok and cc.KIND_MAY_NOT_CHANGE in why
+
+    def test_dropping_what_it_compared_is_not_a_relax(self):
+        ok, why, _ = self._relax(_java(
+            '        AssertHelper.assertTrue(config, true, "Customer name should match");\n', PHONE))
+        assert not ok
+
+    def test_the_shipped_table_carries_it(self):
+        b, a = _checks(self.BEFORE), _checks(_java(NAME_CONTAINS, PHONE))
+        logged = [{"site": c["site"], "message": c["message"], "action": "relax",
+                   "relation": "words", "why": "full name", "evidence": "confirmed",
+                   "saw": "User_x sample_last_name"}
+                  for c in b if c["message"] == "Customer name should match"]
+        rows = cc.ship_rows(ag.delta(b, a), ag.delta(b, a), logged)
+        assert [(r["action"], r.get("relation")) for r in rows] == [("relax", "words")]
+
+
+def test_a_value_the_page_formats_its_own_way_is_seen():
+    assert cc._seen("20000", "Rp20.000")
+    assert not cc._seen("5", "15 items")

@@ -167,8 +167,15 @@ def _locator_calls() -> str:
 
 
 def _selectors_in(text: str) -> list:
+    # A locator inside an iframe is one selector, written as a chain. Read as its
+    # parts, the element's own selector was checked against the top document,
+    # matched nothing there, and a correct fix was rejected as a guess.
+    from shared.frameworks import get_active_plugin
+    chains = get_active_plugin().code.frame_chains(text or "")
     pattern = re.compile(rf"""(?:{_locator_calls()})\s*\(\s*(["'])((?:\\.|(?!\1).)*)\1""", re.I)
-    return [m.group(2) for m in pattern.finditer(text or "")]
+    plain = [(m.start(), m.group(2)) for m in pattern.finditer(text or "")
+             if not any(start <= m.start() < end for start, end, _ in chains)]
+    return [sel for _, sel in sorted(plain + [(start, chain) for start, _, chain in chains])]
 
 
 def _is_broader(before: str, after: str) -> bool:
@@ -213,6 +220,68 @@ def no_selector_broadening(original: str, updated: str) -> tuple:
         if _is_broader(before, after):
             return False, (f"fix broadens the selector {before!r} to {after!r}, "
                            f"which would make the assertion weaker rather than correct")
+    return True, ""
+
+
+_FIELD_TAGS = ("input", "textarea", "select")
+
+
+def _typed_into(name: str, code: str) -> bool:
+    """Whether `code` types into the locator `name`, through a wrapper that takes
+    it as an argument or a call on it."""
+    from shared.frameworks import get_active_plugin
+    calls = "|".join(get_active_plugin().code.TYPING_CALLS)
+    if not calls or not name:
+        return False
+    n = re.escape(name)
+    return bool(re.search(rf"\b(?:{calls})\s*\([^;]*?\b{n}\b|\b{n}\s*\.\s*(?:{calls})\s*\(",
+                          code))
+
+
+def replacement_is_the_field(original: str, updated: str, snapshot_soup=None,
+                             failing_selector: str = "") -> tuple:
+    """Reject an edit that re-points a field the code types into at an element
+    that is not that field. (ok, reason).
+
+    A fix moved `amountField` off a cart's total cell onto
+    `tr:nth-child(2) input`, guessed from the name and phone rows. That is
+    the Email input. Unique and editable, it passed every other guard; the test
+    typed the amount into Email, and the next attempt built a theory about
+    keystroke events on top.
+
+    Judged in the DOM captured at failure, and only when that capture is about
+    this file: its failing selector is one of the file's locators. A field must
+    be an input, textarea or select, and what it says about itself (label, row,
+    column header — see field_context) must share a word with its name. The
+    correct element there was named only by its column header.
+    """
+    if snapshot_soup is None or not failing_selector:
+        return True, ""
+    from shared.check_provenance import _akin, subject_words
+    from shared.dom_snapshot import field_context, select_nodes
+    from shared.frameworks import get_active_plugin
+    code = get_active_plugin().code
+    before = {loc["name"]: loc["raw"] for loc in code.extract_locators(original)
+              if loc.get("name")}
+    if failing_selector not in original and failing_selector not in before.values():
+        return True, ""            # a capture of some other page says nothing here
+    for loc in code.extract_locators(updated):
+        name, raw = loc.get("name"), loc.get("raw")
+        if not name or before.get(name) == raw or not _typed_into(name, updated):
+            continue
+        found = select_nodes(raw, snapshot_soup)
+        if not found or len(found[0]) != 1:
+            continue               # absent or several: the other guards and the run decide
+        (node,), doc = found
+        if node.name not in _FIELD_TAGS and not node.has_attr("contenteditable"):
+            return False, (f"{name} is typed into, but {raw!r} is a <{node.name}> in the "
+                           f"DOM captured at failure, and nothing can be typed there")
+        context = field_context(node, doc)
+        said, wanted = subject_words(context), subject_words(name)
+        if said and wanted and not any(_akin(a, b) for a in said for b in wanted):
+            return False, (f"{name} would point at a field that reads {context[:80]!r} in "
+                           f"the DOM captured at failure, which does not name it. Use the "
+                           f"field whose label, row or column header says what {name} holds")
     return True, ""
 
 
@@ -496,7 +565,7 @@ def matches_negative(selectors: list, negatives: list) -> tuple:
     logged-out, error, empty-state — which the agents already produce in volume
     and have never been compared against.
     """
-    from shared.page_identity import parse as _parse
+    from shared.page_identity import parse as _parse, select as _select
 
     for candidate in selectors or []:
         normalized = _normalize_selector(candidate)
@@ -505,7 +574,7 @@ def matches_negative(selectors: list, negatives: list) -> tuple:
         for negative in negatives or []:
             try:
                 soup = negative if hasattr(negative, "select") else _parse(negative)
-                if soup is not None and soup.select(normalized, limit=1):
+                if soup is not None and _select(soup, normalized, limit=1):
                     return False, (f"the new anchor {candidate!r} also matches a "
                                    f"page the test must not be on — it would pass "
                                    f"there too, so it proves nothing")

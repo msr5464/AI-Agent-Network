@@ -41,7 +41,7 @@ from shared import workspace as workspace_helper
 def log(msg): _log("adapt", msg)
 
 from shared import (assertion_graph, code_analyzer, edit_guards, fix_history,
-                    flow_map, url_properties, verdict_feedback)
+                    flow_map, url_properties, value_match, verdict_feedback)
 from shared.claude import call_claude_ex as _call_claude_ex
 from shared.code_analyzer import invalidate_file, read_source
 from shared.test_runner import run_test
@@ -52,7 +52,10 @@ from lib.transaction import Transaction
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
-MODEL = os.environ.get("ADAPTATION_MODEL", "claude-opus-5")
+# Set in config/.env, no default here: run.sh stops the run when it is missing.
+MODEL = os.environ.get("ADAPTATION_MODEL", "")
+# Set in config/.env. Empty → --effort is not passed and the runner's own effortLevel applies.
+EFFORT = os.environ.get("ADAPTATION_EFFORT") or None
 ATTEMPT = int(os.environ.get("ADAPT_ATTEMPT", "1"))
 APPLY = os.environ.get("ADAPTATION_APPLY", "false").lower() == "true"
 MAX_FILES = int(os.environ.get("ADAPTATION_MAX_FILES_PER_RUN", "6"))
@@ -257,13 +260,17 @@ def build_adapt_prompt(item: dict, plan: dict, scope: dict, flow: dict,
         checks = assertion_graph.merge(
             {t: {"asserts": c.get("_asserts") or {}} for t, c in contracts.items()})["checks"]
     found = check_changes.reports(flow)
+    values = check_changes.value_reports(flow)
     check_text = "\n".join(check_changes.list_lines(
-        checks, extra=lambda c: (check_changes.fenced_report(found[c["id"]])
-                                 if c["id"] in found else ""))) or "_No checks measured._"
+        checks, extra=lambda c: ((check_changes.fenced_report(found[c["id"]])
+                                  if c["id"] in found else "")
+                                 + check_changes.fenced_relation(values.get(c["id"])))
+    )) or "_No checks measured._"
     if item["kind"] in check_changes.CHECK_CHANGING:
         permission = (f"This item is `{item['kind']}`: it may remove or change the checks "
-                      f"listed here, but only the ones you declare in `check_changes`. "
-                      f"Every other check must still be made exactly as it is.")
+                      f"listed here, or `relax` one listed with a relation, but only the "
+                      f"ones you declare in `check_changes`. Every other check must still "
+                      f"be made exactly as it is.")
     else:
         permission = (f"This item is `{item['kind']}`: it may not remove or change any "
                       f"check listed here. Adding checks is fine.")
@@ -535,13 +542,35 @@ def already_applied(diff: dict, items: list) -> bool:
             and not kinds & (check_changes.CHECK_CHANGING | {"coverage_added"}))
 
 
+def value_mismatches(failed: list, checks: list) -> list:
+    """Verify runs that failed only because a listed check saw its expected value
+    rendered differently — `{check, message, expected, actual, relation}` each.
+
+    Recorded so the next attempt is told, and so that run's measurement can
+    confirm a `relax` the next attempt declares.
+    """
+    from shared.frameworks import get_active_plugin
+    parse = get_active_plugin().diagnostics.value_mismatch
+    by_message = {c.get("message"): c for c in checks if c.get("message")}
+    found = []
+    for _test, _status, out in failed:
+        hit = value_match.triage(out, [c.get("message") for c in checks], parse)
+        if hit:
+            found.append({"check": by_message[hit["message"]]["id"],
+                          **{k: str(v)[:120] for k, v in hit.items()}})
+    return found
+
+
 def judge_checks(item: dict, payload: dict, txn, scope: dict, workspace: Path,
-                 flow: dict, before: dict, record: dict) -> tuple:
+                 flow: dict, before: dict, record: dict, recorded: list = None) -> tuple:
     """The `check_changes` guard, over an edit that is on disk. Returns (ok, why).
 
     Two measurements, because each sees what the other cannot: the call graph
     sees a check that disappeared because a step stopped calling a helper; the
     edited files show a check changed in code no in-scope test reaches.
+
+    `recorded` — value mismatches earlier attempts' verify runs measured — is,
+    with the explorer's VALUE_CHECKs, what a declared `relax` must be confirmed by.
     """
     after = check_changes.measure(scope, workspace)
     graph = assertion_graph.delta(before["checks"], after["checks"])
@@ -566,7 +595,8 @@ def judge_checks(item: dict, payload: dict, txn, scope: dict, workspace: Path,
         set(scope.get("verify") or []), fingerprint)
     ok, why, rows = check_changes.validate(
         payload.get("check_changes"), graph, files, item["kind"], listed,
-        check_changes.reports(flow), outside)
+        check_changes.reports(flow), outside,
+        found_values=check_changes.value_reports(flow), recorded=recorded)
 
     holes = sorted(set(after["unresolved"]) - set(before["unresolved"]))
     record["check_changes"] = rows
@@ -739,6 +769,9 @@ def main():
     # attempt, so reading it back showed attempt 3 only what attempt 2 did — and
     # left it free to re-propose the edit attempt 1 had already had rejected.
     history = fix_history.load(AUDIT_DIR)
+    # What earlier verify runs measured the page doing to an expected value. It
+    # vouches for a `relax` the same way the explorer's VALUE_CHECK does.
+    recorded = [m for h in history for m in h.get("value_mismatches") or []]
     retry_note = ""
     if history:
         stop, why = fix_history.exhausted(history)
@@ -796,7 +829,7 @@ def main():
         prompt = build_adapt_prompt(item, plan, scope, flow, workspace, rules,
                                     retry_note + done_section(done),
                                     checks=before["checks"])
-        call = _call_claude_ex(prompt=prompt, model=MODEL, cwd=str(REPO_ROOT),
+        call = _call_claude_ex(prompt=prompt, model=MODEL, effort=EFFORT, cwd=str(REPO_ROOT),
                                timeout=900, log_dir=str(AUDIT_DIR),
                                system_prompt_file=(str(SYSTEM_PROMPT)
                                                    if SYSTEM_PROMPT.exists() else None))
@@ -911,7 +944,7 @@ def main():
                 sound, why = verify_proposal(
                     txn, scope, workspace, record,
                     judge=lambda: judge_checks(item, payload, txn, scope, workspace,
-                                               flow, before, record))
+                                               flow, before, record, recorded))
             except Exception as exc:                       # noqa: BLE001 — see above
                 sound, why = False, f"could not verify the proposal: {exc}"
                 record["guards"].append({"guard": "check_changes", "ok": False,
@@ -957,7 +990,7 @@ def main():
 
         try:
             sound, why = judge_checks(item, payload, txn, scope, workspace, flow,
-                                      before, record)
+                                      before, record, recorded)
         except Exception as exc:  # noqa: BLE001 — fail closed: an unmeasured edit is not safe
             sound, why = False, f"could not measure the checks after the edit: {exc}"
             record["guards"].append({"guard": "check_changes", "ok": False,
@@ -978,9 +1011,22 @@ def main():
             log(f"  {status}: {test.rpartition('#')[2]}")
         record["verified"] = [t for t, _, _ in passed]
         record["failed"] = [{"test": t, "status": s} for t, s, _ in failed]
+        # A failure that is only the page rendering an expected value its own way
+        # is named, so the next attempt can restore the data or declare a relax
+        # this run's measurement already confirms.
+        mismatches = value_mismatches(failed, before["checks"])
+        if mismatches:
+            record["value_mismatches"] = mismatches
+            for m in mismatches:
+                log(f"  value mismatch on check {m['check']}: expected '{m['expected']}', "
+                    f"the page showed '{m['actual']}' ({m['relation']})")
 
         if failed and not passed:
             why = f"every verified test still fails ({len(failed)})"
+            if mismatches:
+                why += (f"; {len(mismatches)} only because the page renders an expected "
+                        f"value differently — restore the test data's shape, or declare "
+                        f"`relax` if this item's kind may change checks")
             txn.rollback(why)
             record.update({"status": "rolled_back", "reason": why})
             result["items"].append(record)
@@ -1027,7 +1073,8 @@ def main():
         rejections=[{"guard": g.get("guard", ""), "reason": g.get("reason", "")}
                     for i in result["items"] for g in (i.get("guards") or [])
                     if not g.get("ok")],
-        outcome=outcome))
+        outcome=outcome,
+        value_mismatches=[m for i in result["items"] for m in i.get("value_mismatches") or []]))
 
     if not APPLY:
         gate = "skipped" if "proposed" not in statuses else "true"

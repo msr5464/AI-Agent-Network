@@ -42,6 +42,15 @@ def attach_dom_snapshot(issue: dict, report_dir: Path, method_name: str,
         text = snapshot.read_text(encoding="utf-8", errors="ignore")
         dom_dir = audit_dir / "dom"
         dom_dir.mkdir(parents=True, exist_ok=True)
+        # The sidecars the header names (element capture, iframe contents) live
+        # beside the original, which CI cleans up, so they are copied too and the
+        # header pointed at the copies.
+        for key in ("fingerprints", "frames"):
+            source = parse_header(text).get(key) or ""
+            if source and Path(source).is_file():
+                copy = dom_dir / f"{method_name}.{key}.json"
+                copy.write_bytes(Path(source).read_bytes())
+                text = text.replace(f'{key}="{source}"', f'{key}="{copy}"', 1)
         preserved = dom_dir / f"{method_name}.html"
         preserved.write_text(text, encoding="utf-8")
 

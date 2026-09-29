@@ -5,7 +5,7 @@
 #   source "$REPO_ROOT/shared/session.sh"
 #
 # Provides: log(), elapsed_since(), fmt_duration(), run_step(), flush_step_done(),
-#           print_step_table()
+#           print_step_table(), require_settings()
 # Sets:     SESSION_START (epoch seconds at time of sourcing)
 #
 # Callers track per-step timing with:
@@ -68,6 +68,21 @@ log() {
   else
     echo "[$(date +%H:%M:%S)] $msg"
   fi
+}
+
+# require_settings <VAR>... — stop before any step when a setting the run cannot
+# do without is empty. Models have no default in code: config/.env is the one
+# place they are set, so a missing one is a configuration error to report, not a
+# reason to let the CLI fall back to whatever model this machine's settings name.
+require_settings() {
+  local name missing=0
+  for name in "$@"; do
+    if [[ -z "${!name:-}" ]]; then
+      log "ERROR: $name is not set — set it in config/.env (see config/.env.example)"
+      missing=1
+    fi
+  done
+  (( missing == 0 )) || exit 1
 }
 
 elapsed_since() {
@@ -188,7 +203,7 @@ run_step() {
   # rather than every attempt's so far.
   local spend=""
   [[ -n "$step_key" ]] && spend=$(cd "${REPO_ROOT:-.}" &&
-    python3 -m shared.metrics --stage "$step_key" "$label" 2>/dev/null || true)
+    python3 -m shared.metrics --stage "$step_key" "$label" "$step_start" 2>/dev/null || true)
   unset STEP_KEY STEP_LABEL STEP_ATTEMPT
   _STEP_DONE_LINE="✓ $label — $(fmt_duration $dur)${spend:+ · $spend}"
 }

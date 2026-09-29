@@ -17,6 +17,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
@@ -25,10 +26,16 @@ REPO_ROOT  = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[
 
 sys.path.insert(0, str(REPO_ROOT))   # repo root → shared.*
 from shared import browser_mode      # noqa: E402  (after sys.path update)
-from shared.credential_extraction import credentials_from_plan  # noqa: E402
+from shared.credential_extraction import (credentials_from_plan, input_text,  # noqa: E402
+                                          mentions_login)
+from shared.test_case import given_values          # noqa: E402
 
 CLAUDE_CLI  = os.environ.get("CLAUDE_CLI_PATH", "claude")
-MODEL       = os.environ.get("AUTHORING_MODEL", "claude-opus-4-6")
+# Set in config/.env, no default here: run.sh stops the run when it is missing.
+MODEL       = os.environ.get("AUTHORING_MODEL", "")
+# This step drives a browser, so it takes the effort every agent's browser step
+# shares; empty, it falls back to AUTHORING_EFFORT.
+EFFORT      = os.environ.get("BROWSER_EFFORT") or os.environ.get("AUTHORING_EFFORT") or None
 # Per-action wait budget handed to Claude for individual browser interactions.
 PW_TIMEOUT  = int(os.environ.get("AUTHORING_BROWSER_TIMEOUT_MS", "30000"))
 PW_HEADLESS = browser_mode.headless()
@@ -44,10 +51,10 @@ VALIDATE_RETRY_ATTEMPTS = int(os.environ.get("VALIDATE_WEB_RETRY_ATTEMPTS", "1")
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 from shared.claude import call_claude_ex            # noqa: E402  (after sys.path update)
-from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools  # noqa: E402
+from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools, CAPTURE_RULES  # noqa: E402
 from shared.log import log as _log      # noqa: E402  (shared, redacts known secrets)
 from shared.page_identity import is_dom_selector    # noqa: E402
-from shared import check_provenance                  # noqa: E402
+from shared import check_provenance, flow_map, value_match  # noqa: E402
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -174,10 +181,33 @@ def parse_selector_output(output: str) -> tuple:
                 f"checked for visibility — keeping it, but step 03 cannot treat "
                 f"it as confirmed-visible.")
 
+        if selectors.get(name, selector) != selector:
+            # One name is one element. Keeping the last one silently gave three
+            # pages the payment-success amount, because the popup, the bank page
+            # and the success screen had all been reported as `amountDisplay`.
+            log(f"WARNING: {name} was reported again as {selector!r} — keeping the "
+                f"first, {selectors[name]!r}. A different element needs its own name.")
+            continue
         selectors[name] = selector
         counts[name] = count
         visibles[name] = visible
     return selectors, counts, visibles, rejected
+
+
+def qualified_locator_names(web_pages: list) -> list:
+    """The locator names step 02 is asked to report, one per element.
+
+    The plan names locators per page object, so two pages may both ask for
+    `amountDisplay` and mean different elements. The selector map is one flat
+    dict, so such a name is written `IssuingBankPage.amountDisplay` here, and
+    step 03 reads it back for that page only.
+    """
+    pages_using: dict = {}
+    for page_def in web_pages:
+        for name in set(page_def.get("locators_needed", [])):
+            pages_using[name] = pages_using.get(name, 0) + 1
+    return [f"{page_def.get('class_name', '?')}.{name}" if pages_using[name] > 1 else name
+            for page_def in web_pages for name in page_def.get("locators_needed", [])]
 
 
 def parse_step_results(output: str) -> tuple:
@@ -246,6 +276,398 @@ def parse_mechanisms(output: str) -> dict:
     return mechanisms
 
 
+def verify_with_evidence(found: dict, counts: dict, visibles: dict,
+                         rejected: dict, rows: list) -> tuple:
+    """Hold every SELECTOR_FOUND to what the browser helpers measured.
+
+    The count and visible numbers on a SELECTOR_FOUND line are the model's report.
+    The helpers write what they actually counted to an evidence file, so where
+    they counted the same selector, that decides: exactly 1/1 in any state it was
+    seen in confirms it; present but never uniquely visible drops it. A selector
+    the helpers never counted keeps the model's numbers, and is counted in the
+    returned stats so how much is still claimed stays visible.
+
+    Returns (found, counts, visibles, rejected, {"live": n, "claimed": n, "dropped": n}).
+    """
+    seen: dict = {}
+    for row in rows or []:
+        for sel, c in (row.get("checks") or {}).items():
+            if isinstance(c, dict) and "total" in c:
+                seen.setdefault(sel, []).append(c)
+        for e in row.get("known") or []:
+            if e.get("selector") and "total" in e:
+                seen.setdefault(e["selector"], []).append(e)
+    stats = {"live": 0, "claimed": 0, "dropped": 0}
+    for name, selector in list(found.items()):
+        measured = seen.get(selector) or []
+        if any(c.get("total") == 1 and c.get("visible") == 1 for c in measured):
+            counts[name], visibles[name] = 1, 1
+            stats["live"] += 1
+            continue
+        present = [c for c in measured if (c.get("total") or 0) >= 1]
+        if present:
+            c = present[-1]
+            rejected[name] = (f"{selector} — the browser helpers measured "
+                              f"{c.get('total')} match(es), {c.get('visible')} visible, "
+                              f"where the marker reported 1/1")
+            for d in (found, counts, visibles):
+                d.pop(name, None)
+            stats["dropped"] += 1
+            continue
+        stats["claimed"] += 1
+    return found, counts, visibles, rejected, stats
+
+
+# Words that name a control's kind, not which control it is.
+_CONTROL_WORDS = {"button", "btn", "field", "input", "icon", "link", "text", "label",
+                  "option", "tab", "the", "and"}
+
+
+def _naming_words(text: str) -> set:
+    """camelCase or prose split into lowercase words. Plainer than
+    check_provenance.subject_words, which drops "checkout" as a form of "check"."""
+    return {w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+", text or "")
+            if len(w) >= 3} - _CONTROL_WORDS
+
+
+def recover_clicked_locators(found: dict, counts: dict, visibles: dict, rows: list,
+                             wanted: list) -> list:
+    """Confirm a plan locator the model clicked but never reported, from the click
+    the browser recorded. Returns the names recovered.
+
+    A run clicked a page's main button with a selector copied from its prompt's
+    example, reported nothing for it, and step 03 guessed `button:has-text('Buy
+    Now')` for a link: the test failed on its first locator. The helpers record
+    every click with the clicked control's selector, counted where it lives. A
+    name is recovered only from one click, measured 1/1, whose text shares a word
+    with the name, and never onto an element another name already has.
+    """
+    clicks = [r["clicked"] for r in rows or [] if isinstance(r.get("clicked"), dict)]
+    clicks = [c for c in clicks if c.get("sel") and c.get("total") == 1 and c.get("visible") == 1]
+    recovered = []
+    for name in wanted:
+        if name in found:
+            continue
+        # The click sharing the most words wins: `buyNowButton` shares one with
+        # "Pay now" and two with "BUY NOW". A tie names nothing.
+        words, shared = _naming_words(name.rsplit(".", 1)[-1]), {}
+        for c in clicks:
+            n = len(words & _naming_words(c.get("text") or ""))
+            if n:
+                shared[c["sel"]] = max(shared.get(c["sel"], 0), n)
+        top = [sel for sel, n in shared.items() if shared and n == max(shared.values())]
+        if len(top) != 1 or top[0] in found.values():
+            continue
+        found[name], counts[name], visibles[name] = top[0], 1, 1
+        recovered.append(name)
+        log(f"  RECOVERED {name} = {found[name]} — clicked in the browser, counted 1/1, "
+            f"but never reported")
+    return recovered
+
+
+_TAKES_TYPING = ("input", "textarea", "select")
+
+
+def _was_typed(value: str, selector, typed: list) -> bool:
+    """Whether `value` is among what the browser recorded typed. A field may
+    format what it is given (`4111111111111111` shown as `4111 1111 1111 1111`),
+    so any relation or the same letters and digits count. A password's value is
+    never recorded: it counts when it went into this field's own selector."""
+    letters = lambda s: re.sub(r"\W", "", str(s)).casefold()
+    for t in typed:
+        if t.get("password"):
+            if selector and t.get("sel") == selector:
+                return True
+            continue
+        shown = t.get("value")
+        if shown is not None and (value_match.relation(value, shown)
+                                  or letters(value) == letters(shown) != ""):
+            return True
+    return False
+
+
+def enforce_typed_fields(inputs: dict, found: dict, counts: dict, visibles: dict,
+                         rejected: dict, rows: list) -> dict:
+    """Drop an INPUT_USED, and its name's selector, when the browser helpers
+    measured that element as one nothing can be typed into.
+
+    Unique and visible says an element exists, not that it is the one the plan
+    means. A run matched the plan's `amountField` to an earlier run's
+    `amountText = td.amount`, the cart's read-only total: it counted 1/1, was
+    kept, and the model reported `INPUT_USED: amountField|20,000` for a value it
+    had only read. Step 03 generated fillText() on a <td>, and two fix attempts
+    went into a field step 02 had never typed into.
+
+    The helpers also record every value typed into any field, as it is typed. When
+    they recorded some, an INPUT_USED value none of them matches was never typed,
+    and is dropped alone: the field may be right, the claim is not.
+
+    What the helpers never measured keeps the model's word, as selectors do.
+    Returns the inputs kept.
+    """
+    seen: dict = {}
+    typed = []
+    for row in rows or []:
+        for sel, c in (row.get("checks") or {}).items():
+            if isinstance(c, dict) and ("editable" in c or c.get("tag")):
+                seen.setdefault(sel, []).append(c)
+        for e in row.get("known") or []:
+            if e.get("selector") and "editable" in e:
+                seen.setdefault(e["selector"], []).append(e)
+        if isinstance(row.get("typed"), dict):
+            typed.append(row["typed"])
+    kept = {}
+    for field, value in inputs.items():
+        selector = found.get(field)
+        readings = seen.get(selector) or []
+        editable = [c["editable"] for c in readings if "editable" in c]
+        if (not readings or any(editable)
+                or (not editable and any(c.get("tag") in _TAKES_TYPING for c in readings))):
+            if typed and not _was_typed(value, selector, typed):
+                log(f"WARNING: dropped INPUT_USED {field}|{value!r} — the browser recorded "
+                    f"every value typed in this run, and this was not one of them")
+                continue
+            kept[field] = value
+            continue
+        tag = next((c["tag"] for c in readings if c.get("tag")), "")
+        rejected[field] = (f"{selector} — reported as typed into ({value!r}), but the browser "
+                           f"helpers measured {'a <' + tag + '>' if tag else 'an element'} "
+                           f"that takes no typing. It is not this field.")
+        log(f"WARNING: dropped {field} and its INPUT_USED — {rejected[field]}")
+        for d in (found, counts, visibles):
+            d.pop(field, None)
+    return kept
+
+
+def known_selectors(plan: dict, roots=None) -> tuple:
+    """(session, {name: selector}) from the newest earlier step-02 run on the same
+    site, preferring one that finished — or ("", {}).
+
+    Every run used to start from nothing: a retry of a session whose previous run
+    had confirmed 19 selectors went looking for all of them again, and found some
+    worse ones (a promo `label[for="690"]`). A site's selectors are facts about the
+    site, not the module, so any earlier run against the same host counts. They are
+    candidates only; the prompt has each counted live before it is reported.
+    """
+    host = urlparse(plan.get("web_base_url") or "").netloc
+    if not host:
+        return "", {}
+    runs = []
+    for root in roots or (AGENT_DIR / "audit", AGENT_DIR / "cache"):
+        for path in Path(root).rglob("02-validate-web.json"):
+            if path.parent == AUDIT_DIR:
+                continue
+            try:
+                data = json.loads(path.read_text())
+                earlier = json.loads((path.parent / "01-parse.json").read_text())
+            except (OSError, ValueError):
+                continue
+            if urlparse(earlier.get("web_base_url") or "").netloc != host:
+                continue
+            if not data.get("selectors"):
+                continue
+            finished = data.get("status") == "ok" and data.get("final_attempt", True) is not False
+            runs.append((finished, path.stat().st_mtime, path.parent.name, data["selectors"]))
+    if not runs:
+        return "", {}
+    _, _, session, selectors = max(runs, key=lambda r: (r[0], r[1]))
+    return session, selectors
+
+
+def progress_notes(outcome: str, parsed: dict, web_steps: list) -> list:
+    """Retry notes for an attempt that ran out before finishing, but not before
+    confirming most of the flow.
+
+    A fresh browser has to walk the flow from the start; it does not have to
+    rediscover it. The retry used to be told the attempt "produced no usable
+    output" — after one had measured 19 selectors and passed 21 of 25 steps — so
+    it spent its whole budget finding the same elements again and would have run
+    out in the same place. Every marker is still re-emitted, so the retry stands
+    on its own when the better of the two attempts is picked.
+    """
+    passed = parsed.get("steps_passed") or []
+    selectors = parsed.get("selectors") or {}
+    if not selectors and not passed:
+        return ["\nPRIOR ATTEMPT NOTES — a previous run of this exact flow did not "
+                f"complete ({outcome}) and produced no usable output. Execute efficiently "
+                "and emit markers as you go (rule 3b) so partial progress is captured even "
+                "if this attempt also runs out of budget."]
+    remaining = [s for s in web_steps if not any(p == s or p.startswith(s) for p in passed)]
+    notes = [f"\nPRIOR ATTEMPT NOTES — a previous run of this exact flow ran out ({outcome}) "
+             "after confirming the selectors and steps below. This is a fresh browser, so "
+             "walk the flow from the start, but do NOT search for these elements again: use "
+             "each selector as it is, confirm a page's ones with a single rule-2c batch "
+             "count, and re-emit their SELECTOR_FOUND / INPUT_USED / VALUE_CHECK / "
+             "STEP_PASSED markers as you pass them. Spend the budget on the steps not yet "
+             "confirmed."]
+    notes += [f"  {name}={selector}" for name, selector in selectors.items()]
+    if remaining:
+        notes += ["Not yet confirmed:"] + [f"  - {s}" for s in remaining]
+    return notes
+
+
+def parse_inputs_used(output: str) -> dict:
+    """`INPUT_USED: <field>|<value typed>` — what this run actually typed, by field.
+
+    Step 03 writes the test's data, and data of a different shape is a different
+    test: step 02 filled `Test User`, step 03 generated a one-word name, and the
+    demo checkout appended a default last name the name check then failed on —
+    a value step 02 never tried. The first report of a field wins, as it does for
+    selectors.
+    """
+    inputs = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("INPUT_USED:"):
+            continue
+        field, sep, value = line[len("INPUT_USED:"):].partition("|")
+        field = field.strip()
+        if sep and field and field not in inputs:
+            inputs[field] = value.strip()
+    return inputs
+
+
+def parse_value_checks(output: str) -> list:
+    """`VALUE_CHECK:` lines — both sides of each comparison step 02 made, with the
+    relation between them computed in Python, never taken from the model."""
+    checks = []
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("VALUE_CHECK:"):
+            check = value_match.parse_value_check(line[len("VALUE_CHECK:"):])
+            if check:
+                checks.append(check)
+    return checks
+
+
+def drop_untraced_sources(value_checks: list, web_steps: list, inputs: dict) -> list:
+    """Drop a VALUE_CHECK whose expected side is not what its source says it is.
+
+    Step 03 asserts every VALUE_CHECK as a contract, with the expected side taken
+    from its source. `literal` is a value the test case quotes: "Record the amount
+    displayed on the order form" came back as `literal|20,000` and was generated
+    as `assertEquals(amount, "20,000")`, a check nobody asked for. `input:<field>`
+    is a value this run typed: one with no INPUT_USED (or whose INPUT_USED was
+    dropped) points the contract at test data step 02 never entered.
+    """
+    steps_text = "\n".join(web_steps)
+    kept = []
+    for c in value_checks:
+        kind, _, name = c["source"].partition(":")
+        if kind == "literal" and not (value_match.appears_in(c["expected"], c["check"])
+                                      or value_match.appears_in(c["expected"], steps_text)):
+            log(f"  DROPPED VALUE_CHECK for {c['check']!r} — its literal {c['expected']!r} is "
+                f"not in the test case, so it was read off the page, not expected by anyone")
+            continue
+        if kind == "input" and name not in inputs:
+            log(f"  DROPPED VALUE_CHECK for {c['check']!r} — nothing was typed into {name}")
+            continue
+        kept.append(c)
+    return kept
+
+
+# Only a claim that two values are the SAME is refuted by their differing. "The
+# amount decreased" holds precisely because its two sides differ, and "the order id
+# is not null" has no second value at all — both were downgraded when every
+# VALUE_CHECK without a relation was.
+_EQUALITY = re.compile(r"\b(match(es|ed|ing)?|same|equals?|identical)\b", re.I)
+_NOT_EQUALITY = re.compile(r"decreas|increas|\bless\b|greater|more than|fewer|lower|higher"
+                           r"|not (null|empty|blank)|differ", re.I)
+
+
+def enforce_value_checks(passed: list, unverified: list, value_checks: list) -> tuple:
+    """Downgrade a comparison reported as passed whose two recorded sides match
+    under no relation at all.
+
+    The same rule as enforce_verification_evidence: the step says the values
+    matched, the values it wrote down say they did not, and the values win. The
+    downgraded step then takes the path every unverified check already takes.
+    """
+    unmatched = [c["check"] for c in value_checks if not c["relation"]
+                 and _EQUALITY.search(c["check"]) and not _NOT_EQUALITY.search(c["check"])]
+    if not unmatched:
+        return passed, unverified
+    kept, downgraded = [], list(unverified)
+    for step in passed:
+        if any(step == c or step.startswith(c) for c in unmatched):
+            log(f"  DOWNGRADED to unverified: {step!r} — the two values recorded for "
+                f"it do not match under any relation")
+            downgraded.append(step)
+        else:
+            kept.append(step)
+    return kept, downgraded
+
+
+def _traced(check: dict, selectors: dict, inputs: dict) -> bool:
+    """Whether a VALUE_CHECK's expected side is what its source says it is.
+
+    Promotion rests on the expected text, so it must not be one the model wrote
+    down freely: a typed value must be the one INPUT_USED recorded, an earlier
+    element must have been measured, and a literal must be in the step itself.
+    """
+    kind, _, name = check["source"].partition(":")
+    if kind == "input":
+        return value_match.relation(inputs.get(name, ""), check["expected"]) in ("equal", "formatting")
+    if kind == "element":
+        return name in selectors
+    return value_match.appears_in(check["expected"], check["check"])
+
+
+def promote_matched_values(passed: list, unverified: list, value_checks: list,
+                           selectors: dict, inputs: dict) -> tuple:
+    """Promote a comparison reported as unverified whose two recorded sides match.
+
+    The other half of enforce_value_checks: the values win in both directions. A
+    run reported `08123456789` against a shown `+628123456789` as unverified
+    ("the digit sequence differs"), and an unverified requested check makes step
+    03 keep a strict assertion that fails on purpose. The relation is measured
+    here, never taken from the model. The element must have a confirmed selector
+    and the expected side must trace to its source (`_traced`), so what is
+    promoted is a measured element showing a value that matches a known one.
+    """
+    matched = {c["check"]: c for c in value_checks
+               if c["relation"] and c.get("element") in selectors
+               and _EQUALITY.search(c["check"]) and not _NOT_EQUALITY.search(c["check"])
+               and _traced(c, selectors, inputs)}
+    if not matched:
+        return passed, unverified
+    promoted, still = list(passed), []
+    for entry in unverified:
+        step = entry.split("|", 1)[0].strip()
+        check = next((c for text, c in matched.items()
+                      if step == text or step.startswith(text)), None)
+        if check and step not in promoted:
+            log(f"  PROMOTED to passed: {step!r} — {check['element']} shows "
+                f"{check['rendered']!r}, which {value_match.MEANING[check['relation']]} "
+                f"{check['expected']!r} ({check['relation']})")
+            promoted.append(step)
+        elif not check:
+            still.append(entry)
+    return promoted, still
+
+
+def drop_unverified_actions(unverified: list) -> list:
+    """Keep only the STEP_UNVERIFIED entries that are checks.
+
+    Unverified means a claim was never observed, and an action claims nothing: it
+    ran, or it failed. A run clicked a payment-method tab, counted the tab after
+    the click, found it gone, and wrote `STEP_UNVERIFIED: Select Credit Card as the
+    payment method (locator report)`. Step 03 kept that as a check the product
+    failed, and step 04 stopped on the `defect` gate when the tab's guessed
+    locator did not load. A comparison is a claim even without a verifying verb.
+    """
+    kept = []
+    for entry in unverified:
+        step = entry.split("|", 1)[0].strip()
+        if (check_provenance.shape(step) == check_provenance.VERIFICATION
+                or _EQUALITY.search(step) or _NOT_EQUALITY.search(step)):
+            kept.append(entry)
+        else:
+            log(f"  IGNORED STEP_UNVERIFIED for {step!r} — an action is not a check, "
+                f"so it cannot be one the product failed")
+    return kept
+
+
 def enforce_verification_evidence(passed: list, unverified: list,
                                   selectors: dict) -> tuple:
     """Downgrade a verification step that passed without confirming an element.
@@ -285,11 +707,11 @@ def enforce_verification_evidence(passed: list, unverified: list,
             kept.append(step)
             continue
         log(f"WARNING: downgrading to unverified — {step!r} was reported as passed, "
-            f"but no selector was confirmed for the element it claims to have seen. "
-            f"A network response or a closed form is not proof that a UI element "
-            f"rendered.")
-        downgraded.append(f"{step}|no element confirmed|reported passed with no "
-                          f"matching SELECTOR_FOUND")
+            f"but no selector was measured for the element it checks. Seeing it in "
+            f"a screenshot, or inferring it from a network response, leaves step 03 "
+            f"nothing to assert against.")
+        downgraded.append(f"{step}|a selector for what it checks|none — "
+                          f"{check_provenance.UNMEASURED}")
     return kept, downgraded
 
 
@@ -496,11 +918,7 @@ def main() -> None:
     # reported here as "no credentials found".
     plan_creds = {k: v for k, v in (plan.get("demo_credentials") or {}).items() if v}
     demo_creds = credentials_from_plan(plan)
-    login_keywords = ("login", "log in", "sign in", "signin", "authenticate")
-    steps_need_login = any(
-        any(kw in step.lower() for kw in login_keywords)
-        for step in web_steps
-    )
+    steps_need_login = mentions_login("\n".join(web_steps))
     if steps_need_login and demo_creds != plan_creds:
         # Recovered from the input file, and put in the prompt's CREDENTIALS block
         # rather than left for Claude to notice in the step text.
@@ -517,8 +935,24 @@ def main() -> None:
         _write_empty(reason="login step detected but no credentials in input file — add Username/Password fields")
         sys.exit(1)
 
+    # Credentials only for a flow that logs in. Without one, an `Email:` is a form
+    # field and an `OTP:` a bank page's: shown as CREDENTIALS, a checkout run was
+    # told to expect a login and to "use exactly these".
+    login_creds = steps_need_login or bool(demo_creds.get("password"))
+    given = given_values(input_text(plan))
+    if demo_creds and not login_creds:
+        stated = {value for _label, value in given}
+        given += [(label, demo_creds[field]) for field, label in
+                  (("username", "Email / username"), ("otp", "OTP"))
+                  if demo_creds.get(field) and demo_creds[field] not in stated]
+    data_section = ("\nTEST DATA — the values the test case gives. Type each exactly as "
+                    "written into the field it names, even where a step says \"dummy "
+                    "data\"; make up values only for fields not listed:\n"
+                    + "".join(f"  {label}: {value}\n" for label, value in given)
+                    if given else "")
+
     creds_section = ""
-    if demo_creds:
+    if demo_creds and login_creds:
         creds_section = f"""
 CREDENTIALS (use exactly these — do NOT use any other values):
   username / email : {demo_creds.get('username', '')}
@@ -529,10 +963,7 @@ CREDENTIALS (use exactly these — do NOT use any other values):
   IMPORTANT: After entering the password and clicking login, an OTP/2FA prompt may appear.
   If it does, enter the OTP code above and submit before continuing."""
 
-    # Build locator names needed across all page objects
-    all_locators = []
-    for page_def in web_pages:
-        all_locators.extend(page_def.get("locators_needed", []))
+    all_locators = qualified_locator_names(web_pages)
 
     # .mcp.json goes in the audit dir, not the repo root: the root is shared
     # mutable state and the server can be running another agent against it at
@@ -542,15 +973,49 @@ CREDENTIALS (use exactly these — do NOT use any other values):
     # the last one writing to the shared root.
     mode_label = browser_mode.label(PW_HEADLESS)
     log(f"Browser mode: {mode_label}")
-    mcp_path = write_mcp_config(AUDIT_DIR, headless=PW_HEADLESS)
+    # What the browser helpers measure goes here, for verify_with_evidence; the
+    # selectors known from an earlier run are counted on every page state.
+    known_from, known = known_selectors(plan)
+    known_path = AUDIT_DIR / "02-known-selectors.json"
+    known_path.write_text(json.dumps([{"owner": "known", "path": "", "name": n, "selector": s}
+                                      for n, s in known.items()], indent=2))
+    evidence_path = AUDIT_DIR / "02-web-evidence.jsonl"
+    evidence_path.unlink(missing_ok=True)
+    mcp_path = write_mcp_config(AUDIT_DIR, headless=PW_HEADLESS,
+                                evidence_file=evidence_path, known_locators_file=known_path)
     log(f"Playwright MCP config written: {mcp_path}")
 
     steps_numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(web_steps))
     locators_hint  = (
         f"\nLocators to discover and report (use these names in SELECTOR_FOUND): "
         f"{json.dumps(all_locators)}"
+        + ("\nA name written Page.name is that page's own element: report it under that "
+           "full name, and never report one element under another page's name."
+           if any("." in n for n in all_locators) else "")
         if all_locators else ""
     )
+
+    known_hint = ""
+    if known:
+        log(f"Reusing {len(known)} selector(s) confirmed on this site by {known_from} "
+            f"as candidates — each is counted again before it is reported")
+        known_hint = (
+            f"\nKNOWN SELECTORS — an earlier run on this site ({known_from}) confirmed these. "
+            "The site may have changed since, so they are candidates, not results: on each "
+            "page, count the ones you need in ONE page.qa.check — or as `check` in the "
+            "page.qa.step call that lands on their page, with harvest: false — before "
+            "harvesting anything. Each that measures total 1 and visible 1 is confirmed "
+            "as that element, not as any role this plan has: report it only under the "
+            "plan's name for the SAME element (these are the earlier run's names). A "
+            "text the earlier run read is never a field this plan types into — a field "
+            "is an input, textarea or select, and `check` reports `editable`. Harvest "
+            "only for elements still missing, and never report one you did not just "
+            "count.\n"
+            # Without the earlier run's page prefix. Shown `OldPage.amountDisplay`, a run
+            # reported `OldPage.amountText`, on a page this plan does not have, and the
+            # plan's own `NewPage.amountText` went unconfirmed.
+            + "".join(f"  {name.rsplit('.', 1)[-1]} = {sel}\n"
+                      for name, sel in list(known.items())[:40]))
 
     fetch_guard = (
         "\n[API] STEPS: never browser_navigate to an API endpoint — loading it replaces the "
@@ -567,8 +1032,10 @@ TARGET URL: {base_url}
 
 STEPS TO EXECUTE:
 {steps_numbered}
+{data_section}
 {creds_section}
 {locators_hint}
+{known_hint}
 {fetch_guard}
 {attempt_notes}
 
@@ -590,6 +1057,8 @@ OUTPUT PROTOCOL — emit these markers on their own lines:
     This is checked mechanically after the run: a verification step reported as
     passed with no matching SELECTOR_FOUND is downgraded to unverified anyway,
     so claiming the pass gains nothing and loses the detail of what you saw.
+    Seen inside an iframe, or on a screen that closes by itself? Rule 2f says
+    how to measure it there.
 
   · A step claiming a STATE CHANGE or that DATA PERSISTED ("the profile summary
     is updated") succeeds when you RE-READ THE STATE and see the new value —
@@ -607,6 +1076,11 @@ OUTPUT PROTOCOL — emit these markers on their own lines:
    any [class*='toast'], [role='alert'] or [role='status'] element for 5s after
    save|no such element ever entered the DOM; the edit form closed and POST
    /update/fullprofiles returned 200 [url=https://www.naukri.com/mnjuser/profile])
+
+  Only a step that CLAIMS something (verify, validate, matches, decreases) can be
+  unverified, under that step's own text — never a variant of it. An action that
+  worked is STEP_PASSED even when you could not measure its control; that control
+  is simply not reported. An unverified action is ignored.
 
   This is NOT a failure and NOT a pass, and it is the right answer far more often
   than either. The flow is fine; the thing the step asserts was never there to
@@ -629,7 +1103,7 @@ OUTPUT PROTOCOL — emit these markers on their own lines:
 
   ⚠ count AND visible ARE BOTH MANDATORY, and are the number of elements the
   selector matched — and how many of those were actually visible — when you
-  evaluated it in the browser (see UNIQUENESS CHECK below). They go at the very
+  evaluated it in the browser (see rule 2c). They go at the very
   END of the line, count then visible, so a selector containing a literal | is
   still safe.
   A marker reporting visible != 1 is DROPPED. The DOM is full of things nobody
@@ -644,8 +1118,8 @@ OUTPUT PROTOCOL — emit these markers on their own lines:
   Narrow it and re-report it with count=1 instead.
   A marker with NO count is ALSO DROPPED. Nothing downstream can tell a selector
   you measured from one you eyeballed, so an unmeasured selector is not a
-  confirmed one. The batch check in rule 2c gives you every count at once —
-  report the number it returned.
+  confirmed one. page.qa measures both numbers for every selector it returns —
+  report the numbers it returned.
 
   ⚠ REPORT THE SELECTOR AS CSS, NOT AS A JAVASCRIPT STRING LITERAL.
   When you paste a selector into browser_evaluate you escape it for JS, so the
@@ -682,7 +1156,7 @@ OUTPUT PROTOCOL — emit these markers on their own lines:
     tried one element, it did not work, and a different one did, the one that
     worked is the only one worth recording.
   • If this name has no SELECTOR_FOUND, the hint must carry its own measured
-    "count": 1 from the rule-2c batch check. A hint with no confirmed selector
+    "count": 1 measured by page.qa (rule 2c). A hint with no confirmed selector
     and no count=1 is DROPPED.
 
 • On every STEP_FAILED, also emit a snapshot of the page at the moment of
@@ -707,103 +1181,89 @@ EXECUTION RULES — follow exactly:
    back in to prove a change persisted, or revisit a page already seen. EXECUTE
    those steps for real — the repetition IS what the test is checking, and
    skipping it would validate nothing. But do NOT re-discover on the way through:
-   reuse the selectors you already confirmed for those elements and skip both the
-   harvest (2a) and the uniqueness check (2c), which have already run for that
-   page and cannot return a different answer the second time. Emit STEP_PASSED as
+   reuse the selectors you already confirmed for those elements and pass
+   harvest: false — they have already been counted on that page and cannot return
+   a different answer the second time. Emit STEP_PASSED as
    normal; do not re-emit SELECTOR_FOUND for a name you have already reported.
 
-2. SELECTOR STRATEGY — three round-trips per page, not fifteen.
+2. SELECTOR STRATEGY — one call per step, and never write measuring code yourself.
 
-   ⚠ BUDGET. Every browser tool call is a full round-trip costing this run about
-   ten seconds, and the context it returns is re-read on every turn after it.
-   Hunting one element at a time through a string of browser_evaluate calls is
-   the single thing that makes this step slow, and it finds nothing the batched
-   sequence below does not. Work page by page: HARVEST once, build ALL the
-   candidates for that page, VERIFY them in one batch.
+   ⚠ BUDGET. Every browser tool call is a full round-trip, and everything it
+   returns is re-read on every turn after it. Every page this browser opens has
+   helpers preloaded for all the measuring below — use them instead of writing a
+   harvest, a count, a frame loop or a recorder yourself (a run used to spend a
+   third of its time retyping exactly those):
 
-   2a) HARVEST — the first thing you do on a page whose elements you need, and
-       again when a modal, dropdown or panel opens. ONE browser_evaluate:
+     page.qa.step(action, opts) → {{ ok, error, settledMs, url, check, frames }}
+         Runs `action` (an async function; leave it out to just look), waits until
+         every frame has stopped changing — never add sleeps — and reports what is
+         on the page now:
+           frames: [{{ frame, prefix, result: [{{ tag, text, type, sel, total,
+                                                visible, near, within }}] }}]
+         Each `sel` is that element's best stable selector, frame chain included,
+         ALREADY COUNTED: `total` and `visible` were measured just now.
+         opts: scope: '<selector>'  harvest only that section, CSS or Playwright
+                               syntax — use it as soon as you know which one (a
+                               whole page is mostly site chrome).
+                               Inside an iframe, name the frame the same way a
+                               selector does: '#pay >> internal:control=enter-frame >> form',
+                               or '#pay >> internal:control=enter-frame' for all of it
+               texts: true     also return plain text elements, to read values
+               check: {{ name: '<selector>', … }}  count these AFTER the action — CSS,
+                               Playwright syntax (:has-text(), role=) or a chain
+               before: {{ name: '<selector>', … }}  count these BEFORE the action:
+                               the control the step clicks. A tab or menu item
+                               that navigates is gone by the time `check` runs
+               harvest: false  skip the harvest when `check` tells you enough
+     page.qa.check({{ name: '<selector>', … }}) → {{ name: {{ total, visible, text, editable, checked }} }}
+         `checked` is there for a radio or checkbox, or the label that controls one:
+         count the option you selected in the same call that selects it.
+     page.qa.record(action, ms) — rule 2f, screens that close by themselves.
 
-       () => {{
-         const ATTRS = ['data-cy','data-testid','data-test','id','name',
-                        'aria-label','placeholder','type'];
-         const root = document.querySelector('<section selector>') || document;
-         return [...root.querySelectorAll(
-                   'input,button,a,select,textarea,[role=button],[contenteditable]')]
-           .filter(el => el.offsetParent !== null)
-           .slice(0, 60)
-           .map(el => {{
-             const o = {{ tag: el.tagName.toLowerCase() }};
-             for (const a of ATTRS) {{ const v = el.getAttribute(a); if (v) o[a] = v; }}
-             const t = (el.innerText || el.value || '').trim();
-             if (t) o.text = t.slice(0, 40);
-             return o;
-           }});
-       }}
+   ONE browser_run_code_unsafe PER STEP — the step's action and the next page's
+   elements come back in the same call:
+       async (page) => page.qa.step(() => page.locator('#add-to-cart').click(),
+                                    {{ before: {{ addToCartButton: '#add-to-cart' }}, scope: '.cart' }})
+   The selector in that example is made up: find each one on the page.
+   A step with several actions puts them all in one function. Use browser_click,
+   browser_type, browser_evaluate or browser_snapshot only when a page.qa call has
+   itself failed. If page.qa is undefined, print QA_HELPERS_MISSING once and fall
+   back to browser_evaluate with your own code.
 
-       Scope `root` to the section you care about as soon as you know which one
-       that is (drop the querySelector and use `document` only for a first look
-       at a small page). An unscoped harvest of a large page returns a lot of
-       site chrome you will never use, and it stays in your context for the rest
-       of the run.
+   2a) FROM THE RESULT — for every element the plan needs on this page, a `sel`
+       with total 1 and visible 1 is confirmed: emit SELECTOR_FOUND for it now,
+       with those two numbers, under the name the plan uses. A field with no
+       unique selector of its own already comes back anchored on the text beside
+       it (`tr:has-text('Name') input`), counted; a clickable element with no
+       role (a `div` with a pointer cursor) is in the result too.
 
-   2b) BUILD CANDIDATES for every locator still needed on this page from the
-       harvest output, in this priority order:
+   2b) WHEN IT IS NOT UNIQUE — `sel` null, or total above 1 — build a narrower
+       candidate, in this priority order:
          a) [data-cy='...'] or [data-testid='...'] or [data-test='...']
-         b) [id='...']
+         b) [id='...'] — always this form for an id starting with a digit:
+            #690 is not valid CSS
          c) [name='...']
          d) [aria-label='...']
-         e) a stable class or attribute combination, parent-scoped if needed
+         e) a stable class or attribute combination, scoped under `within` (the
+            nearest ancestor the result says is unique), e.g. .order-group > div
          f) role-based  (e.g. role=button[name='Sign in'])
-         g) text-based  (e.g. button:has-text('Sign in'))
+         g) text anchored on `near` — what the user reads next to it, e.g.
+            tr:has-text('Name') input
+       and count every candidate for the page in ONE page.qa.check call, or as
+       `check` in the next step's call.
 
-       PREFER PLAIN CSS (a–e). `role=` and `:has-text()` are Playwright-only
-       syntax that document.querySelectorAll cannot evaluate, so each one costs
-       its own separate verification round-trip in 2c instead of riding along in
-       the batch. Reach for them only when nothing in a–e identifies the element.
-
-   2c) UNIQUENESS CHECK — mandatory before emitting SELECTOR_FOUND, and BATCHED.
-       Verify EVERY candidate for the page in ONE browser_evaluate:
-
-       () => {{
-         const candidates = {{ /* name: "selector", ... every candidate for THIS page */ }};
-         const out = {{}};
-         for (const [name, sel] of Object.entries(candidates)) {{
-           try {{
-             const els = [...document.querySelectorAll(sel)];
-             const shown = els.filter(el => {{
-               const r = el.getBoundingClientRect();
-               const cs = getComputedStyle(el);
-               return r.width > 0 && r.height > 0 &&
-                      cs.visibility !== 'hidden' && cs.display !== 'none';
-             }});
-             out[name] = {{ total: els.length, visible: shown.length }};
-           }}
-           catch (e) {{ out[name] = 'INVALID_CSS: ' + e.message; }}
-         }}
-         return out;
-       }}
-
-       • total === 1 AND visible === 1 → emit SELECTOR_FOUND for that name now,
-         reporting both numbers.
-       • visible === 0 → the element is in the DOM but nobody can see it. Do NOT
-         emit it and do NOT go looking for a looser selector that happens to
-         match something visible. If this was the element a verification step
-         needed, that step is STEP_UNVERIFIED; if it was a control an action
-         step needed, go to rule 2e.
-       • total !== 1, or INVALID_CSS → do NOT emit it. Narrow ONLY those, by
-           - adding a parent scope:   #profile-section [name='commit']
-           - combining attributes:    button[type='submit'][name='commit']
-           - using a more specific attribute from the harvest
-         then re-run the SAME snippet with just the unresolved names. Two batch
-         rounds should settle a page — do not degrade into one call per selector.
-       • A role= / :has-text() candidate cannot be counted by the snippet above;
-         count that one on its own with the Playwright locator API instead.
-
-       Never emit a selector that matches more than one element, or none that a
-       user could see. Report both numbers you measured as |count=<n>|visible=<n>
-       on the SELECTOR_FOUND line. This is parsed and enforced, not just guidance:
-       count != 1 is dropped, and so is visible != 1.
+   2c) UNIQUENESS — never emit a selector whose measured total or visible is not
+       exactly 1.
+       • visible 0 → the element is in the DOM but nobody can see it. Do NOT emit
+         it and do NOT go looking for a looser selector that happens to match
+         something visible. If this was the element a verification step needed,
+         that step is STEP_UNVERIFIED; if it was a control an action step needed,
+         go to rule 2e.
+       • total above 1, or an error → narrow ONLY those and count them again. Two
+         check rounds settle a page — do not degrade into one call per selector.
+       Report both numbers as |count=<total>|visible=<visible> on the
+       SELECTOR_FOUND line. This is parsed and enforced: count != 1 is dropped,
+       and so is visible != 1.
 
 2d. OBSTRUCTIONS — before concluding an element is not found or not clickable,
    and before spending any of rule 3's retry budget on it:
@@ -849,13 +1309,57 @@ EXECUTION RULES — follow exactly:
       STEP_FAILED|category=selector_not_found — meaning no control AND no
       implicit mechanism.
 
+2f. FRAMES AND BRIEF SCREENS — two things browser_evaluate cannot see. Both are
+   still held to rules 2a-2c: harvest, count, and report count=1 and visible=1.
+   An element inside an iframe is reported as its whole chain, which is what the
+   generated page object enters the frame with:
+     SELECTOR_FOUND: bankAmount=#checkout >> internal:control=enter-frame >> #amount|count=1|visible=1
+{CAPTURE_RULES}
+
+2g. VALUES — write down what you typed and what you compared, verbatim. The test is
+   generated from these lines; a value you only judged in your head is lost.
+   a) For every field you fill:
+        INPUT_USED: <fieldName>|<the exact value you typed>
+      using the same fieldName as that field's SELECTOR_FOUND. A step that fills
+      fields fills every field the plan names for it, in the element that takes
+      typing (the harvest's `tag` is input, textarea or select). Only a value you
+      typed in this run is an INPUT_USED; a value you read is not. One whose
+      element takes no typing is dropped, with that element's selector.
+   b) For every step that compares two values ("matches the one we filled", "same as
+      earlier", "shows the amount"), right after its outcome marker — STEP_PASSED
+      or STEP_UNVERIFIED, whatever you concluded:
+        VALUE_CHECK: <that step's STEP_PASSED text>|<elementName>|<text the element shows>|<source>|<the other side's text>
+      where source says where the other side came from:
+        input:<fieldName>   a value you typed (its INPUT_USED)
+        element:<name>      a value you read earlier in the flow — give that element
+                            its own SELECTOR_FOUND (e.g. the cart total a later page
+                            must repeat)
+        literal             text quoted in the test case — never a value you only read
+                            on the page. When the test case compares with something
+                            "earlier" ("same as we passed earlier"), read that earlier
+                            value (e.g. the cart total) and name it as element:<name>
+      Copy both texts exactly as the page shows them — never normalise, round or
+      reformat: `Rp20.000` stays `Rp20.000`.
+      Do not decide yourself whether two differently formatted values match. When
+      they differ only in presentation (a country code `+62…` for `0…`, a currency
+      symbol, separators, decimals, spacing, case), report the step STEP_PASSED
+      with its VALUE_CHECK. Python measures the relation and downgrades the step
+      if the two do not match.
+      e.g. VALUE_CHECK: Validate the name shown matches the name entered|customerNameLabel|Test User|input:nameField|Test User
+   A comparison of order ("the amount decreased") or of presence ("is not null")
+   needs no VALUE_CHECK. Nor does a step that only reads a value for later ("Record
+   the amount shown"): it compares nothing. Give its element a SELECTOR_FOUND, and
+   the later comparison names it as element:<name>. A literal VALUE_CHECK whose
+   text is not in the test case is dropped.
+
 3. RETRIES — if an element is not immediately found or visible:
    Wait 1 second and retry up to 3 times before declaring failure.
    Allow at most {PW_TIMEOUT}ms for any single browser action to complete;
    past that, treat the action as failed and move on rather than waiting longer.
 
-3b. EMIT AS YOU GO — print each SELECTOR_FOUND / MECHANISM_FOUND / STEP_PASSED /
-   STEP_FAILED / STEP_UNVERIFIED marker the moment you have it, never batched at
+3b. EMIT AS YOU GO — print each SELECTOR_FOUND / MECHANISM_FOUND / INPUT_USED /
+   VALUE_CHECK / STEP_PASSED / STEP_FAILED / STEP_UNVERIFIED marker the moment you
+   have it, never batched at
    the end. This run has a hard
    wall-clock budget of {_fmt_budget(VALIDATE_TIMEOUT)}; if it is hit, only
    markers already printed can be salvaged.
@@ -890,20 +1394,20 @@ EXECUTION RULES — follow exactly:
 
 7. Include the current page URL in every STEP_FAILED message.
 
-8. SNAPSHOTS — take an accessibility snapshot after a NAVIGATION or a LOGIN, to
-   confirm where you actually landed. Do NOT snapshot after every click or form
-   submit: one snapshot is ~14k characters that stays in your context for the
-   remainder of the run and slows every turn that follows it, and for locating
-   elements the rule-2a harvest tells you more in a tenth of the size. When a
-   modal, dropdown or panel opens, harvest it (2a) instead of re-snapshotting the
-   whole page.
-   Two things override this. The FAILURE PROTOCOL (rule 6): on a failure,
-   capture the screenshot and PAGE_DUMP it asks for regardless. And any step that
-   asserts an element appeared: LOOK for it properly before answering — query the
-   DOM for it directly (a targeted browser_evaluate is cheap, and cheaper than a
-   snapshot), give a transient element a few seconds, and re-check. Saving a
-   snapshot is not a reason to report something you did not actually see; the
-   whole point of this step is to find out what is really on the page.
+8. SNAPSHOTS AND SCREENSHOTS — neither is needed to know where you are: every
+   page.qa.step call returns the URL and what is on the page. Do NOT snapshot or
+   screenshot after a click, a submit or a navigation: one snapshot is ~14k
+   characters that stays in your context for the rest of the run and slows every
+   turn after it, and the step's harvest tells you more in a tenth of the size.
+   When a modal, dropdown or panel opens, `scope` the next harvest to it.
+   Two things override this. The FAILURE PROTOCOL (rule 6): on a failure, capture
+   the screenshot and PAGE_DUMP it asks for regardless. And any step that asserts
+   an element appeared: LOOK for it properly before answering — count it directly
+   with page.qa.check, and give an element that is slow to appear a few seconds
+   (page.qa.step with no action waits for the page to settle) before re-checking.
+   An element that may disappear again is caught by rule 2f, never by a wait.
+   Saving a call is not a reason to report something you did not actually see;
+   the whole point of this step is to find out what is really on the page.
 
 9. Complete ALL steps — do not stop early unless the browser itself crashes.
    Completing a step means reaching an honest answer about it, which is one of
@@ -926,9 +1430,12 @@ Begin executing the steps now using the browser tools.
     # markdown run-summary table that repeats markers already streamed above. The
     # raw transcript in claude-*.log keeps all of it for post-mortem; the console
     # only needs the markers and the tool heartbeat.
-    _PROGRESS_PREFIXES = ("STEP_", "SELECTOR_FOUND", "INTERACTION_HINT",
-                          "MECHANISM_FOUND", "PAGE_DUMP", "API retry", "MCP server",
-                          "→ ")
+    # Markers with their colon: without it, the model's prose "VALUE_CHECK for step
+    # 4 (record amount) — …" printed as if it were a malformed marker.
+    _PROGRESS_PREFIXES = ("STEP_PASSED:", "STEP_FAILED:", "STEP_UNVERIFIED:",
+                          "SELECTOR_FOUND:", "INTERACTION_HINT:", "MECHANISM_FOUND:",
+                          "INPUT_USED:", "VALUE_CHECK:", "PAGE_DUMP:",
+                          "API retry", "MCP server", "→ ")
 
     def _on_output(label: str, line: str) -> None:
         # Matched on the stripped line for the same reason the marker parsers do:
@@ -943,6 +1450,7 @@ Begin executing the steps now using the browser tools.
         return call_claude_ex(
             prompt=build_prompt(attempt_notes),
             model=MODEL,
+            effort=EFFORT,
             cwd=str(REPO_ROOT),
             timeout=VALIDATE_TIMEOUT,
             on_output=_on_output,
@@ -973,8 +1481,26 @@ Begin executing the steps now using the browser tools.
 
     def _parsed(output: str) -> dict:
         passed, failed, unverified = parse_step_results(output)
+        unverified = drop_unverified_actions(unverified)
         found, counts, visibles, rejected = parse_selector_output(output)
+        evidence = flow_map.read_evidence(evidence_path)
+        found, counts, visibles, rejected, measured = verify_with_evidence(
+            found, counts, visibles, rejected, evidence)
+        inputs = enforce_typed_fields(parse_inputs_used(output), found, counts, visibles,
+                                      rejected, evidence)
+        recover_clicked_locators(found, counts, visibles, evidence, all_locators)
+        if found or measured["dropped"]:
+            log(f"Selectors measured live by the browser helpers: {measured['live']} of "
+                f"{measured['live'] + measured['claimed']} kept"
+                + (f", {measured['dropped']} dropped as not unique or not visible"
+                   if measured["dropped"] else "")
+                + (f" — {measured['claimed']} rest on the marker's own count"
+                   if measured["claimed"] else ""))
         passed, unverified = enforce_verification_evidence(passed, unverified, found)
+        value_checks = drop_untraced_sources(parse_value_checks(output), web_steps, inputs)
+        passed, unverified = enforce_value_checks(passed, unverified, value_checks)
+        passed, unverified = promote_matched_values(passed, unverified, value_checks, found,
+                                                    inputs)
         return {
             "output":            output,
             "selectors":         found,
@@ -985,6 +1511,8 @@ Begin executing the steps now using the browser tools.
             "steps_failed":      failed,
             "steps_unverified":  unverified,
             "mechanisms":        parse_mechanisms(output),
+            "inputs_used":       inputs,
+            "value_checks":      value_checks,
             "page_elements":     parse_page_dumps(output),
             # Reconciled against `found`, so the hints written to disk carry the
             # same uniqueness guarantee the selector map does.
@@ -1096,6 +1624,8 @@ Begin executing the steps now using the browser tools.
             selector_visibles=p.get("selector_visibles"),
             rejected_selectors=p.get("rejected_selectors"),
             mechanisms=p.get("mechanisms"),
+            inputs_used=p.get("inputs_used"),
+            value_checks=p.get("value_checks"),
             page_elements=p["page_elements"],
             interaction_hints=p["interaction_hints"],
             skipped=False,
@@ -1169,13 +1699,10 @@ Begin executing the steps now using the browser tools.
                 notes = ["\nPRIOR ATTEMPT NOTES — a previous run of this exact flow walked "
                          "the steps but confirmed ZERO selectors, because SELECTOR_FOUND "
                          "markers were emitted without the mandatory |count=<n> and were "
-                         "therefore all dropped. Run the rule-2c batch check on every page "
-                         "and put the number it returns on every SELECTOR_FOUND line."]
+                         "therefore all dropped. Take the total and visible page.qa measures "
+                         "and put both on every SELECTOR_FOUND line."]
             else:
-                notes = ["\nPRIOR ATTEMPT NOTES — a previous run of this exact flow did not "
-                         f"complete ({result.describe()}) and produced no usable output. "
-                         "Execute efficiently and emit markers as you go (rule 3b) so partial "
-                         "progress is captured even if this attempt also runs out of budget."]
+                notes = progress_notes(result.describe(), parsed, web_steps)
             attempt_notes = "\n".join(notes)
             continue
         break
@@ -1266,7 +1793,8 @@ def _write_result(selectors, steps_passed, steps_failed,
                   skipped=False, reason=None, status="ok", raw_output="",
                   attempts=1, selector_counts=None, steps_unverified=None,
                   selector_visibles=None, rejected_selectors=None,
-                  mechanisms=None, urls_visited=None, final_attempt=True) -> None:
+                  mechanisms=None, urls_visited=None, final_attempt=True,
+                  inputs_used=None, value_checks=None) -> None:
     # Every selector that survives parse_selector_output() was measured at exactly
     # one element, and every hint that survives reconcile_hints() is either backed
     # by one of those or measured itself. Assert it rather than trusting it: this
@@ -1313,6 +1841,12 @@ def _write_result(selectors, steps_passed, steps_failed,
         "steps_unverified":  steps_unverified or [],
         # action -> how it actually takes effect, when it is not a plain click.
         "mechanisms":        mechanisms or {},
+        # field -> the value this run typed into it. Step 03 keeps test data in
+        # the same shape, so the test exercises what was validated.
+        "inputs_used":       inputs_used or {},
+        # Both sides of every comparison, with the relation Python measured
+        # between them — what step 03 asserts each check with.
+        "value_checks":      value_checks or [],
         "page_elements":     page_elements or {},
         "interaction_hints": interaction_hints or [],
         # False while a retry follows — the server keeps the chip running
@@ -1347,6 +1881,14 @@ def _write_result(selectors, steps_passed, steps_failed,
             lines.append("")
             for u in steps_unverified:
                 lines.append(f"- {u}")
+        if inputs_used or value_checks:
+            lines.append("")
+            lines.append("## Values observed")
+            for field, value in (inputs_used or {}).items():
+                lines.append(f"- typed `{field}` = `{value}`")
+            for c in value_checks or []:
+                lines.append(f"- {c['check']}: `{c['rendered']}` vs `{c['expected']}` "
+                             f"({c['source']}) → **{c['relation'] or 'no match'}**")
         if mechanisms:
             lines.append("")
             lines.append("## Discovered Mechanisms")

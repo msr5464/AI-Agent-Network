@@ -29,6 +29,9 @@ export REPO_ROOT
 # ── Session helpers (log, run_step, fmt_duration, elapsed_since) ──────────────
 source "$REPO_ROOT/shared/session.sh"
 
+# The model has no default in code — config/.env sets it.
+require_settings HEALING_MODEL
+
 # ── Queue scout / direct mode ─────────────────────────────────────────────────
 QUEUE_DIR="$AGENT_DIR/queue"
 PROCESSED_DIR="$QUEUE_DIR/processed"
@@ -212,9 +215,6 @@ trap 'on_error $LINENO' ERR
 # the run red but is not a failed retry, and charging it as one meant a long chain
 # could never finish. See retry_verdict in 01_fix.py.
 HEALING_RETRY_COUNT="${HEALING_RETRY_COUNT:-4}"
-if [[ -n "${MAX_FIX_ATTEMPTS:-}" ]]; then
-  log "NOTE: MAX_FIX_ATTEMPTS is set but no longer read — use HEALING_RETRY_COUNT (currently $HEALING_RETRY_COUNT)"
-fi
 FIX_ATTEMPT=1
 
 while true; do

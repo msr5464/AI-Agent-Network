@@ -30,6 +30,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from shared import frames
+
 _HEADER_RE = re.compile(r'<!--\s*qa-agent-network:dom-snapshot(.*?)-->', re.DOTALL)
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 
@@ -141,6 +143,31 @@ def selector_visibility(selector: str, soup, fingerprints: Dict) -> Optional[tup
     90-second Maven run. Splitting the text clause off and matching it against the
     captured text restores the check.
     """
+    found = select_nodes(selector, soup)
+    if found is None:
+        return None
+    nodes, doc = found
+    if not nodes:
+        return 0, 0
+    if doc is not soup:
+        fingerprints = getattr(doc, "qa_prints", None) or {}
+
+    # Only a positive visibility record counts. An element the capture never saw
+    # is unknown, not hidden, and rejecting on unknown would block correct fixes
+    # whenever the sidecar and the markup disagree.
+    visible = {_fp_signature(e) for e in (fingerprints.get("elements") or [])
+               if e.get("is_visible")}
+    if doc is not soup and not fingerprints.get("elements"):
+        # A frame whose own capture failed says nothing about visibility, and the
+        # page's capture cannot stand in for it: unknown, so not held against it.
+        return len(nodes), len(nodes)
+    return len(nodes), sum(1 for n in nodes if _node_signature(n) in visible)
+
+
+def select_nodes(selector: str, soup) -> Optional[tuple]:
+    """(nodes, doc) a selector matches in a snapshot, in the frame document it
+    names; None when undecidable. `doc` is None when the frame is not there.
+    """
     if not selector or soup is None:
         return None
     # Java string escapes are not part of the selector. Read straight out of the
@@ -166,8 +193,16 @@ def selector_visibility(selector: str, soup, fingerprints: Dict) -> Optional[tup
     normalized = _normalize_selector(selector)
     if not normalized:
         return None
+    # Inside an iframe, the element is looked for in that frame's own document and
+    # judged visible by that frame's own capture.
+    from shared.page_identity import in_frame
     try:
-        nodes = soup.select(normalized)
+        doc, inner = in_frame(soup, normalized)
+        if doc is False:
+            return [], None
+        if doc is None:
+            return None
+        nodes = doc.select(inner)
     except Exception:
         return None
 
@@ -177,15 +212,44 @@ def selector_visibility(selector: str, soup, fingerprints: Dict) -> Optional[tup
     elif text_clause is not None:
         nodes = [n for n in nodes
                  if text_clause in _norm_text(n.get_text(" ", strip=True)).lower()]
-    if not nodes:
-        return 0, 0
+    return nodes, doc
 
-    # Only a positive visibility record counts. An element the capture never saw
-    # is unknown, not hidden, and rejecting on unknown would block correct fixes
-    # whenever the sidecar and the markup disagree.
-    visible = {_fp_signature(e) for e in (fingerprints.get("elements") or [])
-               if e.get("is_visible")}
-    return len(nodes), sum(1 for n in nodes if _node_signature(n) in visible)
+
+# Input types that say what a field holds. `text` and `number` say nothing.
+_TELLING_TYPES = ("email", "tel", "password", "url", "date", "search")
+_FIELD_BOX = ("tr", "li", "fieldset")
+
+
+def field_context(node, doc) -> str:
+    """What a form field says about itself, the way a user reads it: its label,
+    aria-label, placeholder, name, id, a telling type, the row or group it sits in
+    and, inside a table, its column header.
+
+    The column header is not optional. A cart's amount input sat in a row naming
+    only the product; "Amount" was its column's header.
+    """
+    parts = [node.get(a) or "" for a in ("aria-label", "placeholder", "name", "id", "title")]
+    if (node.get("type") or "").lower() in _TELLING_TYPES:
+        parts.append(node["type"])
+    if node.get("id") and doc is not None:
+        label = doc.find("label", attrs={"for": node["id"]})
+        if label is not None:
+            parts.append(label.get_text(" ", strip=True))
+    wrapping = node.find_parent("label")
+    if wrapping is not None:
+        parts.append(wrapping.get_text(" ", strip=True))
+    box = node.find_parent(_FIELD_BOX) or node.find_parent(
+        class_=re.compile(r"field|form-group", re.I))
+    if box is not None:
+        parts.append(box.get_text(" ", strip=True))
+    cell, row, table = node.find_parent(["td", "th"]), node.find_parent("tr"), node.find_parent("table")
+    if cell is not None and row is not None and table is not None:
+        cells = row.find_all(["td", "th"], recursive=False)
+        heads = next((r.find_all(["td", "th"], recursive=False) for r in table.find_all("tr")
+                      if r.find("th", recursive=False) is not None), [])
+        if cell in cells and cells.index(cell) < len(heads):
+            parts.append(heads[cells.index(cell)].get_text(" ", strip=True))
+    return " ".join(p for p in parts if p).strip()
 
 
 # Containers named in a selector, used to scope candidates to the region the
@@ -284,7 +348,21 @@ def candidates_from_fingerprints(fingerprints: Dict, element_names: Optional[Lis
     result: Dict = {"url": fingerprints.get("url", ""), "captured_at": "", "test": "",
                     "elements": [], "likely_matches": [], "total_elements": 0,
                     "error": "", "source": "fingerprints"}
-    pool = [e for e in (fingerprints.get("elements") or [])
+    # A selector that failed inside an iframe is replaced by an element of that
+    # iframe, so the candidates are that frame's capture, and every suggestion
+    # keeps the way in.
+    frame_path, failed_inner = frames.split(failed_selector)
+    captured = fingerprints
+    if frame_path and soup is not None:
+        from shared.page_identity import in_frame
+        try:
+            doc = in_frame(soup, failed_selector)[0]
+        except Exception:
+            doc = None
+        if doc in (None, False):
+            return {**result, "error": "the iframe the selector points into was not captured"}
+        captured, failed_selector = getattr(doc, "qa_prints", None) or {}, failed_inner
+    pool = [e for e in (captured.get("elements") or [])
             if e.get("is_visible") and (e.get("area_norm") or 0) > 0
             and e.get("tag") not in ("body", "main", "html")]
     if not pool:
@@ -323,7 +401,9 @@ def candidates_from_fingerprints(fingerprints: Dict, element_names: Optional[Lis
 
     def render(element: Dict) -> Dict:
         out = {"tag": element.get("tag") or "", "visible": True,
-               "suggested_selector": _fp_selector(element, scopes)}
+               "suggested_selector": frames.join(frame_path, _fp_selector(element, scopes))}
+        if frame_path:
+            out["inside_iframe"] = " > ".join(frame_path)
         for src, dst in (("id", "id"), ("testid", "data-testid"), ("alt", "alt"),
                          ("aria_label", "aria-label"), ("role", "role"),
                          ("name", "name"), ("placeholder", "placeholder"),
@@ -424,22 +504,21 @@ def distill(snapshot_text: str, element_names: Optional[List[str]] = None,
         "error": "",
     }
 
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        result["error"] = "beautifulsoup4 not installed — cannot distil the DOM snapshot"
+    from shared.page_identity import parse
+    soup = parse(snapshot_text)
+    if soup is None:
+        result["error"] = "could not parse the DOM snapshot (is beautifulsoup4 installed?)"
         return result
 
-    try:
-        soup = BeautifulSoup(snapshot_text, "lxml")
-    except Exception:
-        try:
-            soup = BeautifulSoup(snapshot_text, "html.parser")
-        except Exception as exc:
-            result["error"] = f"could not parse the DOM snapshot: {exc}"
-            return result
-
     elements = _collect_elements(soup)
+    # The iframes captured beside the page. Their elements are as clickable as the
+    # page's own, and a fixer shown only the top document cannot see them at all.
+    for path, doc in _frame_docs(soup):
+        for element in _collect_elements(doc):
+            element["inside_iframe"] = " > ".join(h or "iframe (no stable selector)"
+                                                  for h in path)
+            element["_frame_path"] = None if None in path else path
+            elements.append(element)
     result["total_elements"] = len(elements)
 
     tokens: List[str] = []
@@ -453,17 +532,63 @@ def distill(snapshot_text: str, element_names: Optional[List[str]] = None,
 
     if tokens:
         ranked = sorted(elements, key=score, reverse=True)
-        result["likely_matches"] = [
-            {**el, "suggested_selector": suggest_selector(el)}
-            for el in ranked if score(el) > 0
-        ][:8]
+        result["likely_matches"] = [_suggested(el) for el in ranked if score(el) > 0][:8]
     else:
         ranked = elements
 
-    result["elements"] = [
-        {**el, "suggested_selector": suggest_selector(el)} for el in ranked[:max_elements]
-    ]
+    result["elements"] = [_suggested(el) for el in ranked[:max_elements]]
     return result
+
+
+def _suggested(element: Dict) -> Dict:
+    out = {k: v for k, v in element.items() if k != "_frame_path"}
+    selector = suggest_selector(element)
+    path = element.get("_frame_path")
+    if element.get("inside_iframe") and not path:
+        # Its iframe cannot be told apart, so no selector reaches it reliably, and a
+        # bare one would search the top document.
+        selector = "(none — its iframe has no stable unique selector)"
+    out["suggested_selector"] = frames.join(path, selector) if path and selector else selector
+    return out
+
+
+_VOLATILE = re.compile(r"\d{4,}|[0-9a-f]{8,}", re.I)
+
+
+def _host_selector(host, doc) -> Optional[str]:
+    """A plain unique selector for a captured <iframe>, or None.
+
+    For showing a fixer the way in, not for proving anything: it tries only the
+    attributes that are stable by nature, where shared/frames.py LINK_JS — which
+    needs a live page — tries more.
+    """
+    tried = []
+    for attr in ("id", "title", "name"):
+        value = host.get(attr)
+        if value and not _VOLATILE.search(value):
+            tried.append(f"#{value}" if attr == "id" and re.fullmatch(r"[A-Za-z][\w-]*", value)
+                         else f"{host.name}[{attr}={_css_value(value)}]")
+    # A per-load name keeps its stem: popup_1790441440177 -> [name^='popup_'].
+    stem = re.match(r"\D{3,}", host.get("name") or "")
+    if stem and _VOLATILE.search(host.get("name")):
+        tried.append(f"{host.name}[name^={_css_value(stem.group(0))}]")
+    for selector in tried:
+        try:
+            if len(doc.select(selector)) == 1:
+                return selector
+        except Exception:
+            continue
+    return None
+
+
+def _frame_docs(doc, path=()):
+    """(hop selectors, document) for every captured iframe below `doc`, depth first."""
+    for host in doc.find_all(["iframe", "frame"]):
+        child = getattr(host, "qa_frame", None)
+        if child is not None:
+            hops = path + (_host_selector(host, doc),)
+            yield list(hops), child
+            yield from _frame_docs(child, hops)
 
 
 def format_for_prompt(distilled: Dict, max_chars: int = 6000) -> str:

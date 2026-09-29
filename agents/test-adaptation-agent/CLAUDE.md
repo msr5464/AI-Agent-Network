@@ -134,7 +134,9 @@ step exists to remove.
 
 The honest limit: an inventory is a bounded sample of a page, so a zero means
 *not observed*, not *absent*. Every report carries `sampled: true`, and the
-mapping ranks candidates rather than ruling one out.
+mapping ranks candidates rather than ruling one out. A page the browser helpers
+counted the page objects' own locators on is not sampled (`sampled: false`,
+`live: true`). A zero there means the locator matched nothing on the page.
 
 ### 3. Transcribe, do not invent
 
@@ -143,9 +145,54 @@ exploration actually observed, matched on the element's name. A flow-map step
 whose selector could not be verified unique justifies nothing — `unverified` is not
 `yes`.
 
-Selector uniqueness is recounted **in Python** against the element inventory the
-browser reported. The model's own count is kept as `claimed_by_model` and used for
-nothing.
+Selector uniqueness is never taken from the model. The model's own count is kept
+as `claimed_by_model` and used for nothing. What decides it, best first:
+
+1. **A live count.** The preloaded browser helpers (`page.qa`, see "Measured
+   evidence" below) counted that exact selector on that page: `counted_against:
+   "live"`, unique only at total 1 and visible 1. Rich syntax and iframe chains are
+   verified this way too, which an inventory recount cannot do.
+2. **An inventory recount** in Python, against every element inventory recorded
+   for the page.
+
+### Measured evidence — the explorer names the page, the helpers measure it
+
+Across 15 explorer runs, 31 of 87 step selectors (36%) were never verified, and 30
+of them for one reason: the model never typed a `PAGE_STATE` inventory for that
+page, so Python had nothing to recount against. The same inventories were also
+most of the model's output.
+
+Now the helpers that `shared/mcp_config.py` preloads into the MCP browser
+(`shared/browser/qa-page.js`) write what they measure to a file as they measure
+it: `03-explore-evidence-<attempt>.jsonl`, one line per settled page state. The
+model calls `page.qa.step(action, {page: '<pageId>'})` once per step. It still
+emits `PAGE_ENTER` and `FLOW_STEP`, and `PAGE_STATE` is optional.
+`flow_map.apply_evidence` folds each line in before verification:
+
+| Evidence | Becomes |
+|---|---|
+| the page's inventory, every frame (identity elements too: headings, header, nav, title-like classes) | that page's inventory, a union with any `PAGE_STATE` the model typed |
+| counts of the selectors a step harvested or asked to `check` | live verification of step selectors (a 1/1 reading is kept) |
+| live counts of every locator in `03-known-locators.json` | per page object, which of its locators resolve on this page and which are broken (0). Those matching several are listed as `several`, not as a fault, because a list locator is meant to |
+
+`03-known-locators.json` is extracted from every in-scope page object before
+exploring, with the framework plugin's `extract_locators()`. Only exact locators
+go in: a literal the code finishes at runtime (`"#item-" + n`, a format template)
+is marked `approx` and left out, because counted as written it matches nothing and
+would read as broken. When known counts exist, `measure_page_objects` ranks page
+objects by the share of their locators that resolve live, and step 04's prompt
+lists the broken ones by name. Without them it falls back to the inventory
+coverage below.
+
+A page the walk entered but no helper call named has no inventory. That is a
+warning, and it earns a second attempt only when a step acted on that page. A
+page the run only passed through (the start page, opened with a saved session)
+has no selector to verify, and a whole attempt was once spent on exactly that.
+
+The evidence never passes through the model's context, so it costs no tokens and
+cannot be misreported. It is appended as it is measured, so an attempt that times
+out still leaves what it saw. Password inputs are never read: the helpers report
+the field with an empty text.
 
 ### 4. Read the entry path; do not derive it
 
@@ -212,7 +259,29 @@ in Python (`lib/check_changes.py`), never by the model:
    `coverage_changed` removal is flagged 🧪 test-only, and `api_contract` changes
    are always ⚠️ (exploration only GETs and only sees top-level keys).
 
-Weakening a check or wrapping it in a condition is refused whatever is declared.
+Weakening a check or wrapping it in a condition is refused whatever is declared,
+with one exception: **`relax`**. A page often renders an expected value its own
+way: a one-word name with a default last name appended, a cart total of `20,000` as
+`Rp20.000`, a phone normalised to `+62`. The explorer writes down both sides of
+each comparison it judges (`VALUE_CHECK: <id>|<element>|<shown>|<source>|<expected>`,
+parsed into `value_checks`), and `shared/value_match.py` measures the relation between
+them in Python. A check listed with a relation (`formatting`, `numeric`, `phone`,
+`words`) may be declared `{"action": "relax", "relation": …}`. It is accepted only when:
+
+- the item's kind is one of the five that may change checks;
+- the edit changed that assertion's comparison and nothing else. It stands at the
+  same place, with the same message, still passes every expression and expected
+  value it compared, and is no more conditional (`assertion_graph.relaxes`);
+- the relation is confirmed by a measurement: the explorer's VALUE_CHECK for that
+  check, or a verify run that failed on it. A verify failure that is only a
+  rendering difference is recorded in the attempt's fix history (`value_mismatches`),
+  named in the rollback reason, and shown to the next attempt.
+
+The PR table lists it as "comparison relaxed to **words**", with what the page showed.
+Every other weakening is refused exactly as before. A check the model **adds**
+compares with the relation its VALUE_CHECK shows. Its expected side comes from a
+typed value, a value read earlier, or the note, and is never a new literal.
+
 Adding, moving and rewording checks is always allowed and is listed.
 
 `delta` pairs checks as multisets — same message first — so the right one of two
@@ -244,7 +313,7 @@ Run over the combined diff of one change item, before anything compiles:
 | guard | rejects |
 |---|---|
 | `validate_fix` | oversized diffs, emptied files, lost methods |
-| `check_changes` | an assertion removed or changed without being declared, or declared but not changed; one changed by a kind that may not; one also made by a test outside the run; one the browser contradicts; any weakened or made conditional — **anywhere in the call graph and in every edited file**. Fails closed when it cannot measure |
+| `check_changes` | an assertion removed or changed without being declared, or declared but not changed; one changed by a kind that may not; one also made by a test outside the run; one the browser contradicts; any weakened or made conditional — **anywhere in the call graph and in every edited file** — except a declared `relax` a measurement confirms. Fails closed when it cannot measure |
 | `no_new_swallowing` | empty catch, `Thread.sleep`, `@Ignore`, `enabled=false`, `assumeTrue`, `SkipException` |
 | `wrapper_compliance` | raw driver calls — Selenium (`driver.findElement`, `.sendKeys()`, `new WebDriverWait`) and Playwright (`locator.click()/fill()/…`, `page.navigate()`, `page.waitForTimeout()`) |
 | `logstep_present` | an interaction added to a test class with no `logStep` — `Element.*` / BasePage wrapper calls, or a helper/page-object call that is not a pure read |
@@ -342,6 +411,18 @@ expensive half, and a failed edit must never cost a second thirty-minute browser
 run. `TESTING_MODE=true` caches steps 01–03 under `cache/<user>/<module>/`; editing
 the change note's content invalidates that cache.
 
+## Elements inside iframes
+
+The explorer measures inside iframes and reports an element there as a chain,
+`#checkout >> internal:control=enter-frame >> #amount`. Its inventory entry carries
+the iframe prefix as `"frame"`, which the helpers compute (`page.qa.prefix`, using
+the rule in `shared/frames.py`). A live count checks every hop of a chain on its
+own. `flow_map.count_in_inventory`
+recounts a chain only against that frame's entries, and a plain selector only
+against the top document's, so a frame element can neither vouch for a top-level
+selector nor be missed by its own. The adapt step writes it with the repo's frame
+API (`config/skills/automation-repo.md`).
+
 ## Locator baselines are committed with the edits
 
 The fingerprints under `src/main/resources/baselines/` describe what each locator matched
@@ -386,6 +467,8 @@ drift.
 | `02-scope.json` + `.md` | blast radius, cost estimate, **frozen intent contracts** |
 | `03-explore-api.json`, `03-explore-web.json` | per-interface exploration |
 | `03-explore.json` + `.md` | combined flow map — the file the server polls |
+| `03-known-locators.json` | every exact locator of the in-scope page objects, counted live by the browser helpers on each page |
+| `03-explore-evidence-<attempt>.jsonl` | what the browser helpers measured, one line per settled page state: inventory, counts, known-locator counts |
 | `04-adapt.json` + `.md` | per-item diffs, guard results, the checks each item changes |
 | `05-ship.json` + `.md` | PR URL, verdict, escalations |
 | `.snapshots.json` | transient; the ERR trap's rollback source |

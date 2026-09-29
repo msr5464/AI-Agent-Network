@@ -170,3 +170,14 @@ class TestCredentialsFromPlan:
     def test_an_explicit_input_file_overrides_the_plans(self, tmp_path):
         plan = {"_input_file": str(tmp_path / "gone.txt")}
         assert credentials_from_plan(plan, self._input(tmp_path))["username"] == "qa.user@example.com"
+
+
+def test_card_details_are_masked_like_the_otp_beside_them():
+    """The run header printed a test case's card number and CVV while masking the
+    bank OTP next to them. A card number in digit groups is one value: masked a
+    token at a time, three of its four groups were left showing."""
+    text = ("Enter card number: 4111 1111 1111 1111\nExpiry: 01/35\nCVV: 123\n"
+            "Enter Bank OTP: 112233 to finish\nAddress: Bangalore, India")
+    assert mask_credential_lines(text) == (
+        "Enter card number: ***MASKED***\nExpiry: ***MASKED***\nCVV: ***MASKED***\n"
+        "Enter Bank OTP: ***MASKED*** to finish\nAddress: Bangalore, India")

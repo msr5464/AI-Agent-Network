@@ -365,3 +365,61 @@ class TestPlaywrightShapes:
     def test_an_added_assertion_is_not_a_new_step(self):
         after = BEFORE + '        AssertHelper.assertEquals(config, badge, "2", "Cart badge");\n'
         assert g.logstep_present(BEFORE, after, is_test_class=True)[0] is True
+
+
+class TestReplacementIsTheField:
+    """A fix re-pointed `amountField` from a cart's total cell at the Email input,
+    guessed from the name and phone rows around it. The page below keeps that
+    cart's shape: the amount input's row names only the
+    product, and "Amount (Rp)" is its column's header."""
+
+    PAGE = """
+        <div class="cart">
+          <table>
+            <tr><th>Product</th><th>Qty</th><th>Amount (Rp)</th></tr>
+            <tr><td>Pillow</td><td>x 1</td><td><input class="text-right" type="number"></td></tr>
+            <tr><td></td><td class="total">Total</td><td class="amount">20,000</td></tr>
+          </table>
+          <table class="customer">
+            <tr><td>Name</td><td><input type="text"></td></tr>
+            <tr><td>Email</td><td><input type="email"></td></tr>
+            <tr><td>Phone no</td><td><input type="text"></td></tr>
+          </table>
+        </div>"""
+
+    SOURCE = """\
+public class CartPage extends BasePage {
+    private final Locator amountField;
+    private final Locator totalText;
+    public CartPage(Config config) {
+        super(config);
+        amountField = page.locator("SELECTOR");
+        totalText = page.locator("td.total");
+    }
+    public void fillAmount(String amount) { fillText(amountField, amount, "Amount"); }
+}
+"""
+
+    def _check(self, replacement, failing="td.amount", source=None):
+        from shared.page_identity import parse
+        before = (source or self.SOURCE).replace("SELECTOR", "td.amount")
+        after = before.replace('"td.amount"', f'"{replacement}"')
+        return g.replacement_is_the_field(before, after, parse(self.PAGE), failing)
+
+    def test_a_field_moved_onto_another_field_is_rejected(self):
+        ok, reason = self._check(".customer tr:nth-child(2) input")
+        assert ok is False and "Email" in reason
+
+    def test_the_field_named_by_its_column_header_is_accepted(self):
+        assert self._check("input.text-right") == (True, "")
+
+    def test_typing_into_something_that_is_not_a_field_is_rejected(self):
+        ok, reason = self._check("td.total")
+        assert ok is False and "<td>" in reason
+
+    def test_a_capture_of_another_page_decides_nothing(self):
+        assert self._check(".customer tr:nth-child(2) input", failing="#elsewhere") == (True, "")
+
+    def test_a_locator_nothing_types_into_is_not_judged(self):
+        source = self.SOURCE.replace("fillText(amountField", "getText(amountField")
+        assert self._check(".customer tr:nth-child(2) input", source=source) == (True, "")

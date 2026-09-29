@@ -209,6 +209,13 @@ class TestUninventoriedPages:
         flow = {"pages": {"login": {}}, "_inventories": {"login": [{"tag": "input"}]}}
         assert fm.pages_without_inventory(flow) == []
 
+    def test_a_page_only_passed_through_is_not_acted_on(self):
+        flow = {"pages": {"login": {}, "products": {}},
+                "steps": [{"page": {"id": "products"}}, {"page": "products"}]}
+        assert fm.pages_acted_on(flow) == {"products"}, (
+            "the start page opened with a saved session has no step, so a missing "
+            "inventory there is no reason for a whole second attempt")
+
     def test_validate_reports_it(self):
         ok, problems = fm.validate(self.WALKED)
         assert ok is False
@@ -368,3 +375,85 @@ class TestDocumentFromInventory:
         assert "<script>" not in doc, "element text must not become markup"
         from shared.page_identity import parse
         assert parse(doc) is not None
+
+
+class TestValueChecks:
+    def test_both_sides_are_kept_and_the_relation_is_measured_here(self):
+        flow = fm.build("OUTCOME_OBSERVED: c1|pass|User_orrju sample_last_name\n"
+                        "**VALUE_CHECK:** c1|customerName|User_orrju sample_last_name"
+                        "|input:nameField|User_orrju\n"
+                        "VALUE_CHECK: new: amount repeats the cart total|amount|Rp20.000"
+                        "|element:cartTotal|20,000\n"
+                        "VALUE_CHECK: too|short\n")
+        assert [(v["check"], v["relation"]) for v in flow["value_checks"]] == [
+            ("c1", "words"), ("new: amount repeats the cart total", "numeric")]
+
+
+class TestMeasuredEvidence:
+    """What the browser helpers measured, folded in: 30 of 87 explorer selectors were
+    unverifiable only because no PAGE_STATE was ever typed for their page."""
+
+    MARKERS = "\n".join([
+        "PAGE_ENTER: products|https://shop.test/inventory.html|Shop",
+        'FLOW_STEP: {"index": 0, "page": "products", "action": {"verb": "click", '
+        '"target": {"name": "cart", "selector": "a.cart"}}, "result": {"outcome": "ok"}}',
+        'FLOW_STEP: {"index": 1, "page": "products", "action": {"verb": "click", '
+        '"target": {"name": "checkout", "selector": "button:has-text(\'Checkout\')"}}, '
+        '"result": {"outcome": "ok"}}',
+    ])
+    ROWS = [
+        {"page": "products", "url": "https://shop.test/inventory.html",
+         "inventory": [{"tag": "a", "class": "cart"}, {"tag": "span", "class": "title",
+                                                       "text": "Products"}],
+         "checks": {"button:has-text('Checkout')": {"total": 1, "visible": 1}},
+         "known": [{"owner": "ProductsPage", "path": "p/ProductsPage.java", "name": "title",
+                    "selector": ".title", "total": 1, "visible": 1},
+                   {"owner": "ProductsPage", "path": "p/ProductsPage.java", "name": "sort",
+                    "selector": "#sort", "total": 0, "visible": 0},
+                   {"owner": "CartPage", "path": "p/CartPage.java", "name": "checkout",
+                    "selector": "#checkout", "total": 0, "visible": 0}]},
+        # A later state of the same page, where the checkout button is gone.
+        {"page": "products", "url": "https://shop.test/inventory.html",
+         "checks": {"button:has-text('Checkout')": {"total": 0, "visible": 0}}},
+    ]
+
+    def test_without_evidence_nothing_is_verified(self):
+        flow = fm.build(self.MARKERS)
+        assert fm.pages_without_inventory(flow) == ["products"]
+        assert {s["selector_check"]["counted_against"] for s in flow["steps"]} == {"none"}
+
+    def test_evidence_inventories_the_page_and_verifies_live(self):
+        flow = fm.build(self.MARKERS, self.ROWS)
+        assert fm.pages_without_inventory(flow) == []
+        cart, checkout = (s["selector_check"] for s in flow["steps"])
+        assert (cart["counted_against"], cart["unique"]) == ("page_inventory", True)
+        assert (checkout["counted_against"], checkout["unique"]) == ("live", True), (
+            "a :has-text() selector the inventory cannot evaluate was counted live, and "
+            "a later state where it is gone does not undo that")
+
+    def test_known_locators_rank_page_objects_and_name_the_broken_ones(self):
+        flow = fm.build(self.MARKERS, self.ROWS)
+        fm.measure_page_objects(flow, [{"path": "p/ProductsPage.java", "snippet": ""}])
+        best = flow["pages"]["products"]["best_page_object"]
+        assert (best["name"], best["matched"], best["evaluable"], best["broken"]) == (
+            "ProductsPage", 1, 2, ["sort"])
+        table = fm.describe_page_objects(flow)
+        assert "resolve live; broken: sort" in table and "counted on the live page" in table
+
+    def test_a_locator_seen_in_an_earlier_state_is_not_broken(self):
+        toast = {"owner": "ProductsPage", "path": "p/ProductsPage.java", "name": "toast",
+                 "selector": ".toast"}
+        rows = [{"page": "products", "url": "u", "known": [{**toast, "total": 1, "visible": 1}]},
+                {"page": "products", "url": "u", "known": [{**toast, "total": 0, "visible": 0}]}]
+        flow = fm.build(self.MARKERS, rows)
+        fm.measure_page_objects(flow, [{"path": "p/ProductsPage.java", "snippet": ""}])
+        best = flow["pages"]["products"]["best_page_object"]
+        assert (best["matched"], best["broken"]) == (1, []), (
+            "a toast counted while it showed is not broken because a later state came "
+            "after it closed")
+
+    def test_evidence_file_tolerates_a_torn_last_line(self, tmp_path):
+        path = tmp_path / "evidence.jsonl"
+        path.write_text(json.dumps(self.ROWS[0]) + "\n{\"page\": \"prod")
+        assert len(fm.read_evidence(path)) == 1
+        assert fm.read_evidence(tmp_path / "missing.jsonl") == []

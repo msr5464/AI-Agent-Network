@@ -141,9 +141,8 @@ wearing a locator's label.
 | `TRIAGING_INPUT_DIR` | Directory containing test report HTML |
 | `TRIAGING_OUTPUT_DIR` | Where to save generated HTML reports |
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary (default: claude) |
-| `TRIAGING_CLASSIFIER_MODEL` | Claude model for classification (default: claude-opus-4-6) |
-| `TRIAGING_REVIEWER_MODEL` | Claude model for review (default: claude-sonnet-4-6) |
-| `TRIAGING_CLASSIFIER_EFFORT`, `TRIAGING_REVIEWER_EFFORT` | Reasoning effort, `low` / `medium` / `high` (default: medium) |
+| `TRIAGING_MODEL` | Claude model for classification and review (required — set in `config/.env`, no default in code). The review stays independent because it is a separate call with no shared context |
+| `TRIAGING_EFFORT` | Reasoning effort for both, `low` / `medium` / `high` / `xhigh` / `max`, set in `config/.env` (empty — the runner's `effortLevel`) |
 | `TRIAGING_MAX_REVIEW_ROUNDS` | Max reviewer/classifier debate rounds (default: 2) |
 | `TRIAGING_SCOUT_LOOKBACK_DAYS` | Days to look back for build tags (default: 7) |
 | `BUILD_TAG` | Direct mode override — skip scout |

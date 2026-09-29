@@ -317,6 +317,8 @@ def call_claude_ex(
     strict_mcp_config: bool = True,
     tools=None,
     disable_slash_commands: bool = False,
+    effort: str = None,
+    setting_sources: str = None,
 ) -> ClaudeResult:
     """Call `claude -p <prompt> --model <model>` and report the full outcome.
 
@@ -348,7 +350,23 @@ def call_claude_ex(
       disable_slash_commands — pass --disable-slash-commands, dropping the user's
                           skills and slash commands from the system prompt. Nothing
                           run headless can invoke them anyway.
+      effort            — pass --effort (low | medium | high | xhigh | max). Unset,
+                          the call inherits the effortLevel in whoever-runs-it's
+                          ~/.claude/settings.json, so thinking time varies by machine.
+      setting_sources   — pass --setting-sources (e.g. "project,local") to keep the
+                          user's settings out: their plugins, hooks and permission
+                          allows. Only safe for a call that uses no tools, since those
+                          allows are what let a headless tool call run.
     """
+    if not (model or "").strip():
+        # Models come only from config/.env, and each run.sh refuses to start without
+        # one. Reaching here means a step ran outside run.sh with nothing set, and
+        # dropping --model would let the CLI pick whatever the machine's own settings
+        # name — a different model per machine, with nothing in the logs to say so.
+        return ClaudeResult(stdout="", returncode=2, status="error", timed_out=False,
+                            duration_s=0.0,
+                            stderr="no Claude model given — set this agent's *_MODEL "
+                                   "in config/.env")
     claude_cli = os.environ.get("CLAUDE_CLI_PATH", "claude")
     cmd = [claude_cli, "-p", prompt, "--model", model]
     if system_prompt_file:
@@ -371,6 +389,10 @@ def call_claude_ex(
         cmd.extend(["--tools", ",".join(names)])
     if disable_slash_commands:
         cmd.append("--disable-slash-commands")
+    if effort:
+        cmd.extend(["--effort", effort])
+    if setting_sources:
+        cmd.extend(["--setting-sources", setting_sources])
     if add_dir:
         # Adds a working directory. Verified empirically: this is additive, not
         # restrictive — it does NOT confine a granted tool to that directory, and
@@ -638,6 +660,7 @@ def call_claude(
     tools=None,
     disable_slash_commands: bool = False,
     partial_on_timeout: bool = False,
+    effort: str = None,
 ) -> str:
     """Call `claude -p <prompt> --model <model>` as a subprocess.
 
@@ -655,6 +678,7 @@ def call_claude(
                                 discarding it. Off by default: callers that
                                 json.loads() the output are better served by an
                                 obvious empty string than by truncated JSON.
+      effort                  — passed as --effort (see call_claude_ex)
 
     Callers that need to know *why* the result was empty should use
     call_claude_ex(), which returns a ClaudeResult with a status field.
@@ -674,6 +698,7 @@ def call_claude(
         strict_mcp_config=strict_mcp_config,
         tools=tools,
         disable_slash_commands=disable_slash_commands,
+        effort=effort,
     )
     if result.status == "ok":
         return result.stdout

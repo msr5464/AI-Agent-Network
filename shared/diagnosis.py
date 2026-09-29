@@ -330,8 +330,10 @@ def collect(issue: Dict, workspace=None, page_objects: Optional[List[Dict]] = No
         selector = page_identity.normalize_selector(evidence["failed_selector"])
         if evidence["failing_selector_matches"] is None and selector:
             try:
-                evidence["failing_selector_matches"] = len(
-                    soup.select(selector, limit=25))
+                nodes = page_identity.select(soup, selector, limit=25)
+                if nodes is None:
+                    raise ValueError("inside an iframe this capture cannot answer for")
+                evidence["failing_selector_matches"] = len(nodes)
                 evidence["matches_source"] = "snapshot"
             except Exception:
                 evidence["notes"].append("failing selector could not be evaluated")

@@ -48,7 +48,10 @@ AUTOMATION_FRAMEWORK_DIR    = workspace_helper.resolve(
     WORKSPACE_DIR, os.environ.get("GITHUB_REPO_AUTOMATION", ""),
     exclude=REPO_ROOT)
 
-MODEL        = os.environ.get("AUTHORING_MODEL", "claude-opus-4-6")
+# Set in config/.env, no default here: run.sh stops the run when it is missing.
+MODEL        = os.environ.get("AUTHORING_MODEL", "")
+# Set in config/.env. Empty → --effort is not passed and the runner's own effortLevel applies.
+EFFORT       = os.environ.get("AUTHORING_EFFORT") or None
 ENVIRONMENT  = os.environ.get("AUTHORING_ENVIRONMENT", "staging")
 COUNTRY      = os.environ.get("AUTHORING_COUNTRY", "SG")
 FIX_ATTEMPT  = int(os.environ.get("FIX_ATTEMPT", "1"))
@@ -111,6 +114,7 @@ def call_claude(prompt: str) -> str:
     result = _call_claude_ex(
         prompt=prompt,
         model=MODEL,
+        effort=EFFORT,
         cwd=str(REPO_ROOT),
         timeout=FIX_TIMEOUT_S,
         on_output=_on_output,
@@ -154,14 +158,17 @@ from shared.telemetry import (read_actions, failing_action, discover as discover
 # flow contract).
 from shared.edit_guards import (apply_edits, compute_diff, log_edits,
                                 logstep_present, no_new_swallowing,
-                                no_selector_broadening, validate_fix,
-                                wrapper_compliance)
+                                no_selector_broadening, replacement_is_the_field,
+                                validate_fix, wrapper_compliance)
 # What the test proves, as opposed to how it proves it. The guards above are all
 # per-file and per-line; none of them notices an assertion being deleted, because
 # that is a one-line diff that loses no method and adds no sleep. An authored test
 # shipped green with `assertTrue(isSuccessToastVisible())` replaced by an `if` and
 # a `logWarning` — every guard above passed it. This is the one that would not.
 from shared import assertion_graph, intent
+# How a page rendered the value an assertion expected — the one kind of failed
+# assertion whose comparator may move, and only to what the page was measured to do.
+from shared import value_match
 # Every attempt already made, and whether the next one can differ from them. The
 # retry loop used to see one attempt back and never saw its own guard rejections at
 # all, so it re-proposed rejected shapes until the budget ran out.
@@ -384,12 +391,17 @@ def freeze_assertions(test_class: str, test_method: str) -> None:
         log(f"  could not persist frozen assertions: {exc}")
 
 
-def check_conservation(test_class: str, test_method: str) -> tuple:
+def check_conservation(test_class: str, test_method: str,
+                       sanction: dict = None) -> tuple:
     """Compare what the test proves now against the frozen copy. (ok, reason).
 
     Abstains — returns ok — when there is nothing to compare against, because a
     missing freeze must not block a legitimate compile-error fix. It only ever
     rejects on a measured loss.
+
+    `sanction` (from triage_value_mismatch) lets that one assertion change its
+    comparator and nothing else; what was relaxed is written back into it as
+    `sanction["relaxed"]`, so the caller can record it without re-measuring.
     """
     path = AUDIT_DIR / FROZEN_ASSERTIONS
     if not path.exists():
@@ -404,21 +416,39 @@ def check_conservation(test_class: str, test_method: str) -> tuple:
     if after is None:
         return True, ""
 
-    report = assertion_graph.conserved(frozen, after)
+    report = assertion_graph.conserved(frozen, after, sanction=sanction)
     if report["ok"]:
         log(f"  {assertion_graph.describe(report)}")
+        if sanction is not None and report.get("relaxed"):
+            sanction["relaxed"] = report["relaxed"]
         return True, ""
     return False, assertion_graph.describe(report)
 
 
-def _run_guards(original: str, updated: str, rel_path: str) -> tuple:
+def _capture_soup(path):
+    """The DOM saved when the test failed, parsed once for the guards. None when
+    there is none."""
+    if not path or not Path(path).exists():
+        return None
+    try:
+        from shared.page_identity import parse as _parse_dom
+        return _parse_dom(Path(path).read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+def _run_guards(original: str, updated: str, rel_path: str, capture: dict = None) -> tuple:
     """Mechanical checks a re-run cannot do for us. Returns (ok, reason).
 
     The verification loop cannot catch a fix built on a wrong diagnosis, because
     the easiest way to make an assertion pass is to weaken it. These run before
     maven does, so a fix that could only pass by weakening the test never reaches
     a runner at all.
+
+    `capture` is the DOM saved when the test failed ({"soup", "failing_selector"}),
+    for the guards that judge a replacement on the page it will act on.
     """
+    capture = capture or {}
     is_test = Path(rel_path).name.endswith(("Test.java", "Tests.java", "Test.kt"))
     checks = (
         ("size/integrity",  lambda: validate_fix(original, updated,
@@ -427,6 +457,8 @@ def _run_guards(original: str, updated: str, rel_path: str) -> tuple:
         ("wrapper_compliance",    lambda: wrapper_compliance(original, updated)),
         ("logstep_present",       lambda: logstep_present(original, updated, is_test)),
         ("no_selector_broadening", lambda: no_selector_broadening(original, updated)),
+        ("replacement_is_the_field", lambda: replacement_is_the_field(
+            original, updated, capture.get("soup"), capture.get("failing_selector", ""))),
         # A fix is the other way a literal URL gets into the repo: step 03's
         # guard cannot see what step 04 writes afterwards.
         ("no_hardcoded_url",      lambda: url_properties.no_hardcoded_url(original, updated)),
@@ -443,7 +475,8 @@ def _run_guards(original: str, updated: str, rel_path: str) -> tuple:
 
 
 def apply_fix(files_map: dict, edits_map: dict = None,
-              test_class: str = "", test_method: str = "") -> tuple:
+              test_class: str = "", test_method: str = "",
+              sanction: dict = None, capture: dict = None) -> tuple:
     """Apply a fix to the framework repo, guarded.
 
     Prefers targeted edits (edits_map) over whole-file replacement (files_map):
@@ -495,7 +528,7 @@ def apply_fix(files_map: dict, edits_map: dict = None,
                 continue
 
         if original:
-            ok, reason = _run_guards(original, updated, rel_path)
+            ok, reason = _run_guards(original, updated, rel_path, capture)
             if not ok:
                 log(f"  REJECTED {rel_path} — {reason}")
                 rejections.append({"file": rel_path, "reason": reason,
@@ -515,7 +548,7 @@ def apply_fix(files_map: dict, edits_map: dict = None,
 
     # ── Assertion conservation, across everything the fix just wrote ──────────
     if patched and test_class and test_method:
-        ok, reason = check_conservation(test_class, test_method)
+        ok, reason = check_conservation(test_class, test_method, sanction)
         if not ok and FORCE:
             log(f"  {reason}")
             log("  FORCE=true — applying it anyway")
@@ -1045,6 +1078,139 @@ def resolve_test_method(test_class: str, test_method: str, files_written: list) 
     return corrected
 
 
+def triage_value_mismatch(failure_text: str) -> dict:
+    """The failing frozen assertion, when all it saw was its expected value rendered
+    differently — `{message, expected, actual, relation}` (`value_match.triage`),
+    or {} for anything else, including a freeze from before assertions kept their
+    argument text: without it the sanction could never be honoured."""
+    from shared.frameworks import get_active_plugin
+    try:
+        frozen = json.loads((AUDIT_DIR / FROZEN_ASSERTIONS).read_text())
+    except (OSError, ValueError):
+        return {}
+    asserts = list((frozen.get("asserts") or {}).values())
+    messages = [assertion_graph.message_of(info.get("args") or "") for info in asserts]
+    mismatch = value_match.triage(failure_text, messages,
+                                  get_active_plugin().diagnostics.value_mismatch) or {}
+    if mismatch:
+        # Whether the expected side is a string literal written in that assertion,
+        # rather than a value the test typed or read. The last literal is the message.
+        mismatch["literal"] = any(
+            lit[1:-1] == mismatch["expected"]
+            for info in asserts
+            if assertion_graph.message_of(info.get("args") or "") == mismatch["message"]
+            for lit in (info.get("literals") or [])[:-1])
+    return mismatch
+
+
+def typed_shape_section(failure_text: str, inputs_used: dict) -> str:
+    """For a value assertion that failed on a real difference: what step 02 typed.
+
+    Not every difference is the product's. A test whose data drifted from the
+    shape step 02 validated — 'Alica Bednar MD' where step 02 typed 'Test User' —
+    fails on a value the product was never shown, and the fixer is the one who can
+    see that, given both.
+    """
+    from shared.frameworks import get_active_plugin
+    parse = get_active_plugin().diagnostics.value_mismatch
+    line = next((ln for ln in (failure_text or "").splitlines() if parse(ln)), "")
+    pair = parse(line) if line else None
+    if not pair or not inputs_used:
+        return ""
+    words = lambda v: len(str(v).split())
+    typed = "".join(f"  {field} = {str(value)[:60]!r} ({words(value)} words)\n"
+                    for field, value in inputs_used.items())
+    return ("\n<validated_inputs>\n"
+            f"The failing assertion expected '{str(pair[0])[:120]}' ({words(pair[0])} words). "
+            "Step 02 validated this flow typing exactly:\n" + typed
+            + "If the expected value is test data the test typed and its shape differs "
+              "from what step 02 typed, the fix is the test data: give it the validated "
+              "shape. The assertion stays as it is.\n</validated_inputs>\n")
+
+
+def literal_fix(mismatch: dict) -> bool:
+    """Whether a value mismatch is fixed in the expected literal itself.
+
+    A literal the page renders with other spacing or case is corrected where it is
+    written, and conservation already accepts exactly that. Offered a comparator
+    instead, a fix wrapped both sides of a message check in
+    `.replaceAll("\\\\s+", "").toLowerCase()`. A value the test typed or read, or
+    one that differs by more than formatting, keeps the comparator route.
+    """
+    return bool(mismatch) and mismatch.get("relation") == "formatting" and bool(mismatch.get("literal"))
+
+
+def value_mismatch_section(mismatch: dict, inputs_used: dict) -> str:
+    """The per-attempt prompt section for a triaged value mismatch. "" without one."""
+    if not mismatch:
+        return ""
+    relation = mismatch["relation"]
+    # Page text in a prompt: capped, as everywhere else.
+    expected, actual = (str(mismatch[k])[:120] for k in ("expected", "actual"))
+    typed = "".join(f"  {field} = {value!r}\n" for field, value in (inputs_used or {}).items())
+    if literal_fix(mismatch):
+        return (
+            f"\n<value_mismatch>\n"
+            f"The failing assertion is \"{mismatch['message']}\". It expected the literal "
+            f"'{expected}' and the page showed '{actual}': the same text, with different "
+            f"spacing or letter case.\n"
+            f"Fix it in that literal: replace '{expected}' with exactly '{actual}', in that "
+            "assertion and nowhere else. Change nothing else about the assertion: no "
+            "trimming, lower-casing or replaceAll on either side, and no other comparator. "
+            "Any of those is rejected.\n"
+            "</value_mismatch>\n")
+    return (
+        f"\n<value_mismatch>\n"
+        f"The failing assertion is \"{mismatch['message']}\". It expected '{expected}' "
+        f"and the page showed '{actual}' — the page {value_match.MEANING[relation]}. "
+        f"That is how the product renders this value, not a different value.\n"
+        + (f"Step 02 validated this flow typing exactly:\n{typed}" if typed else "")
+        + "Fix it ONE of these two ways, preferring the first:\n"
+          "  (a) If the test typed data of a different shape than step 02 did (compare "
+          "with what the test output shows it entered), make the test data keep the "
+          "validated shape — the same number of words, the same kinds of characters. "
+          "The assertion stays exactly as it is.\n"
+          f"  (b) Otherwise change ONLY this assertion to compare with "
+          f"{value_match.ASSERT_WITH[relation]}. Keep the same actual and expected "
+          "expressions, the same message, the same place, and no condition around it. "
+          "This one change is allowed; any other change to any assertion still rejects "
+          "the whole fix.\n"
+          "Never add interactions, clear or change other form fields, or read another "
+          "element to make the shown text match.\n"
+          "</value_mismatch>\n")
+
+
+def restore_generated_files(files_content: dict) -> list:
+    """Put step 03's output back on disk wherever the checkout disagrees with it.
+
+    A resume is handed a fresh worktree cut from the base branch — the one step
+    03 wrote into was removed when that run ended. Without this the generated
+    test class is simply absent, `mvn -Dtest=Class#method` runs ZERO tests, and
+    the fix loop is asked to repair files that do not exist. On a normal run the
+    disk already matches, so nothing is written.
+    """
+    if not AUTOMATION_FRAMEWORK_DIR.exists():
+        return []
+    root = AUTOMATION_FRAMEWORK_DIR.resolve()
+    restored = []
+    for rel_path, content in (files_content or {}).items():
+        full = AUTOMATION_FRAMEWORK_DIR / rel_path
+        try:
+            full.resolve().relative_to(root)
+        except ValueError:
+            log(f"  BLOCKED: {rel_path} escapes repo root")
+            continue
+        if full.exists() and full.read_text() == content:
+            continue
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content)
+        restored.append(rel_path)
+    if restored:
+        log(f"Restored {len(restored)} step-03 file(s) this checkout did not have: "
+            f"{', '.join(Path(p).name for p in restored)}")
+    return restored
+
+
 def load_run_target(gen_data: dict) -> tuple:
     """What step 04 will actually run: (test_class, test_method, files_written).
 
@@ -1109,14 +1275,20 @@ def ensure_url_properties(plan: dict, gen_data: dict) -> None:
     log(f"URL property precheck: {len(urls)} key(s) — {status}")
 
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     gen_data = json.loads((AUDIT_DIR / "03-generate.json").read_text())
+    if FIX_ATTEMPT == 0:
+        # Only before the first run: from attempt 1 on, disk carries the fixes.
+        restore_generated_files(gen_data.get("files_content") or {})
     test_class, test_method, files_written = load_run_target(gen_data)
     plan_data     = json.loads((AUDIT_DIR / "01-parse.json").read_text())
     api_val_path  = AUDIT_DIR / "02-validate-api.json"
     api_validation = json.loads(api_val_path.read_text()) if api_val_path.exists() else {}
+    web_val_path  = AUDIT_DIR / "02-validate-web.json"
+    web_validation = json.loads(web_val_path.read_text()) if web_val_path.exists() else {}
 
     if not test_class:
         log("No test class found in generate output — skipping test run")
@@ -1302,6 +1474,22 @@ def main() -> None:
         }, files_written, FIX_ATTEMPT)
         return
 
+    # The page rendered the expected value differently — a prefix, a format, extra
+    # words. English said "matches"; the relation names what the page actually
+    # does, and lets exactly that assertion move to it, or the data move back to
+    # the shape step 02 validated. Anything else stays the ordinary path.
+    mismatch = (triage_value_mismatch(prev_failure_message or prev_output)
+                if failure_class == "CODE_ERROR" else {})
+    sanction = None
+    if mismatch:
+        log(f"Failure classified as: VALUE_MISMATCH ({mismatch['relation']}) — "
+            f"'{mismatch['expected']}' vs '{mismatch['actual']}'"
+            + (" — fixed in the expected literal" if literal_fix(mismatch) else ""))
+        # No sanction for a literal fix: the comparator must not change, and the
+        # literal's new spacing or case passes conservation on its own.
+        if not literal_fix(mismatch):
+            sanction = {"message": mismatch["message"], "relation": mismatch["relation"]}
+
     # CODE_ERROR — call Claude for a fix, apply it, then run the test
     log(f"Fix attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS}: calling Claude for a fix...")
     generated_files = read_generated_files(files_written)
@@ -1425,6 +1613,12 @@ find a different one, or return "edits": [] and say what would actually be neede
     # PR bodies. Kept in shared/intent.py so the rule reads identically wherever
     # an agent is allowed to edit a test.
     never_rules = "\n".join(f"  - {rule}" for rule in intent.NEVER)
+    # Said here too, or the rule above and the <value_mismatch> section below read
+    # as a contradiction and the model obeys whichever it saw last.
+    value_exception = (
+        "\nThe ONE exception is the assertion a <value_mismatch> section in the message "
+        "names: its comparison may change exactly as that section describes, and nothing "
+        "else about it or any other assertion may." if mismatch else "")
 
     # The input documented how the product misbehaves today. A failure that is
     # exactly that is the test doing its job, and "fixing" it hides the bug.
@@ -1439,6 +1633,20 @@ or work around the test: return "edits": [], explain the match in root_cause, an
 "is_known_product_defect_matched": true. Only for that defect: a compile error, a missing locator,
 a wrong URL or any other automation problem is yours to fix normally, with the flag left false.
 """
+    # Checks step 02 walked in a real browser and never saw hold, kept because the
+    # input asked for them. Failing on one is the same finding as a documented
+    # defect. Without this, a fix "repaired" an order-details email check that
+    # Snap never renders by pointing its locator at the phone number.
+    measured_badly = set(gen_data.get("kept_unmeasured_checks") or [])
+    never_seen = [s for s in gen_data.get("kept_unverified_checks") or []
+                  if s not in measured_badly]
+    if never_seen:
+        defect_rules += (
+            "\nNOT SEEN ON THE PRODUCT: step 02 walked this flow in a real browser and never "
+            "saw these checks hold:\n" + "".join(f"  - {s}\n" for s in never_seen)
+            + 'If the failure below is one of them, return "edits": [], name it in root_cause and '
+              'set "is_known_product_defect_matched": true. Never point its locator at another '
+              "element to make it pass. Any other failure is yours to fix normally.\n")
 
     static_system_prompt = f"""You are a test automation debugging agent for the automation repository whose conventions follow.
 
@@ -1468,7 +1676,7 @@ A test that passes because it stopped checking is worse than a failing one: the 
 visible and this is not. This is enforced mechanically — every assertion reachable from
 {test_class}#{test_method} was fingerprinted before your fix, and one that is removed, moved
 down to a weaker call, wrapped in a condition, or given a different expected value gets the
-WHOLE fix rejected and the attempt wasted, however good the rest of it was.
+WHOLE fix rejected and the attempt wasted, however good the rest of it was.{value_exception}
 
 If the only way to make this test pass is to weaken what it checks, then it should not pass.
 Return "edits": [] and say so in root_cause — that the product does not do what the test
@@ -1538,7 +1746,7 @@ Output ONLY valid JSON.
 {prev_output}
 ```
 </test_failure>
-{retry_section}
+{value_mismatch_section(mismatch, web_validation.get("inputs_used")) or typed_shape_section(prev_failure_message or prev_output, web_validation.get("inputs_used"))}{retry_section}
 """
 
     fix_response = call_claude(prompt)
@@ -1550,14 +1758,17 @@ Output ONLY valid JSON.
     # application misbehaving, and stopping on one would ship code that does not
     # build, labelled as a reproduced bug.
     compile_failed = bool(re.search(r"compilation (error|failure)", prev_output, re.IGNORECASE))
-    if defect_matched and plan_data.get("is_known_product_defect") and not compile_failed:
-        log(f"Failure matches the documented product defect: {root_cause}")
+    documented = plan_data.get("is_known_product_defect")
+    if defect_matched and (documented or never_seen) and not compile_failed:
+        what = ("the documented product defect" if documented
+                else "a check step 02 never saw the product do")
+        log(f"Failure matches {what}: {root_cause}")
         log("  → Stopping the fix loop: the test is correctly catching a known bug.")
         _write_gate("defect")
         _write_result({
             "attempt": FIX_ATTEMPT, "test_class": test_class, "test_method": test_method,
             "passed": False, "known_product_defect": True,
-            "reason": f"failure matches the documented product defect: {root_cause}",
+            "reason": f"failure matches {what}: {root_cause}",
             "root_cause": root_cause, "confidence": confidence,
             "test_output": prev_output, "fixes_applied": [],
             "fix_response_length": len(fix_response), "skipped_rerun": True,
@@ -1565,7 +1776,8 @@ Output ONLY valid JSON.
         return
     if defect_matched:
         log("  The model called this the known product defect, but "
-            + ("the test did not compile" if compile_failed else "the input documented none")
+            + ("the test did not compile" if compile_failed
+               else "the input documented none and step 02 missed no check")
             + " — treating it as an ordinary failure")
 
     proposed = fix_history.fingerprint(files_map, edits_map)
@@ -1575,9 +1787,14 @@ Output ONLY valid JSON.
     fix_rejections: list = []
     if files_map or edits_map:
         fixes_applied, fix_contents, fix_rejections = apply_fix(
-            files_map, edits_map, test_class, test_method)
+            files_map, edits_map, test_class, test_method, sanction,
+            capture={"soup": _capture_soup(evidence.get("dom_snapshot_path")),
+                     "failing_selector": failed_selector})
         if fixes_applied:
             log(f"Applied fixes to {len(fixes_applied)} file(s) — running test")
+        for relaxed in (sanction or {}).get("relaxed") or []:
+            log(f"Relaxed check \"{sanction['message']}\": {relaxed} — the page "
+                f"{value_match.MEANING[sanction['relation']]}")
     if root_cause:
         log(f"Root cause ({confidence or 'unknown confidence'}): {root_cause}")
 
@@ -1710,6 +1927,11 @@ Output ONLY valid JSON.
             "reason": ("stuck on identical failure across fix attempts — see root_cause "
                        "history in the per-attempt audit files" if stuck_on_same_failure
                        else no_progress_why)} if stopped_early else {}),
+        # The failure this attempt was triaged as, and the assertion it relaxed to
+        # the relation the page was measured to satisfy — absent when neither.
+        **({"value_mismatch": mismatch} if mismatch else {}),
+        **({"relaxed_checks": [{**mismatch, "change": r} for r in sanction["relaxed"]]}
+           if sanction and sanction.get("relaxed") else {}),
         **failure_ctx,
     }
 

@@ -72,7 +72,13 @@ MAX_ATTEMPTS = int(os.environ.get("HEALING_MAX_ATTEMPTS", "12"))
 # Handoff file written by test-triaging-agent/05_ship.py
 HANDOFF_FILE = Path(os.environ["HANDOFF_FILE"])
 
-HEALING_MODEL = os.environ.get("HEALING_MODEL", "claude-opus-5")
+# Set in config/.env, no default here: run.sh stops the run when it is missing.
+HEALING_MODEL = os.environ.get("HEALING_MODEL", "")
+# Set in config/.env. Empty → --effort is not passed and the runner's own effortLevel applies.
+HEALING_EFFORT = os.environ.get("HEALING_EFFORT") or None
+# The DOM inspections drive a browser, so they take the effort every agent's
+# browser step shares; empty, they use HEALING_EFFORT like the fix call.
+BROWSER_EFFORT = os.environ.get("BROWSER_EFFORT") or HEALING_EFFORT
 
 GITHUB_TOKEN           = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_ORG             = os.environ.get("GITHUB_ORG", "")
@@ -252,6 +258,7 @@ def call_claude(prompt: str, cwd: Path, use_system_prompt: bool = True,
     if kwargs.get("stream_json"):
         kwargs.setdefault("on_output", _progress)
     output = _call_claude(prompt, HEALING_MODEL, str(cwd),
+                          effort=kwargs.pop("effort", HEALING_EFFORT),
                           system_prompt_file=system_prompt,
                           allowed_tools=(tools or None),
                           add_dir=(add_dir or artifact_dir or None),
@@ -824,6 +831,7 @@ def _inspect_parked_browser(ctx: dict, session: dict) -> dict:
             prompt, AUDIT_DIR,
             use_system_prompt=False,
             timeout=DOM_TIMEOUT_S,
+            effort=BROWSER_EFFORT,
             allowed_tools=mcp_allowed_tools(),
             mcp_config=str(mcp_path),
             strict_mcp_config=True,
@@ -997,6 +1005,7 @@ def inspect_live_dom(ctx: dict, url: str, workspace: Path, props: dict,
         prompt, AUDIT_DIR,
         use_system_prompt=False,
         timeout=DOM_TIMEOUT_S,
+        effort=BROWSER_EFFORT,
         allowed_tools=mcp_allowed_tools(),
         mcp_config=str(mcp_path),
         strict_mcp_config=True,

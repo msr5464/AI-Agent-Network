@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
 from shared import workspace as workspace_helper
-from shared.credential_extraction import extract_credentials
+from shared.credential_extraction import extract_credentials, mentions_login
 from shared import check_provenance
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -34,7 +34,10 @@ AUTOMATION_FRAMEWORK_DIR    = workspace_helper.resolve(
     WORKSPACE_DIR, os.environ.get("GITHUB_REPO_AUTOMATION", ""),
     exclude=REPO_ROOT)
 
-MODEL = os.environ.get("AUTHORING_MODEL", "claude-opus-4-6")
+# Set in config/.env, no default here: run.sh stops the run when it is missing.
+MODEL = os.environ.get("AUTHORING_MODEL", "")
+# Set in config/.env. Empty → --effort is not passed and the runner's own effortLevel applies.
+EFFORT = os.environ.get("AUTHORING_EFFORT") or None
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -43,7 +46,8 @@ def log(msg: str) -> None: _log("01-parse", msg)
 
 from shared.claude import call_claude as _call_claude
 def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, MODEL, str(REPO_ROOT), timeout=600, strict_mcp_config=True, log_dir=str(AUDIT_DIR))
+    output = _call_claude(prompt, MODEL, str(REPO_ROOT), timeout=600, strict_mcp_config=True, log_dir=str(AUDIT_DIR),
+                          effort=EFFORT)
     if not output:
         log("ERROR: Claude CLI returned empty response")
     return output
@@ -321,7 +325,11 @@ Rules:
    beside the one the module already has.
 3. "response_only": true for fields set by the server (id, status, createdAt, updatedAt).
 4. Infer "web_steps_for_validation" from the plain English web steps for use in the
-   Playwright validation script — list them as simple imperative sentences.
+   Playwright validation script — list them as simple imperative sentences. Every
+   value the input gives for a step stays in that step, exactly as written:
+   "Fill Address with '221B Baker Street' and the other fields with dummy data",
+   never "Fill the fields with dummy data". The browser run types what these
+   steps say, and the test is generated from what it typed.
    UI steps ONLY — clicks, fills, navigations, what is visible. Never put a curl command, an API
    call or backend setup in this list; those belong in "api_endpoints" and "interleaved_steps".
 
@@ -345,6 +353,41 @@ Rules:
    to a line the author wrote. Use "inferred" for anything you added yourself.
    Tag verifications only; action steps need no tag. This is cross-checked against
    the input text afterwards, so a mis-tag is caught rather than trusted.
+
+4c. KEEP WHAT A COMPARISON POINTS AT. When a verification compares with something
+   from earlier in the flow ("same as we passed earlier", "matching the ones we
+   filled", "the same total as before"), its other side is that earlier value.
+   Name it concretely: which value, read on which page or typed into which field.
+     Input:  "3. Fill the order form and submit
+              5. Validate the amount on top of the page is same as we passed earlier"
+     Right:  "Read and record the order total shown on the order form" (an action
+             at step 3, before submitting), then
+             "Validate the amount at the top of the page matches the order total
+              recorded on the order form  [source: user]"
+     Wrong:  "Validate the amount matches the expected purchase amount"
+   The wrong one has no source, so the check ends up comparing the page against a
+   number copied from the page itself, and proves nothing. If the earlier value is
+   only shown and never typed, reading and recording it at that earlier step is a
+   mechanic rule 4b allows, not an invented check. Keep the back-reference in
+   "web_test_methods" steps and "interleaved_steps" too: store the earlier value
+   under a name and compare with that name. Never replace it with a literal the
+   input did not quote.
+   A CHANGE check ("the total goes down after applying the voucher") compares one
+   value before and after the change. Record "before" ahead of the whole part of
+   the flow the change belongs to (choosing the method, entering the details it
+   depends on), never in the step just before the named action: a product often
+   applies such a change by itself as soon as it can, so a value read inside that
+   part can already include it. If the flow already reads that value earlier, record
+   that reading.
+     Input:  "4. Validate the cart total is same as the product price
+              5. Choose card payment, enter the card details, Voucher: SAVE10
+              6. Ensure the total goes down after applying the voucher"
+     Right:  record the cart total read at step 4 as totalBeforeVoucher, then
+             "Verify the total after applying the voucher is less than
+              totalBeforeVoucher  [source: user]"
+     Wrong:  "Record the total shown before applying the voucher" after the card
+             details. A product that picks an eligible voucher on its own once a
+             card is entered already shows the discounted total there.
 5. If "existing_module" is true and the input only adds new test scenarios (not new endpoints):
    still list EVERY endpoint this scenario actually calls in "api_endpoints" — including ones that
    already exist in the module's Api enum — because step [02/05] Validate API needs the full list to
@@ -497,9 +540,10 @@ Rules:
             # Which fields, never their values — the run header masks the same
             # lines, and a log that prints them undoes that.
             log(f"Extracted demo credentials from the input text: {', '.join(recovered)}")
-    elif creds:
+    elif creds and mentions_login(raw_text):
         # Half a credential is worse than none downstream — it makes a login look
-        # runnable when it isn't — so say exactly which half is missing.
+        # runnable when it isn't — so say exactly which half is missing. Only for
+        # a flow that logs in: a checkout's `Email:` and bank `OTP:` are not one.
         missing = [f for f in ("username", "password") if not creds.get(f)]
         log(f"WARNING: the input file names {', '.join(sorted(creds))} but no "
             f"{' or '.join(missing)} — a login step will fail validation in step 02")

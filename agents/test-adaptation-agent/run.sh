@@ -31,6 +31,9 @@ export REPO_ROOT
 
 source "$REPO_ROOT/shared/session.sh"
 
+# The model has no default in code — config/.env sets it.
+require_settings ADAPTATION_MODEL
+
 USER_ID="${USER_ID:-cli}"
 if [[ "$USER_ID" == "default" || "$USER_ID" == "cli" ]]; then
   QUEUE_DIR="$AGENT_DIR/queue"
@@ -274,9 +277,6 @@ fi
 
 # ── Step 04 — Adapt (with retry loop) ────────────────────────────────────────
 ADAPTATION_RETRY_COUNT="${ADAPTATION_RETRY_COUNT:-2}"
-if [[ -n "${MAX_ADAPT_ATTEMPTS:-}" ]]; then
-  log "NOTE: MAX_ADAPT_ATTEMPTS is set but no longer read — use ADAPTATION_RETRY_COUNT (currently $ADAPTATION_RETRY_COUNT)"
-fi
 if [[ "$START_FROM_STEP" -le 4 ]]; then
   ADAPT_ATTEMPT=1
   while true; do

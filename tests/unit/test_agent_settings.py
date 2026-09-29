@@ -175,8 +175,28 @@ class TestCoercion:
         assert os.environ["AUTHORING_FIX_RETRY_COUNT"] == "2"
 
     def test_select_rejects_values_outside_its_options(self, env_file):
-        agent_settings.set_many({"triaging_classifier_effort": "bogus"})
-        assert os.environ["TRIAGING_CLASSIFIER_EFFORT"] == "medium"
+        agent_settings.set_many({"triaging_effort": "bogus"})
+        assert os.environ["TRIAGING_EFFORT"] == ""
+
+    def test_an_effort_can_be_left_unset(self, env_file):
+        """"Not set" is an option, so an unset effort is not saved as the first
+        one the dropdown happens to show."""
+        agent_settings.set_many({"healing_effort": ""})
+        assert os.environ["HEALING_EFFORT"] == ""
+
+
+class TestModelValidation:
+    """Models have no default in code, and every run.sh stops without one."""
+
+    @pytest.mark.parametrize("bad", ["", "   "])
+    def test_an_empty_model_is_rejected(self, env_file, bad):
+        with pytest.raises(agent_settings.SettingsValidationError) as exc:
+            agent_settings.set_many({"triaging_model": bad})
+        assert "triaging_model" in exc.value.errors
+
+    def test_a_named_model_is_saved(self, env_file):
+        agent_settings.set_many({"triaging_model": "claude-sonnet-5"})
+        assert os.environ["TRIAGING_MODEL"] == "claude-sonnet-5"
 
 
 class TestWorkspaceValidation:

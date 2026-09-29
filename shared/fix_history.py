@@ -95,9 +95,16 @@ def record(attempt: int, root_cause: str = "", confidence: str = "",
            proposed: Optional[List[Dict[str, str]]] = None,
            applied: Optional[List[str]] = None,
            rejections: Optional[List[Dict[str, str]]] = None,
-           outcome: str = FAILED, failure_location: str = "") -> Dict[str, Any]:
-    """Build one attempt's record. Pure — the caller decides when to persist it."""
-    return {
+           outcome: str = FAILED, failure_location: str = "",
+           value_mismatches: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    """Build one attempt's record. Pure — the caller decides when to persist it.
+
+    `value_mismatches` — checks a verify run saw fail only because the page
+    renders the expected value differently (`shared/value_match.py`), each
+    `{check, message, expected, actual, relation}`. Kept so the next attempt is
+    told, and so that run's measurement can later vouch for a relaxed comparator.
+    """
+    entry = {
         "attempt": attempt,
         "root_cause": (root_cause or "").strip(),
         "confidence": confidence or "",
@@ -107,6 +114,9 @@ def record(attempt: int, root_cause: str = "", confidence: str = "",
         "outcome": outcome,
         "failure_location": failure_location or "",
     }
+    if value_mismatches:
+        entry["value_mismatches"] = value_mismatches
+    return entry
 
 
 # ── Identifying what was proposed ─────────────────────────────────────────────
@@ -226,6 +236,12 @@ def render(history: List[Dict[str, Any]]) -> str:
         if entry.get("applied"):
             lines.append("Applied, and the test still failed: "
                          + ", ".join(entry["applied"]))
+        for m in entry.get("value_mismatches") or []:
+            # Page text, so capped like every other page text in a prompt.
+            expected, actual = (str(m.get(k, ""))[:120] for k in ("expected", "actual"))
+            lines.append(f"VALUE MISMATCH on check {m.get('check', '?')} "
+                         f"(\"{m.get('message', '')}\"): expected '{expected}', the page "
+                         f"showed '{actual}' — relation `{m.get('relation', '')}`")
         lines.append("")
 
     lines.append("</previous_fix_attempts>")

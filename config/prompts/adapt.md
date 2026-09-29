@@ -76,8 +76,9 @@ selector); add or remove a step; add an assertion; remove or change a check your
 item's kind allows, declared in `check_changes`; add a page object for a genuinely
 new page; add a field to a data builder.
 
-You may not: weaken an assertion or make it conditional; remove or change one
-without declaring it; add `Thread.sleep`; add a `try/catch`
+You may not: weaken an assertion or make it conditional — the single exception is a
+declared `relax` (below); remove or change one without declaring it; add
+`Thread.sleep`; add a `try/catch`
 that swallows a failure; add `@Ignore` or `enabled = false`; call the browser
 driver or locator object directly (`locator.click()`, `driver.findElement`,
 `.sendKeys()`, `new WebDriverWait`) instead of the framework's wrappers; or
@@ -127,8 +128,9 @@ Respond with a JSON object ONLY. No prose, no markdown fences.
   "check_changes": [
     {
       "check": "<id of a listed check, e.g. c1038d38>",
-      "action": "change" | "remove",
+      "action": "change" | "remove" | "relax",
       "new_expected": ["<every expected value the check will have, in order>"],
+      "relation": "<relax only: the relation listed for this check>",
       "why": "<which part of the note this follows from>"
     }
   ],
@@ -149,7 +151,18 @@ Rules for `check_changes`:
 - `new_expected` only for `change`: the full list of the check's expected values
   after your edit, in the order the check has them, without quotes. A check that
   expects `"1"` and becomes `"2"` is `["2"]`. Omit it for `remove`.
+- `relax` only for a check listed with a **relation** — the page was measured to
+  render its expected value differently (`words`: inside a longer text, `numeric`:
+  the same number formatted differently, `phone`: the same number with another
+  prefix, `formatting`: spacing or case). Change nothing but that assertion's
+  comparison to match the relation: the same expressions, the same expected values,
+  the same message, no condition around it. Put the listed relation in `relation`.
+  A relax nothing measured is refused, and so is any other weakening.
 - Empty when you return `covered_by`: a covered item makes no edits.
+
+A check you **add** compares with the relation the flow map's `VALUE_CHECK` shows
+for it, when there is one. Its expected side is a value the flow typed, a value the
+test reads earlier in the flow, or text quoted in the note — never a new literal.
 
 Rules for `edits`:
 

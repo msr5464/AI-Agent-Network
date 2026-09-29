@@ -641,7 +641,6 @@ def _stale_after() -> int:
     try:
         return int(
             os.environ.get("QA_AGENT_STALE_AFTER_SECONDS")
-            or os.environ.get("QA_HEALING_STALE_AFTER_SECONDS")
             or _DEFAULT_STALE_AFTER_SECONDS
         )
     except ValueError:

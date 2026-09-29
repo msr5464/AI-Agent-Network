@@ -124,18 +124,32 @@ def credentials_from_plan(plan: dict, input_file: str = "") -> dict:
     creds = {k: v for k, v in (plan.get("demo_credentials") or {}).items() if v}
     if creds.get("username") and creds.get("password"):
         return creds
+    text = input_text(plan, input_file)
+    return {**extract_credentials(text), **creds} if text else creds
 
+
+def input_text(plan: dict, input_file: str = "") -> str:
+    """The raw test case a plan was parsed from, or "" when it cannot be found."""
     path = input_file or plan.get("_input_file") or os.environ.get("INPUT_FILE", "")
     if not path:
-        return creds
+        return ""
     # queue/<module>.txt moves to queue/processed/<module>.txt once a run
     # completes, so a session resumed from a later step finds it there — the
     # same two candidates 05_ship.py reads the raw test case from.
     candidates = [Path(path), Path(path).parent / "processed" / Path(path).name]
     for candidate in candidates:
         try:
-            text = candidate.read_text()
+            return candidate.read_text()
         except OSError:      # not there, or unreadable
             continue
-        return {**extract_credentials(text), **creds}
-    return creds
+    return ""
+
+
+LOGIN_WORDS = ("login", "log in", "sign in", "signin", "authenticate")
+
+
+def mentions_login(text: str) -> bool:
+    """Whether a flow logs in. An `Email:` and an `OTP:` are credentials only
+    then: a checkout form asks for an email, and a bank page for an OTP."""
+    lowered = (text or "").lower()
+    return any(word in lowered for word in LOGIN_WORDS)

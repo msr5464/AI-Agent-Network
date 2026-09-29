@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from shared import locator_capture as capture
+from shared import frames
 from shared.locator_score import Volatility
 
 # The ARIA-role table lives in the framework plugins (CodeEngine.map_role);
@@ -187,8 +188,12 @@ def scoped_by_context(ctx, el: dict, expect_index: int, snap: dict | None) -> di
     return None
 
 
-def candidates_for(el: dict, vol: Volatility) -> list[dict]:
+def candidates_for(el: dict, vol: Volatility, frame_path: list | None = None) -> list[dict]:
     """The preference ladder, most maintainable first.
+
+    `frame_path` (shared/frames.py) puts every rung inside those iframes: the
+    probe becomes a chain and the code enters the frames first. Without it an
+    element found in a frame was written back as a top-document locator.
 
     Two different things are produced per candidate, and the distinction is the
     whole reason this reads the way it does:
@@ -212,8 +217,8 @@ def candidates_for(el: dict, vol: Volatility) -> list[dict]:
     role, acc = el.get("role"), el.get("accessible_name")
 
     def add(strategy: str, sel: str, **emit_kwargs) -> None:
-        snippet = code.emit_locator(**emit_kwargs)
-        candidate = {"strategy": strategy, "sel": sel,
+        snippet = code.emit_locator(**emit_kwargs, frame_path=frame_path)
+        candidate = {"strategy": strategy, "sel": frames.join(frame_path, sel),
                      "python": snippet.get("python", ""),
                      "java": snippet.get("java") or None}
         # Page-object field form, where the framework has one (Selenium's

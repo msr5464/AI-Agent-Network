@@ -68,6 +68,9 @@ def main():
         "refusals": web_flow.get("refusals") or [],
         "violations": web_flow.get("violations") or [],
         "outcomes": web_flow.get("outcomes") or [],
+        # Both sides of every comparison the explorer made, with the relation
+        # measured between them — what a `relax` declaration is confirmed by.
+        "value_checks": web_flow.get("value_checks") or [],
         "notes": web_flow.get("notes") or [],
         # Carried through rather than dropped. Every consumer of the combined flow
         # that wants to recount a selector, recognise a page, or build a negative

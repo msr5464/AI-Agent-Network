@@ -31,6 +31,9 @@ export REPO_ROOT
 # ── Session helpers (log, run_step, fmt_duration, elapsed_since) ──────────────
 source "$REPO_ROOT/shared/session.sh"
 
+# The model has no default in code — config/.env sets it.
+require_settings TRIAGING_MODEL
+
 # ── Session init ───────────────────────────────────────────────────────────────
 if [[ -n "$BUILD_TAG" ]]; then
   SESSION_ID="$(date +%Y%m%d-%H%M%S)-${BUILD_TAG//\//-}"

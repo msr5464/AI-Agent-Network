@@ -28,8 +28,12 @@ AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 
-TRIAGING_CLASSIFIER_MODEL = os.environ.get("TRIAGING_CLASSIFIER_MODEL", "claude-opus-4-6")
-TRIAGING_CLASSIFIER_EFFORT = os.environ.get("TRIAGING_CLASSIFIER_EFFORT", "medium")
+# One model and effort for the whole agent, shared with 04_review. The reviewer's
+# independence comes from being a separate call with no shared context. Both are
+# set in config/.env, with no default here: run.sh stops the run without a model,
+# and an empty effort is not passed, so the runner's own effortLevel applies.
+TRIAGING_MODEL = os.environ.get("TRIAGING_MODEL", "")
+TRIAGING_EFFORT = os.environ.get("TRIAGING_EFFORT") or None
 
 MAX_LOG_CHARS = 4000   # Truncate execution log per failure to fit context
 BATCH_SIZE = 10        # Failures per Claude call (avoid context limits)
@@ -46,8 +50,9 @@ def load_json(filename):
 
 from shared.claude import call_claude as _call_claude
 def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, TRIAGING_CLASSIFIER_MODEL, str(REPO_ROOT),
-                          log_dir=str(AUDIT_DIR))
+    output = _call_claude(prompt, TRIAGING_MODEL, str(REPO_ROOT),
+                          log_dir=str(AUDIT_DIR),
+                          effort=TRIAGING_EFFORT or None)
     if not output:
         log("Claude CLI returned empty response")
     return output

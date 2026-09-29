@@ -341,6 +341,10 @@ def asserts_in(text: str, site: str) -> List[Dict]:
             "strength": _strength(callee.split(".")[-1]),
             "literals": _STRING.findall(args),
             "skeleton": skeleton,
+            # The argument text as written. Not part of the fingerprint: it is
+            # what lets a sanctioned comparator change prove it still compares
+            # the same two expressions (see `relaxes`).
+            "args": args,
             "raw": f"{callee.split('.')[-1]}|{skeleton}|{expected}",
         })
     return found
@@ -516,13 +520,80 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
     return result
 
 
-def conserved(before: Dict, after: Dict) -> Dict:
+# A type cast in a skeleton: `(int) x` → `(_)_`, `(String) x` → `(String)_`. Told
+# apart from a call's parentheses (`f(x)` → `_(_)`) by what precedes it.
+_CAST = re.compile(r"(?<![\w)\]])\((?:_|[A-Z]\w*)\)(?=[\w(@#])")
+
+
+def _uncast(skeleton: str) -> str:
+    """The skeleton with type casts removed. A cast changes a value's type, never
+    what is compared — `(int) parseAmount(a)` against `(int) parseAmount(b)` is
+    the same check as without them — and a compile fix that added one to make an
+    overload apply was rejected as a removed assertion."""
+    return _CAST.sub("", skeleton or "")
+
+
+def _top_level_args(args: str) -> List[str]:
+    """`a, f(b, c), "x"` → ['a', 'f(b, c)', '"x"']. Commas inside strings or calls
+    do not split."""
+    scan = _blank_literals(args)
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(scan):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(args[start:i].strip())
+            start = i + 1
+    parts.append(args[start:].strip())
+    return [p for p in parts if p]
+
+
+def message_of(args: str) -> str:
+    """The failure message an assertion was written with: its last string literal."""
+    literals = _STRING.findall(args or "")
+    return literals[-1].strip('"') if literals else ""
+
+
+def relaxes(before_args: str, after_args: str) -> bool:
+    """Whether `after_args` is `before_args` with only the comparator changed.
+
+    The message is the same, every expected value `before` held is still passed,
+    and every expression it compared is still an argument — so equality moved to
+    `contains`, or both sides wrapped in a parser, passes; an assertion that
+    stopped looking at the page (`assertTrue(config, true, …)`) does not. Where
+    the assertion stands and how deeply it is guarded are the caller's to check:
+    the two shapes that call this keep them differently.
+    """
+    if not before_args or after_args is None:
+        return False
+    if message_of(before_args) != message_of(after_args):
+        return False
+    before_literals = _STRING.findall(before_args)[:-1]
+    after_values = {canonical_value(v) for v in _STRING.findall(after_args)[:-1]}
+    if any(canonical_value(v) not in after_values for v in before_literals):
+        return False
+    flat_after = re.sub(r"\s+", "", after_args)
+    return all(re.sub(r"\s+", "", operand) in flat_after
+               for operand in _top_level_args(before_args)
+               if not _STRING.fullmatch(operand))
+
+
+def conserved(before: Dict, after: Dict, sanction: Optional[Dict] = None) -> Dict:
     """Compare two fingerprint sets. Returns a verdict with named reasons.
 
     Neither argument is modified: `before` is usually a frozen contract that the
     caller reuses across change items and fix attempts.
+
+    `sanction` — `{"message": …, "relation": …}` — lets the one frozen assertion
+    written with that message change its comparator and nothing else (`relaxes`),
+    at the same place and no more conditional than before. It exists for a value
+    the page was measured to render differently (`shared/value_match.py`), and it
+    is reported as `relaxed`, never folded into "preserved". Everything else is
+    judged exactly as without it.
     """
-    lost, weakened, conditionalised, moved, changed = [], [], [], [], []
+    lost, weakened, conditionalised, moved, changed, relaxed = [], [], [], [], [], []
     after_asserts = after["asserts"]
     # Insertion-ordered, so every fallback below pairs in source order and the
     # verdict cannot depend on the hash seed.
@@ -536,9 +607,38 @@ def conserved(before: Dict, after: Dict) -> Dict:
         del unmatched[afp]
         return True
 
+    # 0. The sanctioned assertion, first, found by its message. The fingerprint
+    # leaves the message out, so two checks that differ only in theirs (name and
+    # phone, both `assertEquals(config, x.get(), data.get(), …)`) share one, and
+    # pairing by fingerprint handed the name check's relaxation to the phone
+    # check — reported as a weakening of a check nobody touched.
+    wanted = (sanction or {}).get("message")
+    target = next((fp for fp, info in before["asserts"].items()
+                   if wanted and message_of(info.get("args") or "") == wanted), None)
+    if target:
+        info = before["asserts"][target]
+        same_place = [a for a in unmatched
+                      if after_asserts[a]["site"] == info["site"]
+                      and message_of(after_asserts[a].get("args") or "") == wanted]
+        untouched = any((after_asserts[a]["callee"], after_asserts[a].get("skeleton"),
+                         after_asserts[a]["literals"])
+                        == (info["callee"], info.get("skeleton"), info["literals"])
+                        for a in same_place)
+        replacement = None if untouched else next(
+            (a for a in same_place
+             if len(after_asserts[a]["cond_path"]) <= len(info["cond_path"])
+             and relaxes(info.get("args"), after_asserts[a].get("args"))), None)
+        if claim(target, replacement):
+            relation = (sanction or {}).get("relation")
+            relaxed.append(f"{info['callee']} at {info['site']} -> "
+                           f"{after_asserts[replacement]['callee']}"
+                           + (f" ({relation})" if relation else ""))
+
     # 1. Same fingerprint. A contract frozen before occurrence suffixes existed
     # stores the bare hash, which is exactly the base of `<hash>_1` now.
     for fp, info in before["asserts"].items():
+        if fp in pairs:
+            continue
         legacy = f"{fp}_1" if "skeleton" not in info else None
         claim(fp, fp if fp in unmatched else (legacy if legacy in unmatched else None))
 
@@ -558,7 +658,7 @@ def conserved(before: Dict, after: Dict) -> Dict:
             afp = next((a for a in unmatched
                         if after_asserts[a]["callee"] == info["callee"]
                         and after_asserts[a]["site"] == info["site"]
-                        and after_asserts[a].get("skeleton") == info["skeleton"]
+                        and _uncast(after_asserts[a].get("skeleton")) == _uncast(info["skeleton"])
                         and (not same_value
                              or _canonical(after_asserts[a]["literals"][:-1]) == expected)),
                        None)
@@ -617,7 +717,7 @@ def conserved(before: Dict, after: Dict) -> Dict:
         "verdict": "CONFIRMED" if (not ok or not new_holes) else "PLAUSIBLE",
         "reason": " | ".join(reasons),
         "lost": lost, "weakened": weakened, "changed": changed,
-        "conditionalised": conditionalised, "moved": moved,
+        "conditionalised": conditionalised, "moved": moved, "relaxed": relaxed,
         "new_unresolved": new_holes,
         "counted": len(before["asserts"]),
     }
@@ -628,6 +728,8 @@ def describe(report: Dict) -> str:
         line = f"assertion conservation OK ({report['counted']} assertion(s) preserved)"
         if report["moved"]:
             line += f"; moved: {', '.join(report['moved'][:3])}"
+        if report.get("relaxed"):
+            line += f"; relaxed as sanctioned: {', '.join(report['relaxed'])}"
         if report["new_unresolved"]:
             line += (f"; PLAUSIBLE not CONFIRMED — {len(report['new_unresolved'])} "
                      f"call(s) could not be resolved: "
@@ -760,7 +862,8 @@ def merge(per_test: Dict[str, Dict]) -> Dict:
                 merged[slot] = {**parts, "site": site, "callee": info["callee"],
                                 "cond": cond, "owner": owner,
                                 "strength": tuple(info.get("strength") or (-1, -1)),
-                                "via": info.get("via", ""), "tests": []}
+                                "via": info.get("via", ""), "args": info.get("args"),
+                                "tests": []}
             merged[slot]["tests"].append(test)
 
     checks = list(merged.values())

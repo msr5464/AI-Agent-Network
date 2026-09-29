@@ -5,12 +5,14 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from shared import frames
 from shared.frameworks.base import (
     CodeEngine,
     DiagnosticEngine,
     FrameworkPlugin,
     TelemetryParser,
     TestRunner,
+    literal_is_assembled,
 )
 
 
@@ -208,6 +210,7 @@ class PlaywrightDiagnosticEngine(DiagnosticEngine):
 class PlaywrightCodeEngine(CodeEngine):
     ELEMENT_TYPES = ("Locator",)
     LOCATOR_CALLS = ("locator", "waitForSelector")
+    TYPING_CALLS = ("fillText", "typeText", "enterData", "fill", "type", "pressSequentially")
     # Only the wrapper classes may make these calls. `Element.click(...)` is a
     # wrapper itself, hence the lookbehind.
     RAW_DRIVER_CALLS = (
@@ -229,6 +232,27 @@ class PlaywrightCodeEngine(CodeEngine):
     )
     _FINDBY_FIELD = re.compile(r"\b(?:WebElement|MobileElement|Locator|By)\s+(\w+)")
     _ACCESSOR_NAME = re.compile(r"\b(?:Locator|WebElement|MobileElement|By)\s+(\w+)\s*\([^)]*\)\s*\{(?:[^{}]|\{[^{}]*\})*$")
+
+    # page.frameLocator("a")[.frameLocator("b")].locator("c"), and the same through
+    # page.locator("a").contentFrame() — Java and Python spellings. A chain ending
+    # in getBy*() is not read: step 02 and the heal both write .locator(css).
+    _STR = r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'"""
+    _HOP = (rf"""(?:frameLocator|frame_locator)\s*\(\s*(?:{_STR})\s*\)"""
+            rf"""|locator\s*\(\s*(?:{_STR})\s*\)\s*\.\s*(?:contentFrame\s*\(\s*\)|content_frame\b)""")
+    _CHAIN = re.compile(rf"""\b(?:this\s*\.\s*)?page\s*\.\s*(?:{_HOP})(?:\s*\.\s*(?:{_HOP}))*"""
+                        rf"""\s*\.\s*locator\s*\(\s*(?:{_STR})\s*\)""")
+    _CHAIN_NAME = re.compile(r"\b(\w+)\s*=\s*$")
+
+    def frame_chains(self, source: str) -> List[Tuple[int, int, str]]:
+        def unquote(literal: str) -> str:
+            return (literal[1:-1].replace('\\"', '"').replace("\\'", "'")
+                    .replace("\\\\", "\\"))
+
+        found = []
+        for match in self._CHAIN.finditer(source or ""):
+            pieces = [unquote(m.group(0)) for m in re.finditer(self._STR, match.group(0))]
+            found.append((match.start(), match.end(), frames.join(pieces[:-1], pieces[-1])))
+        return found
     
     _GETBY_PATTERNS = (
         (re.compile(r"""(?:(?P<name>\w+)\s*=\s*)?(?:page|this\.page)\s*\.\s*getByRole\s*\(\s*(?:[\w.]*AriaRole\s*\.\s*)?(?P<role>\w+)"""), "role"),
@@ -284,6 +308,11 @@ class PlaywrightCodeEngine(CodeEngine):
     def normalize_selector(self, raw: str) -> Optional[str]:
         if not raw:
             return None
+        if frames.scoped(raw):
+            # Each hop on its own: the chain's `>>` is not CSS, but every piece is.
+            path, inner = frames.split(raw)
+            pieces = [self.normalize_selector(piece) for piece in path + [inner]]
+            return None if not all(pieces) else frames.join(pieces[:-1], pieces[-1])
         selector = raw.strip()
         if selector.startswith("Locator@"):
             selector = selector[len("Locator@"):].strip()
@@ -310,9 +339,34 @@ class PlaywrightCodeEngine(CodeEngine):
         def _unescape(sel: str) -> str:
             return sel.replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
 
+        # A locator inside an iframe, as one entry. Its hops are masked from the
+        # plain patterns below: `page.locator("#frame").contentFrame()...` would
+        # otherwise register the IFRAME as the field's locator.
+        chains = self.frame_chains(source)
+        for start, _end, raw in chains:
+            if raw in seen:
+                continue
+            seen.add(raw)
+            name = ""
+            lead = self._CHAIN_NAME.search(source[:start])
+            if lead:
+                name = lead.group(1)
+            else:
+                head = self._ACCESSOR_NAME.search(source[:start])
+                name = head.group(1) if head else ""
+            path, _inner = frames.split(raw)
+            found.append({"name": name, "raw": raw, "kind": "css", "value": "",
+                          "approx": False, "frame_path": path,
+                          "selector": self.normalize_selector(raw) or ""})
+
+        def _in_chain(position: int) -> bool:
+            return any(start <= position < end for start, end, _raw in chains)
+
         for index, pattern in enumerate(self._LOCATOR_PATTERNS):
             is_findby = index == 2
             for match in pattern.finditer(source):
+                if _in_chain(match.start("sel")):
+                    continue
                 raw = _unescape(match.group("sel"))
                 if not raw or raw in seen:
                     continue
@@ -328,11 +382,14 @@ class PlaywrightCodeEngine(CodeEngine):
                     if head:
                         name = head.group(1)
                 found.append({"name": name, "raw": raw, "kind": "css",
-                              "value": "", "approx": False,
+                              "value": "",
+                              "approx": literal_is_assembled(source, match.end(), raw),
                               "selector": self.normalize_selector(raw) or ""})
 
         for pattern, kind in self._GETBY_PATTERNS:
             for match in pattern.finditer(source):
+                if _in_chain(match.start()):
+                    continue
                 groups = match.groupdict()
                 value = groups.get("val") or groups.get("role") or ""
                 if not value:
@@ -384,6 +441,22 @@ class PlaywrightCodeEngine(CodeEngine):
     def emit_locator(self, **kwargs) -> Dict[str, str]:
         def _q(s: str) -> str:
             return '"' + (s or "").replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+        path = list(kwargs.pop("frame_path", None) or [])
+        if frames.scoped(kwargs.get("selector") or ""):
+            outer, kwargs["selector"] = frames.split(kwargs["selector"])
+            path = outer + path
+        if path:
+            # The same call, rooted in the iframe instead of the page. Options
+            # classes belong to the receiver in Java, so they move with it.
+            code = self.emit_locator(**kwargs)
+            java_root = "page" + "".join(f".frameLocator({_q(h)})" for h in path)
+            python_root = "page" + "".join(f".frame_locator({_q(h)})" for h in path)
+            return {
+                "python": python_root + code["python"][len("page"):] if code["python"] else "",
+                "java": (java_root + code["java"][len("page"):]).replace(
+                    "new Page.Get", "new FrameLocator.Get") if code["java"] else "",
+            }
 
         if "testid" in kwargs:
             return {

@@ -55,6 +55,21 @@ before the file is written:
 | `SELECTOR_FOUND` with no `visible` at all | kept, recorded as visibility-unmeasured (a pre-protocol cached run must not empty the map) |
 | `INTERACTION_HINT` whose name has a confirmed selector | kept, with the hint's selector **replaced by the confirmed one** |
 | `INTERACTION_HINT` with no confirmed selector and no `count: 1` | dropped |
+| a plan locator with no `SELECTOR_FOUND`, whose element the browser recorded being clicked (counted 1/1, its text sharing the most words with the name, no tie) | **recovered** from that click (`recover_clicked_locators`). A run clicked a page's main button with a selector copied from its prompt's example and never reported it; step 03 guessed a `button` for what was a link, and the test failed on its first locator |
+| `SELECTOR_FOUND` for a field with an `INPUT_USED`, measured by the helpers as taking no typing (`editable: false`, or a harvested `tag` other than input/textarea/select) | dropped, with the `INPUT_USED` and any `VALUE_CHECK` whose source is that input (`enforce_typed_fields`) |
+
+Unique and visible says an element exists, not that it is the one a name means.
+A run matched the plan's `amountField` to an earlier run's `amountText`, a cart's
+read-only total cell, and reported `INPUT_USED: amountField|20,000` for a value it
+had only read. Step 03 generated `fillText()` on a `<td>`.
+
+The claim itself is checked too. `qa-helpers.js` reports every value typed into
+any field as it happens, cross-origin iframes included, and `qa-page.js` writes
+each one to the evidence file as a `typed` row. A password's value is never
+recorded, only its selector. When a run recorded any typing, an `INPUT_USED` whose
+value matches none of the recorded values is dropped. The field's selector stays,
+because only the claim is wrong. A field that formats its input
+(`4111111111111111` shown as `4111 1111 1111 1111`) still counts.
 
 The hint rules exist because a hint records an element the model *interacted with*,
 including ones an interaction then failed on — an observed run hinted a profile edit
@@ -86,6 +101,84 @@ This is enforced, not requested: a verification step reported as passed with no
 in Python (`enforce_verification_evidence`). Step outcomes were the last self-report
 in this step that nothing checked.
 
+The other direction is enforced too: only a claim can be unverified. A
+`STEP_UNVERIFIED` on an action is ignored (`drop_unverified_actions`). A run clicked
+a payment-method tab and counted it after the click, when it was gone. It then wrote
+`STEP_UNVERIFIED: Select Credit Card as the payment method (locator report)`. Step 03
+kept that as a requested check, and step 04 stopped on the `defect` gate when the
+tab's guessed locator failed. The PR reported a product defect that did not exist. `page.qa.step`'s `before` option counts the control a
+step clicks before the click.
+
+A downgraded step carries `check_provenance.UNMEASURED`, and steps 03 and 05 word it
+differently from a check that was looked for and not found. The model may well have
+seen it, so it is reported as "the locator is a guess" and never as "the product did
+not do this". Both kinds still keep the assertion at full strength and still make the
+verdict NEEDS-REVIEW.
+
+### Why step 02 is fast now — preloaded helpers, Chromium, known selectors
+
+The same 11-step checkout took 15 minutes to validate on a good night and timed out
+at 30 on a slow one. The cost was never the flow. It came from four places:
+
+| Cost | Where it went | Fix |
+|------|---------------|-----|
+| Browser | The MCP server launched the machine's branded Chrome, whose renderer sat at 100% CPU for ~80s after every page load on this site. A trivial evaluate took 2-10s, and a step took 15-55s. | `--browser chromium` (`PLAYWRIGHT_MCP_BROWSER`), which is also the engine the generated tests run on. Evaluates dropped to 2-15ms. |
+| Model output | 48 of 59 tool calls were JavaScript the model typed from scratch: the same harvest, count, frame loop and recorder, over and over. That was a third of the 40k output tokens. | `shared/browser/`. `qa-helpers.js` (`window.__qa`, every frame) and `qa-page.js` (`page.qa`, loaded with `--init-page`) do the measuring. Each call is one line. |
+| Round trips | About 2.4 calls per step, plus fixed sleeps. | `page.qa.step(action, opts)`: act, wait until every frame and the network have settled, then return the harvest (every element's best stable selector, already counted) or a batch `check`, all in one call. |
+| Rediscovery | Every run started from nothing, and found some worse selectors the second time. | `known_selectors()` seeds the prompt with the newest confirmed map for the same host. Each selector is counted live again before it is reported. |
+
+The quality bar is unchanged. Every selector is still measured live at count 1 and
+visible 1 (the helpers do the same counting rule 2c always required), every iframe
+hop is still proven unique, and brief screens are still recorded in the call that
+shows them (`page.qa.record`). Driven by script with these helpers, the whole
+checkout (buy, card, promo, 3-D Secure OTP, the result screen and the redirect)
+takes about 35s of browser time.
+
+The counts are also checked, not just requested. The helpers write what they
+measure to `02-web-evidence.jsonl` as they measure it. `verify_with_evidence`
+checks every `SELECTOR_FOUND` against that file before the map is written:
+
+| Evidence for the selector | Outcome |
+|---|---|
+| a 1/1 reading | kept, counted as measured live |
+| readings, none of them 1/1 | dropped into `rejected_selectors` with the measured count |
+| none (typed outside the helpers) | kept on the model's numbers, as before |
+
+The log line `Selectors measured live by the browser helpers: N of M kept` shows how
+much still rests on the model's word: it adds how many were dropped and how many
+rest on the marker's own count. The seeded `02-known-selectors.json` is
+counted live on every page state too. The adaptation explorer uses the same
+evidence (see its CLAUDE.md).
+
+### Frames and brief screens
+
+`browser_evaluate` reaches the top document only, and every tool call costs seconds.
+Rule 2f (`CAPTURE_RULES` in `shared/mcp_config.py`, which the adaptation explorer also
+gets) covers what that misses. It measures inside a cross-origin iframe through
+`browser_run_code_unsafe` → `frame.evaluate`. It also catches a screen that closes by
+itself: one call performs the action and records every new state of every frame for
+20 seconds, measuring selectors while they are on screen. An embedded checkout run
+needed both. The bank page's amount could not be counted, and the payment result
+closed about 10s after the click, while the model's next look came 12s after it.
+
+An element inside an iframe is reported as a **chain**:
+`#checkout >> internal:control=enter-frame >> #amount`. This is the string Playwright
+itself compiles `frameLocator(...)` into and prints in failure messages, so the same
+text flows from `SELECTOR_FOUND` through codegen (the plugin renders it as
+`page.frameLocator(...).locator(...)`), the step 04 guards, the failure snapshot and
+the healing agent. `shared/frames.py` holds the format and the rule that picks each
+iframe's selector: stable attributes only, the src path and never its host, and
+no selector at all when the only choice would be positional. Every hop is checked
+unique on its own, because a count through two matching iframes reads 1 while the
+click fails. That rule is preloaded into every page the MCP browser opens
+(`--init-script`, `window.__qaLink`) and the prompts only call it: asked to paste
+it, the model retyped it without the title rule and reported a 3-D Secure page's
+fields without their iframe.
+
+A locator name the plan uses on more than one page (`amountDisplay` on a popup, a
+bank page and a success screen) is asked for as `IssuingBankPage.amountDisplay`,
+and a name reported twice keeps its first selector, never the last.
+
 ### Assertions vs mechanisms
 
 The two halves of a test are treated very differently, following the rule
@@ -99,7 +192,7 @@ trusting the model's claim about itself):
 
 | Check | Outcome |
 |-------|---------|
-| the input asked for it | **kept at full strength.** The test fails on purpose, the PR says why, and the verdict is NEEDS-REVIEW. The product does not do what was asked — that is a finding |
+| the input asked for it | **kept at full strength.** The test fails on purpose, the PR says why, and the verdict is NEEDS-REVIEW. The product does not do what was asked — that is a finding. Step 04 is told these checks and stops with the `defect` gate when one is the failure, instead of pointing its locator at some other element |
 | the pipeline invented it | **dropped entirely** — locator, accessor and assertion. A failing check nobody asked for is exactly what gets "fixed" by deleting it |
 
 Dropping is the irreversible direction, so it needs the harder test: a check is only
@@ -135,6 +228,48 @@ pair is caught too.
 This exists because none of the six per-file guards could see it: deleting an
 assertion is a one-line diff that loses no method, adds no `Thread.sleep`, and is
 invisible to `no_selector_broadening`, which only inspects `page.locator(...)` calls.
+
+A fix may not point a field at a different field either (`replacement_is_the_field`).
+A fix re-pointed `amountField` at `tr:nth-child(2) input`, guessed from the name and
+phone rows around it. That was the Email input, unique
+and editable, so every other guard passed it. The test typed the amount into
+Email, and the next attempt blamed keystroke events. When a fix changes the
+locator of something the code types into (the plugin's `TYPING_CALLS`), the
+element is looked up in the DOM saved at failure. It must be an input, textarea
+or select, and its label, row or table column header must share a word with the
+locator's name. The column header is not optional: the real amount input's row
+named only the product, and "Amount" was its column's header. The guard only
+judges a capture taken for this
+file's own failing locator; a capture of any other page decides nothing.
+
+### Values and check contracts — "matches" is decided by the page
+
+English says "validate the name matches the one we filled". That names two values and
+leaves the comparison open, and a page rarely renders a value as typed. A run failed
+on `Expected: 'User_orrju' | Actual: 'User_orrju sample_last_name'`. Step 02 had typed
+`Test User` and seen `Test User`. Step 03 generated a one-word name, and the demo
+appended a default last name. The same test also expected an invented `Rp 490.909`, and
+compared the bank page's `19000.00` with `Rp19.000` as strings. Step 02 had judged those
+two equal as numbers, in prose, and nothing kept that judgment.
+
+`shared/value_match.py` measures the relation between two texts in Python. The relations
+are `equal`, `formatting` (whitespace/case), `numeric` (`Rp20.000` = `20,000`), `phone`
+(`081…` = `+6281…`) and `words` (the expected text appears as whole words). Anything else
+is `None`: a different value, which is a finding.
+
+| Where | What happens |
+|-------|--------------|
+| **01 Parse** | Rule 4: every value the input gives for a step stays in that step of `web_steps_for_validation`, as written. Reworded to "fill the fields with dummy data", a run's address and card number never reached the browser. Rule 4c: a comparison with something earlier in the flow ("same as we passed earlier") keeps that back-reference. The plan names the earlier value and where it was typed or read. A value that was only shown gets a read-and-record step at that earlier point. That run had reworded one to "matches the expected purchase amount", and step 02 then compared the page's `Rp20.000` with itself. |
+| **02 Validate Web** | The prompt's TEST DATA block lists every `Label: value` line of the raw test case (`shared/test_case.py`), so a value reaches the browser even when step 01 reworded it away. An `Email:` or `OTP:` goes there too unless the flow logs in; only then is it a CREDENTIAL. Rule 2g: `INPUT_USED: <field>\|<typed>` for every field filled, and `VALUE_CHECK: <step>\|<element>\|<shown>\|<input:field \| element:name \| literal>\|<other side>` for every comparison. Written to `02-validate-web.json` as `inputs_used` / `value_checks`, with the relation computed in Python. The values win in both directions. A comparison whose two sides match under no relation is downgraded to unverified. One the model reported unverified is promoted to passed when its two sides do match, the element's selector was confirmed, and the expected side traces to its source: the typed value, a measured element, or a literal in the step. A run had called `08123456789` against `+628123456789` a mismatch. A `literal` whose text is not in the test case was read off the page, and is dropped (`drop_untraced_sources`). "Record the amount shown" had come back as `literal\|20,000` and been generated as `assertEquals(amount, "20,000")`. |
+| **03 Generate**, in the prompt | VALIDATED INPUTS: a typed value the test case itself states is marked GIVEN BY THE TEST CASE and becomes that field's default exactly as written. Every other field's test data keeps the typed value's shape (word count, character classes, prefix), randomised inside it. CHECK CONTRACTS: each check is asserted with exactly its measured relation, with the expected side taken from its source, never a new literal. A contract overrides the plan's `assertEquals` wording. A `numeric` contract compares both amounts as plain number text through the string equality assertion. When it said "the two parsed numbers", the model wrote `assertEquals(config, long, long, …)`, which has no overload, and the compile gate stopped the run. |
+| **03 Generate**, after codegen | An expected value (an assertion's whole string argument, or a CSV cell under an `expected*` header) that appears neither in the test case nor in anything step 02 typed, read or reported is untraced. One repair pass under `VALUE_REPAIR_MAX_DIFF_LINES` runs, and it is kept only if it removes some. Whatever remains goes in `03-generate.json` → `untraced_expected_values`. |
+| **04 Run & Fix** | A failure that is an `Expected/Actual` pair with a benign relation, pinned by its message to exactly one frozen assertion, is `VALUE_MISMATCH`. When its expected side is a string literal and the page only spaces or cases it differently, the fix is that literal, rewritten to exactly what the page shows (`literal_fix`). No sanction is given, so a comparator change is rejected: offered one, a fix wrapped both sides of a message check in `.replaceAll("\\s+", "").toLowerCase()`. Otherwise the prompt offers two fixes in order: (a) restore the data's validated shape, or (b) change **only** that assertion's comparator. `conserved(sanction=…)` accepts exactly (b): same place, same message, every compared expression and expected value still passed, no deeper condition. It is recorded as `relaxed_checks`. A frozen file without argument text (an older session) gets no sanction. |
+
+The message is the pin because the fingerprint leaves it out. Name and phone checks with
+one call shape share a fingerprint, so without it the name check's relaxation was paired
+with the untouched phone check. A relaxed check still counts toward APPROVED. The
+relation names what the product was measured to do, so it is not a weakening a human
+must sign off.
 
 ### When step 04 stops retrying
 
@@ -231,7 +366,7 @@ Web Steps:
 - `false`   — test failed after all fix attempts → ship with NEEDS-REVIEW verdict
 - `skipped` — no test could be run (infra issue) → clean exit
 - `stuck`   — the test ran and failed, and a further attempt provably could not differ (see "When step 04 stops retrying") → ship with NEEDS-REVIEW
-- `defect`  — the test ran and failed exactly as the input's documented `Actual Result` says the product misbehaves today; the loop stops instead of working around a real bug → ship with NEEDS-REVIEW. Only when step 01 found an Actual Result in the input text, and never on a compile failure
+- `defect`  — the test ran and failed exactly as the input's documented `Actual Result` says the product misbehaves today, or on a check step 02 never saw the product do; the loop stops instead of working around a real bug → ship with NEEDS-REVIEW. Never on a compile failure
 
 **.verdict**
 - `APPROVED`      — test passed, nothing the input asked for went unverified, no fix was rejected for weakening an assertion
@@ -248,11 +383,13 @@ Web Steps:
 | `00-session-init.md` | run.sh | Session metadata, env snapshot |
 | `01-parse.json` + `.md` | Parse | Generation plan |
 | `02-validate-api.json` + `.md` | Validate API | Auth status, confirmed endpoint response shapes |
-| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms` |
+| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms`, `inputs_used`, `value_checks` |
 | `claude-*.log` | Validate Web | Raw `claude -p` stream, for diagnosing empty runs |
+| `02-known-selectors.json` | Validate Web | The confirmed selectors seeded from an earlier run on the same host |
+| `02-web-evidence.jsonl` | Validate Web | What the browser helpers measured, one line per settled page state. Every `SELECTOR_FOUND` is checked against it |
 | `03-system-prompt.txt`, `04-system-prompt.txt` | Generate, Run & Fix | The static half of each prompt — conventions, references, rules — sent once as `--system-prompt-file` instead of inside every batch or attempt |
-| `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators` |
-| `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes |
+| `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators`, `untraced_expected_values` |
+| `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes, `value_mismatch` / `relaxed_checks` when a failure was triaged as one |
 | `.assertions-frozen.json` | Run & Fix | What the generated test proved before any fix — the conservation baseline |
 | `.fix-history.json` | Run & Fix | Every fix attempt, appended: diagnosis, edits proposed, guards that rejected them. Feeds the next prompt and the stop rule |
 | `.fix-passed` | Run & Fix | Gate: true / false / skipped / stuck / defect |
@@ -266,7 +403,9 @@ Web Steps:
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary | `claude` |
-| `AUTHORING_MODEL` | Claude model for all AI steps | `claude-opus-4-6` |
+| `AUTHORING_MODEL` | Claude model for all AI steps. No default in code: run.sh stops without it | required |
+| `AUTHORING_EFFORT` | Thinking effort for steps 01, 02 and 04 (`low`, `medium`, `high`, `xhigh`, `max`). Step 03 uses `GENERATE_EFFORT`, and step 02 uses `BROWSER_EFFORT` when it is set. Empty = the runner's `effortLevel` | set in `config/.env` |
+| `BROWSER_EFFORT` | Thinking effort for step 02, shared with every agent's browser-driving calls. Step 02 runs ~40 turns and pays it on each. Empty = `AUTHORING_EFFORT` | set in `config/.env` |
 | `WORKSPACE_DIR` | Parent directory containing the automation repo | required unless `FRAMEWORK_DIR` is set |
 | `FRAMEWORK_DIR` | Absolute path to the checkout, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION` | optional |
 | `GITHUB_TOKEN` | GitHub auth token for PR creation | required |
@@ -286,12 +425,15 @@ Web Steps:
 | `VALIDATE_WEB_RETRY_ATTEMPTS` | Extra full re-runs step 02 attempts on recoverable failures | `1` |
 | `HEADLESS_BROWSER` | Set `false` to watch every browser this agent starts — step 02's validation and step 04's `mvn test` run | `true` |
 | `PLAYWRIGHT_MCP_VERSION` | `@playwright/mcp` version the browser steps launch (pinned, not `latest`) | `0.0.79` |
+| `PLAYWRIGHT_MCP_BROWSER` | Browser the MCP server launches for step 02. `chrome` restores the machine's branded Chrome | `chromium` |
 | `VALIDATE_API_REQUEST_TIMEOUT_S` | Timeout (s) for each real HTTP call in Validate API | `15` |
 | `VALIDATE_API_RETRY_ON_ERROR` | Set `false` to disable the one connection-error retry in Validate API | `true` |
 | `ALLOW_MISSING_SELECTORS` | Let step 03 generate when step 02 confirmed nothing | `false` |
 | `GENERATE_COMPILE_CHECK` | Set `false` to skip step 03's `mvn test-compile` gate (a non-Maven framework plugin) | `true` |
 | `GENERATE_COMPILE_TIMEOUT_S` | Timeout (s) for that compile | `180` |
+| `GENERATE_EFFORT` | Thinking effort for step 03 codegen calls (`low`, `medium`, `high`, `xhigh`, `max`). Pinned so the run does not inherit the effortLevel in the runner's `~/.claude/settings.json` | set in `config/.env` |
 | `COMPILE_REPAIR_MAX_DIFF_LINES` | Diff budget for the compile repair pass | `60` |
+| `VALUE_REPAIR_MAX_DIFF_LINES` | Diff budget for the untraced-expected-value repair pass | `60` |
 | `FORCE` | Let a step 04 fix through even when it weakens an assertion. For a human who has read the diff — never for the loop | `false` |
 | `SLACK_BOT_TOKEN` | Slack bot token | optional |
 | `SLACK_NOTIFY_CHANNEL` | Slack channel for success notifications | optional |

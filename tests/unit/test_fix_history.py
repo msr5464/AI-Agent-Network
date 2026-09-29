@@ -131,3 +131,23 @@ class TestPersistence:
 
     def test_missing_history_is_empty(self, tmp_path):
         assert fh.load(tmp_path) == []
+
+
+class TestValueMismatches:
+    MISMATCH = {"check": "c1", "message": "Customer name should match",
+                "expected": "User_x", "actual": "User_x sample_last_name" + "!" * 200,
+                "relation": "words"}
+
+    def test_recorded_only_when_there_are_some(self):
+        assert "value_mismatches" not in fh.record(1, outcome=fh.ROLLED_BACK)
+        entry = fh.record(1, outcome=fh.ROLLED_BACK, value_mismatches=[self.MISMATCH])
+        assert entry["value_mismatches"] == [self.MISMATCH]
+
+    def test_they_round_trip_and_reach_the_next_prompt(self, tmp_path):
+        fh.append(tmp_path, fh.record(1, outcome=fh.ROLLED_BACK,
+                                      value_mismatches=[self.MISMATCH]))
+        history = fh.load(tmp_path)
+        assert history[0]["value_mismatches"][0]["relation"] == "words"
+        text = fh.render(history)
+        assert "VALUE MISMATCH on check c1" in text and "`words`" in text
+        assert "!" * 121 not in text, "page text in a prompt is capped"
