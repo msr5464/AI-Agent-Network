@@ -1236,7 +1236,7 @@ def ensure_credentials(plan: dict) -> None:
 
     try_fix_infra_credentials() below already repairs this, but only after a maven
     cycle has failed AND classify_failure() matched a credential signature. A run
-    that resumes at step 04, or whose step 03 came from TESTING_MODE cache, starts
+    that resumes at step 04, or whose plan came from the step cache, starts
     with no properties at all: getRunTimeProperty returns null, the login form is
     filled with nothing, and the failure looks like a broken locator on whatever
     page the test lands on. Writing them up front costs nothing and removes a whole
@@ -1328,9 +1328,13 @@ def main() -> None:
                 log("Re-run also FAILED — reproducible, fix attempt 1 will apply a Claude fix")
                 test_output = test_output_retry
                 failure_ctx = build_failure_context(test_class, test_method, test_output, run_started_at)
+                record_failed_locators(test_output, f"{test_class}#{test_method}", plan_data)
         else:
             log("Initial test PASSED")
         _write_gate("true" if passed else "false")
+        if passed:
+            record_proven_locators(files_written, plan_data, f"{test_class}#{test_method}",
+                                   run_started_at)
         _write_result({
             "attempt": 0,
             "test_class": test_class,
@@ -1381,10 +1385,13 @@ def main() -> None:
         log("Detected a null-credential error signature — checking the demo-credential property")
         if try_fix_infra_credentials(plan_data):
             log("Credential property written — running test")
+            run_started_at = time.time()
             passed, test_output = run_maven_test(test_class, test_method)
             if passed:
                 log("Test PASSED after credential auto-repair")
                 _write_gate("true")
+                record_proven_locators(files_written, plan_data, f"{test_class}#{test_method}",
+                                       run_started_at)
                 _write_result({
                     "attempt": FIX_ATTEMPT,
                     "test_class": test_class,
@@ -1871,6 +1878,7 @@ Output ONLY valid JSON.
     failure_ctx = {}
     if not passed:
         failure_ctx = build_failure_context(test_class, test_method, test_output, run_started_at)
+        record_failed_locators(test_output, f"{test_class}#{test_method}", plan_data)
 
     current = fix_history.record(
         FIX_ATTEMPT, root_cause, confidence, proposed, fixes_applied, fix_rejections,
@@ -1892,6 +1900,8 @@ Output ONLY valid JSON.
     if passed:
         log(f"Test PASSED after fix attempt {FIX_ATTEMPT}")
         _write_gate("true")
+        record_proven_locators(files_written, plan_data, f"{test_class}#{test_method}",
+                               run_started_at)
     elif stuck_on_same_failure:
         log(f"Test still FAILED after fix attempt {FIX_ATTEMPT} — at the EXACT SAME location "
             f"as before the fix ({prev_failure_location}). The applied fix had no effect on "
@@ -1964,6 +1974,119 @@ def _stop_no_progress(current: dict, history: list, result: dict,
 
 def _write_gate(value: str) -> None:
     (AUDIT_DIR / ".fix-passed").write_text(value)
+
+
+def record_failed_locators(test_output: str, test: str, plan: dict) -> list:
+    """Add the step 02 locator a failing run of the generated test was on to
+    `04-failed-locators.json`. Returns the names added.
+
+    A step 02 restored from the step cache hands step 03 the same selectors every
+    run, and only a passing run's proof ever corrected it: a selector a test failed
+    on was restored again and again. run.sh keeps this file in the cache when the
+    run ends red, and the next run validates step 02 again rather than restoring
+    it (shared/proven_locators.py). Only a step 02 selector counts, as step 02 gave
+    it: a locator step 03 inferred, or one a fix has since changed, is not one the
+    cache hands out. Every failing run is read, not only the first: a fix that
+    gets past one failure can reach an element the test never got to before.
+    """
+    from shared import failure_identity, proven_locators
+    from shared.page_identity import normalize_selector
+
+    failure = failure_identity.identify(test_output)
+    if not failure.get("available"):
+        return []
+    try:
+        step02 = json.loads((AUDIT_DIR / "02-validate-web.json").read_text()).get("selectors") or {}
+    except (OSError, ValueError):
+        return []
+    norm = lambda s: normalize_selector(s or "") or (s or "").strip()
+    path = AUDIT_DIR / proven_locators.FAILED_FILE
+    recorded = proven_locators.selectors(path)
+    names = [n for n, s in step02.items()
+             if s and norm(s) == norm(failure["selector"]) and n not in recorded]
+    if not names:
+        return []
+    try:
+        earlier = json.loads(path.read_text()).get("locators") or []
+    except (OSError, ValueError):
+        earlier = []
+    path.write_text(json.dumps({
+        "status": "failed", "test": test,
+        "failed_at": datetime.now().isoformat(timespec="seconds"),
+        "web_base_url": plan.get("web_base_url") or "",
+        "input_file": Path(plan.get("_input_file") or "").name,
+        "feature_name": plan.get("feature_name") or "",
+        "locators": earlier + [{"name": n, "selector": step02[n],
+                                "element": failure.get("element", "")} for n in names]},
+        indent=2))
+    log(f"Failed locator from step 02: {', '.join(names)} — if the run ends red, the "
+        f"next run validates step 02 again instead of restoring it from the step cache")
+    return names
+
+
+def record_proven_locators(files_written: list, plan: dict, test: str,
+                           run_started_at: float) -> list:
+    """Write the locators this passing run proved to `04-proven-locators.json`.
+
+    Step 02 is seeded from earlier runs, and only ever saw what step 02 had
+    confirmed: a locator step 04 fixed on the way to green was never seeded, and a
+    wrong step 02 selector it replaced kept being. The framework already records
+    the proof. On every page load of a test that finishes it writes a baseline per
+    page object, with how many elements each locator matched (`coverage`) and what
+    the element was (`fingerprints`). Joined with the final page-object source,
+    which holds every accepted fix, that is: this selector matched exactly one
+    visible element while the test passed.
+
+    Only a baseline written by this run counts. An element not on screen when its
+    page object loaded reads 0 and stays unproven; step 02's own confirmation still
+    covers it. The file carries its site, test case and module, and names in step
+    02's form, so the cache copy run.sh keeps can be read without the session.
+    Returns the proven entries.
+    """
+    from shared import baseline as baseline_store, proven_locators
+    from shared.frameworks import get_active_plugin
+    from shared.page_identity import is_alternatives, qualified_locator_names
+
+    folder = baseline_store.repo_directory(AUTOMATION_FRAMEWORK_DIR)
+    pages = {p.get("class_name") for p in plan.get("web_pages") or [] if p.get("class_name")}
+    if folder is None or not pages:
+        return []
+    qualified = set(qualified_locator_names(plan.get("web_pages") or []))
+    started = datetime.fromtimestamp(run_started_at).replace(microsecond=0)
+    code = get_active_plugin().code
+    proven = []
+    for rel in files_written:
+        page = Path(rel).stem
+        path = AUTOMATION_FRAMEWORK_DIR / rel
+        if page not in pages or not path.is_file():
+            continue
+        base = baseline_store.load(page, preserved=str(folder),
+                                   module=plan.get("feature_name") or "")
+        try:
+            recorded = datetime.fromisoformat(base.get("recorded_at") or "")
+        except ValueError:
+            continue
+        if not base.get("available") or recorded < started:
+            continue          # no baseline from this run: nothing it can prove
+        coverage, prints = base.get("coverage") or {}, base.get("fingerprints") or {}
+        for loc in code.extract_locators(path.read_text()):
+            field, selector = loc.get("name"), loc.get("raw") or ""
+            if (not field or loc.get("approx") or not selector or is_alternatives(selector)
+                    or coverage.get(field) != 1
+                    or (prints.get(field) or {}).get("is_visible") is False):
+                continue
+            proven.append({"page": page, "field": field, "selector": selector,
+                           "name": f"{page}.{field}" if f"{page}.{field}" in qualified
+                           else field})
+    (AUDIT_DIR / proven_locators.FILE).write_text(json.dumps({
+        "status": "ok", "test": test, "passed_at": datetime.now().isoformat(timespec="seconds"),
+        "web_base_url": plan.get("web_base_url") or "",
+        "input_file": Path(plan.get("_input_file") or "").name,
+        "feature_name": plan.get("feature_name") or "",
+        "locators": proven}, indent=2))
+    log(f"Proven locators: {len(proven)} — each matched one visible element while this "
+        f"run passed; later runs of step 02 are seeded with them first")
+    return proven
 
 
 # What the NEXT attempt needs and cannot re-derive: where the test failed, what it

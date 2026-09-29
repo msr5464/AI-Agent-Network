@@ -15,7 +15,7 @@ set -Eeuo pipefail
 #
 # Unlike healing, the expensive step here is exploration, not the edit. So this
 # supports resume (a 30-minute browser run must never be re-paid to retry an
-# edit) and caches steps 01-03 under TESTING_MODE.
+# edit) and caches steps 01-03 under CACHE_STEPS.
 # ─────────────────────────────────────────────────────────────────────────────
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,15 +45,15 @@ mkdir -p "$PROCESSED_DIR"
 
 START_FROM_STEP="${START_FROM_STEP:-1}"
 EXPLORE_ONLY="${EXPLORE_ONLY:-false}"
-TESTING_MODE="${TESTING_MODE:-false}"
+CACHE_STEPS="${CACHE_STEPS:-true}"
 
-# ── Testing-mode cache ────────────────────────────────────────────────────────
+# ── Step cache ────────────────────────────────────────────────────────────────
 # Steps 01-03 are the expensive, non-deterministic half. Developing step 04
 # against a cached exploration costs no browser time and no model calls.
 # Both halves of a step's output move together. Caching only the .json left a
 # restored session with no report to read, so the History detail view showed a
-# run that had apparently produced nothing — and TESTING_MODE is on in
-# config/.env, so that was every run on this machine.
+# run that had apparently produced nothing — and CACHE_STEPS is on by
+# default, so that was every repeated run.
 # A hit also needs the note it was cached from to match INPUT_FILE byte for byte —
 # content, not mtime; see test-authoring-agent/run.sh for why.
 # A resume never takes a cache hit. Retrying a step means running it again, and
@@ -64,18 +64,20 @@ TESTING_MODE="${TESTING_MODE:-false}"
 # bump would restore a plan whose kinds mean something else now, and an
 # exploration that was never asked about the tests' checks.
 CACHE_VERSION=2
-_cache_hit()     { [[ "$TESTING_MODE" == "true" ]] && [[ "$START_FROM_STEP" -le 1 ]] \
+_cache_hit()     { [[ "$CACHE_STEPS" == "true" ]] && [[ "$START_FROM_STEP" -le 1 ]] \
                      && [[ -f "$CACHE_DIR/$1" ]] \
                      && [[ "$(cat "$CACHE_DIR/$1.version" 2>/dev/null)" == "$CACHE_VERSION" ]] \
                      && [[ -f "$CACHE_DIR/$1.input" ]] && cmp -s "$CACHE_DIR/$1.input" "$INPUT_FILE"; }
 _cache_restore() {
+  # Belongs to the step being restored, not to the one still holding its ✓ back.
+  flush_step_done
   cp "$CACHE_DIR/$1" "$AUDIT_DIR/$1"
   local md="${1%.json}.md"
   [[ -f "$CACHE_DIR/$md" ]] && cp "$CACHE_DIR/$md" "$AUDIT_DIR/$md"
-  log "TESTING_MODE: restored $1 from cache"
+  log "Step cache: restored $1"
 }
 _cache_save() {
-  [[ "$TESTING_MODE" == "true" ]] || return 0
+  [[ "$CACHE_STEPS" == "true" ]] || return 0
   [[ -f "$AUDIT_DIR/$1" ]] || return 0
   # Never cache a step that produced nothing. A skipped exploration was cached
   # once and then restored on every later run of the same note — including the
@@ -96,6 +98,15 @@ sys.exit(1 if (str(d.get("status", "")).lower() in ("skipped", "failed", "unsafe
   local md="${1%.json}.md"
   [[ -f "$AUDIT_DIR/$md" ]] && cp "$AUDIT_DIR/$md" "$CACHE_DIR/$md"
   return 0
+}
+# _cache_skipped <step_key> <label>  → closes a restored step as run_step closes one
+# that ran, as authoring's run.sh does: a ✓ line and a skipped stage. Without them a
+# restored step had no line of its own and no stage in the session's metrics.
+_cache_skipped() {
+  log "✓ $2 — skipped (step cache hit)"
+  STEP_NAMES+=("$2")
+  STEP_DURATIONS+=(0)
+  record_stage "$1" "$2" "${#STEP_NAMES[@]}" 0 0 0 true
 }
 
 # ── Mode resolution ───────────────────────────────────────────────────────────
@@ -236,6 +247,7 @@ trap 'on_error $LINENO' ERR
 if [[ "$START_FROM_STEP" -le 1 ]]; then
   if _cache_hit "01-parse-change.json"; then
     _cache_restore "01-parse-change.json"
+    _cache_skipped parse_change "[01/05] Parse Change"
   else
     run_step "[01/05] Parse Change" "python3 '$AGENT_DIR/actions/01_parse_change.py'" parse_change
     _cache_save "01-parse-change.json"
@@ -257,6 +269,7 @@ if [[ "$START_FROM_STEP" -le 3 ]]; then
     _cache_restore "03-explore.json"
     _cache_hit "03-explore-api.json" && _cache_restore "03-explore-api.json"
     _cache_hit "03-explore-web.json" && _cache_restore "03-explore-web.json"
+    _cache_skipped explore "[03/05] Explore"
   else
     run_step "[03/05] Explore" \
       "python3 '$AGENT_DIR/actions/03_explore_api.py' && python3 '$AGENT_DIR/actions/03_explore_web.py' && python3 '$AGENT_DIR/actions/03_combine_explore.py'" explore

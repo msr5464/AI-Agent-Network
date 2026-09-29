@@ -235,7 +235,7 @@ agents at once without seeing or disturbing each other's work.
   routes are default-deny (`@owns_session`). The server binds `127.0.0.1` by
   default; if it must listen elsewhere, set `QA_AGENT_PROXY_SECRET` in both repos
   so identity headers are only trusted from the Studio proxy.
-- **Per-user state.** `.txt` queues and `TESTING_MODE` caches are per user:
+- **Per-user state.** `.txt` queues and `CACHE_STEPS` caches are per user:
   `queue/<user-id>/` and `cache/<user-id>/<module>/`. The CLI and anonymous
   identities (`cli`, `default`) use the queue root. Healing's `.json` queue is
   global. Each healing run gets its own CDP port for repair mode (`repairPort`).
@@ -347,7 +347,7 @@ A variable already exported in the calling shell always wins over every `.env`
 file, so you can override for a single run:
 ```bash
 AUTO_PUSH=false ./scripts/run-healing-agent.sh
-TESTING_MODE=true ./scripts/run-authoring-agent.sh payments
+CACHE_STEPS=false ./scripts/run-authoring-agent.sh payments
 ```
 
 ---

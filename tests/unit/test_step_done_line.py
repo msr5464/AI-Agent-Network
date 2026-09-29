@@ -81,7 +81,7 @@ def test_a_direct_done_marker_flushes_the_pending_one(tmp_path):
     script.write_text(
         f'source "{REPO_ROOT}/shared/session.sh"\n'
         'run_step "[01/05] Parse" "true"\n'
-        'log "✓ [02/05] Validate Web — skipped (TESTING_MODE cache hit)"\n'
+        'log "✓ [02/05] Validate Web — skipped (step cache hit)"\n'
     )
     out = subprocess.run(["bash", str(script)], capture_output=True, text=True,
                          env={"PATH": "/usr/bin:/bin", "AUDIT_DIR": ""}).stdout

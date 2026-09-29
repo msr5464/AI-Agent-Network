@@ -114,7 +114,7 @@ def credentials_from_plan(plan: dict, input_file: str = "") -> dict:
 
     01_parse fills demo_credentials, but a plan can reach a later step without
     them: one Claude returned without them, or — the case that bit us — a
-    TESTING_MODE-cached plan written before this extractor understood
+    plan restored from the step cache, written before this extractor understood
     `username=foo`. Every step that needs credentials reads them through here,
     so a run whose input file has them never writes an empty
     {feature}.username property or reports them missing.

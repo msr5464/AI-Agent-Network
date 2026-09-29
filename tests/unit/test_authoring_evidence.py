@@ -203,6 +203,137 @@ class TestStepO3Scan:
         assert mod.unusable_locators('page.locator("button[type=\'submit\']")') == []
 
 
+class TestPreferProven:
+    """A passing test's locator is kept over a different one the model reported
+    for the same name, when this run counted it at one visible element."""
+
+    WANTED = ["amountField", "buyButton", "CartPage.total", "ResultPage.total"]
+
+    def _run(self, mod, found, proven, rows):
+        counts = {n: 1 for n in found}
+        visibles = dict(counts)
+        changed = mod.prefer_proven(found, counts, visibles, rows, proven, self.WANTED)
+        return found, changed
+
+    def test_the_proven_selector_replaces_the_reported_one(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        found, changed = self._run(mod, {"amountField": "div.cart input.amt"},
+                                   {"amountField": "input.amt"},
+                                   [{"known": [{"selector": "input.amt", "total": 1, "visible": 1}]}])
+        assert found == {"amountField": "input.amt"}
+        assert changed == [{"name": "amountField", "reported": "div.cart input.amt",
+                            "proven": "input.amt"}]
+
+    def test_a_name_never_reported_is_filled(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        found, _ = self._run(mod, {"CartPage.total": ".total"},
+                             {"CartPage.total": ".total", "ResultPage.total": ".total"},
+                             [{"checks": {".total": {"total": 1, "visible": 1}}}])
+        assert found == {"CartPage.total": ".total", "ResultPage.total": ".total"}
+
+    @pytest.mark.parametrize("readings", [
+        [], [{"known": [{"selector": "a.buy", "total": 2, "visible": 2}]}],
+        [{"known": [{"selector": "a.buy", "total": 1, "visible": 0}]}]])
+    def test_a_proven_selector_not_counted_1_1_here_is_not_used(self, tmp_path, monkeypatch,
+                                                                readings):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        found, changed = self._run(mod, {"buyButton": "button.buy"}, {"buyButton": "a.buy"},
+                                   readings)
+        assert found == {"buyButton": "button.buy"} and changed == []
+
+    def test_a_name_this_plan_does_not_ask_for_is_ignored(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        found, _ = self._run(mod, {}, {"otherField": "#x"},
+                             [{"known": [{"selector": "#x", "total": 1, "visible": 1}]}])
+        assert found == {}
+
+    def _proven_file(self, root, **overrides):
+        d = root / "cache" / "user-a" / "checkout"
+        d.mkdir(parents=True)
+        data = {"web_base_url": "https://shop.test/", "input_file": "checkout.txt",
+                "locators": [{"name": "buyButton", "selector": "a.buy"}], **overrides}
+        (d / "04-proven-locators.json").write_text(json.dumps(data))
+
+    @pytest.mark.parametrize("overrides,expected", [
+        ({}, {"buyButton": "a.buy"}),
+        ({"input_file": "login.txt"}, {}),
+        ({"web_base_url": "https://other.test/"}, {}),
+    ], ids=["this-test-case", "another-test-case", "another-site"])
+    def test_only_this_test_cases_proof_is_read(self, tmp_path, monkeypatch, overrides, expected):
+        mod = _load_action("02_validate_web.py", tmp_path / "audit", monkeypatch)
+        monkeypatch.setattr(mod, "AGENT_DIR", tmp_path)
+        monkeypatch.setenv("USER_ID", "user-a")
+        monkeypatch.setenv("MODULE", "checkout")
+        self._proven_file(tmp_path, **overrides)
+        plan = {"web_base_url": "https://shop.test/", "_input_file": "/q/user-a/checkout.txt"}
+        assert mod.proven_for_test_case(plan) == expected
+
+
+class TestFailedLocators:
+    """A reproducible failure on a step 02 selector is recorded for the step cache."""
+
+    OUTPUT = ("[ERROR] Failed to click on element 'Close button' with locator: "
+              "Locator@#frame >> internal:control=enter-frame >> div.close: Error {\n")
+
+    def _record(self, tmp_path, monkeypatch, output, selectors):
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        (tmp_path / "02-validate-web.json").write_text(json.dumps({"selectors": selectors}))
+        plan = {"web_base_url": "https://shop.test/", "_input_file": "/q/checkout.txt",
+                "feature_name": "shop"}
+        return mod.record_failed_locators(output, "ShopWebTest#buy", plan)
+
+    def test_the_failing_step_02_selector_is_recorded(self, tmp_path, monkeypatch):
+        names = self._record(tmp_path, monkeypatch, self.OUTPUT,
+                             {"closeButton": "#frame >> internal:control=enter-frame >> div.close",
+                              "buyButton": "a.buy"})
+        assert names == ["closeButton"]
+        data = json.loads((tmp_path / "04-failed-locators.json").read_text())
+        assert (data["input_file"], data["locators"][0]["element"]) == ("checkout.txt",
+                                                                        "Close button")
+
+    def test_a_later_failing_run_adds_to_what_was_recorded(self, tmp_path, monkeypatch):
+        """A fix got past the first failure and reached another step 02 element."""
+        selectors = {"closeButton": "#frame >> internal:control=enter-frame >> div.close",
+                     "buyButton": "a.buy"}
+        self._record(tmp_path, monkeypatch, self.OUTPUT, selectors)
+        later = "Failed to click on element 'Buy' with locator: Locator@a.buy: Error {\n"
+        assert self._record(tmp_path, monkeypatch, later, selectors) == ["buyButton"]
+        assert self._record(tmp_path, monkeypatch, later, selectors) == []
+        data = json.loads((tmp_path / "04-failed-locators.json").read_text())
+        assert [e["name"] for e in data["locators"]] == ["closeButton", "buyButton"]
+
+    def test_a_locator_step_02_never_gave_is_not_recorded(self, tmp_path, monkeypatch):
+        assert self._record(tmp_path, monkeypatch, self.OUTPUT, {"buyButton": "a.buy"}) == []
+        assert not (tmp_path / "04-failed-locators.json").exists()
+
+    def test_a_failure_that_names_no_locator_is_not_recorded(self, tmp_path, monkeypatch):
+        output = "✘ FAIL: total | Expected: '10' | Actual: '12'"
+        assert self._record(tmp_path, monkeypatch, output, {"buyButton": "a.buy"}) == []
+
+
+class TestPlanFiles:
+    """The API enum has one entry per endpoint: a web test with none is not asked
+    for one, since a model that declines to invent it aborted the whole step."""
+
+    def _files(self, mod, test_type, endpoints):
+        plan = {"web_pages": [{"class_name": "CartPage"}], "api_endpoints": endpoints}
+        return mod._plan_files(plan, test_type, False, "", "", "Shop", "shop")
+
+    def test_a_web_test_without_endpoints_gets_no_api_enum(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        files = self._files(mod, "web", [])
+        assert not any(f.endswith("ShopApi.java") for f in files)
+        assert "src/main/java/automation/modules/shop/web/CartPage.java" in files
+
+    @pytest.mark.parametrize("test_type,endpoints", [
+        ("api", []), ("both", []), ("web", [{"name": "GET_CART"}])])
+    def test_an_api_test_or_one_with_endpoints_still_gets_it(self, tmp_path, monkeypatch,
+                                                             test_type, endpoints):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        assert "src/main/java/automation/modules/shop/api/ShopApi.java" in self._files(
+            mod, test_type, endpoints)
+
+
 class TestFixResponseShapes:
     def test_targeted_edits_are_preferred_and_grouped_per_file(self, tmp_path, monkeypatch):
         mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
@@ -1715,34 +1846,147 @@ class TestRetryAfterTimeout:
 
 
 class TestKnownSelectors:
-    """A retry used to rediscover all 19 selectors an earlier run had confirmed."""
+    """Seeds merge every earlier run on the site. Taken from one run, whatever an
+    older run confirmed and that run did not report was lost, and step 03 guessed it."""
 
-    def _run(self, root, name, host, selectors, status="ok", final=True, age=0):
+    PLAN = {"web_base_url": "https://shop.test", "feature_name": "shop",
+            "_input_file": "/queue/another-user/checkout.txt"}
+
+    def _run(self, root, name, selectors, host="shop.test", status="ok", final=True,
+             age=0, test_case="checkout.txt", module="shop", log=""):
         import os, time
         d = root / name
         d.mkdir(parents=True)
-        (d / "01-parse.json").write_text(json.dumps({"web_base_url": f"https://{host}/"}))
+        (d / "01-parse.json").write_text(json.dumps({
+            "web_base_url": f"https://{host}/", "feature_name": module,
+            "_input_file": f"/queue/some-user/{test_case}"}))
         f = d / "02-validate-web.json"
         f.write_text(json.dumps({"selectors": selectors, "status": status,
                                  "final_attempt": final}))
+        if log:
+            (d / "stdout.log").write_text(log)
         stamp = time.time() - age
         os.utime(f, (stamp, stamp))
 
-    def test_the_newest_finished_run_on_the_same_site_wins(self, tmp_path, monkeypatch):
+    def _known(self, mod, root, plan=None):
+        sessions, entries = mod.known_selectors(plan or self.PLAN, roots=[root])
+        return sessions, [(e["name"], e["selector"]) for e in entries]
+
+    def test_every_run_on_the_site_contributes_newest_first(self, tmp_path, monkeypatch):
         mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
         root = tmp_path / "audit"
-        self._run(root, "old-ok", "demo.midtrans.com", {"a": "#old"}, age=300)
-        self._run(root, "new-ok", "demo.midtrans.com", {"a": "#new"}, age=200)
-        self._run(root, "newest-timeout", "demo.midtrans.com", {"a": "#partial"},
-                  status="timeout", final=False, age=10)
-        self._run(root, "other-site", "www.saucedemo.com", {"a": "#other"}, age=0)
-        assert mod.known_selectors({"web_base_url": "https://demo.midtrans.com"},
-                                   roots=[root]) == ("new-ok", {"a": "#new"})
+        self._run(root, "old", {"buy": "a.buy", "total": "#total"}, age=300)
+        self._run(root, "new", {"pay": "#pay"}, age=100)
+        self._run(root, "unfinished", {"otp": "#otp"}, status="timeout", final=False, age=50)
+        self._run(root, "other-site", {"x": "#x"}, host="elsewhere.test", age=0)
+        assert self._known(mod, root) == (
+            ["unfinished", "new", "old"],
+            [("otp", "#otp"), ("pay", "#pay"), ("buy", "a.buy"), ("total", "#total")]), (
+            "each selector was measured 1/1 on its own, so an unfinished run counts")
+
+    def test_this_test_case_comes_first_then_this_module(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        root = tmp_path / "audit"
+        self._run(root, "own", {"buy": "a.buy"}, age=300)
+        self._run(root, "module", {"cart": "#cart"}, test_case="refund.txt", age=100)
+        self._run(root, "other", {"login": "#login"}, test_case="login.txt",
+                  module="auth", age=10)
+        assert self._known(mod, root)[1] == [("buy", "a.buy"), ("cart", "#cart"),
+                                             ("login", "#login")]
+        monkeypatch.setattr(mod, "KNOWN_LIMIT", 2)
+        assert self._known(mod, root)[1] == [("buy", "a.buy"), ("cart", "#cart")], (
+            "the cap cuts the unrelated flow, never this one")
+
+    def test_one_entry_per_selector_under_the_first_runs_name(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        root = tmp_path / "audit"
+        self._run(root, "own", {"amountText": ".amount"}, age=300)
+        self._run(root, "other", {"totalLabel": ".amount"}, test_case="refund.txt",
+                  module="billing", age=10)
+        assert self._known(mod, root)[1] == [("amountText", ".amount")]
+
+    def test_two_per_name_the_first_and_the_newest_other(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        root = tmp_path / "audit"
+        self._run(root, "own-old", {"buy": "a.old"}, age=300)
+        self._run(root, "own-mid", {"buy": "a.mid"}, age=200)
+        self._run(root, "other-new", {"buy": "a.new"}, test_case="login.txt",
+                  module="auth", age=10)
+        assert self._known(mod, root)[1] == [("buy", "a.mid"), ("buy", "a.new")], (
+            "older runs of this test case cannot push out the newest confirmation")
+
+    def test_page_prefixed_names_are_separate(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        root = tmp_path / "audit"
+        self._run(root, "own", {"BankPage.amount": "#txn", "SuccessPage.amount": ".headline",
+                                "PopupPage.amount": ".header"})
+        assert len(self._known(mod, root)[1]) == 3
+
+    @pytest.mark.parametrize("log", [
+        "[07:35:14] Step cache: restored 02-validate-web.json (x)",
+        "[07:35:14] TESTING_MODE: restored 02-validate-web.json from cache (x)",
+    ], ids=["current", "before-rename"])
+    def test_the_current_and_a_cache_restored_session_are_skipped(self, tmp_path, monkeypatch,
+                                                                 log):
+        root = tmp_path / "audit"
+        mod = _load_action("02_validate_web.py", root / "current", monkeypatch)
+        self._run(root, "current", {"mine": "#mine"})
+        self._run(root, "restored", {"stale": "#stale"}, age=0, log=log)
+        self._run(root, "real", {"buy": "a.buy"}, age=500)
+        assert self._known(mod, root) == (["real"], [("buy", "a.buy")])
 
     def test_nothing_known_is_nothing(self, tmp_path, monkeypatch):
         mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
-        assert mod.known_selectors({"web_base_url": "https://x.test"}, roots=[tmp_path]) == ("", {})
-        assert mod.known_selectors({}, roots=[tmp_path]) == ("", {})
+        assert mod.known_selectors({"web_base_url": "https://x.test"}, roots=[tmp_path]) == ([], [])
+        assert mod.known_selectors({}, roots=[tmp_path]) == ([], [])
+
+    def _proven(self, root, name, locators, host="shop.test", age=0,
+                test_case="checkout.txt", module="shop"):
+        import os, time
+        d = root / name
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / "04-proven-locators.json"
+        f.write_text(json.dumps({
+            "status": "ok", "web_base_url": f"https://{host}/", "input_file": test_case,
+            "feature_name": module,
+            "locators": [{"name": n, "selector": s} for n, s in locators.items()]}))
+        stamp = time.time() - age
+        os.utime(f, (stamp, stamp))
+
+    def test_a_step_04_replacement_drops_the_replaced_selector(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        root = tmp_path / "audit"
+        self._run(root, "run", {"buyNowButton": "button.guess", "total": "#total"}, age=100)
+        self._proven(root, "run", {"buyNowButton": "a.buy"}, age=50)
+        _, entries = mod.known_selectors(self.PLAN, roots=[root])
+        assert [(e["name"], e["selector"], e["proven"]) for e in entries] == [
+            ("buyNowButton", "a.buy", True), ("total", "#total", False)]
+
+    def test_a_proven_selector_takes_the_first_place(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        root = tmp_path / "audit"
+        self._run(root, "newer", {"buy": "a.new"}, age=10)
+        self._proven(root, "older", {"buy": "a.proven"}, age=300)
+        self._run(root, "oldest", {"buy": "a.oldest"}, age=500)
+        _, entries = mod.known_selectors(self.PLAN, roots=[root])
+        assert {(e["selector"], e["proven"]) for e in entries} == {
+            ("a.proven", True), ("a.new", False)}, (
+            "the proven one and the newest other one; the third is skipped")
+
+    def test_a_cache_folder_with_only_a_proven_file_is_read(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        root = tmp_path / "cache"
+        self._proven(root / "user", "checkout", {"buy": "a.buy"})
+        self._proven(root / "user", "elsewhere", {"x": "#x"}, host="other.test")
+        assert self._known(mod, root) == (["checkout"], [("buy", "a.buy")]), (
+            "site and test case come from the file itself; another site is ignored")
+
+    def test_a_list_of_alternatives_is_never_seeded(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path / "current", monkeypatch)
+        root = tmp_path / "audit"
+        self._run(root, "run", {"buy": "button.buy, a.buy", "total": "#total"})
+        self._proven(root, "proven", {"pay": "button.pay, a.pay"})
+        assert self._known(mod, root)[1] == [("total", "#total")]
 
 
 def test_an_unverified_action_is_not_a_check(tmp_path, monkeypatch):
@@ -2004,3 +2248,81 @@ def test_a_clicked_locator_nobody_reported_is_confirmed_from_the_click(tmp_path,
         "two shared words beat the one `now` shares with 'Pay now'")
     assert "continueButton" not in found, "a click whose text does not name it is not it"
     assert "detailsIcon" not in found, "a click on an element that was not unique confirms nothing"
+
+
+class TestProvenLocators:
+    """Step 04 fixed a locator on the way to a passing test, and later runs never saw
+    it: seeding read only step 02's map. The framework's baselines from the passing
+    run say which locators matched one visible element while it passed."""
+
+    REL = "src/main/java/automation/modules/shop/web/LandingPage.java"
+    PAGE = ("public class LandingPage extends BasePage {\n"
+            "    private final Locator buyNowButton;\n    private final Locator thankYou;\n"
+            "    private final Locator rows;\n    private final Locator either;\n"
+            "    public LandingPage(Config config) {\n        super(config);\n"
+            "        buyNowButton = page.locator(\"a:has-text('Buy Now')\");\n"
+            "        thankYou = page.locator(\"div.thanks\");\n"
+            "        rows = page.locator(\"tr.row\");\n"
+            "        either = page.locator(\"button.x, a.x\");\n    }\n}\n")
+    PLAN = {"web_base_url": "https://shop.test/", "_input_file": "/queue/u/checkout.txt",
+            "feature_name": "shop",
+            "web_pages": [{"class_name": "LandingPage", "locators_needed": ["buyNowButton"]}]}
+
+    def _setup(self, tmp_path, monkeypatch, recorded_at):
+        fw = tmp_path / "fw"
+        (fw / self.REL).parent.mkdir(parents=True)
+        (fw / self.REL).write_text(self.PAGE)
+        base = fw / "src/main/resources/baselines/shop"
+        base.mkdir(parents=True)
+        (base / "LandingPage.json").write_text(json.dumps({
+            "pageObject": "LandingPage", "recordedAt": recorded_at,
+            "coverage": {"buyNowButton": 1, "thankYou": 0, "rows": 3, "either": 1},
+            "fingerprints": {"buyNowButton": {"is_visible": True},
+                             "either": {"is_visible": True}}}))
+        (tmp_path / "audit").mkdir()
+        return _load_action("04_run_and_fix.py", tmp_path / "audit", monkeypatch,
+                            workspace=tmp_path)
+
+    def test_only_what_matched_one_visible_element_in_this_run(self, tmp_path, monkeypatch):
+        import time
+        from datetime import datetime
+        mod = self._setup(tmp_path, monkeypatch, datetime.now().isoformat(timespec="seconds"))
+        proven = mod.record_proven_locators([self.REL], self.PLAN, "LandingTest#buy",
+                                            time.time() - 5)
+        assert [(p["name"], p["selector"]) for p in proven] == [
+            ("buyNowButton", "a:has-text('Buy Now')")], (
+            "0 matches, 3 matches and a list of alternatives prove nothing")
+        data = json.loads((tmp_path / "audit" / "04-proven-locators.json").read_text())
+        assert (data["web_base_url"], data["input_file"], data["feature_name"]) == (
+            "https://shop.test/", "checkout.txt", "shop"), "readable without the session"
+
+    def test_names_follow_step_02s_qualified_form(self, tmp_path, monkeypatch):
+        import time
+        from datetime import datetime
+        mod = self._setup(tmp_path, monkeypatch, datetime.now().isoformat(timespec="seconds"))
+        plan = {**self.PLAN, "web_pages": [
+            {"class_name": "LandingPage", "locators_needed": ["buyNowButton"]},
+            {"class_name": "OtherPage", "locators_needed": ["buyNowButton"]}]}
+        proven = mod.record_proven_locators([self.REL], plan, "t", time.time() - 5)
+        assert [p["name"] for p in proven] == ["LandingPage.buyNowButton"]
+
+    def test_a_baseline_from_before_this_run_proves_nothing(self, tmp_path, monkeypatch):
+        import time
+        mod = self._setup(tmp_path, monkeypatch, "2020-01-01T00:00:00")
+        assert mod.record_proven_locators([self.REL], self.PLAN, "t", time.time()) == []
+
+
+def test_an_either_or_selector_is_dropped_and_the_click_refills_it(tmp_path, monkeypatch):
+    """`button:has-text("Buy Now"), a:has-text("Buy Now")` counted 1 because only the
+    link matched, and named neither."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    found, counts, visibles, rejected = mod.parse_selector_output(
+        'SELECTOR_FOUND: buyNowButton=button:has-text("Buy Now"), a:has-text("Buy Now")'
+        "|count=1|visible=1\nSELECTOR_FOUND: total=td.total|count=1|visible=1")
+    assert found == {"total": "td.total"} and "alternatives" in rejected["buyNowButton"]
+    rows = [{"clicked": {"sel": "a.btn.buy", "total": 1, "visible": 1, "text": "BUY NOW"}}]
+    assert mod.recover_clicked_locators(found, counts, visibles, rows, ["buyNowButton"]) == [
+        "buyNowButton"] and found["buyNowButton"] == "a.btn.buy"
+    hints = [{"type": "button", "name": "payButton", "selector": "button.pay, a.pay",
+              "text": "Pay", "count": 1}]
+    assert mod.reconcile_hints(hints, found) == [], "an unconfirmed either/or hint is dropped"

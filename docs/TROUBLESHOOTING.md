@@ -96,7 +96,7 @@ live in `queue/<user-id>/`, not the queue root the CLI reads.)
 
 ### Generated tests fail in step 04
 
-1. **Iterate with `TESTING_MODE=true`** — steps 01–02 are restored from cache, so
+1. **Iterate with `CACHE_STEPS=true`** (the default) — steps 01–02 are restored from cache, so
    each run goes straight to Generate.
 2. **Raise `AUTHORING_FIX_RETRY_COUNT`** — only helps while attempts are still
    exploring: the loop stops early once an attempt can bring nothing new (no

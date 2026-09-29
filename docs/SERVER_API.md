@@ -263,8 +263,9 @@ GET /agents/<agent>/sessions/<session_id>/events   → {"events": [ … ]}
 POST /agents/<agent>/run/<session_id>/cancel
 ```
 → `{"status": "cancelling", "session_id": "…"}`. Sends SIGTERM to the run's
-process group and escalates to SIGKILL after a grace period; the session ends
-`cancelled`. 404 if not running, 409 if the session belongs to another agent.
+process group and escalates to SIGKILL after a grace period, together with the
+process groups its steps started (each `claude -p` runs in a session of its own);
+the session ends `cancelled`. 404 if not running, 409 if the session belongs to another agent.
 
 ### History
 

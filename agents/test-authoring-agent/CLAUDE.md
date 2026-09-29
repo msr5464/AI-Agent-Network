@@ -55,6 +55,7 @@ before the file is written:
 | `SELECTOR_FOUND` with no `visible` at all | kept, recorded as visibility-unmeasured (a pre-protocol cached run must not empty the map) |
 | `INTERACTION_HINT` whose name has a confirmed selector | kept, with the hint's selector **replaced by the confirmed one** |
 | `INTERACTION_HINT` with no confirmed selector and no `count: 1` | dropped |
+| `SELECTOR_FOUND` (or an unconfirmed `INTERACTION_HINT`) that is a list of alternatives, `button:has-text('X'), a:has-text('X')` (`is_alternatives`) | dropped — it counts 1 while only one alternative matches, and names no element. A clicked control is then recovered from its click (next row) |
 | a plan locator with no `SELECTOR_FOUND`, whose element the browser recorded being clicked (counted 1/1, its text sharing the most words with the name, no tie) | **recovered** from that click (`recover_clicked_locators`). A run clicked a page's main button with a selector copied from its prompt's example and never reported it; step 03 guessed a `button` for what was a link, and the test failed on its first locator |
 | `SELECTOR_FOUND` for a field with an `INPUT_USED`, measured by the helpers as taking no typing (`editable: false`, or a harvested `tag` other than input/textarea/select) | dropped, with the `INPUT_USED` and any `VALUE_CHECK` whose source is that input (`enforce_typed_fields`) |
 
@@ -125,7 +126,7 @@ at 30 on a slow one. The cost was never the flow. It came from four places:
 | Browser | The MCP server launched the machine's branded Chrome, whose renderer sat at 100% CPU for ~80s after every page load on this site. A trivial evaluate took 2-10s, and a step took 15-55s. | `--browser chromium` (`PLAYWRIGHT_MCP_BROWSER`), which is also the engine the generated tests run on. Evaluates dropped to 2-15ms. |
 | Model output | 48 of 59 tool calls were JavaScript the model typed from scratch: the same harvest, count, frame loop and recorder, over and over. That was a third of the 40k output tokens. | `shared/browser/`. `qa-helpers.js` (`window.__qa`, every frame) and `qa-page.js` (`page.qa`, loaded with `--init-page`) do the measuring. Each call is one line. |
 | Round trips | About 2.4 calls per step, plus fixed sleeps. | `page.qa.step(action, opts)`: act, wait until every frame and the network have settled, then return the harvest (every element's best stable selector, already counted) or a batch `check`, all in one call. |
-| Rediscovery | Every run started from nothing, and found some worse selectors the second time. | `known_selectors()` seeds the prompt with the newest confirmed map for the same host. Each selector is counted live again before it is reported. |
+| Rediscovery | Every run started from nothing, and found some worse selectors the second time. Seeded from one earlier run, it still lost whatever an older run had confirmed and that run had not reported, and step 03 guessed that locator. | `known_selectors()` merges every earlier run on the same host: this test case's runs first, then this module's, then the rest, newest first within each. One entry per selector, at most 2 per name (the first, then the most recently confirmed other one), 60 in total. A session whose step 02 came from the step cache is skipped, since its copy carries a fresh file time. Each selector is counted live again before it is reported. **Proven locators come first.** When step 04's test passes, `record_proven_locators` joins the framework's baselines from that run (each page object's `coverage` and `fingerprints`) with the final page-object source: a locator that matched exactly one visible element while the test passed is written to `04-proven-locators.json`, and run.sh keeps a copy in `cache/<user>/<module>/` whatever CACHE_STEPS says. Seeding reads those first (slot 1 per name, marked in the prompt), and a step 02 selector that step 04 replaced for the same name is dropped. Only a baseline written by the passing run counts; an element not on screen when its page object loaded reads 0 and stays unproven. The prompt asking for proven locators first was not enough, so it is enforced: when this run counts one of this test case's proven locators at 1/1, it is kept over a different selector the model reported for that name, and fills a name the model left out (`prefer_proven`, recorded as `proven_preferred`). |
 
 The quality bar is unchanged. Every selector is still measured live at count 1 and
 visible 1 (the helpers do the same counting rule 2c always required), every iframe
@@ -383,13 +384,15 @@ Web Steps:
 | `00-session-init.md` | run.sh | Session metadata, env snapshot |
 | `01-parse.json` + `.md` | Parse | Generation plan |
 | `02-validate-api.json` + `.md` | Validate API | Auth status, confirmed endpoint response shapes |
-| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms`, `inputs_used`, `value_checks` |
+| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms`, `inputs_used`, `value_checks`, `proven_preferred` (names whose reported selector was replaced by this test case's proven one) |
 | `claude-*.log` | Validate Web | Raw `claude -p` stream, for diagnosing empty runs |
 | `02-known-selectors.json` | Validate Web | The confirmed selectors seeded from an earlier run on the same host |
 | `02-web-evidence.jsonl` | Validate Web | What the browser helpers measured, one line per settled page state. Every `SELECTOR_FOUND` is checked against it |
 | `03-system-prompt.txt`, `04-system-prompt.txt` | Generate, Run & Fix | The static half of each prompt — conventions, references, rules — sent once as `--system-prompt-file` instead of inside every batch or attempt |
 | `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators`, `untraced_expected_values` |
 | `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes, `value_mismatch` / `relaxed_checks` when a failure was triaged as one |
+| `04-proven-locators.json` | Run & Fix | Only on a passing run: the locators that matched one visible element while it passed. Seeds later runs of step 02; also copied to `cache/<user>/<module>/` |
+| `04-failed-locators.json` | Run & Fix | Each step 02 selector, as step 02 gave it, that a failing run of the test was on (the reproducible initial failure, or a later attempt's), with its name. Copied to `cache/<user>/<module>/` when the run ends `false` or `stuck`, so the next run validates step 02 again instead of restoring it |
 | `.assertions-frozen.json` | Run & Fix | What the generated test proved before any fix — the conservation baseline |
 | `.fix-history.json` | Run & Fix | Every fix attempt, appended: diagnosis, edits proposed, guards that rejected them. Feeds the next prompt and the stop rule |
 | `.fix-passed` | Run & Fix | Gate: true / false / skipped / stuck / defect |
@@ -416,6 +419,7 @@ Web Steps:
 | `AUTHORING_BRANCH_PREFIX` | Branch name prefix | `authoring` |
 | `AUTHORING_FIX_RETRY_COUNT` | Max retry cycles for failing tests. A ceiling — the loop stops early once an attempt can bring nothing new | `2` |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) | `true` |
+| `CACHE_STEPS` | Restore steps 01–02 from `cache/<user>/<module>/` when the input file is byte-identical to the one they were cached from. A resume never takes a hit. Nor does a cached step 02 when a later passing run proved a locator it lacks or has another selector for, and that step 02 was never seeded with, or when a red run failed on a selector it still hands out: step 02 is the only reader of proven and failed locators, so it runs again (`shared/proven_locators.py`). Each step's `.md` report is cached with it, and step 02's seeds (`02-known-selectors.json`) with step 02 | `true` |
 | `AUTHORING_ENVIRONMENT` | Maven `-Denvironment=` value | `staging` |
 | `AUTHORING_COUNTRY` | Maven `-Dcountry=` value | `SG` |
 | `MAVEN_TEST_TIMEOUT_S` | Timeout (s) for a single `mvn test` run in step 04 | `300` |
@@ -479,7 +483,7 @@ START_FROM_STEP=4 SESSION_ID=20260330-143022-create-payments \
   ./scripts/run-authoring-agent.sh
 ```
 
-A resume never takes a `TESTING_MODE` cache hit. Retrying a step means running it
+A resume never takes a `CACHE_STEPS` cache hit. Retrying a step means running it
 again, and the cached artefact is the output of the run being retried — restoring
 it made the retry a no-op that reported the step done in 0s and gated every step
 after it on a result the retry existed to replace.
@@ -512,7 +516,7 @@ src/main/java/automation/modules/{feature}/
   {Feature}Data.java
   {Feature}Builder.java
   {Feature}Helper.java          extends ApiHelper
-  api/{Feature}Api.java         enum implements ApiDetails
+  api/{Feature}Api.java         enum implements ApiDetails — only when the plan has API endpoints or the test type is api/both
   web/{Page}Page.java           extends BasePage
 
 src/test/java/automation/{feature}/

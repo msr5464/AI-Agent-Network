@@ -294,14 +294,15 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "options": _EFFORT_OPTIONS,
     },
     {
-        "key": "testing_mode",
-        "env_var": "TESTING_MODE",
-        "label": "Testing Mode (cache steps)",
-        "description": "Cache parse and validate-web outputs per feature so they are reused "
-                       "on re-runs. Useful when iterating on code generation.",
+        "key": "cache_steps",
+        "env_var": "CACHE_STEPS",
+        "label": "Cache Steps",
+        "description": "Reuse the slow early steps (authoring's Parse and Validate, "
+                       "adaptation's Parse and Explore) when the same input file runs "
+                       "again. Editing the input, or retrying a step, runs them afresh.",
         "type": "boolean",
         "category": "common",
-        "default": False,
+        "default": True,
         "sensitive": False,
     },
     # ── Test Authoring ───────────────────────────────────────────────────────
@@ -800,6 +801,7 @@ def set_many(updates: Dict[str, Any]) -> None:
     produce a config the agents cannot run with.
     """
     resolved: Dict[str, Tuple[Dict[str, Any], str]] = {}  # key → (entry, env string)
+    type_errors: Dict[str, str] = {}
 
     for key, value in updates.items():
         entry = _SCHEMA_BY_KEY.get(key)
@@ -809,9 +811,12 @@ def set_many(updates: Dict[str, Any]) -> None:
             current = str(get(key, "") or "")
             if current and value == _partial_mask(current):
                 continue  # the display mask came back unchanged — keep the real value
-        resolved[key] = (entry, _to_env_str(_coerce(entry, value)))
+        try:
+            resolved[key] = (entry, _to_env_str(_coerce(entry, value)))
+        except ValueError as e:
+            type_errors[key] = str(e)
 
-    errors = _validate({k: v[1] for k, v in resolved.items()})
+    errors = {**_validate({k: v[1] for k, v in resolved.items()}), **type_errors}
     if errors:
         raise SettingsValidationError(errors)
 
@@ -936,13 +941,24 @@ def _to_env_str(value: Any) -> str:
     return str(value)
 
 
+_TRUE_WORDS = ("true", "1", "yes", "on")
+_FALSE_WORDS = ("false", "0", "no", "off")
+
+
 def _coerce(entry: Dict[str, Any], value: Any) -> Any:
-    """Coerce a submitted value to the type the schema declares."""
+    """Coerce a submitted value to the type the schema declares.
+
+    Raises ValueError for a value of the wrong type. Each used to fall back to
+    something silently: `"maybe"` for a boolean was saved as false.
+    """
     t = entry.get("type")
     if t == "boolean":
         if isinstance(value, bool):
             return value
-        return str(value).lower() in ("true", "1", "yes", "on")
+        word = str(value).strip().lower()
+        if word in _TRUE_WORDS or word in _FALSE_WORDS:
+            return word in _TRUE_WORDS
+        raise ValueError("Must be true or false.")
     if t == "number":
         if value == "" or value is None:
             return entry.get("default", 0)
@@ -950,7 +966,7 @@ def _coerce(entry: Dict[str, Any], value: Any) -> Any:
             default = entry.get("default", 0)
             num = int(value) if isinstance(default, int) else float(value)
         except (TypeError, ValueError):
-            return entry.get("default", 0)
+            raise ValueError("Must be a number.")
         lo, hi = entry.get("min"), entry.get("max")
         if lo is not None:
             num = max(num, lo)
@@ -960,5 +976,9 @@ def _coerce(entry: Dict[str, Any], value: Any) -> Any:
     if t == "select":
         allowed = [o["value"] for o in entry.get("options", [])]
         s = str(value) if value is not None else ""
-        return s if s in allowed else entry.get("default", "")
+        if s in allowed:
+            return s
+        if not s:
+            return entry.get("default", "")
+        raise ValueError(f"Must be one of: {', '.join(repr(a) for a in allowed)}.")
     return str(value) if value is not None else ""

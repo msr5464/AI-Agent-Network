@@ -117,15 +117,22 @@ Healing has no resume; it retries internally.
 
 ## Speeding up iterations
 
-### TESTING_MODE (authoring, adaptation)
+### CACHE_STEPS (authoring, adaptation)
 
-Caches the slow early steps — authoring 01–02, adaptation 01–03 — and restores
-them on the next run with the same input. Editing the input file invalidates the
-cache.
+On by default. Caches the slow early steps — authoring 01–02, adaptation 01 and
+03 — and restores them on the next run with the same input. Editing the input
+file invalidates the cache. So does a passing authoring run whose step 04 had to
+fix a locator step 02 got wrong or never found: the next run re-runs step 02,
+seeded with the locators that passed, and caches that instead. It does so once
+per new proof: a proven locator that step 02 was already seeded with does not
+re-run it again. A run that ends red after its test failed on a step 02 selector
+does the same, so a selector the site has since changed is not handed out again;
+a failure on anything else (an assertion, a compile error) keeps the cache.
 
 ```bash
-TESTING_MODE=true ./scripts/run-authoring-agent.sh payments   # first run fills the cache
-TESTING_MODE=true ./scripts/run-authoring-agent.sh payments   # later runs skip to 03
+./scripts/run-authoring-agent.sh payments                     # first run fills the cache
+./scripts/run-authoring-agent.sh payments                     # later runs skip to 03
+CACHE_STEPS=false ./scripts/run-authoring-agent.sh payments   # run every step afresh
 rm -rf agents/test-authoring-agent/cache/cli/payments/        # clear it
 ```
 
@@ -144,7 +151,7 @@ STOP_AFTER=collect ./scripts/run-triaging-agent.sh MyBuild-123
 | Variable | Purpose | Dev value |
 |----------|---------|-----------|
 | `AUTO_PUSH` | `false`: run in your checkout, no push, no PR | `false` |
-| `TESTING_MODE` | Cache early steps (authoring, adaptation) | `true` |
+| `CACHE_STEPS` | Cache early steps (authoring, adaptation) | `true` |
 | `STOP_AFTER` | Stop triaging after a step | `collect` / `classify` |
 | `AUTHORING_FIX_RETRY_COUNT`, `HEALING_RETRY_COUNT`, `ADAPTATION_RETRY_COUNT` | Retry budgets | `1` for faster feedback |
 | `HEADLESS_BROWSER` | `false` shows every browser any agent starts, including Maven test runs | `false` |

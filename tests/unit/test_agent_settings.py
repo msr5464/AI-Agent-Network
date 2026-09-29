@@ -132,12 +132,12 @@ class TestEnvFileWrites:
         assert os.environ["AUTHORING_FIX_RETRY_COUNT"] == "7"
 
     def test_booleans_are_written_lowercase(self, env_file):
-        """run.sh compares with [[ "$TESTING_MODE" == "true" ]] — no lowercasing,
+        """run.sh compares with [[ "$CACHE_STEPS" == "true" ]] — no lowercasing,
         so "True" would silently read as off."""
-        agent_settings.set_many({"auto_push": True, "testing_mode": False})
+        agent_settings.set_many({"auto_push": True, "cache_steps": False})
         text = env_file.read_text()
         assert "AUTO_PUSH=true" in text
-        assert "TESTING_MODE=false" in text
+        assert "CACHE_STEPS=false" in text
 
 
 class TestSecretMasking:
@@ -170,14 +170,6 @@ class TestCoercion:
         agent_settings.set_many({"authoring_fix_retry_count": 999})
         assert os.environ["AUTHORING_FIX_RETRY_COUNT"] == "10"
 
-    def test_garbage_numbers_fall_back_to_the_default(self, env_file):
-        agent_settings.set_many({"authoring_fix_retry_count": "not-a-number"})
-        assert os.environ["AUTHORING_FIX_RETRY_COUNT"] == "2"
-
-    def test_select_rejects_values_outside_its_options(self, env_file):
-        agent_settings.set_many({"triaging_effort": "bogus"})
-        assert os.environ["TRIAGING_EFFORT"] == ""
-
     def test_an_effort_can_be_left_unset(self, env_file):
         """"Not set" is an option, so an unset effort is not saved as the first
         one the dropdown happens to show."""
@@ -197,6 +189,33 @@ class TestModelValidation:
     def test_a_named_model_is_saved(self, env_file):
         agent_settings.set_many({"triaging_model": "claude-sonnet-5"})
         assert os.environ["TRIAGING_MODEL"] == "claude-sonnet-5"
+
+
+class TestTypeValidation:
+    """A value of the wrong type is refused, not replaced: `"maybe"` for a
+    boolean used to be saved as false."""
+
+    @pytest.mark.parametrize("key,bad", [
+        ("cache_steps", "maybe"), ("cache_steps", None),
+        ("authoring_fix_retry_count", "two"),
+        ("browser_effort", "extreme"),
+    ])
+    def test_a_value_of_the_wrong_type_is_rejected(self, env_file, key, bad):
+        before = env_file.read_text()
+        with pytest.raises(agent_settings.SettingsValidationError) as exc:
+            agent_settings.set_many({key: bad})
+        assert key in exc.value.errors
+        assert env_file.read_text() == before
+
+    @pytest.mark.parametrize("given,written", [
+        (True, "true"), ("off", "false"), (" Yes ", "true"), ("0", "false")])
+    def test_boolean_words_are_accepted(self, env_file, given, written):
+        agent_settings.set_many({"cache_steps": given})
+        assert os.environ["CACHE_STEPS"] == written
+
+    def test_an_empty_select_or_number_still_means_its_default(self, env_file):
+        agent_settings.set_many({"browser_effort": "", "authoring_fix_retry_count": ""})
+        assert os.environ["BROWSER_EFFORT"] == ""
 
 
 class TestWorkspaceValidation:

@@ -41,22 +41,18 @@ source "$REPO_ROOT/shared/session.sh"
 # The model has no default in code — config/.env sets it.
 require_settings AUTHORING_MODEL
 
-# ── Testing-mode cache helpers ────────────────────────────────────────────────
-# When TESTING_MODE=true, step-01 and step-02 outputs are cached under
-# agents/test-authoring-agent/cache/<module>/ so they are reused on every
+# ── Step cache helpers ────────────────────────────────────────────────────────
+# When CACHE_STEPS=true, step-01 and step-02 outputs are cached under
+# agents/test-authoring-agent/cache/<user>/<module>/ so they are reused on every
 # subsequent run of the same input file — saving ~3 minutes per iteration.
 # "Same" means same content: editing the file's steps invalidates the cache.
-# Clear the cache manually to force a fresh run:
-#   rm -rf agents/test-authoring-agent/cache/<module>/
-TESTING_MODE="${TESTING_MODE:-false}"
-# Resolved here rather than further down, because the cache path depends on it.
+# Set CACHE_STEPS=false, or clear the cache, to force a fresh run:
+#   rm -rf agents/test-authoring-agent/cache/<user>/<module>/
+CACHE_STEPS="${CACHE_STEPS:-true}"
+# Resolved here rather than further down, because the queue and cache paths depend on it.
 USER_ID="${USER_ID:-cli}"
-# Scoped by user. Two people running the same module name shared one cache
-# directory, so run A's cached step output was restored into run B's audit dir —
-# cross-user content leakage, plus torn reads from a concurrent cp.
-CACHE_DIR="$AGENT_DIR/cache/$USER_ID/$MODULE"
 
-# _cache_hit <filename>  → returns 0 if TESTING_MODE=true, the file is cached, and it
+# _cache_hit <filename>  → returns 0 if CACHE_STEPS=true, the file is cached, and it
 # was cached from an input byte-identical to INPUT_FILE. Content, not mtime: the
 # server rewrites a queue file on every save and every run moves it to processed/,
 # so an mtime check would miss on every UI run. Snapshotted per file, so a run that
@@ -65,21 +61,26 @@ CACHE_DIR="$AGENT_DIR/cache/$USER_ID/$MODULE"
 # cached artefact is the output of the run being retried. See the same guard in
 # test-adaptation-agent/run.sh, where restoring it made the retry a no-op.
 _cache_hit() {
-  [[ "$TESTING_MODE" == "true" ]] && [[ "${START_FROM_STEP:-1}" -le 1 ]] \
+  [[ "$CACHE_STEPS" == "true" ]] && [[ "${START_FROM_STEP:-1}" -le 1 ]] \
     && [[ -f "$CACHE_DIR/$1" ]] \
     && [[ -f "$CACHE_DIR/$1.input" ]] && cmp -s "$CACHE_DIR/$1.input" "$INPUT_FILE"
 }
-# _cache_restore <filename>  → copies file from cache into current AUDIT_DIR
+# _cache_restore <filename>  → copies file, and its .md report, from cache into AUDIT_DIR
 _cache_restore() {
+  # Belongs to the step being restored, not to the one still holding its ✓ back.
+  flush_step_done
   cp "$CACHE_DIR/$1" "$AUDIT_DIR/$1"
-  log "TESTING_MODE: restored $1 from cache ($CACHE_DIR)"
+  local md="${1%.json}.md"
+  [[ -f "$CACHE_DIR/$md" ]] && cp "$CACHE_DIR/$md" "$AUDIT_DIR/$md"
+  log "Step cache: restored $1 ($CACHE_DIR)"
 }
-# _cache_save <filename>  → copies file from current AUDIT_DIR into cache
+# _cache_save <filename> [companion]  → copies file from current AUDIT_DIR into cache,
+# with its .md report and the companion file, if any, that describes it
 _cache_save() {
   # A step that produced nothing is not worth caching: restored on the next run of
   # the same input it hands back the failure as though it had succeeded. See the
   # same guard in test-adaptation-agent/run.sh.
-  if [[ "$TESTING_MODE" == "true" ]] && [[ -f "$AUDIT_DIR/$1" ]] \
+  if [[ "$CACHE_STEPS" == "true" ]] && [[ -f "$AUDIT_DIR/$1" ]] \
      && python3 -c 'import json, sys
 d = json.load(open(sys.argv[1]))
 sys.exit(1 if (str(d.get("status", "")).lower() in ("skipped", "failed", "unsafe", "empty")
@@ -87,8 +88,53 @@ sys.exit(1 if (str(d.get("status", "")).lower() in ("skipped", "failed", "unsafe
     mkdir -p "$CACHE_DIR"
     cp "$AUDIT_DIR/$1" "$CACHE_DIR/$1"
     if [[ -f "$INPUT_FILE" ]]; then cp "$INPUT_FILE" "$CACHE_DIR/$1.input"; else rm -f "$CACHE_DIR/$1.input"; fi
-    log "TESTING_MODE: cached $1 → $CACHE_DIR"
+    # Saved with the JSON it reports on. Passed to _cache_save on its own, a .md
+    # failed the JSON check above and was never cached, so a restored session had
+    # no report to show. Removed first, so none outlives the file it described.
+    local f
+    for f in "${1%.json}.md" ${2:+"$2"}; do
+      rm -f "$CACHE_DIR/$f"
+      [[ -f "$AUDIT_DIR/$f" ]] && cp "$AUDIT_DIR/$f" "$CACHE_DIR/$f"
+    done
+    log "Step cache: saved $1 → $CACHE_DIR"
   fi
+}
+# _proven_agrees  → returns 0 unless, since step 02 was cached, a passing run proved a
+# locator the cached step 02 lacks or has a different selector for, and was not seeded
+# with, or a test failed on a selector it still hands out. Step 02 is the only step
+# that reads proven and failed locators, so restoring it would hand step 03 the same
+# selector every run. A check that fails re-runs step 02.
+_proven_agrees() {
+  local superseded
+  superseded=$(cd "$REPO_ROOT" && python3 -m shared.proven_locators current \
+                 "$CACHE_DIR" "$AUDIT_DIR/01-parse.json" 2>/dev/null) && return 0
+  flush_step_done
+  if [[ -n "$superseded" ]]; then
+    log "Step cache: not restoring 02-validate-web.json — $superseded"
+  else
+    log "Step cache: not restoring 02-validate-web.json — could not check it against the proven locators"
+  fi
+  return 1
+}
+# _cache_test_outcome  → keeps what step 04 learned about step 02's locators in the
+# cache, whatever CACHE_STEPS says, so clearing the audit folder does not lose it.
+# A passing run's proof (04-proven-locators.json) seeds step 02 of later runs, and
+# replaces any failure recorded before it. The step 02 locators a failing test was on
+# (04-failed-locators.json) are kept only when the run ended red: `false` or `stuck`,
+# not a documented product defect or an infra skip. Either can make _proven_agrees run
+# step 02 again. Neither is ever restored as a step output.
+_cache_test_outcome() {
+  local gate
+  gate=$(cat "$AUDIT_DIR/.fix-passed" 2>/dev/null || true)
+  if [[ -f "$AUDIT_DIR/04-proven-locators.json" ]]; then
+    mkdir -p "$CACHE_DIR"
+    cp "$AUDIT_DIR/04-proven-locators.json" "$CACHE_DIR/04-proven-locators.json"
+    rm -f "$CACHE_DIR/04-failed-locators.json"
+  elif [[ -f "$AUDIT_DIR/04-failed-locators.json" ]] && [[ "$gate" == "false" || "$gate" == "stuck" ]]; then
+    mkdir -p "$CACHE_DIR"
+    cp "$AUDIT_DIR/04-failed-locators.json" "$CACHE_DIR/04-failed-locators.json"
+  fi
+  return 0
 }
 
 # ── Locate input file ─────────────────────────────────────────────────────────
@@ -187,6 +233,13 @@ else
 fi
 
 export INPUT_FILE MODULE
+
+# Scoped by user. Two people running the same module name shared one cache
+# directory, so run A's cached step output was restored into run B's audit dir —
+# cross-user content leakage, plus torn reads from a concurrent cp. Set only now:
+# a queue-mode run learns its MODULE above, and before it every such run shared
+# cache/<user>/ while its proven locators went to cache/<user>/<module>/.
+CACHE_DIR="$AGENT_DIR/cache/$USER_ID/$MODULE"
 
 # ── Session init ───────────────────────────────────────────────────────────────
 # Honor a pre-set SESSION_ID / AUDIT_DIR (used by qa_agents_server so the wrapper
@@ -324,15 +377,13 @@ if [[ "$START_FROM_STEP" -gt 1 ]]; then
   record_stage "parse" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
 elif _cache_hit "01-parse.json"; then
   _cache_restore "01-parse.json"
-  [[ -f "$CACHE_DIR/01-parse.md" ]] && cp "$CACHE_DIR/01-parse.md" "$AUDIT_DIR/01-parse.md"
-  log "✓ [01/05] Parse — skipped (TESTING_MODE cache hit)"
+  log "✓ [01/05] Parse — skipped (step cache hit)"
   STEP_NAMES+=("[01/05] Parse")
   STEP_DURATIONS+=(0)
   record_stage "parse" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
 else
   run_step "[01/05] Parse" "python3 '$AGENT_DIR/actions/01_parse.py'" parse
   _cache_save "01-parse.json"
-  _cache_save "01-parse.md"
 fi
 
 # ── Step 02 — Validate API + Validate Web (each self/env-gated by test_type) ──
@@ -358,8 +409,7 @@ else
 # test_type isn't api/both, so it's always safe to invoke unconditionally. --
 if _cache_hit "02-validate-api.json"; then
   _cache_restore "02-validate-api.json"
-  [[ -f "$CACHE_DIR/02-validate-api.md" ]] && cp "$CACHE_DIR/02-validate-api.md" "$AUDIT_DIR/02-validate-api.md"
-  log "✓ [02/05] Validate API — skipped (TESTING_MODE cache hit)"
+  log "✓ [02/05] Validate API — skipped (step cache hit)"
   STEP_NAMES+=("[02/05] Validate API")
   STEP_DURATIONS+=(0)
   record_stage "validate_api" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
@@ -373,15 +423,13 @@ d = json.loads(Path(os.environ['AUDIT_DIR']).joinpath('02-validate-api.json').re
 sys.exit(0 if not d.get('skipped', True) else 1)
 " 2>/dev/null; then
     _cache_save "02-validate-api.json"
-    _cache_save "02-validate-api.md"
   fi
 fi
 
 if [[ "$TEST_TYPE" == "web" || "$TEST_TYPE" == "both" ]]; then
-  if _cache_hit "02-validate-web.json"; then
+  if _cache_hit "02-validate-web.json" && _proven_agrees; then
     _cache_restore "02-validate-web.json"
-    [[ -f "$CACHE_DIR/02-validate-web.md" ]] && cp "$CACHE_DIR/02-validate-web.md" "$AUDIT_DIR/02-validate-web.md"
-    log "✓ [02/05] Validate Web — skipped (TESTING_MODE cache hit)"
+    log "✓ [02/05] Validate Web — skipped (step cache hit)"
     STEP_NAMES+=("[02/05] Validate Web")
     STEP_DURATIONS+=(0)
     record_stage "validate_web" "${STEP_NAMES[$((${#STEP_NAMES[@]}-1))]}" "${#STEP_NAMES[@]}" 0 0 0 true
@@ -395,10 +443,11 @@ d = json.loads(Path(os.environ['AUDIT_DIR']).joinpath('02-validate-web.json').re
 sys.exit(0 if (d.get('selectors') or d.get('steps_passed') or d.get('steps_failed')
               or d.get('steps_unverified')) else 1)
 " 2>/dev/null; then
-      _cache_save "02-validate-web.json"
-      _cache_save "02-validate-web.md"
+      # With what step 02 was seeded with: _proven_agrees does not re-run it for a
+      # proven locator it was already shown (shared/proven_locators.py).
+      _cache_save "02-validate-web.json" "02-known-selectors.json"
     else
-      log "TESTING_MODE: step-02 result is empty — not caching (will re-run next time)"
+      log "Step cache: step-02 result is empty — not caching (will re-run next time)"
     fi
   fi
 else
@@ -482,6 +531,9 @@ else
     done
   fi
 fi
+
+# What step 04 learned about step 02's locators goes into the step cache.
+_cache_test_outcome
 
 # ── Step 05 — Ship ────────────────────────────────────────────────────────────
 run_step "[05/05] Ship" "python3 '$AGENT_DIR/actions/05_ship.py'" ship

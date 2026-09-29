@@ -1243,7 +1243,7 @@ def main() -> None:
 
     # Second line of defence behind step 02's own filter: a cached
     # 02-validate-web.json written before that filter existed still carries
-    # Playwright-MCP refs, and a TESTING_MODE rerun would feed them straight into
+    # Playwright-MCP refs, and a rerun from the step cache would feed them straight into
     # codegen. A locator like [ref='f2e585'] compiles and never matches, so the
     # cost of letting one through is a 30-second timeout in step 04 with a failure
     # message that points at the page, not at the selector.
@@ -2147,7 +2147,11 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
         files.append(f"src/main/java/automation/modules/{feature_lower}/{feature_class}Data.java")
         files.append(f"src/main/java/automation/modules/{feature_lower}/{feature_class}Builder.java")
         files.append(f"src/main/java/automation/modules/{feature_lower}/{feature_class}Helper.java")
-        files.append(f"src/main/java/automation/modules/{feature_lower}/api/{feature_class}Api.java")
+        # The API enum has one entry per endpoint, so a web test with none has
+        # nothing to put in it. Asked for one anyway, the model declined to invent
+        # an interface, and the file it never wrote aborted the step.
+        if test_type in ("api", "both") or plan.get("api_endpoints"):
+            files.append(f"src/main/java/automation/modules/{feature_lower}/api/{feature_class}Api.java")
         if test_type in ("web", "both"):
             for page_def in plan.get("web_pages", []):
                 class_name = page_def["class_name"]

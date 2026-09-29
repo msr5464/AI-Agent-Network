@@ -131,3 +131,26 @@ class TestStateMarkers:
     def test_healthy_page_has_no_markers(self):
         soup = pi.parse(fx.DASHBOARD_OK)
         assert pi.state_markers(pi.page_facts(fx.DASHBOARD_OK, soup), soup) == []
+
+
+class TestIsAlternatives:
+    """A comma list counts 1 while only one alternative matches, and names no element."""
+
+    @pytest.mark.parametrize("selector", [
+        "a, b",
+        "button:has-text(\"Buy Now\"), a:has-text(\"Buy Now\")",
+        "#pay >> internal:control=enter-frame >> button.ok, a.ok",
+    ])
+    def test_a_list_of_alternatives(self, selector):
+        assert pi.is_alternatives(selector)
+
+    @pytest.mark.parametrize("selector", [
+        "a:has-text('X, Y')",
+        "[title='a, b']",
+        "#pay >> internal:control=enter-frame >> div.header-amount",
+        "text=Hello, world",
+        "div.cart tr:has-text('Name') input[type='text']",
+        "",
+    ])
+    def test_one_selector(self, selector):
+        assert not pi.is_alternatives(selector)

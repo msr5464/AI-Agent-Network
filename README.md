@@ -201,9 +201,9 @@ says how many lines it hides.
 ### Agent 1 — Test Authoring
 
 ```bash
-./scripts/run-authoring-agent.sh payments                     # queue/payments.txt
+./scripts/run-authoring-agent.sh payments                     # queue/payments.txt; steps 01–02 come from the cache when it is unchanged
 ./scripts/run-authoring-agent.sh                              # oldest file in queue/
-TESTING_MODE=true ./scripts/run-authoring-agent.sh payments   # reuse cached steps 01–02
+CACHE_STEPS=false ./scripts/run-authoring-agent.sh payments   # this run only: parse and validate afresh, ignoring the cache
 START_FROM_STEP=4 SESSION_ID=<id> ./scripts/run-authoring-agent.sh   # resume
 ```
 

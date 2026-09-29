@@ -53,8 +53,9 @@ VALIDATE_RETRY_ATTEMPTS = int(os.environ.get("VALIDATE_WEB_RETRY_ATTEMPTS", "1")
 from shared.claude import call_claude_ex            # noqa: E402  (after sys.path update)
 from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools, CAPTURE_RULES  # noqa: E402
 from shared.log import log as _log      # noqa: E402  (shared, redacts known secrets)
-from shared.page_identity import is_dom_selector    # noqa: E402
-from shared import check_provenance, flow_map, value_match  # noqa: E402
+from shared.page_identity import (is_alternatives, is_dom_selector,  # noqa: E402
+                                  qualified_locator_names)
+from shared import check_provenance, flow_map, proven_locators, value_match  # noqa: E402
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -160,6 +161,13 @@ def parse_selector_output(output: str) -> tuple:
             drop(f"{selector!r} is not a usable DOM selector "
                  f"(Playwright-MCP ref or pseudo-attribute)")
             continue
+        if is_alternatives(selector):
+            # Counts 1 while only one alternative matches, and names no element: a run
+            # reported `button:has-text("Buy Now"), a:has-text("Buy Now")` for a link.
+            # A control the browser saw clicked is recovered from that click instead.
+            drop(f"{selector!r} is a list of alternatives, which is a guess: count each "
+                 f"alternative and report the one that matched.")
+            continue
         if count is None:
             drop(f"{selector!r} was reported without a |count=, so its uniqueness "
                  f"was never measured. Re-report it with the count from the batch "
@@ -192,22 +200,6 @@ def parse_selector_output(output: str) -> tuple:
         counts[name] = count
         visibles[name] = visible
     return selectors, counts, visibles, rejected
-
-
-def qualified_locator_names(web_pages: list) -> list:
-    """The locator names step 02 is asked to report, one per element.
-
-    The plan names locators per page object, so two pages may both ask for
-    `amountDisplay` and mean different elements. The selector map is one flat
-    dict, so such a name is written `IssuingBankPage.amountDisplay` here, and
-    step 03 reads it back for that page only.
-    """
-    pages_using: dict = {}
-    for page_def in web_pages:
-        for name in set(page_def.get("locators_needed", [])):
-            pages_using[name] = pages_using.get(name, 0) + 1
-    return [f"{page_def.get('class_name', '?')}.{name}" if pages_using[name] > 1 else name
-            for page_def in web_pages for name in page_def.get("locators_needed", [])]
 
 
 def parse_step_results(output: str) -> tuple:
@@ -276,6 +268,65 @@ def parse_mechanisms(output: str) -> dict:
     return mechanisms
 
 
+def _readings(rows: list) -> dict:
+    """{selector: [every count the browser helpers took of it]}, from the evidence."""
+    seen: dict = {}
+    for row in rows or []:
+        for sel, c in (row.get("checks") or {}).items():
+            if isinstance(c, dict) and "total" in c:
+                seen.setdefault(sel, []).append(c)
+        for e in row.get("known") or []:
+            if e.get("selector") and "total" in e:
+                seen.setdefault(e["selector"], []).append(e)
+    return seen
+
+
+def proven_for_test_case(plan: dict) -> dict:
+    """{name: selector} the last passing run of this test case proved, or {}.
+
+    Read from run.sh's copy in the step cache, which it keeps for every module
+    whatever CACHE_STEPS says. Only this test case's: another flow on the same
+    site can use the same name, `submitButton`, for a different element.
+    """
+    module = os.environ.get("MODULE", "")
+    path = AGENT_DIR / "cache" / os.environ.get("USER_ID", "cli") / module / proven_locators.FILE
+    try:
+        data = json.loads(path.read_text()) if module else {}
+    except (OSError, ValueError):
+        return {}
+    if (urlparse(data.get("web_base_url") or "").netloc
+            != urlparse(plan.get("web_base_url") or "").netloc
+            or data.get("input_file") != Path(plan.get("_input_file") or "").name):
+        return {}
+    return proven_locators.selectors(path)
+
+
+def prefer_proven(found: dict, counts: dict, visibles: dict, rows: list,
+                  proven: dict, wanted: list) -> list:
+    """Keep, for each name, the selector the last passing run of this test case
+    used, when this run counted it at one visible element. Returns what changed.
+
+    The prompt asks for proven locators first, and it was not enough: a run was
+    seeded with a form's five proven field locators, counted every one at 1/1,
+    and reported other selectors for the same fields. Both kinds work on the page,
+    but only the proven one has been through a passing test, and a map that
+    changes between runs hands step 03 and step 04 new code to get right each
+    time. A name the model did not report at all is filled the same way.
+    """
+    live = {sel for sel, taken in _readings(rows).items()
+            if any(c.get("total") == 1 and c.get("visible") == 1 for c in taken)}
+    changed = []
+    for name, selector in proven.items():
+        if name not in wanted or found.get(name) == selector or selector not in live:
+            continue
+        changed.append({"name": name, "reported": found.get(name), "proven": selector})
+        found[name], counts[name], visibles[name] = selector, 1, 1
+        log(f"  PROVEN {name} = {selector} — a passing test used it and it counted 1/1 "
+            + (f"here; kept over the reported {changed[-1]['reported']}"
+               if changed[-1]["reported"] else "here, but it was never reported"))
+    return changed
+
+
 def verify_with_evidence(found: dict, counts: dict, visibles: dict,
                          rejected: dict, rows: list) -> tuple:
     """Hold every SELECTOR_FOUND to what the browser helpers measured.
@@ -289,14 +340,7 @@ def verify_with_evidence(found: dict, counts: dict, visibles: dict,
 
     Returns (found, counts, visibles, rejected, {"live": n, "claimed": n, "dropped": n}).
     """
-    seen: dict = {}
-    for row in rows or []:
-        for sel, c in (row.get("checks") or {}).items():
-            if isinstance(c, dict) and "total" in c:
-                seen.setdefault(sel, []).append(c)
-        for e in row.get("known") or []:
-            if e.get("selector") and "total" in e:
-                seen.setdefault(e["selector"], []).append(e)
+    seen = _readings(rows)
     stats = {"live": 0, "claimed": 0, "dropped": 0}
     for name, selector in list(found.items()):
         measured = seen.get(selector) or []
@@ -439,23 +483,61 @@ def enforce_typed_fields(inputs: dict, found: dict, counts: dict, visibles: dict
     return kept
 
 
-def known_selectors(plan: dict, roots=None) -> tuple:
-    """(session, {name: selector}) from the newest earlier step-02 run on the same
-    site, preferring one that finished — or ("", {}).
+# How many known selectors seed step 02: in total, and per locator name. The prompt
+# lists every one, re-read on each turn, and the browser helpers count every one on
+# each new page state.
+KNOWN_LIMIT = 60
+KNOWN_PER_NAME = 2
 
-    Every run used to start from nothing: a retry of a session whose previous run
-    had confirmed 19 selectors went looking for all of them again, and found some
-    worse ones (a promo `label[for="690"]`). A site's selectors are facts about the
-    site, not the module, so any earlier run against the same host counts. They are
+
+# run.sh's log line for a restored step 02. The second is how sessions logged it
+# before the setting was CACHE_STEPS; their copies are still in audit/.
+_RESTORED_MARKERS = ("Step cache: restored 02-validate-web.json",
+                     "TESTING_MODE: restored 02-validate-web.json")
+
+
+def _restored_from_cache(session_dir: Path) -> bool:
+    """Whether a session's step 02 is a step-cache copy. run.sh restores it with a
+    plain `cp`, so old results carry a fresh file time and would rank as the newest
+    run. The run they came from is read on its own."""
+    try:
+        text = (session_dir / "stdout.log").read_text(errors="ignore")
+    except OSError:
+        return False
+    return any(marker in text for marker in _RESTORED_MARKERS)
+
+
+def known_selectors(plan: dict, roots=None) -> tuple:
+    """(sessions, [{name, selector, from}]) — what earlier step-02 runs on the same
+    site confirmed, merged — or ([], []).
+
+    Every run used to start from nothing, and then from one earlier run's map:
+    whatever an older run had confirmed and the chosen one had not reported was lost,
+    and step 03 guessed that locator. A site's selectors are facts about the site, so
+    every earlier run on the host counts: this test case's runs first, then this
+    module's, then the rest, newest first within each. One entry per selector, at most
+    KNOWN_PER_NAME per name (the first in that order, then the most recently confirmed
+    other one, in case the site changed since), KNOWN_LIMIT in all. They are
     candidates only; the prompt has each counted live before it is reported.
     """
     host = urlparse(plan.get("web_base_url") or "").netloc
     if not host:
-        return "", {}
-    runs = []
+        return [], []
+    test_case = Path(plan.get("_input_file") or "").name
+    module = plan.get("feature_name") or ""
+
+    def tier(input_file: str, feature_name: str) -> int:
+        return (0 if test_case and Path(input_file or "").name == test_case
+                else 1 if module and feature_name == module else 2)
+
+    def usable(selectors: dict) -> dict:
+        # A list of alternatives names no element; it is never a seed.
+        return {n: s for n, s in (selectors or {}).items() if s and not is_alternatives(s)}
+
+    runs = []   # (tier, mtime, session, {name: selector}, proven)
     for root in roots or (AGENT_DIR / "audit", AGENT_DIR / "cache"):
         for path in Path(root).rglob("02-validate-web.json"):
-            if path.parent == AUDIT_DIR:
+            if path.parent == AUDIT_DIR or _restored_from_cache(path.parent):
                 continue
             try:
                 data = json.loads(path.read_text())
@@ -464,14 +546,63 @@ def known_selectors(plan: dict, roots=None) -> tuple:
                 continue
             if urlparse(earlier.get("web_base_url") or "").netloc != host:
                 continue
-            if not data.get("selectors"):
+            selectors = usable(data.get("selectors"))
+            # A selector step 04 replaced on the way to a passing test is not seeded:
+            # the proven file beside it, when at least as new, has the working one.
+            proven_path = path.parent / proven_locators.FILE
+            if proven_path.is_file() and proven_path.stat().st_mtime >= path.stat().st_mtime:
+                replaced = proven_locators.selectors(proven_path)
+                selectors = {n: s for n, s in selectors.items() if replaced.get(n, s) == s}
+            if selectors:
+                # Each selector was measured 1/1 on its own, so an unfinished run counts.
+                runs.append((tier(earlier.get("_input_file"), earlier.get("feature_name")),
+                             path.stat().st_mtime, path.parent.name, selectors, False))
+        # Carries its own site, test case and module: the cache copy has no plan beside it.
+        for path in Path(root).rglob(proven_locators.FILE):
+            if path.parent == AUDIT_DIR:
                 continue
-            finished = data.get("status") == "ok" and data.get("final_attempt", True) is not False
-            runs.append((finished, path.stat().st_mtime, path.parent.name, data["selectors"]))
-    if not runs:
-        return "", {}
-    _, _, session, selectors = max(runs, key=lambda r: (r[0], r[1]))
-    return session, selectors
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            selectors = usable(proven_locators.selectors(path))
+            if urlparse(data.get("web_base_url") or "").netloc != host or not selectors:
+                continue
+            runs.append((tier(data.get("input_file"), data.get("feature_name")),
+                         path.stat().st_mtime, path.parent.name, selectors, True))
+    runs.sort(key=lambda r: (r[0], -r[1]))
+
+    # Per name: the first proven selector in that order (else the first of any), and
+    # the most recently confirmed other one. By recency alone, so older runs of this
+    # test case cannot push out the selector a newer run found after the site changed.
+    first, first_proven, by_recency = {}, {}, {}
+    for _tier, _mtime, _session, selectors, proven in runs:
+        for name, sel in selectors.items():
+            first.setdefault(name, sel)
+            if proven:
+                first_proven.setdefault(name, sel)
+    first.update(first_proven)
+    for _tier, _mtime, _session, selectors, _proven in sorted(runs, key=lambda r: -r[1]):
+        for name, sel in selectors.items():
+            if sel not in by_recency.setdefault(name, []):
+                by_recency[name].append(sel)
+    allowed = {name: {first[name]} | set([s for s in newest if s != first[name]]
+                                         [:KNOWN_PER_NAME - 1])
+               for name, newest in by_recency.items()}
+    proven_selectors = {sel for *_rest, selectors, proven in runs if proven
+                        for sel in selectors.values()}
+
+    entries, seen, sessions = [], set(), []
+    for _tier, _mtime, session, selectors, _proven in runs:
+        for name, sel in selectors.items():
+            if len(entries) >= KNOWN_LIMIT or sel in seen or sel not in allowed[name]:
+                continue
+            seen.add(sel)
+            entries.append({"name": name, "selector": sel, "from": session,
+                            "proven": sel in proven_selectors})
+            if session not in sessions:
+                sessions.append(session)
+    return sessions, entries
 
 
 def progress_notes(outcome: str, parsed: dict, web_steps: list) -> list:
@@ -877,6 +1008,10 @@ def reconcile_hints(hints: list, selectors: dict) -> list:
                 f"confirmed selector and no measured count=1, so its uniqueness is "
                 f"unknown. Report it via SELECTOR_FOUND, or add \"count\": 1.")
             continue
+        elif is_alternatives(hint["selector"]):
+            log(f"WARNING: dropped hint {name} — {hint['selector']!r} is a list of "
+                f"alternatives, which names no element.")
+            continue
         kept.append({k: v for k, v in hint.items() if k != "count"})
     return kept
 
@@ -974,11 +1109,12 @@ CREDENTIALS (use exactly these — do NOT use any other values):
     mode_label = browser_mode.label(PW_HEADLESS)
     log(f"Browser mode: {mode_label}")
     # What the browser helpers measure goes here, for verify_with_evidence; the
-    # selectors known from an earlier run are counted on every page state.
+    # selectors known from earlier runs are counted on every page state.
     known_from, known = known_selectors(plan)
+    proven_here = proven_for_test_case(plan)
     known_path = AUDIT_DIR / "02-known-selectors.json"
-    known_path.write_text(json.dumps([{"owner": "known", "path": "", "name": n, "selector": s}
-                                      for n, s in known.items()], indent=2))
+    known_path.write_text(json.dumps([{"owner": "known", "path": "", **entry}
+                                      for entry in known], indent=2))
     evidence_path = AUDIT_DIR / "02-web-evidence.jsonl"
     evidence_path.unlink(missing_ok=True)
     mcp_path = write_mcp_config(AUDIT_DIR, headless=PW_HEADLESS,
@@ -997,25 +1133,32 @@ CREDENTIALS (use exactly these — do NOT use any other values):
 
     known_hint = ""
     if known:
-        log(f"Reusing {len(known)} selector(s) confirmed on this site by {known_from} "
-            f"as candidates — each is counted again before it is reported")
+        log(f"Reusing {len(known)} selector(s) confirmed on this site by {len(known_from)} "
+            f"earlier run(s), this test case's own first ({', '.join(known_from[:3])}"
+            f"{', …' if len(known_from) > 3 else ''}) as candidates — each is counted again "
+            f"before it is reported")
         known_hint = (
-            f"\nKNOWN SELECTORS — an earlier run on this site ({known_from}) confirmed these. "
+            "\nKNOWN SELECTORS — earlier runs on this site confirmed these, this test case's "
+            "own runs first, then the newest. A name may appear twice: the second is a "
+            "newer alternative for the same element. One marked \"(a passing test used "
+            "it)\" matched exactly one visible element while a generated test passed: "
+            "try it first. "
             "The site may have changed since, so they are candidates, not results: on each "
             "page, count the ones you need in ONE page.qa.check — or as `check` in the "
             "page.qa.step call that lands on their page, with harvest: false — before "
             "harvesting anything. Each that measures total 1 and visible 1 is confirmed "
             "as that element, not as any role this plan has: report it only under the "
-            "plan's name for the SAME element (these are the earlier run's names). A "
-            "text the earlier run read is never a field this plan types into — a field "
+            "plan's name for the SAME element (these are the earlier runs' names). A "
+            "text an earlier run read is never a field this plan types into — a field "
             "is an input, textarea or select, and `check` reports `editable`. Harvest "
             "only for elements still missing, and never report one you did not just "
             "count.\n"
-            # Without the earlier run's page prefix. Shown `OldPage.amountDisplay`, a run
+            # Without the earlier runs' page prefix. Shown `OldPage.amountDisplay`, a run
             # reported `OldPage.amountText`, on a page this plan does not have, and the
             # plan's own `NewPage.amountText` went unconfirmed.
-            + "".join(f"  {name.rsplit('.', 1)[-1]} = {sel}\n"
-                      for name, sel in list(known.items())[:40]))
+            + "".join(f"  {entry['name'].rsplit('.', 1)[-1]} = {entry['selector']}"
+                      + ("   (a passing test used it)" if entry.get("proven") else "") + "\n"
+                      for entry in known))
 
     fetch_guard = (
         "\n[API] STEPS: never browser_navigate to an API endpoint — loading it replaces the "
@@ -1261,6 +1404,10 @@ EXECUTION RULES — follow exactly:
          go to rule 2e.
        • total above 1, or an error → narrow ONLY those and count them again. Two
          check rounds settle a page — do not degrade into one call per selector.
+       • never a comma list of alternatives (`button:has-text('X'), a:has-text('X')`):
+         it counts 1 while only one of them matches, and names no element. Count
+         each alternative on its own and report the one that matched; a list is
+         dropped.
        Report both numbers as |count=<total>|visible=<visible> on the
        SELECTOR_FOUND line. This is parsed and enforced: count != 1 is dropped,
        and so is visible != 1.
@@ -1489,6 +1636,7 @@ Begin executing the steps now using the browser tools.
         inputs = enforce_typed_fields(parse_inputs_used(output), found, counts, visibles,
                                       rejected, evidence)
         recover_clicked_locators(found, counts, visibles, evidence, all_locators)
+        preferred = prefer_proven(found, counts, visibles, evidence, proven_here, all_locators)
         if found or measured["dropped"]:
             log(f"Selectors measured live by the browser helpers: {measured['live']} of "
                 f"{measured['live'] + measured['claimed']} kept"
@@ -1517,6 +1665,7 @@ Begin executing the steps now using the browser tools.
             # Reconciled against `found`, so the hints written to disk carry the
             # same uniqueness guarantee the selector map does.
             "interaction_hints": reconcile_hints(parse_interaction_hints(output), found),
+            "proven_preferred":  preferred,
         }
 
     def _score(result, p: dict) -> tuple:
@@ -1635,6 +1784,7 @@ Begin executing the steps now using the browser tools.
             attempts=len(attempts),
             urls_visited=list(getattr(r, "navigated_urls", []) or []),
             final_attempt=final,
+            proven_preferred=p.get("proven_preferred"),
         )
 
     attempt_notes = ""
@@ -1794,7 +1944,7 @@ def _write_result(selectors, steps_passed, steps_failed,
                   attempts=1, selector_counts=None, steps_unverified=None,
                   selector_visibles=None, rejected_selectors=None,
                   mechanisms=None, urls_visited=None, final_attempt=True,
-                  inputs_used=None, value_checks=None) -> None:
+                  inputs_used=None, value_checks=None, proven_preferred=None) -> None:
     # Every selector that survives parse_selector_output() was measured at exactly
     # one element, and every hint that survives reconcile_hints() is either backed
     # by one of those or measured itself. Assert it rather than trusting it: this
@@ -1849,6 +1999,9 @@ def _write_result(selectors, steps_passed, steps_failed,
         "value_checks":      value_checks or [],
         "page_elements":     page_elements or {},
         "interaction_hints": interaction_hints or [],
+        # name -> the selector the model reported and the proven one kept instead
+        # (prefer_proven). Empty when the model chose the proven one itself.
+        "proven_preferred":  proven_preferred or [],
         # False while a retry follows — the server keeps the chip running
         # instead of judging this snapshot as the step's outcome.
         "final_attempt":     final_attempt,

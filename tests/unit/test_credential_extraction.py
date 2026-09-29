@@ -138,7 +138,7 @@ class TestCredentialsFromPlan:
         assert credentials_from_plan(plan) == {"username": "planned", "password": "planned-pw"}
 
     def test_a_plan_without_them_falls_back_to_its_input_file(self, tmp_path):
-        """The TESTING_MODE-cached plan case: 01-parse.json has no
+        """The step-cached plan case: 01-parse.json has no
         demo_credentials at all, but the queue file it names has both."""
         plan = {"_input_file": self._input(tmp_path)}
         assert credentials_from_plan(plan) == {

@@ -408,8 +408,10 @@ START_FROM_STEP=4 SESSION_ID=<sid> ./scripts/run-adaptation-agent.sh  # resume
 
 Resume matters more here than anywhere else in this repo: exploration is the
 expensive half, and a failed edit must never cost a second thirty-minute browser
-run. `TESTING_MODE=true` caches steps 01–03 under `cache/<user>/<module>/`; editing
-the change note's content invalidates that cache.
+run. `CACHE_STEPS=true` (the default) caches steps 01 and 03 under
+`cache/<user>/<module>/`; step 02 always runs again, since the contracts it freezes
+must describe the code as it is now. Editing the change note's content invalidates
+that cache.
 
 ## Elements inside iframes
 

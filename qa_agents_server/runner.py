@@ -467,8 +467,53 @@ def _is_our_agent_process(pid: int) -> bool:
     return bool(cmd) and "run.sh" in cmd and "-agent/" in cmd
 
 
+def _descendant_groups(pgid: int) -> List[int]:
+    """The process groups of everything descended from a member of `pgid`, other
+    than `pgid` itself.
+
+    A step runs `claude -p` in a session of its own (shared/claude.py), so that a
+    timeout takes down the MCP servers and browsers it started too, and a signal to
+    the run's group never reaches it. The step forwards SIGTERM to it, but a step
+    forked just after the SIGTERM never gets one, and the SIGKILL that follows
+    leaves it no chance to: its claude and browser kept running, and spending,
+    with nothing left to stop them. Read before that SIGKILL, while the step is
+    alive and still their parent.
+    """
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = [tuple(int(p) for p in line.split()) for line in out.splitlines()
+            if len(line.split()) == 3 and all(p.isdigit() for p in line.split())]
+    children: Dict[int, list] = {}
+    for child, parent, group in rows:
+        children.setdefault(parent, []).append((child, group))
+    stack = [child for child, _parent, group in rows if group == pgid]
+    seen, groups = set(stack), []
+    while stack:
+        for child, group in children.get(stack.pop(), ()):
+            if child in seen:
+                continue
+            seen.add(child)
+            stack.append(child)
+            if group > 1 and group not in (pgid, os.getpgrp()) and group not in groups:
+                groups.append(group)
+    return groups
+
+
+def _sigkill_tree(pgid: int) -> None:
+    """SIGKILL a run's process group and every group a step started beneath it."""
+    for group in _descendant_groups(pgid) + [pgid]:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 def _kill_group(pid: int, label: str = "") -> bool:
-    """SIGTERM a process group, then SIGKILL whatever is left. True if signalled."""
+    """SIGTERM a process group, then SIGKILL whatever is left, with the groups its
+    steps started. True if signalled."""
     try:
         pgid = os.getpgid(pid)
     except (ProcessLookupError, PermissionError):
@@ -487,12 +532,8 @@ def _kill_group(pid: int, label: str = "") -> bool:
             return True
         time.sleep(0.2)
 
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-        print(f"[runner] stopped {label or pid} (SIGKILL after "
-              f"{_KILL_GRACE_SECONDS}s grace)")
-    except (ProcessLookupError, PermissionError):
-        pass
+    _sigkill_tree(pgid)
+    print(f"[runner] stopped {label or pid} (SIGKILL after {_KILL_GRACE_SECONDS}s grace)")
     return True
 
 
@@ -1310,7 +1351,7 @@ def _wait_and_reap(run: RunState) -> None:
             "message": f"run exceeded {timeout_s}s — killing",
         })
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            _sigkill_tree(os.getpgid(proc.pid))
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()

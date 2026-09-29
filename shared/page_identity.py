@@ -160,6 +160,53 @@ def is_dom_selector(raw: str) -> bool:
     return get_active_plugin().code.is_dom_selector(raw)
 
 
+def is_alternatives(selector: str) -> bool:
+    """Whether a selector is a list of alternatives: `button:has-text('X'), a:has-text('X')`.
+
+    A comma outside every `(…)` and `[…]` separates alternatives. It counts 1 as long
+    as only one of them matches, so a guess passes the uniqueness check without saying
+    which element it meant. Quoted text in CSS only occurs inside those brackets, so
+    tracking their depth (and skipping what is quoted) is enough. A `text=` or
+    `xpath=` segment of a `>>` chain is literal text to its engine, so its commas are
+    not separators.
+    """
+    for segment in (selector or "").split(">>"):
+        segment = segment.strip()
+        if re.match(r"(text|xpath)=", segment):
+            continue
+        depth, quote = 0, ""
+        for ch in segment:
+            if quote:
+                if ch == quote:
+                    quote = ""
+            elif ch in "'\"":
+                quote = ch
+            elif ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth = max(depth - 1, 0)
+            elif ch == "," and depth == 0:
+                return True
+    return False
+
+
+def qualified_locator_names(web_pages: list) -> list:
+    """The locator names step 02 is asked to report, one per element.
+
+    The plan names locators per page object, so two pages may both ask for
+    `amountDisplay` and mean different elements. The selector map is one flat
+    dict, so such a name is written `IssuingBankPage.amountDisplay` there, and
+    step 03 reads it back for that page only. Step 04 names the locators a passing
+    test proved the same way, so both line up when step 02 is seeded.
+    """
+    pages_using: dict = {}
+    for page_def in web_pages:
+        for name in set(page_def.get("locators_needed", [])):
+            pages_using[name] = pages_using.get(name, 0) + 1
+    return [f"{page_def.get('class_name', '?')}.{name}" if pages_using[name] > 1 else name
+            for page_def in web_pages for name in page_def.get("locators_needed", [])]
+
+
 def normalize_selector(raw: str) -> Optional[str]:
     """Reduce a recorded locator to plain CSS, or None if it cannot be evaluated.
 
