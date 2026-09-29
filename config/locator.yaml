@@ -1,0 +1,98 @@
+# Locator self-healing — tunable knobs.
+# Weights follow Similo (TOSEM 2023) + Similo++ (arXiv 2505.16424) with
+# modern-web additions marked "added" below. Hand-set for bootstrap; once we
+# have real heal history these should be optimised against it, not intuition.
+
+weights:
+  testid:          3.0   # added — strongest signal in a testid-instrumented app
+  accessible_name: 2.0   # added — subsumes label / aria-label / text semantics
+  tag:             1.5
+  id:              1.5   # scored 0 when the id matches volatile_id
+  name:            1.5
+  role:            1.5   # added
+  text:            1.5
+  neighbor_texts:  1.5
+  type:            1.0   # Similo++
+  aria_label:      1.0   # Similo++
+  attrs:           1.0   # Similo++ — all attributes as a k=v set
+  class_list:      0.5
+  href:            0.5
+  alt:             0.5
+  abs_xpath:       0.5
+  id_xpath:        0.5
+  is_interactive:  0.5
+  location:        0.5
+  area:            0.5
+  shape:           0.5
+
+scoring:
+  tag_role_match: 0.5    # tags differ but the computed ARIA role still matches
+  absent_penalty: 0.35   # candidate lacks a property the baseline had (vs. differing)
+
+thresholds:
+  accept:      0.75   # score_top1 must clear this
+  auto:        0.85   # at/above this we expect verification to pass first try
+  margin:      0.10   # score_top1 - score_top2. The ambiguity guard.
+  role_fuzzy:  0.85   # Jaro-Winkler floor for T2 fuzzy accessible-name match
+
+capture:
+  screenshots: false   # base64 element crops for the PR; off by default (slow)
+
+classify:
+  landmark_overlap_min:   0.34   # below this we are on a different screen
+  neighbour_survival_min: 0.50   # below this the whole feature was deleted
+  misbound_max:           0.70   # locator resolves, but to a different element
+  misbound_margin:        0.08   # another element beats the resolved one by this much
+  heal_misbound:          false  # report silent rebinds; do not fix them unasked
+  heal_assertions:        false  # never rewrite what a test verifies
+
+budgets:
+  candidates_to_verify: 3      # R3
+  llm_topk:             10     # R5 attempt 1
+  llm_topk_wide:        20     # R5 attempt 2
+  llm_attempts:         2
+  heal_seconds:         300    # wall clock per heal
+  max_heals_per_run:    5      # more than this = deploy failure, not drift
+  app_error_backoff:    3      # app-level failures before we stop trying
+  confirm_runs:         2      # R6: fresh-context reruns before we patch
+  heal_history_window_days: 30
+  heal_history_max:     3      # heals in window before we demand a testid
+
+# Patterns that mark a value as machine-generated and therefore worthless
+# as a stable signal. Matched case-insensitively against the whole value.
+volatile:
+  id:
+    - '^:r[0-9a-z]+:$'                 # React useId
+    - '.*[-_][0-9a-f]{6,}$'            # trailing hex hash
+    - '.*[-_][0-9]{4,}$'               # trailing long digit run
+    - '^[0-9a-f]{8}-[0-9a-f]{4}-'      # uuid
+    - '^(mui|jss|ember|ext-gen)[-_]?[0-9]+$'
+  class:
+    - '^css-[0-9a-z]{5,}$'             # emotion / styled-components
+    - '^jss[0-9]+$'
+    - '^sc-[0-9a-z]{6,}$'
+    - '^[a-z]+_[a-z0-9]+__[0-9a-z]{5,}$'  # CSS modules
+    - '.*[-_][0-9a-f]{6,}$'
+    # Tailwind / utility-first classes. These are presentational, not identity:
+    # a redesign rewrites them wholesale while the element stays the same. Real
+    # page objects lean on them anyway (div.bg-black button[type='submit'],
+    # div.rounded-2.5xl), which is exactly how a locator ends up pinned to a
+    # style decision.
+    - '^(sm|md|lg|xl|2xl|hover|focus|active|disabled|group-hover|dark|first|last|odd|even):'
+    - '^(p|m|px|py|pt|pb|pl|pr|mx|my|mt|mb|ml|mr|w|h|min|max|text|bg|border|rounded|shadow|opacity|z|gap|space|flex|grid|col|row|items|justify|self|order|font|leading|tracking|top|right|bottom|left|inset|divide|ring|fill|stroke|cursor|overflow|object|transition|duration|ease|scale|rotate|translate)-[\w./%\[\]-]+$'
+    - '^(flex|grid|block|inline|inline-block|inline-flex|hidden|absolute|relative|fixed|sticky|static|truncate|container|sr-only|antialiased|italic|underline|uppercase|lowercase|capitalize|rounded|border|shadow)$'
+
+# Attributes we never build an emitted locator from.
+emit_blacklist:
+  - style
+  - class
+  - data-reactid
+  - data-react-checksum
+  - ng-reflect-.*
+
+testid_attrs:
+  - data-testid
+  - data-test-id
+  - data-test
+  - data-qa
+  - data-cy

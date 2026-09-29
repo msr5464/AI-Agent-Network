@@ -25,6 +25,7 @@ as *unevaluable*, never as *unmatched*. Confusing the two would invent evidence.
 import re
 from typing import Dict, List, Optional
 
+from shared import frames
 from shared.dom_snapshot import parse_header
 
 # Playwright suffixes that narrow an already-valid CSS selector. Dropping them
@@ -51,9 +52,28 @@ _LOCATOR_PATTERNS = (
     re.compile(r"""@FindBy\s*\(\s*(?:css|id)\s*=\s*"""
                r"""(?P<q>["'])(?P<sel>(?:\\.|(?!(?P=q)).)*)(?P=q)"""),
 )
-# The two @FindBy forms carry no assignment, so their field name is read from
-# the declaration that follows the annotation.
+# The @FindBy form carries no assignment, so its field name is read from the
+# declaration that FOLLOWS the annotation.
 _FINDBY_FIELD = re.compile(r"\b(?:WebElement|MobileElement|Locator|By)\s+(\w+)")
+
+# An accessor declares its name BEFORE the selector:
+#     public Locator loginButton() { return page.locator("#login"); }
+# Searching forward here (as @FindBy must) reads the *next* accessor's name and
+# pairs every selector with the wrong field — which is worse than no name at all,
+# because a caller cannot tell it is wrong.
+_ACCESSOR_NAME = re.compile(
+    r"\b(?:Locator|WebElement|MobileElement|By)\s+(\w+)\s*\([^)]*\)\s*\{"
+    r"(?:[^{}]|\{[^{}]*\})*$")
+
+
+def _unescape(selector: str) -> str:
+    """Java string escapes are not part of the selector.
+
+    `page.locator("[name=\\"user\\"]")` reads out of the source with its
+    backslashes still attached, and that string matches nothing and compiles as
+    nothing.
+    """
+    return selector.replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
 
 # Playwright's semantic builders. This framework uses getByRole heavily, so a
 # page object made of them must not look like a page object with no locators at
@@ -114,44 +134,75 @@ _STATE_TEXT_MARKERS = (
 _MATCH_LIMIT = 25
 
 
+# Playwright-MCP snapshot handles. `browser_snapshot` labels every node with an
+# ephemeral ref (`e71`, `f2e585`) that means nothing outside that one snapshot.
+# Recorded as a selector it compiles fine and matches nothing, forever — which is
+# how a generated page object ends up polling `[ref='f2e585']` for 30 seconds.
+_ARIA_REF = re.compile(r"(?:^|[\[\s])(?:aria-)?ref\s*=", re.I)
+_BARE_REF = re.compile(r"^(?=.*\d)[a-f][0-9a-f]{2,}$", re.I)
+
+# Playwright has no `text` attribute — whoever writes button[text='Save'] means
+# :has-text('Save'). As CSS it is syntactically valid and matches nothing, so it
+# survives every check that only asks "does this parse?".
+_TEXT_ATTR = re.compile(r"\[\s*text\s*=", re.I)
+
+
+def is_dom_selector(raw: str) -> bool:
+    """Whether a recorded locator can actually match in a real browser run.
+
+    Deliberately distinct from normalize_selector(), which asks whether a selector
+    can be evaluated against a *parsed snapshot*: `button:has-text("Login")` is a
+    perfectly good runtime selector that BeautifulSoup cannot evaluate, and
+    `[ref=e71]` is the reverse — evaluable-looking and runtime-useless. Callers
+    recording selectors for later code generation want this question, not that one.
+    """
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().code.is_dom_selector(raw)
+
+
 def normalize_selector(raw: str) -> Optional[str]:
     """Reduce a recorded locator to plain CSS, or None if it cannot be evaluated.
 
     None means "we cannot tell", and every caller must keep that distinct from a
     match count of zero.
     """
-    if not raw:
-        return None
-    selector = raw.strip()
-
-    # Playwright's Locator.toString() is what reaches us through error messages.
-    if selector.startswith("Locator@"):
-        selector = selector[len("Locator@"):].strip()
-
-    # Strip repeatedly: "a >> nth=0 >> visible=true" is legal.
-    while True:
-        stripped = _NARROWING_SUFFIX.sub("", selector)
-        if stripped == selector:
-            break
-        selector = stripped.strip()
-
-    if not selector:
-        return None
-    lowered = selector.lower()
-    if lowered.startswith(_UNEVALUABLE_PREFIX):
-        return None
-    if any(token in lowered for token in _UNEVALUABLE_TOKEN):
-        return None
-
-    return selector
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().code.normalize_selector(raw)
 
 
 def _compile_ok(soup, selector: str) -> bool:
     try:
-        soup.select(selector, limit=1)
-        return True
+        return select(soup, selector, limit=1) is not None
     except Exception:
         return False
+
+
+def in_frame(soup, selector: str):
+    """(document, the element's own selector) for a selector that may enter iframes.
+
+    The document is None when this capture cannot answer — a hop matching several
+    iframes, where Playwright refuses to act and no count is honest, or a frame
+    the capture does not hold — and False when a hop matches no iframe at all,
+    which is a real absence.
+    """
+    path, inner = frames.split(selector)
+    doc = soup
+    for hop in path:
+        hosts = doc.select(hop)
+        if not hosts:
+            return False, inner
+        doc = getattr(hosts[0], "qa_frame", None) if len(hosts) == 1 else None
+        if doc is None:
+            return None, inner
+    return doc, inner
+
+
+def select(soup, selector: str, limit: int = 0):
+    """soup.select() that follows an iframe chain. None when it cannot say."""
+    doc, inner = in_frame(soup, selector)
+    if doc is None:
+        return None
+    return doc.select(inner, limit=limit) if doc is not False else []
 
 
 def page_facts(snapshot_text: str, soup=None) -> Dict:
@@ -200,8 +251,21 @@ def page_facts(snapshot_text: str, soup=None) -> Dict:
 
 
 def parse(snapshot_text: str):
-    """Parse a snapshot once so callers can share the tree. None on failure."""
-    if not snapshot_text:
+    """Parse a snapshot once so callers can share the tree. None on failure.
+
+    The iframes captured beside it — a `frames` sidecar named in the header — are
+    parsed too and hung on their <iframe> tags (`qa_frame`, with that frame's own
+    element capture as `qa_prints`), so select() can follow a frame chain. A
+    snapshot without the sidecar parses exactly as it always did.
+    """
+    soup = _soup(snapshot_text)
+    if soup is not None:
+        _attach_frames(soup, snapshot_text)
+    return soup
+
+
+def _soup(text: str):
+    if not text:
         return None
     try:
         from bs4 import BeautifulSoup
@@ -209,10 +273,30 @@ def parse(snapshot_text: str):
         return None
     for parser in ("lxml", "html.parser"):
         try:
-            return BeautifulSoup(snapshot_text, parser)
+            return BeautifulSoup(text, parser)
         except Exception:
             continue
     return None
+
+
+def _attach_frames(soup, snapshot_text: str) -> None:
+    import json
+    from pathlib import Path
+    sidecar = parse_header(snapshot_text[:2000]).get("frames") or ""
+    try:
+        records = json.loads(Path(sidecar).read_text(encoding="utf-8")) if sidecar else []
+    except (OSError, ValueError):
+        return
+    docs = {0: soup}
+    for record in records or []:               # a parent is always written before its children
+        parent, child = docs.get(record.get("parent")), _soup(record.get("html") or "")
+        hosts = parent.find_all(["iframe", "frame"]) if parent is not None else []
+        ordinal = record.get("ordinal", -1)
+        if child is None or not 0 <= ordinal < len(hosts):
+            continue
+        child.qa_prints = record.get("fingerprints") or {}
+        hosts[ordinal].qa_frame = child
+        docs[record.get("index")] = child
 
 
 def extract_locators(source: str) -> List[Dict[str, str]]:
@@ -221,64 +305,8 @@ def extract_locators(source: str) -> List[Dict[str, str]]:
     Reads the page-object source the fix step already loads, so no extra file
     access is needed. Duplicates are collapsed on the raw selector string.
     """
-    found: List[Dict[str, str]] = []
-    seen = set()
-    if not source:
-        return found
-
-    for pattern in _LOCATOR_PATTERNS:
-        for match in pattern.finditer(source):
-            raw = match.group("sel")
-            if not raw or raw in seen:
-                continue
-            seen.add(raw)
-            name = match.groupdict().get("name") or ""
-            if not name:
-                # @FindBy: the field is declared just after the annotation.
-                tail = source[match.end():match.end() + 200]
-                field = _FINDBY_FIELD.search(tail)
-                if field:
-                    name = field.group(1)
-            found.append({"name": name, "raw": raw, "kind": "css",
-                          "value": "", "approx": False,
-                          "selector": normalize_selector(raw) or ""})
-
-    for pattern, kind in _GETBY_PATTERNS:
-        for match in pattern.finditer(source):
-            groups = match.groupdict()
-            value = groups.get("val") or groups.get("role") or ""
-            if not value:
-                continue
-            name = groups.get("name") or ""
-            if not name:
-                field = _FINDBY_FIELD.search(source[max(0, match.start() - 200):match.start()])
-                if field:
-                    name = field.group(1)
-            entry = {"name": name, "kind": kind, "value": value,
-                     "approx": kind in ("role", "text", "label"),
-                     "selector": "", "accessible_name": ""}
-            if kind == "role":
-                # setName() is a chained call, so look just past the match.
-                set_name = _SET_NAME.search(source[match.end():match.end() + 300])
-                entry["accessible_name"] = set_name.group("val") if set_name else ""
-                entry["selector"] = _ROLE_TAGS.get(value.upper(), "")
-                entry["raw"] = (f"getByRole({value}"
-                                + (f', name="{entry["accessible_name"]}"' if entry["accessible_name"] else "")
-                                + ")")
-            elif kind == "testid":
-                entry["selector"] = f"[data-testid='{value}']"
-                entry["raw"] = f'getByTestId("{value}")'
-            elif kind == "placeholder":
-                entry["selector"] = f"[placeholder='{value}']"
-                entry["raw"] = f'getByPlaceholder("{value}")'
-            else:  # text / label — matched by content, not by selector
-                entry["accessible_name"] = value
-                entry["raw"] = f'getBy{kind.capitalize()}("{value}")'
-            if entry["raw"] in seen:
-                continue
-            seen.add(entry["raw"])
-            found.append(entry)
-    return found
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().code.extract_locators(source)
 
 
 def locator_coverage(locators: List[Dict[str, str]], soup) -> Dict:
@@ -301,7 +329,7 @@ def locator_coverage(locators: List[Dict[str, str]], soup) -> Dict:
 
         if selector and _compile_ok(soup, selector):
             try:
-                nodes = soup.select(selector, limit=_MATCH_LIMIT * 8)
+                nodes = select(soup, selector, limit=_MATCH_LIMIT * 8)
                 if wanted:
                     nodes = [n for n in nodes if _has_accessible_name(n, wanted)]
                 entry["count"] = len(nodes[:_MATCH_LIMIT])

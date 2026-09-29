@@ -19,7 +19,7 @@ cd "$PROJECT_ROOT"
 # 1. Verify Python
 write_step "Verifying Python 3"
 if ! command -v python3 &> /dev/null; then
-    echo -e "${RED}Error: python3 not found. Please install Python 3.9+ and try again.${NC}"
+    echo -e "${RED}Error: python3 not found. Please install Python 3.10+ and try again.${NC}"
     exit 1
 fi
 
@@ -79,6 +79,6 @@ fi
 
 write_step "Setup complete. Next steps:"
 echo -e "  1. ${YELLOW}source .venv/bin/activate${NC}  — activate the virtual environment in your shell."
-echo -e "  2. ${YELLOW}Edit config/.env${NC} — fill in DB credentials, Claude CLI path, GitHub token, Slack token."
-echo -e "  3. Analyse a build:  ${YELLOW}./scripts/run-analyse.sh${NC}"
-echo -e "  4. Fix & raise PR:   ${YELLOW}./scripts/run-autofix.sh${NC}"
+echo -e "  2. ${YELLOW}python -m playwright install chromium${NC} — browser for the locator engine."
+echo -e "  3. ${YELLOW}Edit config/.env${NC} — see README \"Minimum configuration\"."
+echo -e "  4. Run an agent:     ${YELLOW}make help${NC}"

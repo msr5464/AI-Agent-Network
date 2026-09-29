@@ -83,7 +83,9 @@ def db_row_to_test_result(db_row: Dict, execution_log: Optional[str] = None, dur
         status = TestStatus.FAIL
     elif status_str in ['ERROR', 'ERRORED']:
         status = TestStatus.ERROR
-    elif status_str in ['SKIP', 'SKIPPED']:
+    elif status_str in ['SKIP', 'SKIPPED', 'ABORTED']:
+        # An aborted test never finished (TestNG reports it as a SkipException).
+        # It fell through to the unknown-status default and counted as a pass.
         status = TestStatus.SKIP
     else:
         # Default to PASS if unknown
@@ -193,7 +195,7 @@ def get_execution_logs_from_html(report_dir: str) -> tuple[Dict[str, str], Dict[
         # Base URL for constructing links (using Config if available)
         try:
             from ..settings import Config
-            base_url = Config.DASHBOARD_BASE_URL
+            base_url = Config.TRIAGING_DASHBOARD_BASE_URL
             report_name = Path(report_dir).name
             
             # Extract project name and job name using centralized builder

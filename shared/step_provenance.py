@@ -25,6 +25,11 @@ _KINDS = (("STEP:", "step"), ("ACTION:", "action"), ("API:", "api"))
 # The framework's own wording when a wait gives up. Used to locate the failure
 # moment inside the log, not to classify it.
 _GIVE_UP = ("failed to load element", "element not visible after timeout",
+            # WaitHelper no longer calls every failed wait a timeout: an
+            # ambiguous locator throws at once and says so. Both wordings mark
+            # the same moment — the wait giving up — and missing one of them
+            # loses the gap measurement for exactly those failures.
+            "matches more than one element", "failed after",
             "------------end of execution------------")
 
 

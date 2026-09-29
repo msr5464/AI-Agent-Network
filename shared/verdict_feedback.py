@@ -68,3 +68,59 @@ def summarize(feedback_file) -> Dict[str, int]:
         if kind:
             counts[kind] = counts.get(kind, 0) + 1
     return counts
+
+
+# ── test-adaptation-agent: did a human accept what was proposed? ──────────────
+#
+# The promotion criterion from propose-only to apply is not a date and not a
+# feeling — it is whether people were accepting the proposals verbatim. That is
+# only knowable if somebody writes it down, so this records it in the same file
+# and the same shape as the verdict mistakes above.
+#
+# As with everything else here: this records, nothing reads it back
+# automatically. A threshold moved by a machine on evidence a machine gathered is
+# how a system talks itself into a corner.
+
+def record_proposal(path, session_id: str, module: str, item: int, kind: str,
+                    accepted: Optional[bool], note: str = "") -> None:
+    """Log one proposed change item and what a human did with it.
+
+    `accepted` is None while nobody has judged it yet — deliberately distinct
+    from False, because "not reviewed" and "rejected" would otherwise average
+    together into a number that means nothing.
+    """
+    target = Path(path)
+    entries = _load(target)
+    entries.append({
+        "kind": "adaptation_proposal",
+        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "session_id": session_id,
+        "module": module,
+        "item": item,
+        "change_kind": kind,
+        "accepted": accepted,
+        "note": note,
+    })
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(entries[-_MAX_ENTRIES:], indent=2))
+
+
+def proposal_acceptance(path) -> Dict:
+    """How proposals have been received so far. Read by a human, not by a gate."""
+    entries = [e for e in _load(Path(path))
+               if e.get("kind") == "adaptation_proposal"]
+    judged = [e for e in entries if e.get("accepted") is not None]
+    accepted = [e for e in judged if e["accepted"]]
+    by_kind: Dict[str, Dict[str, int]] = {}
+    for entry in judged:
+        row = by_kind.setdefault(entry.get("change_kind", "?"),
+                                 {"accepted": 0, "total": 0})
+        row["total"] += 1
+        row["accepted"] += 1 if entry["accepted"] else 0
+    return {
+        "proposed": len(entries),
+        "judged": len(judged),
+        "accepted": len(accepted),
+        "rate": (len(accepted) / len(judged)) if judged else None,
+        "by_kind": by_kind,
+    }

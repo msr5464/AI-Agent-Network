@@ -27,7 +27,7 @@ function Invoke-OrFail {
 Write-Step "Verifying Python executable ($PythonExe)"
 $pythonCmd = Get-Command $PythonExe -ErrorAction SilentlyContinue
 if (-not $pythonCmd) {
-    throw "Python was not found on the PATH. Install Python 3.9+ and try again."
+    throw "Python was not found on the PATH. Install Python 3.10+ and try again."
 }
 
 if (-not (Test-Path $Requirements)) {
@@ -73,5 +73,5 @@ if (-not (Test-Path $envPath) -and (Test-Path $envExamplePath)) {
 
 Write-Step "Setup complete. Next steps:"
 Write-Host "  1. Edit config\.env — fill in DB credentials, Claude CLI path, GitHub token, Slack token." -ForegroundColor Yellow
-Write-Host "  2. Analyse a build:  .\scripts\run-analyse.ps1" -ForegroundColor Yellow
-Write-Host "  3. Fix and raise PR: .\scripts\run-autofix.ps1" -ForegroundColor Yellow
+Write-Host "  2. Analyse a build:  .\scripts\run-triaging-agent.ps1" -ForegroundColor Yellow
+Write-Host "  3. Fix and raise PR: .\scripts\run-healing-agent.ps1" -ForegroundColor Yellow

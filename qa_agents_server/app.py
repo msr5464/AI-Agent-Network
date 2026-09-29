@@ -18,7 +18,7 @@ from qa_agents_server.paths import REPO_ROOT
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from qa_agents_server import runner, storage  # noqa: E402
+from qa_agents_server import runner, seed_examples, storage  # noqa: E402
 from qa_agents_server.routes import qa_bp  # noqa: E402
 
 
@@ -37,6 +37,14 @@ def create_app() -> Flask:
     storage.init()
     runner.reconcile_on_boot()
 
+    # Put the documented examples in each agent's queue so a fresh checkout has
+    # something in the UI. Seeds once per checkout and never overwrites; see
+    # seed_examples for the rules. Done here rather than in run-server.sh so it
+    # also covers `python -m qa_agents_server.app` and any other entry point.
+    seeded = seed_examples.seed_all(log=lambda m: print(f"[seed]{m}"))
+    if seeded:
+        print(f"Seeded example queue items for {len(seeded)} agent(s)")
+
     app.register_blueprint(qa_bp)
 
     @app.route("/health")
@@ -45,7 +53,7 @@ def create_app() -> Flask:
             "status": "ok",
             "service": "qa_agents_server",
             "version": "0.1.0",
-            "active_run": runner.get_active_session_id(),
+            "active_run": None,  # For backward compatibility. Clients should use /api/agents/<agent>/run/active
         })
 
     @app.errorhandler(404)
@@ -54,7 +62,9 @@ def create_app() -> Flask:
 
     @app.errorhandler(500)
     def _internal(_e):
-        return jsonify({"error": "internal server error"}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "internal server error", "details": str(_e)}), 500
 
     # Ensure subprocesses are cleaned up on shutdown (Ctrl-C, SIGTERM, atexit).
     def _shutdown(*_args):
@@ -69,9 +79,22 @@ def create_app() -> Flask:
 
 
 def main():
-    port = int(os.getenv("QA_AGENT_SERVER_PORT", "8765"))
-    host = os.getenv("QA_AGENT_SERVER_HOST", "0.0.0.0")
+    port = int(os.getenv("QA_AGENT_SERVER_PORT", "6001"))
+    # Localhost by default. This server implements no auth of its own — it
+    # trusts X-User-ID and X-User-Role from the AI-Test-Studio proxy, and both
+    # are headers any client can type — so routes.py has always documented that
+    # it "is expected to bind to localhost". It then defaulted to 0.0.0.0,
+    # contradicting its own precondition: anyone who could reach the port
+    # bypassed login, approval, roles and rate limiting entirely. Override
+    # deliberately for a real deployment, and set QA_AGENT_PROXY_SECRET (see
+    # routes._from_trusted_proxy) when you do.
+    host = os.getenv("QA_AGENT_SERVER_HOST", "127.0.0.1")
     app = create_app()
+    if host not in ("127.0.0.1", "localhost", "::1") and not (
+            os.getenv("QA_AGENT_PROXY_SECRET") or "").strip():
+        print(f"WARNING: binding {host} with no QA_AGENT_PROXY_SECRET set — "
+              f"identity headers are unauthenticated and anyone who can reach "
+              f"this port can act as any user.")
     print(f"QA Agent Server listening on http://{host}:{port}")
     # threaded=True is essential: SSE endpoints hold a connection open, and
     # the runner spawns background threads per run.

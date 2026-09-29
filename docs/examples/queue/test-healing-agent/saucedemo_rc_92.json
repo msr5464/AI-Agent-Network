@@ -1,0 +1,84 @@
+{
+  "build_tag": "saucedemo_rc_92",
+  "created_at": "2026-03-17T18:17:50.118427Z",
+  "source_session": "20260317-181745-saucedemo_rc_92",
+  "source_audit_dir": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-saucedemo_rc_92",
+  "automation_issues": [
+    {
+      "test_name": "automation.saucedemo.SauceDemoWebTest.addProductToCart",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "LOCATOR_STALE",
+      "root_cause": "ProductsPage: inventory, title and cart link still match, so this is the right page; only [data-test='add-to-cart-sauce-labs-backpack'] no longer resolves",
+      "failure_signature": "FAILED: Failed to click on element 'Add to cart: sauce-labs-backpack' with locator",
+      "cause_group_key": "ProductsPage:[data-test='add-to-cart-sauce-labs-backpack']",
+      "cause_group_size": 2,
+      "recommended_action": "edit the selector",
+      "error_type": "Failed to click on element 'Add to cart: sauce-labs-backpack' with locator",
+      "error_message": "Failed to click on element 'Add to cart: sauce-labs-backpack' with locator: Locator@[data-test='add-to-cart-sauce-labs-backpack']: Timeout 5000ms exceeded.\nCall log:\n-   - waiting for locator(\"[data-test='add-to-cart-sauce-labs-backpack']\")\n",
+      "stack_trace": "ProductsPage.java:44",
+      "execution_log": "[18:17:47] ACTION: Navigating to: https://www.saucedemo.com/\n[18:17:48] Products page loaded — 6 inventory items visible\n[18:17:53] WARNING: Element not visible after timeout: Add to cart: sauce-labs-backpack\n\tat automation.modules.saucedemo.web.ProductsPage.addProductToCart(ProductsPage.java:44)\n",
+      "class_name": "automation.saucedemo.SauceDemoWebTest",
+      "method_name": "addProductToCart",
+      "full_name": "automation.saucedemo.SauceDemoWebTest.addProductToCart",
+      "dom_snapshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-saucedemo_rc_92/artifacts/addProductToCart_181753.html",
+      "failure_url": "https://www.saucedemo.com/inventory.html",
+      "trace_path": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-saucedemo_rc_92/artifacts/addProductToCart_181753.zip",
+      "failed_selector": "[data-test='add-to-cart-sauce-labs-backpack']",
+      "flaky_tests": [
+        "automation.saucedemo.SauceDemoWebTest.simulateWebLifecycle"
+      ],
+      "screenshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-saucedemo_rc_92/artifacts/addProductToCart_181753.png"
+    },
+    {
+      "test_name": "automation.saucedemo.SauceDemoWebTest.simulateWebLifecycle",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "LOCATOR_STALE",
+      "root_cause": "Same ProductsPage selector as addProductToCart, but this test is in flaky_tests — it has passed on 3 of the last 5 nightlies",
+      "failure_signature": "FAILED: Failed to click on element 'Add to cart: sauce-labs-backpack' with locator",
+      "cause_group_key": "ProductsPage:[data-test='add-to-cart-sauce-labs-backpack']",
+      "cause_group_size": 2,
+      "recommended_action": "edit the selector",
+      "error_type": "Failed to click on element 'Add to cart: sauce-labs-backpack' with locator",
+      "error_message": "Failed to click on element 'Add to cart: sauce-labs-backpack' with locator: Locator@[data-test='add-to-cart-sauce-labs-backpack']: Timeout 5000ms exceeded.\n",
+      "stack_trace": "ProductsPage.java:44",
+      "execution_log": "[18:18:02] Products page loaded — 6 inventory items visible\n[18:18:07] WARNING: Element not visible after timeout: Add to cart: sauce-labs-backpack\n\tat automation.modules.saucedemo.web.ProductsPage.addProductToCart(ProductsPage.java:44)\n",
+      "class_name": "automation.saucedemo.SauceDemoWebTest",
+      "method_name": "simulateWebLifecycle",
+      "full_name": "automation.saucedemo.SauceDemoWebTest.simulateWebLifecycle",
+      "dom_snapshot": "",
+      "failure_url": "",
+      "trace_path": "",
+      "failed_selector": "",
+      "flaky_tests": [
+        "automation.saucedemo.SauceDemoWebTest.simulateWebLifecycle"
+      ]
+    },
+    {
+      "test_name": "automation.saucedemo.SauceDemoWebTest.verifyProductAppearsInCart",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "LOCATOR_STALE",
+      "root_cause": "CartPage: .cart_item still matches, so the cart did open; the Continue Shopping button's data-test attribute was dropped, so the page-load check on [data-test='continue-shopping'] no longer resolves",
+      "failure_signature": "FAILED: Failed to load Element Locator@[data-test='continue-shopping'] in CartPage",
+      "cause_group_key": "CartPage:[data-test='continue-shopping']",
+      "cause_group_size": 1,
+      "recommended_action": "edit the selector",
+      "error_type": "Failed to load Element Locator@[data-test='continue-shopping'] in CartPage",
+      "error_message": "Failed to load Element Locator@[data-test='continue-shopping'] in CartPage\n",
+      "stack_trace": "CartPage.java:19",
+      "execution_log": "[18:18:20] ACTION: Clicking: Add to cart: sauce-labs-bike-light\n[18:18:20] ACTION: Clicking: Shopping cart link\n[18:18:25] WARNING: Element not visible after timeout: [data-test='continue-shopping']\n\tat automation.modules.saucedemo.web.CartPage.<init>(CartPage.java:19)\n",
+      "class_name": "automation.saucedemo.SauceDemoWebTest",
+      "method_name": "verifyProductAppearsInCart",
+      "full_name": "automation.saucedemo.SauceDemoWebTest.verifyProductAppearsInCart",
+      "dom_snapshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260317-181745-saucedemo_rc_92/artifacts/verifyProductAppearsInCart_181825.html",
+      "failure_url": "https://www.saucedemo.com/cart.html",
+      "trace_path": "",
+      "failed_selector": "[data-test='continue-shopping']",
+      "flaky_tests": [
+        "automation.saucedemo.SauceDemoWebTest.simulateWebLifecycle"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+Module: saucedemo
+Type: web
+URL: https://www.saucedemo.com/
+
+Steps:
+1. Navigate to the SauceDemo website.
+2. Log in as the standard user (Username: standard_user, Password: secret_sauce).
+3. Verify the "Products" page is displayed.
+4. Click the "Sauce Labs Backpack" product name to open its details page.
+5. Verify the details page shows the name "Sauce Labs Backpack" and the price "$29.99".
+6. Click "Add to cart" on the details page.
+7. Verify the button now reads "Remove" and the cart badge shows 1.
+8. Click "Back to products".
+9. Verify the "Products" page is displayed and the cart badge still shows 1.

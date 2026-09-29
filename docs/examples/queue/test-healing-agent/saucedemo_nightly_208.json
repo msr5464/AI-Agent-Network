@@ -1,0 +1,32 @@
+{
+  "build_tag": "saucedemo_nightly_208",
+  "created_at": "2026-03-16T02:30:50.118427Z",
+  "source_session": "20260316-023011-saucedemo_nightly_208",
+  "source_audit_dir": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260316-023011-saucedemo_nightly_208",
+  "automation_issues": [
+    {
+      "test_name": "automation.saucedemo.SauceDemoWebTest.simulateWebLifecycle",
+      "classification": "AUTOMATION_ISSUE",
+      "confidence": "HIGH",
+      "root_cause_category": "AMBIGUOUS_LOCATOR",
+      "root_cause": "Locator \"[data-test='remove-sauce-labs-bike-light']\" resolved to 2 elements — the header mini-cart now repeats each cart row's Remove button with the same data-test",
+      "failure_signature": "FAILED: Error: strict mode violation",
+      "cause_group_key": "CartPage:[data-test='remove-sauce-labs-bike-light']",
+      "cause_group_size": 1,
+      "recommended_action": "narrow the selector so it matches exactly one element",
+      "error_type": "Error: strict mode violation",
+      "error_message": "Error: strict mode violation: locator(\"[data-test='remove-sauce-labs-bike-light']\") resolved to 2 elements:\n  1) <button class=\"btn btn_secondary btn_small cart_button\" id=\"remove-sauce-labs-bike-light\" data-test=\"remove-sauce-labs-bike-light\">…\n  2) <button class=\"btn btn_secondary btn_small mini_cart_remove\" data-test=\"remove-sauce-labs-bike-light\">…\n",
+      "stack_trace": "CartPage.java:37",
+      "execution_log": "[02:30:12] ACTION: Navigating to: https://www.saucedemo.com/\n[02:30:13] ACTION: Clicking: Add to cart: sauce-labs-backpack\n[02:30:13] ACTION: Clicking: Add to cart: sauce-labs-bike-light\n[02:30:14] ACTION: Clicking: Shopping cart link\n[02:30:15] Cart loaded — 2 line items\n[02:30:15] ACTION: Clicking: Remove: Sauce Labs Bike Light\n[02:30:15] Error: strict mode violation: locator(\"[data-test='remove-sauce-labs-bike-light']\") resolved to 2 elements\n\tat automation.modules.saucedemo.web.CartPage.removeProduct(CartPage.java:37)\n",
+      "class_name": "automation.saucedemo.SauceDemoWebTest",
+      "method_name": "simulateWebLifecycle",
+      "full_name": "automation.saucedemo.SauceDemoWebTest.simulateWebLifecycle",
+      "dom_snapshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260316-023011-saucedemo_nightly_208/artifacts/simulateWebLifecycle_023015.html",
+      "failure_url": "https://www.saucedemo.com/cart.html",
+      "trace_path": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260316-023011-saucedemo_nightly_208/artifacts/simulateWebLifecycle_023015.zip",
+      "failed_selector": "[data-test='remove-sauce-labs-bike-light']",
+      "flaky_tests": [],
+      "screenshot": "/path/to/QA-Agent-Network/agents/test-triaging-agent/audit/20260316-023011-saucedemo_nightly_208/artifacts/simulateWebLifecycle_023015.png"
+    }
+  ]
+}

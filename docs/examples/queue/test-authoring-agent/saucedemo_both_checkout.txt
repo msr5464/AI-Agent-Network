@@ -1,0 +1,28 @@
+Module: saucedemo
+Type: both
+API URL: https://jsonplaceholder.typicode.com
+URL: https://www.saucedemo.com/
+
+Auth (API): none. JSONPlaceholder is a public mock API — no token, API key or login call is needed.
+Headers (API): send "Content-Type: application/json; charset=UTF-8" on every request that has a body.
+Auth (web): the public SauceDemo standard user — Username: standard_user, Password: secret_sauce.
+
+Steps:
+1. Create a shopper:
+   curl -X POST https://jsonplaceholder.typicode.com/users \
+     -H "Content-Type: application/json; charset=UTF-8" \
+     -d '{"name": "Leanne Graham", "address": {"zipcode": "92998-3874"}}'
+2. Verify the response status code is 201 and id is present.
+3. Capture id, name and address.zipcode from the response.
+4. Navigate to the SauceDemo website and log in as the standard user.
+5. Add "Sauce Labs Backpack" to the cart and open the cart.
+6. Click "Checkout".
+7. Enter the first word of the captured name as First Name, the rest of the name as Last Name, and the captured zipcode as Zip/Postal Code.
+8. Verify the First Name, Last Name and Zip/Postal Code fields show the values captured from the API.
+9. Click "Continue".
+10. Verify the checkout overview lists "Sauce Labs Backpack" and shows "Item total: $29.99".
+11. Click "Finish".
+12. Verify the page shows "Thank you for your order!".
+13. Delete the shopper using the id captured in step 3 (JSONPlaceholder always returns id 11 for a new user):
+    curl -X DELETE https://jsonplaceholder.typicode.com/users/11
+14. Verify the response status code is 200.
