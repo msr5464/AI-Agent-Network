@@ -423,3 +423,33 @@ public class CartPage extends BasePage {
     def test_a_locator_nothing_types_into_is_not_judged(self):
         source = self.SOURCE.replace("fillText(amountField", "getText(amountField")
         assert self._check(".customer tr:nth-child(2) input", source=source) == (True, "")
+
+
+class TestOptionTemplateStaysATemplate:
+    """A locator built from an option's key serves every value of its enum. Only the
+    value the failing test used is exercised, so a fix that writes that one value
+    into the template passes — and silently breaks every other option."""
+
+    @pytest.fixture(autouse=True)
+    def _playwright(self, monkeypatch):
+        monkeypatch.setenv("AUTOMATION_FRAMEWORK", "playwright")
+
+    TEMPLATE = ('    public PaymentPage choose(PaymentMethod method) {\n'
+                '        click(page.frameLocator("#pay").locator("a[data-option=\'" + method.getKey() + "\']"), "Method");\n'
+                '        return this;\n    }\n')
+
+    def test_writing_one_value_into_the_template_is_rejected(self):
+        after = self.TEMPLATE.replace('"a[data-option=\'" + method.getKey() + "\']"',
+                                      '"a[data-option=\'card\']"')
+        ok, reason = g.no_selector_broadening(self.TEMPLATE, after)
+        assert ok is False and "every option" in reason
+
+    def test_fixing_the_templates_fixed_part_is_allowed(self):
+        after = self.TEMPLATE.replace("a[data-option='", "a[data-choice='")
+        assert g.no_selector_broadening(self.TEMPLATE, after)[0] is True
+
+    def test_moving_to_a_native_select_is_allowed(self):
+        after = self.TEMPLATE.replace(
+            'click(page.frameLocator("#pay").locator("a[data-option=\'" + method.getKey() + "\']"), "Method");',
+            'selectOption(page.locator("select#method"), method.getKey(), "Method");')
+        assert g.no_selector_broadening(self.TEMPLATE, after)[0] is True

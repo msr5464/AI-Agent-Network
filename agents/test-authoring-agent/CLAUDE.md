@@ -274,10 +274,21 @@ must sign off.
 
 ### When step 04 stops retrying
 
-`AUTHORING_FIX_RETRY_COUNT` is a **ceiling, not a target**. A budget bounds the worst
-case; it cannot tell a real attempt from a repeat of one. So the loop also stops the
-moment it can prove the next attempt would not differ, which is the whole reason the
-budget could come down from 4 to 2.
+`AUTHORING_FIX_RETRY_COUNT` counts only fix attempts **in a row that made no
+progress**. An attempt whose fix worked and let the test reach a failure this run has
+not had before is progress, however red the run still is: a test with three
+independent bugs needs three attempts that all succeeded, and charging them as retries
+once stopped a run right after it fixed one bug and reached the next. Any progress
+resets the count. Going back to a failure seen earlier is not progress — that is two
+fixes undoing each other. `AUTHORING_MAX_FIX_ATTEMPTS` (8) is the absolute ceiling, the
+same design as the healing agent's `HEALING_RETRY_COUNT` / `HEALING_MAX_ATTEMPTS`.
+
+Step 04 decides, because every input is there: `retry_verdict` writes `.fix-retry`
+(`retry`, or `stop: <reason>`), and run.sh loops on it. Each `.fix-history.json` entry
+records the failure it `targeted` and whether it made `progress`.
+
+A budget still cannot tell a real attempt from a repeat of one. So the loop also stops
+the moment it can prove the next attempt would not differ.
 
 Three proofs, all in `shared/fix_history.py`:
 
@@ -384,14 +395,17 @@ Web Steps:
 | `00-session-init.md` | run.sh | Session metadata, env snapshot |
 | `01-parse.json` + `.md` | Parse | Generation plan |
 | `02-validate-api.json` + `.md` | Validate API | Auth status, confirmed endpoint response shapes |
-| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms`, `inputs_used`, `value_checks`, `proven_preferred` (names whose reported selector was replaced by this test case's proven one) |
+| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms`, `inputs_used`, `value_checks`, `proven_preferred` (names whose reported selector was replaced by this test case's proven one), `option_sets` (every option each choice offered, read off the evidence) |
 | `claude-*.log` | Validate Web | Raw `claude -p` stream, for diagnosing empty runs |
 | `02-known-selectors.json` | Validate Web | The confirmed selectors seeded from an earlier run on the same host |
 | `02-web-evidence.jsonl` | Validate Web | What the browser helpers measured, one line per settled page state. Every `SELECTOR_FOUND` is checked against it |
 | `03-system-prompt.txt`, `04-system-prompt.txt` | Generate, Run & Fix | The static half of each prompt — conventions, references, rules — sent once as `--system-prompt-file` instead of inside every batch or attempt |
-| `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators`, `untraced_expected_values` |
+| `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators`, `untraced_expected_values`; the reuse ledger (`reuse`, `reuse_unknown`, `new_operations`), `created_files` / `pre_run_files`, and the review records `test_shape`, `modified_existing`, `changed_existing_api`, `near_duplicates`, `option_enum_gaps`, `reuse_unused`; `restored_existing_tests` (existing `@Test` methods step 03 changed and put back) |
+| `pre-run/` | Generate, Run & Fix | Every existing file this run changed, as it was before the run touched it — step 03's copies, plus any a step 04 fix added. What `modified_existing` and the regression re-run diff against |
 | `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes, `value_mismatch` / `relaxed_checks` when a failure was triaged as one |
 | `04-proven-locators.json` | Run & Fix | Only on a passing run: the locators that matched one visible element while it passed. Seeds later runs of step 02; also copied to `cache/<user>/<module>/` |
+| `04-regression.json` + `.md` | Run & Fix | Only after the new test passes: the existing methods this run changed, the existing tests that reach them, and each re-run's result with its first error line. A failure, or more tests than the cap, makes the verdict NEEDS-REVIEW |
+| `regression-baselines/` | Run & Fix | Page fingerprints the regression re-runs recorded, kept out of the checkout so they never ride into the PR |
 | `04-failed-locators.json` | Run & Fix | Each step 02 selector, as step 02 gave it, that a failing run of the test was on (the reproducible initial failure, or a later attempt's), with its name. Copied to `cache/<user>/<module>/` when the run ends `false` or `stuck`, so the next run validates step 02 again instead of restoring it |
 | `.assertions-frozen.json` | Run & Fix | What the generated test proved before any fix — the conservation baseline |
 | `.fix-history.json` | Run & Fix | Every fix attempt, appended: diagnosis, edits proposed, guards that rejected them. Feeds the next prompt and the stop rule |
@@ -417,7 +431,8 @@ Web Steps:
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs | `main` |
 | `GITHUB_PR_REVIEWERS` | Comma-separated reviewer handles | optional |
 | `AUTHORING_BRANCH_PREFIX` | Branch name prefix | `authoring` |
-| `AUTHORING_FIX_RETRY_COUNT` | Max retry cycles for failing tests. A ceiling — the loop stops early once an attempt can bring nothing new | `2` |
+| `AUTHORING_FIX_RETRY_COUNT` | Fix attempts in a row that may make no progress before the loop stops. An attempt that fixes a bug and lets the test reach a new one is not counted. The loop also stops early once an attempt can bring nothing new | `2` |
+| `AUTHORING_MAX_FIX_ATTEMPTS` | Absolute ceiling on fix attempts, however much progress they make | `8` |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) | `true` |
 | `CACHE_STEPS` | Restore steps 01–02 from `cache/<user>/<module>/` when the input file is byte-identical to the one they were cached from. A resume never takes a hit. Nor does a cached step 02 when a later passing run proved a locator it lacks or has another selector for, and that step 02 was never seeded with, or when a red run failed on a selector it still hands out: step 02 is the only reader of proven and failed locators, so it runs again (`shared/proven_locators.py`). Each step's `.md` report is cached with it, and step 02's seeds (`02-known-selectors.json`) with step 02 | `true` |
 | `AUTHORING_ENVIRONMENT` | Maven `-Denvironment=` value | `staging` |
@@ -515,7 +530,8 @@ The section below covers **agent-specific generation rules** that are not in the
 src/main/java/automation/modules/{feature}/
   {Feature}Data.java
   {Feature}Builder.java
-  {Feature}Helper.java          extends ApiHelper
+  {Feature}Helper.java          extends ApiHelper — the module's flow API (business operations)
+  {Feature}Enums.java           option enums, one nested enum per choice — only when the plan has option_enums
   api/{Feature}Api.java         enum implements ApiDetails — only when the plan has API endpoints or the test type is api/both
   web/{Page}Page.java           extends BasePage
 
@@ -636,41 +652,135 @@ healing agent (where the heal is exactly what makes the old fingerprint stale) a
 
 ---
 
-## Step narration — one `logStep` per step
+## The module's flow API — reuse first, then business operations
 
-The run report prints one line per `logStep`. A test that opens with a single run-on
-summary — *"Login to Naukri, toggle the trailing dot in Profile Summary, save the change,
-and verify it persists after page reload"* — passes every check that existed before
-(`logStep` present, in a test class, plain English) and still produces a one-line report
-for a four-step scenario: when it fails, the report cannot say which step broke. The
-derived intent contract is built from the same strings, so one sentence collapses four
-checkable claims into one blob.
+A test that drives page objects call by call is long, and the next test copies the
+same calls. One run produced a 96-line test with 18 `logStep`s over six page objects,
+while the module's helper held two trivial methods. That was the pipeline's doing,
+not the model's: the plan wrote test steps as page calls, the codegen rules capped a
+helper at "one step", and the narration repair unpacked any helper call that covered
+two plan steps back into the page calls behind it.
+
+The module's Helper is now the API its tests are written against: business
+operations a person would name (check out, make a payment, confirm an OTP), each
+covering as many pages as the operation takes. A test reads as one call per step,
+followed by that step's checks — about 25-30 lines for a typical scenario.
+
+### The plan (step 01)
+
+| Field | What it says |
+|-------|--------------|
+| `reuse` | Every existing method a step calls (`how: as_is`) or changes slightly (`how: extend`, with the exact `change`), from the module or the framework's shared code |
+| `helper_web_methods` | Only new operations: `kind` stage or composed, `params`, `returns`, `navigates_through`, `composes`, and in an existing module `why_new` |
+| `option_enums` | Each choice among options the page offers: `name`, what it `chooses`, the `page` and `control` it is picked with, the values this test `exercised` |
+| test-method `steps` | One object per business step: `logstep` (the action and its expected outcome), `call` (the one call that carries it out), `checks` (tagged per rule 4b) |
+
+The planner is shown what exists, not file contents cut at 3000 characters:
+`shared/module_index.py` indexes the existing module (one line per public member) and
+the framework's shared code (`shared_code` in `config/repo-map.json`). It walks a
+ladder for every operation and page method a step needs: use an existing method as
+it is; else change one slightly — a new enum value and its case, an overload that
+keeps the old signature, an optional data field, a value returned instead of void, a
+shared private step — without changing what it does for its current callers; only
+then write a new one. A method that would differ from an existing one by a hard-coded
+value is never new. A `reuse` claim naming a method neither index has moves to
+`reuse_unknown`, and codegen writes it like any new method.
+
+A **stage** ends where the input checks something, so the check sits right after the
+value it checks. Planning also thinks one test ahead: a run of stages a later test would
+want as one call gets a **composed** operation (`makePayment` = choose the method, enter
+the details, continue, confirm), even when this test checks between them — this test
+calls the stages, the next calls `makePayment(PaymentMethod.Wallet, payment)`. Each
+operation is named with the business verb for what it does, never for what it returns
+(`continueToBank`, not `continueAndGetBankAmount`). Operations never assert; they return
+what the checks need, several values as a nested Lombok `@Value` class read through
+getters. Test data is one setup line: a `build*` helper method that does the CSV read and
+the Builder chain.
+
+### Option enums come from the page, not the model
+
+A step that picks one option of several becomes an enum parameter. Its values are
+not the model's idea of what the page probably offers: `shared/option_sets.py` reads
+them off step 02's evidence. For the control the flow clicked, it takes the elements
+in the same state and frame that differ from it only in the attribute its selector
+keys on — every payment method in the list, every promo radio. Step 02 records them
+as `option_sets`; step 03 shows them as an OPTION SETS hint with the select-any-value
+locator already written.
+
+The page object gets one selection method whose locator is the confirmed selector
+with only the key replaced, so the value the flow used rebuilds the measured selector
+byte for byte. The helper stage does the follow-up steps for each exercised value;
+every other value throws "not automated yet" rather than running guessed steps.
+
+| What the template gives up | Why that is acceptable |
+|----------------------------|------------------------|
+| The option click is not baselined, proven or auto-healed — every tool that reads locators reads fields, and this one is built in a method | Healing abstains on it rather than making a wrong edit, and `edit_guards.no_selector_broadening` rejects any fix that writes one option's value into the template, which would silently break the others |
+| Options in a collapsed group, a native `<select>`'s options, and lists whose items carry per-element generated ids are not found | The enum then lists only what was seen and its Javadoc says so — a missing value is visible, an invented one is not |
+
+### Proving a slight change was slight (step 04)
+
+Changing an existing method is only safe if its existing callers still work, and
+step 04 otherwise runs only the new test. So once the new test passes, the run
+re-runs the existing tests that reach anything it changed:
+
+| Part | How |
+|------|-----|
+| What changed | Every existing file is copied to `pre-run/` before step 03 overwrites it, or before a step 04 fix first touches it. `module_index.changed_methods` / `changed_fields` diff against those copies |
+| Which tests | `blast_radius.tests_reaching`: the class reference graph narrowed by the call graph `assertion_graph.fingerprints` walks, so a change to one helper method re-runs only the tests that call it. A changed field or removed method counts as the whole class |
+| How they run | Step 04's own `run_maven_test` — same environment, country and browser mode as the new test — with `baseline.dir` pinned to `regression-baselines/`, so their fingerprints never reach the PR |
+| Outcome | A failure is retried once. Nothing is fixed. A failure, or more than `REGRESSION_MAX_TESTS` (10) tests, makes the verdict NEEDS-REVIEW; `.fix-passed` still means "the new test passed", which is what Analytics counts |
+
+### What a reviewer sees
+
+`03-generate.json` keeps review records, and step 05 puts them in the PR under
+"Review notes (guidance, not a gate)": the reuse ledger, every existing method changed
+with its re-run results, new operations with their `why_new`, `near_duplicates` (a new
+method whose calls repeat an existing one's with only literals different),
+`changed_existing_api`, `option_enum_gaps`, `reuse_unused` (an `as_is` reuse no generated
+file calls), and `test_shape` — each new test's length
+against `BODY_LINES_GUIDELINE` (30, in `shared/logstep_narration.py`) and any step that
+drives a page object call by call. None of these is a gate.
+
+---
+
+## Step narration — one `logStep` per business step
+
+The run report prints one line per `logStep`. A test narrated by one run-on summary
+passes every check that existed before (`logStep` present, in a test class, plain
+English) and still produces a one-line report: when it fails, the report cannot say
+which step broke. The derived intent contract is built from the same strings, so one
+sentence collapses several checkable claims into one blob. The opposite failure is a
+`logStep` per click, which turns the report into a transcript nobody reads.
 
 Presence was already checked (`logstep_present` in `shared/edit_guards.py`); granularity
 is what this adds, in two places:
 
 | Where | What happens |
 |-------|--------------|
-| **03 Generate**, in the prompt | Rule 7b: one `logStep` per plan step, immediately before the call(s) that carry it out; setup lines get none; a helper may encapsulate one step, never the whole scenario. Shown with a wrong/right pair. |
-| **03 Generate**, after codegen | `_repair_step_narration()` audits each generated test class with `shared/logstep_narration.py` and runs one targeted repair pass over the ones that fall short, guarded by `validate_fix` and rejected unless it actually adds narration. What survives is recorded in `03-generate.json` → `under_narrated_tests`. |
+| **03 Generate**, in the prompt | Rule 7b: one `logStep` per plan step object, immediately before its call and followed by its checks; setup lines get none. Shown with a wrong/right pair. |
+| **03 Generate**, after codegen | `_repair_step_narration()` audits each generated test class with `shared/logstep_narration.py` and runs one targeted repair pass over the ones that fall short. The repair rewrites narration only: it may not add, remove, move or unpack a call, which is checked by comparing the method's acting statements before and after. What survives is recorded in `03-generate.json` → `under_narrated_tests`. |
 
 The expectation is deliberately the *smaller* of two bounds: the plan's own step count for
-that method (setup steps dropped), and the number of statements in the method that
-actually drive or check the app. A method cannot narrate more groups than it has work to
-narrate, so capping by the second is what keeps the guard from firing on correct code —
-and it is why a test whose whole scenario hides behind one helper call is asked for two
-steps rather than five. The repair is given the helper and page objects generated
-alongside it as read-only context and may only call methods that already exist there.
+that method, and the number of statements in the method that actually drive or check the
+app. A method cannot narrate more groups than it has work to narrate, so capping by the
+second keeps the guard from firing on correct code. A business step in the plan counts
+once and is never filtered as setup, whatever verb it starts with.
 
 ---
 
 ## Key Rules for Existing Module Appending
 
 When `existing_module=true` in the plan:
-- Do NOT recreate `{Feature}Data.java`, `{Feature}Builder.java`, or `{Feature}Api.java` unless
-  new fields/endpoints are needed
-- DO add new methods to `{Feature}Helper.java` (API and web workflows)
-- DO add new page objects if new pages are involved
-- DO create a new test class file (e.g., `{Feature}NewScenarioTest.java`) rather than modifying
-  an existing test file — this avoids merge conflicts and preserves existing tests
-- Read the existing Helper/Data files before generating to avoid duplicating methods or fields
+- Walk the reuse ladder above: existing methods as they are, then slight changes that
+  keep every current caller's behaviour, and only then new methods, each with `why_new`.
+- `{Feature}Data.java` and `{Feature}Builder.java` are regenerated only when the plan
+  adds `data_fields`, keeping every existing field; the Api enum only for new endpoints.
+- New page objects for new pages; new methods on existing pages at the end of their section.
+- New `@Test` methods go into the module's existing test class; existing test methods are
+  never edited. That is enforced, not asked: `_restore_existing_tests` puts back any existing
+  `@Test` method that changed (whitespace aside) before anything is written. It exists
+  because a repair pass weakened one — the untraced-value check judged an existing test's
+  expected value against the new input, which never mentioned it. That check now judges
+  only values this run added.
+- Every existing file touched is copied to `pre-run/` first, and the existing tests that
+  reach a changed method are re-run once the new test passes.

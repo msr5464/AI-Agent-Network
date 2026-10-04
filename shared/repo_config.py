@@ -1,8 +1,9 @@
 """Per-repo metadata from config/repo-map.json.
 
 Fields read: `framework` (shared/frameworks/detect.py, as a fallback when a
-repo's build files do not settle which framework it uses) and
-`reference_files` (the authoring agent's worked examples).
+repo's build files do not settle which framework it uses), `reference_files`
+(the authoring agent's worked examples) and `shared_code` (the framework's
+shared code, which the authoring agent indexes so the model reuses it).
 
 Usage:
     from shared.repo_config import load_repo_config

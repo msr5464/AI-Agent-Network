@@ -2,10 +2,11 @@
 """
 Step 03 — Generate
 Uses Claude to generate all required Java files for the feature module and
-writes them directly into the Thanos-pw repository.
+writes them directly into the automation repository.
 
-For new modules: creates Data, Builder, Helper, Api enum, Page objects, Test classes.
-For existing modules: adds new methods / new test class only.
+For new modules: creates Data, Builder, Helper, Api enum, option Enums, Page objects,
+Test classes. For existing modules: reuses what exists, changes existing methods only
+in the small ways the plan's reuse ledger names, and adds what is new.
 
 When plan["flow_style"] == "interleaved" (set by 01_parse.py when a test_type=="both"
 input describes ONE sequence mixing real API and web actions, rather than two
@@ -15,7 +16,8 @@ plan["interleaved_steps"]'s order instead of separate Api/Web test classes.
 Reads:  $AUDIT_DIR/01-parse.json
         $AUDIT_DIR/02-validate-web.json
         $AUDIT_DIR/02-validate-api.json (if present — API validation hints)
-Writes: Java files into Thanos-pw repo
+Writes: Java files into the automation repo
+        $AUDIT_DIR/pre-run/ (existing files as they were)
         $AUDIT_DIR/03-generate.json
         $AUDIT_DIR/03-generate.md
 """
@@ -34,6 +36,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
 from shared import workspace as workspace_helper
+from shared import module_index
+from shared.logstep_narration import BODY_LINES_GUIDELINE
+from shared.repo_config import load_repo_config
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
@@ -66,8 +71,9 @@ GENERATE_EFFORT = os.environ.get("GENERATE_EFFORT") or None
 # was asked only to de-hardcode.
 URL_REPAIR_MAX_DIFF_LINES = int(os.environ.get("URL_REPAIR_MAX_DIFF_LINES", "60"))
 # Diff budget for the step-narration repair pass. Splitting one summary logStep
-# into a line per step, and unpacking the single helper call that hid them, is a
-# few lines per step — larger than the URL swap, still nowhere near a rewrite.
+# into a line per step is a few lines per step — larger than the URL swap, still
+# nowhere near a rewrite. The repair may not touch a call (see
+# _repair_step_narration), so this only ever buys narration.
 NARRATION_REPAIR_MAX_DIFF_LINES = int(
     os.environ.get("NARRATION_REPAIR_MAX_DIFF_LINES", "120"))
 # Compile what was just written, before step 04 spends a maven run, a browser
@@ -197,9 +203,10 @@ def read_existing_files_context(files_to_generate: list) -> str:
         return ""
     return (
         "\n\n<existing_file_contents>\n"
-        "The files below ALREADY EXIST in the repo. "
-        "You MUST preserve every existing method, field, import, and JavaDoc exactly. "
-        "Only ADD new methods/locators required for this scenario — do not remove or rewrite anything.\n"
+        "The files below ALREADY EXIST in the repo. Keep every existing member, field, import, "
+        "annotation and JavaDoc exactly as it is. Change an existing method only as an \"extend\" "
+        "entry of generation_plan[\"reuse\"] says (rule 11); everything else you add goes at the "
+        "end of its section.\n"
         + "".join(sections)
         + "</existing_file_contents>"
     )
@@ -287,7 +294,7 @@ from shared.edit_guards import validate_fix  # noqa: E402
 from shared import check_provenance, test_case  # noqa: E402
 from shared import logstep_narration  # noqa: E402
 from shared import assertion_graph, value_match  # noqa: E402
-from shared.code_analyzer import without_comments  # noqa: E402
+from shared.code_analyzer import split_class_members, without_comments  # noqa: E402
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -423,13 +430,23 @@ def prune_unverified_checks(plan: dict, web_data: dict, raw_input: str) -> dict:
                 sink.extend(n for n in names if n not in keep)
                 page[key] = keep
 
+    def invented(check: str) -> bool:
+        return (check_provenance.shape(check) == check_provenance.VERIFICATION
+                and any(check_provenance.subject_words(check) & subj for subj in subjects))
+
     for method in plan.get("web_test_methods") or []:
         steps = method.get("steps") or []
         keep = []
         for step in steps:
-            if (check_provenance.shape(step) == check_provenance.VERIFICATION
-                    and any(check_provenance.subject_words(step) & subj
-                            for subj in subjects)):
+            if isinstance(step, dict):
+                # A business step carries its action and its checks together.
+                # Dropping an invented check must not drop the action with it.
+                checks = [c for c in step.get("checks") or [] if isinstance(c, str)]
+                removed_steps.extend(c for c in checks if invented(c))
+                step["checks"] = [c for c in checks if not invented(c)]
+                keep.append(step)
+                continue
+            if invented(step):
                 removed_steps.append(step)
                 continue
             keep.append(step)
@@ -620,6 +637,49 @@ contents. No prose.
 
 # ── What step 02 typed and compared ───────────────────────────────────────────
 
+def _lower_camel(name: str) -> str:
+    return (name[:1].lower() + name[1:]) if name else "option"
+
+
+def option_sets_hint(web_data: dict, plan: dict) -> str:
+    """OPTION SETS: what each declared choice offered, as the browser measured it.
+
+    Only for the controls generation_plan["option_enums"] names; a set found
+    beside any other locator is a fact nobody asked to act on. Rendered in this
+    repo's locator syntax with the key spliced in, so rule 18's selection method
+    is the confirmed selector with only the key replaced, and the value the flow
+    used rebuilds the measured selector byte for byte.
+    """
+    enums = [e for e in plan.get("option_enums") or [] if isinstance(e, dict) and e.get("control")]
+    if not enums:
+        return ""
+    from shared.locator_emit import code_for
+    sets = web_data.get("option_sets") or {}
+    lines = ["", "", "OPTION SETS — every option the page offered at each choice (rule 18):"]
+    for enum in enums:
+        name, control, page = enum.get("name") or "Option", enum["control"], enum.get("page") or ""
+        found = sets.get(f"{page}.{control}") or sets.get(control)
+        if not found:
+            exercised = ", ".join(enum.get("exercised") or []) or "the exercised value"
+            lines.append(f"  {name} ({page}.{control}): no alternatives were recorded — list only "
+                         f"{exercised}, and say so in the enum's Javadoc.")
+            continue
+        lines.append(f"  {name} ({page}.{control}), keyed by `{found['attribute']}`; "
+                     f"the flow used `{found['chosen']}`:")
+        for option in found["options"]:
+            note = (f" — shown {option['occurrences']} times on that page, so its locator is not unique"
+                    if option["occurrences"] > 1 else "")
+            lines.append(f"    key \"{option['key']}\", label \"{option['label']}\"{note}")
+        if found.get("truncated"):
+            lines.append("    … the page offered more; these are the first ones.")
+        if found.get("template"):
+            code = code_for(found["template"])
+            java = code.get("java") or code.get("findby") or ""
+            spliced = java.replace("{key}", '" + ' + _lower_camel(name) + '.getKey() + "')
+            lines.append(f"    select any value with: {spliced}")
+    return "\n".join(lines)
+
+
 def value_contracts_hint(web_data: dict, raw_input: str = "") -> str:
     """The prompt section built from what step 02 typed and compared.
 
@@ -718,7 +778,12 @@ def untraced_expected_values(files_map: dict, raw_input: str, web_data: dict) ->
     observed = _observed_texts(raw_input, web_data)
     out = {}
     for path, values in expected_literals(files_map).items():
-        missing = [v for v in values if not value_match.appears_in(v, observed)]
+        # A value the file already had before this run traces to the input that
+        # wrote it, not to this one. Judging it against this run's input asked the
+        # repair to "fix" an existing, passing test — and it weakened one.
+        already = set(expected_literals({path: read_existing_file(path)}).get(path, []))
+        missing = [v for v in values if v not in already
+                   and not value_match.appears_in(v, observed)]
         if missing:
             out[path] = missing
     return out
@@ -915,7 +980,7 @@ contents. No prose.
     return applied
 
 
-def _compile_check(written_contents: dict) -> dict:
+def _compile_check(written_contents: dict, pre_run: dict = None) -> dict:
     """Compile what was just written; repair once; abort if it still does not build.
 
     This is the cheapest guard in the pipeline and it did not exist. The observed
@@ -923,6 +988,10 @@ def _compile_check(written_contents: dict) -> dict:
     existed — and paid for it with the whole initial maven run, a no-change
     re-run to rule out flakiness, and one of only two fix attempts. A compile is
     seconds, needs no browser, and cannot be flaky.
+
+    `pre_run` holds the existing files this run changed, as they were before it.
+    Errors only in files this run did not write then usually mean a change to one
+    of them broke the code that calls it, and the log says which.
 
     Returns written_contents with any repaired file replaced.
     """
@@ -952,9 +1021,16 @@ def _compile_check(written_contents: dict) -> dict:
 
     if not ours:
         # Every error is in a file this run did not write, so there is nothing here
-        # to repair — the checkout was already broken.
-        log("ERROR: the compile failure is entirely in files this run did not "
-            "generate — the framework checkout does not build on its own.")
+        # to repair. Either the checkout was already broken, or this run changed an
+        # existing file and something that calls it no longer compiles.
+        changed = sorted(p for p in (pre_run or {}) if p in written_contents)
+        if changed:
+            log(f"ERROR: the compile failure is in files this run did not generate, but this "
+                f"run changed {', '.join(Path(p).name for p in changed)} — a changed "
+                f"signature breaks the code that calls it; keep the old one as an overload.")
+        else:
+            log("ERROR: the compile failure is entirely in files this run did not "
+                "generate — the framework checkout does not build on its own.")
         (AUDIT_DIR / "03-generate.json").write_text(json.dumps({
             "error": "compile_failed",
             "compile_errors": errors,
@@ -1023,16 +1099,12 @@ def _repair_step_narration(files_map: dict, plan: dict) -> tuple:
             log(f"  {Path(path).name}#{name}: {f['log_steps']} logStep(s) for "
                 f"{f['expected']}+ steps")
 
-    # The methods the test calls decide how finely it CAN be narrated: a test
-    # whose whole scenario sits behind one helper call has nothing to put a
-    # second logStep in front of until that call is unpacked. So the helper and
-    # page objects generated alongside it go in as read-only context, and the
-    # repair may only call methods that already exist there.
-    support = "".join(
-        f"\n--- {path} (read-only: call these, do not change this file) ---\n{content}\n"
-        for path, content in files_map.items()
-        if content and "src/main/" in path.replace("\\", "/"))
-
+    # The repair rewrites narration and nothing else. It used to be handed the
+    # helper and page objects and told to unpack a helper call into the page calls
+    # behind it, so each plan step had a call to sit in front of — which turned a
+    # test written against business operations back into a page-object script.
+    # A step is now one operation, so a call that carries two plan steps keeps its
+    # one call and its logStep names both; what the test does may not change.
     wanted = ""
     for path, methods in findings.items():
         for name, f in methods.items():
@@ -1054,25 +1126,19 @@ report shows one line for the whole test and a failure cannot be located.
 
 Methods to fix, with the steps each one is supposed to show:
 {wanted}
-Rewrite each test method so that:
+Rewrite the NARRATION of each test method — the config.logStep(...) lines only:
   - Every step above gets its OWN config.logStep("...") stating the action AND the
-    expected outcome, placed immediately BEFORE the call(s) that carry it out,
-    with a blank line separating each step group.
-  - No logStep narrates more than one step. Split the existing run-on sentence;
-    do not keep it as an extra summary line.
-  - If one helper call currently hides several steps, replace it with the
-    finer-grained methods that ALREADY EXIST on the helper or page objects below,
-    so each step has its own call to sit in front of. If no such method exists,
-    keep the call as it is and narrate at the granularity the existing calls allow
-    — never invent a method that is not defined in the files below.
+    expected outcome, placed immediately BEFORE the call that carries it out, with a
+    blank line separating each step group. A step's checks follow its call.
+  - Split a run-on summary logStep into one per step; do not keep it as an extra line.
+  - Never add, remove, reorder, split or replace a call or an assertion. A Helper
+    operation stays one call even when it carries two steps: put one logStep before
+    it naming both, rather than unpacking it into the page calls behind it.
   - Setup lines (reading properties or credentials, constructing the helper) get
     no logStep.
 
-Change NOTHING else: same assertions with the same strength, same locators, same
-method signatures, same annotations, same comments and JavaDoc.
-
-<support_files>{support}
-</support_files>
+Change NOTHING else: same calls in the same order, same assertions with the same
+strength, same method signatures, same annotations, same comments and JavaDoc.
 {offending}
 Return ONLY a JSON object mapping each test class path above to its complete
 corrected contents. No prose.
@@ -1097,6 +1163,18 @@ corrected contents. No prose.
                           if name in findings[path])
         if after_total <= before_total:
             log(f"  narration-repair added no steps to {Path(path).name} — keeping the original")
+            continue
+        # The prompt forbids touching a call; this is what holds it to that. The
+        # statements that drive or check the app, in order, must be the same
+        # sequence before and after — only the narration between them may move.
+        acted = {name: [" ".join(a.split()) for a in logstep_narration.acting_statements(body)]
+                 for name, body in logstep_narration.test_bodies(files_map[path]).items()}
+        if any(acted.get(name) != [" ".join(a.split())
+                                   for a in logstep_narration.acting_statements(body)]
+               for name, body in logstep_narration.test_bodies(content).items()
+               if name in findings[path]):
+            log(f"  narration-repair REJECTED for {Path(path).name} — it changed what the "
+                f"test does, not only how it is narrated")
             continue
         ok, reason = validate_fix(files_map[path], content, Path(path).name,
                                   NARRATION_REPAIR_MAX_DIFF_LINES)
@@ -1168,17 +1246,20 @@ def _layer_of(rel_path: str) -> int:
     """Framework layer a file belongs to, lowest dependency first.
 
     Batches are generated in this order so each call can be shown the real
-    contents of everything it depends on: page objects and data types first,
+    contents of everything it depends on: the module's option enums first, since
+    data, pages and operations all take them; then data types and page objects,
     then the Helper that orchestrates them, then the test class that calls both.
     """
     name = Path(rel_path).name
     if rel_path.startswith("src/test/"):
-        return 3          # test classes call helpers, pages, builders
+        return 4          # test classes call helpers, pages, builders
     if name.endswith("Helper.java"):
-        return 2          # helpers orchestrate page objects
+        return 3          # helpers orchestrate page objects
     if "/web/" in rel_path:
-        return 1          # page objects depend only on the framework's BasePage
-    return 0              # Data / Builder / Api enum — no intra-module deps
+        return 2          # page objects: the framework's BasePage, and the enums
+    if name.endswith("Enums.java"):
+        return 0          # option enums depend on nothing
+    return 1              # Data / Builder / Api enum — at most the enums
 
 
 def _batch_by_layer(files: list, size: int) -> list:
@@ -1295,6 +1376,24 @@ def main() -> None:
                    "for example), the Rules win.\n") + "\n".join(
         f"\n--- {path} ---\n{content}\n" for path, content in refs.items()
     )
+
+    # What already exists. Codegen has no tools, so a method it is not shown is a
+    # method it writes again: the shared code goes into the static prompt (it is
+    # the same for every batch), the module's own index into each batch.
+    shared_index = module_index.describe_shared(
+        AUTOMATION_FRAMEWORK_DIR, load_repo_config().get("shared_code") or [])
+    shared_section = ("\n\n<shared_code_index>\nThe framework's shared code, one public member per "
+                      "line. Call these instead of writing your own (rule 11).\n"
+                      f"{shared_index}\n</shared_code_index>") if shared_index else ""
+    module_section = ""
+    if existing:
+        module_idx = module_index.describe(AUTOMATION_FRAMEWORK_DIR, [
+            f"src/main/java/automation/modules/{feature.lower()}",
+            f"src/test/java/automation/{feature.lower()}"])
+        if module_idx:
+            module_section = ("\n\n<existing_module_index>\nEvery public member this module "
+                              f"already has, before this run:\n{module_idx}\n</existing_module_index>")
+    option_hint = option_sets_hint(web_data, plan)
 
     # Build selector hint for page objects
     selector_hint = ""
@@ -1481,7 +1580,7 @@ def main() -> None:
 
 <reference_implementations>
 {ref_section}
-</reference_implementations>
+</reference_implementations>{shared_section}
 
 Rules (MANDATORY — violations will cause compilation failures):
 1. Every file must compile standalone — include all necessary imports.
@@ -1501,7 +1600,22 @@ Rules (MANDATORY — violations will cause compilation failures):
      auth comes only from plan["api_auth"] (rule 5b) and properties. A token in code is a leaked secret.
 5. Helper: extends ApiHelper (import automation.core.api.ApiHelper). Pass customBaseUrl to super(config, BASE_URL).
    API methods call execute()/executeAndVerify()/executeRaw().
-   Web methods only if they orchestrate 2+ page objects.
+   WEB: the Helper is the module's flow API — the business operations
+   generation_plan["helper_web_methods"] lists, which the tests are written against:
+     a) A "stage" carries one business step, across as many pages as it takes. It constructs
+        the page object it starts on (that constructor checks the page loaded) and returns
+        what the step's checks need.
+     b) A "composed" operation calls its stages in order and adds nothing of its own. Write
+        every one the plan lists, even though this test calls the stages: it is for the next
+        test, which wants the whole run as one call.
+     c) Choices are parameters — an option enum (rule 18) or a Data field — never part of a
+        method's name, and neither is what it returns: continueToBank(), not
+        continueAndGetBankAmount().
+     d) Operations never assert; the test asserts on what they return.
+     e) When a step's checks need several values, return a small result type nested in the
+        Helper and read through getters: `@Value public static class Receipt {{ String amount;
+        String orderId; }}` (Lombok). Page objects return plain values; only the Helper
+        assembles result types.
 5b. API AUTH — source this ONLY from plan["api_auth"].type below; never invent a different auth
    mechanism or guess at field names not present in api_auth:
    a) type == "none": no auth headers at all — do not call setAuthToken or add any auth logic.
@@ -1520,8 +1634,9 @@ Rules (MANDATORY — violations will cause compilation failures):
    real HTTP call), it's safe to assume the recipe itself is correct — any resulting 401/403 in the
    generated test points at how this code applies auth, not at the credentials or the API.
 6. Page objects: extend BasePage. Define all locators in the constructor using the
-   target framework's native locator syntax — {_LOCATOR_SYNTAX_HINT}.
-   Call waitUntilLoaded() LAST in constructor. waitUntilLoaded() uses WaitHelper.
+   target framework's native locator syntax — {_LOCATOR_SYNTAX_HINT}. The one exception is
+   an option control's selection method (rule 18c), which builds its locator from the key.
+   End the constructor with the page-loaded check <framework_conventions> prescribes.
    All interactions use BasePage methods (click, fillText, getText, isElementDisplayed).
    Navigation methods return the next page object.
 6b. NAVIGATION — never drive the browser's navigation API directly. Use
@@ -1548,12 +1663,19 @@ Rules (MANDATORY — violations will cause compilation failures):
      - hybrid flow: groups={{GROUP_REGRESSION, GROUP_WEB, GROUP_API}}
    Every @Test method has @TestVariables(automatedBy = QA.Mukesh).
    STRICT GUARDRAILS for @Test methods:
-     - Declarative only: high-level calls to the Helper and page objects, then AssertHelper
-       assertions. No loops, Java Stream filtering or JSONPath extraction (see rule 14c).
+     - One call per step: each step is ONE call — a Helper operation, or one page method on a
+       page object an operation returned — followed by that step's AssertHelper checks. Never
+       chain page-object actions in a test, and never construct a page object in one. No loops,
+       Java Stream filtering or JSONPath extraction (see rule 14c).
+     - Short: about {BODY_LINES_GUIDELINE} lines between the method's braces is normal. Go past
+       it only when the input's own steps and checks need it; a longer test usually means a
+       sequence that belongs in a Helper operation.
      - Hide API intricacies: never build a request body (new XBuilder()...) or chain dependent API
        calls inside @Test — the Helper does it and returns the result.
-     - No data hardcoding: product ids, names and other test data come from the module's CSV
-       through a Helper method, or from a Builder. Group CSV data by business entity inside the
+     - Test data is ONE setup line: a Helper method that reads the module's data and returns the
+       built Data object — `PaymentData payment = shop.buildPayment("card_with_promo");` — with the
+       CSV lookup and the Builder chain inside it. Name it build*/get*: it is setup, not a step.
+       Never a Builder chain, a CSV read or a hardcoded value inside @Test. Group CSV data by business entity inside the
        module's csvFiles/ folder (users.csv, products.csv), NOT by API vs web — API and web tests
        that use the same entity share one sheet. A CSV listed under "Files to generate" is
        OPTIONAL: return it only if a generated test reads from it. When extending an existing CSV,
@@ -1566,36 +1688,31 @@ Rules (MANDATORY — violations will cause compilation failures):
                    -> Log.comment(config, "...")       NEVER config.logStep / Log.step
    A reference page object that calls Log.step() is a known violation, not a pattern —
    follow the rule above, not that file.
-7b. STEP NARRATION — one logStep per step, never one summary line. The run report
-   prints ONE LINE PER logStep: a test narrated once produces a one-line report for
-   the whole scenario, and when it fails the report cannot say which step broke.
-   The intent contract is derived from these same strings, so a run-on sentence
-   collapses several checkable claims into one blob.
-   - Every step in this method's "steps" list in <generation_plan> gets its OWN
-     config.logStep("<action AND its expected outcome>"), placed immediately BEFORE
-     the call(s) that carry it out, with a blank line between step groups.
-   - Setup lines — reading properties or credentials, constructing the helper —
-     get no logStep.
-   - A helper method may encapsulate ONE step. It must NOT swallow the whole
-     scenario: if a single call would cover several plan steps, split it into the
-     per-step methods so the test method itself shows the flow.
-   WRONG — four steps, one logStep, and a helper that hides all of them:
-     config.logStep("Login, toggle the trailing dot in Profile Summary, save, and verify it persists");
-     String[] result = helper.toggleProfileSummaryDot(username, password);
-     AssertHelper.assertEquals(config, result[1], result[0], "Summary should persist");
-   RIGHT — each step narrated where it happens:
-     config.logStep("Login to Naukri and open the profile page");
-     ProfilePage profile = helper.loginAndOpenProfile(username, password);
+7b. STEP NARRATION — one logStep per business step: never one summary line for the whole
+   test, never one per click. The run report prints ONE LINE PER logStep, and the intent
+   contract is derived from these same strings.
+   - Every object in this method's "steps" in <generation_plan> gets its OWN
+     config.logStep("<its logstep text>"), placed immediately BEFORE its "call" and followed
+     by its "checks", with a blank line between steps.
+   - Setup lines — reading properties or credentials, building data, constructing the
+     helper — get no logStep.
+   - A check that sits between two stages means calling the stages in separate steps; use
+     the composed operation only when nothing is checked in between.
+   WRONG — page objects driven click by click from the test, one logStep per field:
+     config.logStep("Enter the card number");
+     cardPage.fillCardNumber(order.getCardNumber());
+     config.logStep("Enter the expiry date");
+     cardPage.fillExpiry(order.getCardExpiry());
+     config.logStep("Click Pay and open the receipt");
+     ReceiptPage receipt = cardPage.clickPay();
+   RIGHT — one call per business step, its checks right after it:
+     config.logStep("Check out the order and verify the total matches the order amount");
+     String total = shop.checkout(order);
+     AssertHelper.assertEquals(config, total, order.getAmount(), "Total should match the order amount");
 
-     config.logStep("Toggle the trailing dot in Profile Summary and save the change");
-     String saved = profile.toggleTrailingDotAndSave();
-
-     config.logStep("Reload the profile page and read the Profile Summary shown");
-     String displayed = profile.reload().getProfileSummary();
-
-     config.logStep("Verify the reloaded Profile Summary matches the saved value");
-     AssertHelper.assertEquals(config, displayed, saved,
-         "Profile Summary after reload should match the saved modified summary");
+     config.logStep("Pay by credit card and verify the receipt charges the same total");
+     ShopHelper.Receipt receipt = shop.makePayment(PaymentMethod.CreditCard, order);
+     AssertHelper.assertEquals(config, receipt.getAmount(), total, "Receipt should charge the checkout total");
    WEB LOGIN CREDENTIALS (not API auth — see rule 5b for that) — follow this priority order:
    a) For EXISTING modules: scan every @Test method in the existing test class shown in
       <existing_file_contents> and find how they load credentials. Copy that pattern exactly.
@@ -1622,12 +1739,24 @@ Rules (MANDATORY — violations will cause compilation failures):
    rather than inventing a locator to hang it on — a guessed locator like
    `[class*='toast']` fails later and looks like a flake.
 10. Waits: ONLY WaitHelper.* — never Thread.sleep().
-11. For existing modules:
-    - Data, Builder, Api enum: do NOT regenerate — omit them from your output entirely.
-    - Helper, page objects, AND any existing test class shown in <existing_file_contents>:
-      Return the COMPLETE file with ALL existing methods/fields/annotations kept intact.
-      ADD your new methods/locators at the end of the appropriate section.
-      Do NOT remove, rename, or rewrite any existing method — only append.
+11. REUSE BEFORE ANYTHING NEW. generation_plan["reuse"] is binding:
+    - "as_is": call that existing method exactly as <existing_module_index> or
+      <shared_code_index> declares it. Never write a method that does the same thing.
+    - "extend": make exactly the stated "change" to that existing method, in the existing file
+      shown in <existing_file_contents>. Allowed changes only: add an enum value and its case;
+      add a parameter through an overload whose old signature delegates with its former value;
+      read a new optional Data field, absent meaning today's behaviour; return a value where it
+      returned void; extract a private step both callers share. Never change what an existing
+      call does for its current callers, never remove or rename a public method or enum value,
+      and never edit an existing test method.
+    - Only then a new method (generation_plan["helper_web_methods"], or a page's actions). A
+      call to a method that exists nowhere — not in either index, not in the plan — is a new
+      method: write it. A method that would differ from an existing one only by a hard-coded
+      value or choice is never new; extend the existing one.
+    - Every existing file you return is COMPLETE: every other member, field, annotation, JavaDoc
+      and comment exactly as it was; new members go at the end of their section.
+    - Data, Builder, Api enum of an existing module: return them only when they are listed under
+      "Files to generate" (the plan adds a field or an endpoint), keeping every existing member.
     - If the test class file in <files_to_generate> already exists (shown in <existing_file_contents>),
       add the new @Test method(s) to THAT class — do NOT create a separate class.
 12. Preserve ALL existing JavaDoc comments, inline comments, and annotations exactly as written.
@@ -1639,28 +1768,25 @@ Rules (MANDATORY — violations will cause compilation failures):
     a) PAGE OBJECTS: several small actions on the SAME page in a row (filling a form's five fields)
        become ONE higher-level method on that page object — `fillCheckoutDetails(data)` — and the
        test calls that once.
-    b) HELPERS (shared steps): steps that several tests repeat become one Helper method, called
-       from each test instead of copied into every one.
+    b) HELPERS (business operations): a step that crosses pages, or takes several actions before
+       the input checks something, is a Helper operation (rule 5). The same sequence is never
+       written twice — not in two tests, and not in two operations.
     c) HELPERS (non-trivial logic): JSON extraction (`response.jsonPath().getList(...)`), Java
        Stream filtering/mapping, loops and multi-step data preparation live in the Helper, which
        returns what the test asserts on. Never do them inside the @Test method.
-    d) Do NOT add a thin wrapper around a SINGLE existing call, or one that only chains two calls
-       with no logic of its own (getCredentials(role) then doLogin()) — that adds nothing.
-       Grouping MULTIPLE steps or real logic is the point.
-    Rule 7b still applies: grouping never hides several PLAN steps behind one call — each plan
-    step keeps its own logStep in the test method.
+    d) Do NOT add a thin wrapper: a method that only renames one existing call and adds nothing —
+       no navigation, read, wait or result of its own. A stage that returns what its step
+       produced is not one, and neither is a composed operation.
 15. INTERLEAVED FLOWS — when generation_plan["flow_style"] == "interleaved", generate exactly ONE
     test method (do NOT split into separate Api/Web test classes) in the single test class listed
     under "Files to generate". Follow generation_plan["interleaved_steps"] IN ORDER: for each step,
     call the Helper's API methods (execute()/executeAndVerify()/etc., per rule 5) when
-    "interface": "api", and drive the Page Objects via the Helper's web orchestration methods
-    (per rule 6) when "interface": "web" — all within one @Test method named
+    "interface": "api", and the Helper's web operations (rule 5) when "interface": "web",
+    following each entry's "call" and "checks" when it has them — all within one @Test method named
     generation_plan["interleaved_test_method_name"]. Data an earlier API step produced (e.g. an id
     from a create call) must be threaded into later steps exactly as a real caller would, not
-    re-fetched or re-derived redundantly. For this method, the Helper is EXPECTED to have both API
-    methods (rule 5) and web orchestration methods (rule 6) — that is correct here, not a violation
-    of rule 5's "web methods only if they orchestrate 2+ page objects" guidance, since the method
-    orchestrates real cross-interface state, not just page objects.
+    re-fetched or re-derived redundantly. For this method the Helper has both API methods and
+    web operations, which is expected.
 16. URLs — NEVER write a literal "http://..." or "https://..." anywhere in the Java you
     generate: not in a test, not in a page object, not in a helper, and above all not as a
     `private static final String BASE_URL = "https://..."` constant. Every URL listed under
@@ -1676,17 +1802,35 @@ Rules (MANDATORY — violations will cause compilation failures):
     editing Java.
 17. Code quality (strict): no System.out.println, no commented-out code, no unused imports, and no
     intermediate variable whose value is never used.
+18. OPTION ENUMS — for every entry in generation_plan["option_enums"]:
+    a) Declare it in the module's <Feature>Enums class, `public class <Feature>Enums {{ public enum
+       PaymentMethod {{ … }} }}`, imported with `import <package_main>.<Feature>Enums.*;`.
+       Values in CamelCase.
+    b) The values are exactly the OPTION SETS listed for that control, each constructed with its
+       key and label — `CreditCard("<key>", "<label>")` — and exposing getKey() and getLabel().
+       A value the page showed more than once gets a Javadoc line saying its locator is not
+       unique there; never reach for .first(). With no option set recorded, list only the
+       exercised values and say so in the enum's Javadoc.
+    c) The page object has ONE selection method for the control. Its locator is the confirmed
+       selector with only the key replaced, as the OPTION SETS hint shows, so the value the flow
+       used rebuilds the measured selector exactly. A native <select> takes getKey() in its
+       select call instead.
+    d) The Helper stage that takes the choice does the follow-up steps for each value this test
+       exercised, and every other value reaches
+       `default -> throw new UnsupportedOperationException(method.getLabel() + " is not automated yet");`
+       — never guessed steps for an option nobody ran.
+    e) The choice is the enum wherever it travels: a parameter, or a Data field.
 """
     SYSTEM_PROMPT_FILE.write_text(static_system_prompt)
 
     def build_prompt(batch_files: list, generated_context: str = "") -> str:
         return f"""{csv_roles_hint}
-{existing_files_context}{generated_context}
+{existing_files_context}{module_section}{generated_context}
 
 <generation_plan>
 {json.dumps(plan, indent=2)}
 </generation_plan>
-{selector_hint}{mechanism_hint}{value_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
+{selector_hint}{option_hint}{mechanism_hint}{value_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
 
 Generate the following files (Java source, plus CSV test data where a test reads data) and return them as a single JSON object where
 keys are relative file paths (from the automation repo root) and values are the complete
@@ -1851,6 +1995,17 @@ Return ONLY a JSON object, no prose:
         }, indent=2))
         sys.exit(1)
 
+    # Existing test methods are somebody's shipped tests. Codegen and every repair
+    # pass above are told not to touch them, and one still did: a repair rewrote an
+    # existing assertEquals as a non-empty check. Telling is not enough, so any
+    # existing @Test method that changed is put back exactly as it was.
+    files_map, restored_tests = _restore_existing_tests(files_map)
+
+    # Every existing file as it was before this run touches it. The review notes
+    # diff against these copies, and step 04 reads them to find the existing tests
+    # that reach a method this run (or one of its fixes) changed.
+    pre_run = _snapshot_existing(files_map)
+
     # Write each file to Thanos-pw, saving content for per-step git commits in ship step
     written = []
     written_contents: dict = {}  # {rel_path: content} — used by 05_ship.py for step-03 commit
@@ -1910,7 +2065,9 @@ Return ONLY a JSON object, no prose:
 
     # Compile before step 04 does. A wrong import is seconds to catch here and a
     # maven run, a browser launch and a fix attempt to catch there.
-    written_contents = _compile_check(written_contents)
+    written_contents = _compile_check(written_contents, pre_run)
+
+    review = _review_records(written_contents, pre_run, plan, web_data, feature, feature_class)
 
     # A dropped check that reappears in the generated code is the whole pruning
     # step defeated: the locator would be guessed, the assertion would fail, and
@@ -1978,6 +2135,23 @@ Return ONLY a JSON object, no prose:
         # Expected values neither the test case states nor step 02 saw, left after
         # the repair pass. Empty is the normal case.
         "untraced_expected_values": untraced_values,
+        # Which files existed before this run (their pre-run copies are in
+        # pre-run/ beside this file) and which it created. Step 04 re-runs the
+        # existing tests that reach a changed method of the former.
+        # Existing @Test methods this run changed and _restore_existing_tests put
+        # back. Empty is the normal case.
+        "restored_existing_tests": restored_tests,
+        "pre_run_files": sorted(pre_run),
+        "created_files": sorted(p for p in written if p not in pre_run),
+        # The reuse ledger as planned, and claims that named nothing real.
+        "reuse": plan.get("reuse") or [],
+        "reuse_unknown": plan.get("reuse_unknown") or [],
+        "new_operations": [{"name": op.get("name"), "kind": op.get("kind"),
+                            "why_new": op.get("why_new") or ""}
+                           for op in plan.get("helper_web_methods") or []
+                           if isinstance(op, dict)],
+        # Review notes, never gates — see _review_records.
+        **review,
     }
     (AUDIT_DIR / "03-generate.json").write_text(json.dumps(result, indent=2))
 
@@ -2017,7 +2191,205 @@ Return ONLY a JSON object, no prose:
             "## ⚠️ Pages Generated with ZERO Confirmed Selectors",
             "All locators below are guessed from naming conventions, not validated:",
         ] + [f"- `{name}`" for name, _needed in pages_with_zero_coverage]
+    summary_lines += _review_summary(review)
     (AUDIT_DIR / "03-generate.md").write_text("\n".join(summary_lines))
+
+
+def _review_summary(review: dict) -> list:
+    """03-generate.md lines for the review records: guidance, never a gate."""
+    lines = []
+    methods = (review.get("test_shape") or {}).get("methods") or {}
+    if methods:
+        lines += ["", "## Test Method Shape",
+                  f"Guideline: about {BODY_LINES_GUIDELINE} lines between the braces."]
+        lines += [f"- `{name}` — {m['body_lines']} lines"
+                  + (f"; {len(m['page_action_chains'])} step(s) drive a page object call by call"
+                     if m["page_action_chains"] else "")
+                  for name, m in sorted(methods.items())]
+    notes = []
+    for path, diff in (review.get("modified_existing") or {}).items():
+        parts = [f"{kind} {', '.join(f'`{k}`' for k in keys)}"
+                 for kind, keys in diff.items() if keys]
+        notes.append(f"- existing `{Path(path).name}`: " + "; ".join(parts))
+    for path, gone in (review.get("changed_existing_api") or {}).items():
+        notes.append(f"- ⚠️ `{Path(path).name}` lost existing API: {', '.join(gone)}")
+    for pair in review.get("near_duplicates") or []:
+        notes.append(f"- ⚠️ `{pair['new']}` repeats `{pair['like']}` (similarity {pair['ratio']})")
+    for name, gap in (review.get("option_enum_gaps") or {}).items():
+        notes.append(f"- ⚠️ enum `{name}`: missing keys {gap['missing_keys']}, "
+                     f"{gap['unobserved_constants']} constant(s) the page did not offer")
+    for existing in review.get("reuse_unused") or []:
+        notes.append(f"- planned reuse never called: `{existing}`")
+    if notes:
+        lines += ["", "## Review Notes (guidance, not a gate)"] + notes
+    return lines
+
+
+def _restore_existing_tests(files_map: dict) -> tuple:
+    """Put back every existing @Test method a generated test class changed. (files_map, restored).
+
+    Compared on comment-free text with whitespace collapsed, so re-indentation is
+    not a change; anything else is, however small. The method is restored from the
+    file on disk, member for member, and the run's new methods stay.
+    """
+    restored = {}
+    for path, content in list(files_map.items()):
+        if not (path.startswith("src/test/") and path.endswith(".java") and content):
+            continue
+        before = read_existing_file(path)
+        if not before:
+            continue
+        old = {m["name"]: m["text"] for m in split_class_members(before)
+               if m["kind"] == "method" and re.search(r"@Test\b", m["text"])}
+        new = {m["name"]: m["text"] for m in split_class_members(content)
+               if m["kind"] == "method" and re.search(r"@Test\b", m["text"])}
+        names = []
+        for name, old_text in old.items():
+            new_text = new.get(name)
+            if new_text is None or new_text == old_text:
+                continue
+            if " ".join(without_comments(new_text).split()) == " ".join(without_comments(old_text).split()):
+                continue
+            content = content.replace(new_text, old_text, 1)
+            names.append(name)
+        if names:
+            files_map[path] = content
+            restored[path] = names
+            log(f"GUARD: {Path(path).name} changed existing test method(s) "
+                f"{', '.join(names)} — restored exactly as they were")
+    return files_map, restored
+
+
+def _snapshot_existing(files_map: dict) -> dict:
+    """{path: content before this run} for every existing source file about to be overwritten.
+
+    Also written to `pre-run/<path>` in the audit dir: step 04 runs in another
+    process, and its own fixes are diffed against the same copies.
+    """
+    pre_run = {}
+    for rel_path in files_map:
+        if not rel_path.endswith(".java"):
+            continue
+        before = read_existing_file(rel_path)
+        if not before:
+            continue
+        pre_run[rel_path] = before
+        copy = AUDIT_DIR / "pre-run" / rel_path
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        copy.write_text(before)
+    return pre_run
+
+
+def _review_records(written_contents: dict, pre_run: dict, plan: dict, web_data: dict,
+                    feature: str, feature_class: str) -> dict:
+    """What a reviewer needs to know about this run's code. Notes, never gates.
+
+    - test_shape: each new @Test's length and any step that drives a page object
+      call by call. About BODY_LINES_GUIDELINE lines is the norm, not a limit.
+    - modified_existing: per existing file, the methods this run changed, added or
+      removed. A slight change is allowed; a reviewer still has to see it.
+    - changed_existing_api: public signatures and enum constants that disappeared.
+      Callers written against them no longer compile, or no longer mean the same.
+    - near_duplicates: a new method whose calls repeat an existing one's with only
+      literals different — the copy the reuse ladder forbids.
+    - option_enum_gaps: options the page offered that the enum lacks, and constants
+      nothing on the page backs.
+    - reuse_unused: "as_is" entries of the reuse ledger that no generated file calls —
+      the plan said an existing method does this, and the code did something else.
+    """
+    feature_lower = feature.lower()
+    module_rel = f"src/main/java/automation/modules/{feature_lower}"
+    module_dir = AUTOMATION_FRAMEWORK_DIR / module_rel
+
+    page_classes = {Path(p).stem for p in written_contents if "/web/" in p}
+    if (module_dir / "web").is_dir():
+        page_classes |= {f.stem for f in (module_dir / "web").glob("*.java")}
+    test_shape = {}
+    for path, content in written_contents.items():
+        if path.startswith("src/test/") and path.endswith(".java"):
+            prior = set(test_methods_in(pre_run.get(path, "")))
+            for name, measured in logstep_narration.shape(content, page_classes, prior).items():
+                test_shape[f"{Path(path).stem}#{name}"] = measured
+
+    modified, lost = {}, {}
+    for path, before in pre_run.items():
+        after = written_contents.get(path)
+        if after is None:
+            continue
+        diff = module_index.changed_methods(before, after)
+        if any(diff.values()):
+            modified[path] = diff
+        gone = module_index.lost_api(before, after)
+        if gone:
+            lost[path] = gone
+
+    new_sources = {p: c for p, c in written_contents.items()
+                   if p.startswith("src/main/") and p.endswith(".java")}
+    only = {p: ((modified.get(p) or {}).get("added", []) + (modified.get(p) or {}).get("changed", []))
+            if p in pre_run else module_index.method_keys(c)
+            for p, c in new_sources.items()}
+    existing_sources = {}
+    if module_dir.is_dir():
+        for f in sorted(module_dir.rglob("*.java")):
+            rel = str(f.relative_to(AUTOMATION_FRAMEWORK_DIR))
+            if rel in pre_run:
+                existing_sources[rel] = pre_run[rel]
+            elif rel not in written_contents:
+                existing_sources[rel] = f.read_text(encoding="utf-8", errors="ignore")
+    near = module_index.near_duplicates(new_sources, existing_sources, only=only)
+
+    gaps = {}
+    enums_path = f"{module_rel}/{feature_class}Enums.java"
+    enums_src = written_contents.get(enums_path) or read_existing_file(enums_path)
+    sets = web_data.get("option_sets") or {}
+    for enum in plan.get("option_enums") or []:
+        if not isinstance(enum, dict) or not enums_src:
+            continue
+        found = sets.get(f"{enum.get('page')}.{enum.get('control')}") or sets.get(enum.get("control") or "")
+        if not found:
+            continue
+        missing = [o["key"] for o in found["options"] if f'"{o["key"]}"' not in enums_src]
+        constants = next((v for k, v in module_index.enum_constants(enums_src).items()
+                          if k.rsplit(".", 1)[-1] == enum.get("name")), [])
+        extra = max(0, len(constants) - len(found["options"]))
+        if missing or extra:
+            gaps[enum.get("name")] = {"missing_keys": missing, "unobserved_constants": extra}
+
+    generated = "\n".join(written_contents.values())
+    unused = []
+    for entry in plan.get("reuse") or []:
+        if not isinstance(entry, dict) or entry.get("how") != "as_is":
+            continue
+        ref = module_index.parse_member_reference(str(entry.get("existing") or ""))
+        if ref and not re.search(rf"\b{re.escape(ref[1])}\s*\(", generated):
+            unused.append(entry.get("existing"))
+
+    long_tests = {k: v for k, v in test_shape.items()
+                  if v["body_lines"] > BODY_LINES_GUIDELINE or v["page_action_chains"]}
+    for name, measured in long_tests.items():
+        log(f"NOTE: {name} is {measured['body_lines']} lines (guideline ~{BODY_LINES_GUIDELINE})"
+            + (f"; {len(measured['page_action_chains'])} step(s) drive a page object call by call"
+               if measured["page_action_chains"] else ""))
+    for path, diff in modified.items():
+        log(f"NOTE: existing {Path(path).name} — changed {len(diff['changed'])}, "
+            f"added {len(diff['added'])}, removed {len(diff['removed'])} method(s)")
+    for path, gone in lost.items():
+        log(f"WARNING: {Path(path).name} lost existing API: {', '.join(gone)}")
+    for pair in near:
+        log(f"WARNING: new {pair['new']} repeats {pair['like']} (similarity {pair['ratio']})")
+    for name, gap in gaps.items():
+        log(f"WARNING: enum {name} — missing keys {gap['missing_keys']}, "
+            f"{gap['unobserved_constants']} constant(s) the page did not offer")
+    for existing in unused:
+        log(f"NOTE: the plan reuses {existing} as it is, but no generated file calls it")
+    return {
+        "test_shape": {"guideline_lines": BODY_LINES_GUIDELINE, "methods": test_shape},
+        "modified_existing": modified,
+        "changed_existing_api": lost,
+        "near_duplicates": near,
+        "option_enum_gaps": gaps,
+        "reuse_unused": unused,
+    }
 
 
 def _find_existing_test_class(feature_lower: str, test_type: str) -> str:
@@ -2137,6 +2509,28 @@ def _find_existing_helper(feature_lower: str, feature_class: str) -> str:
     return str(chosen.relative_to(AUTOMATION_FRAMEWORK_DIR)) if chosen else ""
 
 
+def _extended_files(plan: dict, feature_lower: str) -> list:
+    """The module's existing files that a "reuse" entry with how=extend changes.
+
+    The entry names a class; the file it lives in is found on disk inside this
+    module. A class elsewhere — the framework's shared code — is never edited by
+    an authoring run, so it is not listed even when an entry names it.
+    """
+    module_dir = (AUTOMATION_FRAMEWORK_DIR / "src" / "main" / "java" / "automation"
+                  / "modules" / feature_lower)
+    found = []
+    for entry in plan.get("reuse") or []:
+        if not isinstance(entry, dict) or entry.get("how") != "extend":
+            continue
+        ref = module_index.parse_member_reference(str(entry.get("existing") or ""))
+        if not ref:
+            continue
+        owner = ref[0].split(".")[0]
+        for path in sorted(module_dir.rglob(f"{owner}.java")) if module_dir.is_dir() else []:
+            found.append(str(path.relative_to(AUTOMATION_FRAMEWORK_DIR)))
+    return found
+
+
 def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, feature) -> list:
     """Build the list of files that need to be generated or updated."""
     files = []
@@ -2166,6 +2560,18 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
                 class_name = page_def["class_name"]
                 page_path = f"src/main/java/automation/modules/{feature_lower}/web/{class_name}.java"
                 files.append(page_path)
+        # A field the plan adds has to land somewhere. Leaving Data and Builder out
+        # for every existing module meant a new optional field — one of the small
+        # changes the reuse ladder allows — could never be written.
+        if plan.get("data_fields"):
+            files.append(f"src/main/java/automation/modules/{feature_lower}/{feature_class}Data.java")
+            files.append(f"src/main/java/automation/modules/{feature_lower}/{feature_class}Builder.java")
+        files.extend(_extended_files(plan, feature_lower))
+
+    # Option enums live in one class per module, new or existing alike.
+    if plan.get("option_enums"):
+        files.append(f"src/main/java/automation/modules/{feature_lower}/{feature_class}Enums.java")
+    files = list(dict.fromkeys(files))
 
     # Test classes — for existing modules, prefer adding to an existing class.
     # Interleaved "both" flows get ONE combined test class instead of the usual

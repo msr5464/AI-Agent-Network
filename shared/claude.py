@@ -65,10 +65,34 @@ class ClaudeResult(NamedTuple):
     navigated_urls: list = []
     # The CLI's usage-cap message, when that is why the call stopped.
     limit_message:  str = ""
+    # Browser tool calls the model made, how many came back without an error, and
+    # the first error's text. None when not counted (no stream_json). Read them
+    # through browser_unavailable().
+    browser_calls:  Optional[int] = None
+    browser_ok:     Optional[int] = None
+    browser_error:  str = ""
 
     @property
     def ok(self) -> bool:
         return self.status == "ok"
+
+    def browser_unavailable(self) -> str:
+        """Why no browser ever answered this call, or "" when one did.
+
+        Only meaningful for a call handed a browser. Either the model never called
+        a browser tool, or every call it made errored — a browser that cannot
+        launch fails every call the same way, behind a server that connected
+        fine. Nothing in the output was then observed on a page, however the
+        model wrote it up. Check usage_limit first: a capped call never ran a turn.
+        """
+        if self.browser_calls is None:
+            return ""
+        if self.browser_calls == 0:
+            return "the model never called a browser tool"
+        if self.browser_ok == 0:
+            return (f"all {self.browser_calls} browser call(s) failed — "
+                    f"{self.browser_error}")
+        return ""
 
     def describe(self) -> str:
         """One-line explanation suitable for logging when output is missing/short."""
@@ -186,6 +210,13 @@ class _StreamJsonDecoder:
         self.result_text: str = ""
         self.tool_uses:   int = 0
         self.navigated_urls: list = []
+        # Browser tool calls, and how many came back without an error. A server
+        # that connects can still fail to launch its browser, and then every call
+        # errors while the run looks like an ordinary short one.
+        self.browser_calls: int = 0
+        self.browser_ok:    int = 0
+        self.browser_error: str = ""
+        self._browser_ids:  set = set()
         # Usage reported by the CLI in its `result` / `system.init` events. The
         # CLI computes cost itself, so no rate card is needed on our side.
         self.usage: dict = {}
@@ -203,6 +234,31 @@ class _StreamJsonDecoder:
         url = inp.get("url") if isinstance(inp, dict) else None
         if isinstance(url, str) and url.strip() and url.strip() not in self.navigated_urls:
             self.navigated_urls.append(url.strip())
+
+    def _note_browser_call(self, block: dict) -> None:
+        """Remember a browser tool call, so its result can be told apart.
+
+        Matched on the tool part of the MCP name, as _note_navigation is.
+        """
+        name = block.get("name") or ""
+        if name.startswith("mcp__") and name.rsplit("__", 1)[-1].startswith("browser_"):
+            self.browser_calls += 1
+            self._browser_ids.add(block.get("id"))
+
+    def _note_browser_result(self, block: dict) -> None:
+        """Count a browser call's result: answered, or the first error's text."""
+        if block.get("tool_use_id") not in self._browser_ids:
+            return
+        if not block.get("is_error"):
+            self.browser_ok += 1
+            return
+        if not self.browser_error:
+            content = block.get("content")
+            if isinstance(content, list):
+                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+            lines = [ln.strip() for ln in str(content or "").splitlines()
+                     if ln.strip() and ln.strip() != "### Error"]
+            self.browser_error = (lines[0] if lines else "error")[:300]
 
     def feed(self, raw_line: str) -> list:
         """Consume one JSONL line. Returns progress lines to surface to the caller."""
@@ -237,7 +293,14 @@ class _StreamJsonDecoder:
                 elif block.get("type") == "tool_use":
                     self.tool_uses += 1
                     self._note_navigation(block)
+                    self._note_browser_call(block)
                     progress.append(f"→ {_describe_tool_use(block)}")
+
+        elif etype == "user":
+            content = (ev.get("message") or {}).get("content")
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    self._note_browser_result(block)
 
         elif etype == "result":
             if isinstance(ev.get("result"), str):
@@ -580,6 +643,9 @@ def call_claude_ex(
         tool_uses=decoder.tool_uses if decoder is not None else None,
         navigated_urls=list(decoder.navigated_urls) if decoder is not None else [],
         limit_message=cap,
+        browser_calls=decoder.browser_calls if decoder is not None else None,
+        browser_ok=decoder.browser_ok if decoder is not None else None,
+        browser_error=decoder.browser_error if decoder is not None else "",
     )
 
     # One choke point instruments every call site. Best-effort by construction —

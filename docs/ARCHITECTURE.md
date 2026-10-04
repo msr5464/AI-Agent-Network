@@ -85,7 +85,7 @@ Turns a plain English feature file into production-ready Java test code and rais
 | 02 Validate API | For API steps: plain HTTP calls against the real endpoints, no model call |
 | 02 Validate Web | For UI steps: Claude drives a browser through the Playwright MCP server, recording which selectors match exactly one visible element |
 | 03 Generate | Claude writes the test class, page objects and data; URL and credential keys go into the repo's properties file, and a compile gate runs before the step ends |
-| 04 Run + Fix | Runs the generated test; on failure Claude fixes the code and retries (up to `AUTHORING_FIX_RETRY_COUNT`, stopping early once an attempt can bring nothing new). Assertions are frozen, so a fix cannot weaken them |
+| 04 Run + Fix | Runs the generated test; on failure Claude fixes the code and retries. Only attempts that make no progress count against `AUTHORING_FIX_RETRY_COUNT` (a fix that lets the test reach a new failure does not), up to `AUTHORING_MAX_FIX_ATTEMPTS`, stopping early once an attempt can bring nothing new. Assertions are frozen, so a fix cannot weaken them |
 | 05 Ship | Branch → commit → push → `gh pr create` → Slack. Verdict `APPROVED` only when the test ran and passed honestly, otherwise `NEEDS-REVIEW` |
 
 **Input:** `agents/test-authoring-agent/queue/<module>.txt`  
@@ -360,8 +360,8 @@ Grouped by concern; each module's docstring explains its rules.
 |---------|---------|
 | Running Claude | `claude.py` (the `claude -p` wrapper: streaming, logging, cost), `mcp_config.py` (Playwright MCP config), `json_extract.py`, `narration.py` |
 | Repo and git | `workspace.py` (find/clone the automation repo, base checkout, worktrees, git lock), `git.py`, `github.py` (`gh pr create`), `repo_config.py`, `properties_file.py`, `url_properties.py`, `credential_properties.py`, `credential_extraction.py`, `credential_masking.py` |
-| Framework access | `frameworks/` (plugins + detection), `telemetry.py` (action timelines), `dom_snapshot.py`, `trace_network.py`, `test_runner.py`, `test_catalog.py`, `code_analyzer.py`, `browser_mode.py` |
-| Diagnosis and locators | `diagnosis.py`, `baseline.py`, `page_identity.py`, `preconditions.py`, `failure_context.py`, `failure_identity.py`, `failure_clusters.py`, `history.py`, `locator_*.py` (capture, candidates, score, decide, resolve, verify, emit, patch, classify, assertions) |
+| Framework access | `frameworks/` (plugins + detection), `telemetry.py` (action timelines), `dom_snapshot.py`, `trace_network.py`, `test_runner.py`, `test_catalog.py`, `code_analyzer.py`, `module_index.py` (what code already exists, and what a change changed), `browser_mode.py` |
+| Diagnosis and locators | `diagnosis.py`, `baseline.py`, `page_identity.py`, `preconditions.py`, `failure_context.py`, `failure_identity.py`, `failure_clusters.py`, `history.py`, `locator_*.py` (capture, candidates, score, decide, resolve, verify, emit, patch, classify, assertions), `option_sets.py` (the options a choice offered, from browser evidence) |
 | What a test proves | `intent.py`, `assertion_graph.py`, `logstep_narration.py`, `step_provenance.py`, `check_provenance.py`, `edit_guards.py`, `fix_history.py` |
 | Adaptation | `blast_radius.py`, `flow_map.py`, `entry_path.py`, `session_state.py`, `mint_session.py`, `adaptation_handoff.py` |
 | Session plumbing | `load_env.sh`, `session.sh` (`log`, `run_step`, `fmt_duration`), `log.py`, `audit.py`, `run_artifacts.py`, `metrics.py`, `slack.py`, `verdict_feedback.py` |

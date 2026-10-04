@@ -161,7 +161,7 @@ The browser is already signed in through a saved session.
 
 def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
                 stop_before: str, scope: dict = None, evidence_path: Path = None) -> tuple:
-    """One exploration. Returns (flow, status, raw_stdout).
+    """One exploration. Returns (flow, ClaudeResult).
 
     The flow map is built from the model's markers AND what the browser helpers
     measured (`evidence_path`): inventories and live counts it never had to type.
@@ -190,6 +190,13 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
         model=MODEL, effort=EFFORT, cwd=str(REPO_ROOT), timeout=TIMEOUT_S,
         on_output=on_output, log_dir=str(AUDIT_DIR),
         allowed_tools=mcp_allowed_tools(),
+        # The browser and nothing else. allowed_tools only gates permission, and
+        # the user's own allow rules still admit built-ins past it: explorers have
+        # grepped the framework's properties files, where its credentials live,
+        # read test sources, and tried to install a browser from Bash. The prompt
+        # already carries every source this step needs.
+        tools="",
+        disable_slash_commands=True,
         mcp_config=str(mcp_path), strict_mcp_config=True,
         stream_json=True,
         system_prompt_file=str(SYSTEM_PROMPT) if SYSTEM_PROMPT.exists() else None,
@@ -200,7 +207,7 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
     flow = flow_map.build(result.stdout or "", evidence)
     if result.status != "ok" and flow["status"] == "ok":
         flow["status"] = "partial"
-    return flow, result.status, (result.stdout or "")
+    return flow, result
 
 
 def write(result: dict):
@@ -340,8 +347,9 @@ def main():
                 f"config {mcp_path.name}, "
                 + ("storage-state reused (no credential in the prompt)"
                    if session.get("path") else "no session — this flow does not sign in"))
-        flow, status, raw = run_attempt(plan, rules, notes, mcp_path, stop_before, scope,
-                                        evidence_path)
+        flow, claude = run_attempt(plan, rules, notes, mcp_path, stop_before, scope,
+                                   evidence_path)
+        status, raw = claude.status, claude.stdout or ""
         if status == "usage_limit":
             # An empty flow map here would be read as "the flow could not be
             # walked", which is a finding about the product. This is a finding
@@ -349,6 +357,20 @@ def main():
             log("ERROR: Claude usage limit reached — exploration did not run")
             result.update({"ran": False, "status": "skipped", "attempts": attempt,
                            "reason": "Claude usage limit reached — re-run once it resets"})
+            write(result)
+            (AUDIT_DIR / ".skip-reason").write_text("infra")
+            sys.exit(1)
+        unavailable = claude.browser_unavailable()
+        if unavailable:
+            # The same kind of stop as the cap: a finding about this machine, not
+            # the product. A browser that cannot launch was explored as "0 steps,
+            # status empty", closed with a ✓, and moved the note to processed/.
+            # A retry launches the same browser, so there is none.
+            log(f"ERROR: no browser answered — {unavailable}\n"
+                f"       → FIX: see the claude-*.log in this audit dir; a browser that "
+                f"is not installed names its install command there")
+            result.update({"ran": False, "status": "skipped", "attempts": attempt,
+                           "reason": f"No browser answered — {unavailable}"})
             write(result)
             (AUDIT_DIR / ".skip-reason").write_text("infra")
             sys.exit(1)

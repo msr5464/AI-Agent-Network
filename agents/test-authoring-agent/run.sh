@@ -11,8 +11,9 @@ set -euo pipefail
 #   ./scripts/run-authoring-agent.sh                            # queue mode: picks oldest .txt
 #   AUTO_PUSH=false ./scripts/run-authoring-agent.sh payments   # dry-run
 #
-# Retry loop: if mvn test fails after generation, re-runs 04_run_and_fix.py
-# up to AUTHORING_FIX_RETRY_COUNT (default: 2).
+# Retry loop: if mvn test fails after generation, re-runs 04_run_and_fix.py while it
+# says to. Only attempts that make no progress count against AUTHORING_FIX_RETRY_COUNT
+# (default: 2); AUTHORING_MAX_FIX_ATTEMPTS (default: 8) is the absolute ceiling.
 # ─────────────────────────────────────────────────────────────────────────────
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -209,8 +210,8 @@ if [[ "$START_FROM_STEP" -gt 1 ]]; then
   # .fix-history.json included: a resumed step 04 must not inherit the attempts of
   # the run it replaces, or its first attempt is told not to repeat work that no
   # longer exists on disk — and can be stopped early for "bringing nothing new".
-  rm -f "$AUDIT_DIR/.fix-passed" "$AUDIT_DIR/.verdict" "$AUDIT_DIR/.cancelled" \
-        "$AUDIT_DIR/.fix-history.json"
+  rm -f "$AUDIT_DIR/.fix-passed" "$AUDIT_DIR/.fix-retry" "$AUDIT_DIR/.verdict" \
+        "$AUDIT_DIR/.cancelled" "$AUDIT_DIR/.fix-history.json"
 
 elif [[ -n "$MODULE" ]]; then
   INPUT_FILE="$QUEUE_DIR/${MODULE}.txt"
@@ -482,12 +483,12 @@ else
 fi
 
 # ── Step 04 — Run & Fix (with retry loop) ─────────────────────────────────────
-# Per-agent, deliberately: this used to read MAX_FIX_ATTEMPTS, which test-healing-agent
-# read too. Healing earns a bigger budget — each of its attempts fixes one locator and
-# uncovers the next, so the loop walks a chain. This one re-attacks the same failure, so
-# it wants a smaller number. One shared knob meant setting healing's budget silently set
-# this one as well.
-AUTHORING_FIX_RETRY_COUNT="${AUTHORING_FIX_RETRY_COUNT:-2}"
+# The loop stops when 04_run_and_fix.py says so (.fix-retry). The budget it applies
+# counts attempts that made NO progress: a fix that works and lets the test reach the
+# next bug leaves the run red but is not a failed retry, and charging it as one ran the
+# budget out on a test with two independent bugs after fixing the first. Per-agent
+# settings, as for healing (HEALING_RETRY_COUNT): sharing one knob meant setting one
+# agent's budget silently set the other's. See retry_verdict in 04_run_and_fix.py.
 
 if [[ "$START_FROM_STEP" -gt 4 ]]; then
   log "✓ [04/05] Run & Fix — reused from resumed session"
@@ -499,36 +500,23 @@ else
   run_step "[04/05] Run & Fix (initial)" \
     "FIX_ATTEMPT=0 python3 '$AGENT_DIR/actions/04_run_and_fix.py'" run_and_fix
 
-  FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
-
-  if [[ "$FIX_RESULT" != "true" && "$FIX_RESULT" != "skipped" && "$FIX_RESULT" != "stuck" \
-        && "$FIX_RESULT" != "defect" ]]; then
-    FIX_ATTEMPT=1
-    while true; do
-      export STEP_ATTEMPT="$FIX_ATTEMPT"
-      run_step "[04/05] Run & Fix (attempt $FIX_ATTEMPT/$AUTHORING_FIX_RETRY_COUNT)" \
-        "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/04_run_and_fix.py'" run_and_fix
-
-      FIX_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed" 2>/dev/null || echo "skipped")
-
-      # "stuck" (not just "skipped") also stops the loop early — 04_run_and_fix.py
-      # sets it when a fix attempt had no effect on the failure's exact location,
-      # meaning further attempts are unlikely to converge either. "defect" means the
-      # failure is the product bug the input documented — another attempt could only
-      # work around it.
-      if [[ "$FIX_RESULT" == "true" || "$FIX_RESULT" == "skipped" || "$FIX_RESULT" == "stuck" \
-            || "$FIX_RESULT" == "defect" ]]; then
-        break
-      fi
-
-      if [[ "$FIX_ATTEMPT" -ge "$AUTHORING_FIX_RETRY_COUNT" ]]; then
-        log "Tests still failing after $FIX_ATTEMPT fix attempt(s) — proceeding to ship"
-        break
-      fi
-
+  # Missing means the step never got far enough to decide — stop rather than loop
+  # on a file nobody wrote. "stop" alone: the gate (true, stuck, defect, skipped)
+  # already says why, and the step logged it.
+  RETRY_VERDICT=$(tr -d '\n' < "$AUDIT_DIR/.fix-retry" 2>/dev/null || echo "stop: no verdict written")
+  FIX_ATTEMPT=1
+  while [[ "$RETRY_VERDICT" == "retry" ]]; do
+    export STEP_ATTEMPT="$FIX_ATTEMPT"
+    run_step "[04/05] Run & Fix (attempt $FIX_ATTEMPT)" \
+      "FIX_ATTEMPT=$FIX_ATTEMPT python3 '$AGENT_DIR/actions/04_run_and_fix.py'" run_and_fix
+    RETRY_VERDICT=$(tr -d '\n' < "$AUDIT_DIR/.fix-retry" 2>/dev/null || echo "stop: no verdict written")
+    if [[ "$RETRY_VERDICT" == "retry" ]]; then
       log "Tests failed — retrying (fix attempt $((FIX_ATTEMPT + 1)))"
       FIX_ATTEMPT=$((FIX_ATTEMPT + 1))
-    done
+    fi
+  done
+  if [[ "$RETRY_VERDICT" == stop:* ]]; then
+    log "Tests still failing — ${RETRY_VERDICT#stop: }. Proceeding to ship"
   fi
 fi
 

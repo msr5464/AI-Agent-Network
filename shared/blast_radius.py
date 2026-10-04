@@ -264,6 +264,64 @@ def _walk(seeds: Set[str], edges: Dict[str, Set[str]], hubs: Dict[str, int],
     return reached, blocked
 
 
+def tests_reaching(repo_path: str, changed_files: List[str],
+                   changed_members: Optional[Dict[str, List[str]]] = None,
+                   max_hops: int = MAX_HOPS) -> dict:
+    """Existing tests that execute any of `changed_files`, however indirectly.
+
+    The question a run asks after changing code other tests already use: which of
+    those tests could this have broken? `resolve` answers a different one — it
+    starts from tests a change note names — so this walks the reverse edges from
+    the changed classes instead, with the same hubs and shared infrastructure
+    left impassable: a change to one module's helper must not reach every other
+    module by way of the base class they all extend.
+
+    A class reference is a coarse edge. Every test of a module constructs its
+    helper, so a change to one helper method "reaches" the API tests that never
+    call it. `changed_members` ({path: [method or constructor names]}) narrows a
+    file to the tests whose call graph enters one of those members — the walk
+    `assertion_graph.fingerprints` already makes. A test whose walk could not
+    resolve a call is kept: what cannot be followed cannot be ruled out. A path
+    without names (a changed field, a removed method) stays a whole-class change.
+
+    Returns {"seeds", "tests": ["pkg.Class#method"], "blocked": {fqcn: count}}.
+    """
+    graph = index(repo_path)
+    classes = graph["classes"]
+    by_path = {entry["path"].replace("\\", "/"): fqcn for fqcn, entry in classes.items()}
+    seeds = {by_path[p.replace("\\", "/")] for p in changed_files or []
+             if p.replace("\\", "/") in by_path}
+    impassable = {**graph["hubs"],
+                  **{f: len(graph["referenced_by"].get(f, ()))
+                     for f in graph["infrastructure"]}}
+    reached, blocked = _walk(seeds, graph["referenced_by"], impassable, max_hops)
+    test_classes = {f for f in reached if classes.get(f, {}).get("role") == "test"}
+    tests = [f"{klass['qualified_name']}#{method['name']}"
+             for klass in list_tests(repo_path)["classes"]
+             if klass["qualified_name"] in test_classes
+             for method in klass["methods"]]
+
+    named = {p: names for p, names in (changed_members or {}).items() if names}
+    if named:
+        whole = [p for p in changed_files or [] if p not in named]
+        keep = set(tests_reaching(repo_path, whole, max_hops=max_hops)["tests"]) if whole else set()
+        wanted = {(Path(p).stem, name) for p, names in named.items() for name in names}
+        from shared import assertion_graph
+        members = assertion_graph.member_index(repo_path)
+        for test in tests:
+            if test in keep:
+                continue
+            klass, method = test.rsplit("#", 1)
+            prints = assertion_graph.fingerprints(klass.rsplit(".", 1)[-1], method, members,
+                                                  follow_constructors=True, record_reached=True)
+            entered = {(owner.rsplit(".", 1)[-1], name)
+                       for owner, _, name in (r.partition("#") for r in prints["reached"])}
+            if entered & wanted or prints["unresolved"]:
+                keep.add(test)
+        tests = sorted(keep)
+    return {"seeds": sorted(seeds), "tests": sorted(tests), "blocked": blocked}
+
+
 def _match_tests(catalog: dict, affects: List[str], named: List[str],
                  module: str) -> tuple:
     """Test methods selected by glob, explicit name, or module fallback."""

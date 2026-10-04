@@ -3,7 +3,7 @@
 Step 01 — Parse
 Reads the plain-text input file from the queue, calls Claude to extract a
 structured generation plan, and detects whether the target feature module
-already exists in Thanos-pw.
+already exists in the automation repo.
 
 Reads:  $INPUT_FILE  (plain text in queue/)
 Writes: $AUDIT_DIR/01-parse.json
@@ -21,7 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → pl
 
 from shared import workspace as workspace_helper
 from shared.credential_extraction import extract_credentials, mentions_login
-from shared import check_provenance
+from shared import check_provenance, module_index
+from shared.repo_config import load_repo_config
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR  = Path(os.environ["AUDIT_DIR"])
@@ -83,6 +84,13 @@ def resolve_check_provenance(plan: dict, raw_input: str) -> dict:
     def visit(steps):
         out = []
         for step in steps or []:
+            if isinstance(step, dict):
+                # A business step: the tags sit on its checks. Its logstep text is
+                # narration, so a tag the model put there anyway is only removed.
+                step["logstep"] = _SOURCE_TAG.sub("", str(step.get("logstep") or "")).strip()
+                step["checks"] = visit([c for c in step.get("checks") or [] if isinstance(c, str)])
+                out.append(step)
+                continue
             match = _SOURCE_TAG.search(step)
             claimed = match.group(1).lower() if match else ""
             clean = _SOURCE_TAG.sub("", step).strip()
@@ -108,6 +116,8 @@ def resolve_check_provenance(plan: dict, raw_input: str) -> dict:
     for step in plan.get("interleaved_steps") or []:
         if isinstance(step, dict) and step.get("description"):
             step["description"] = visit([step["description"]])[0]
+        if isinstance(step, dict) and step.get("checks"):
+            step["checks"] = visit([c for c in step["checks"] if isinstance(c, str)])
 
     plan["check_provenance"] = verdicts
     untraceable = sorted(s for s, v in verdicts.items() if v["droppable"])
@@ -129,6 +139,71 @@ def resolve_check_provenance(plan: dict, raw_input: str) -> dict:
     return verdicts
 
 
+def settle_flow_plan(plan: dict, existing: bool, known: dict) -> dict:
+    """Make the flow-API half of the plan safe to generate from. Returns notes for 01-parse.md.
+
+    - "option_enums", "reuse" and "helper_web_methods" always exist as lists.
+    - Each option enum's control is in its page's locators_needed, so step 02 is
+      asked to confirm it and step 03 has a measured selector to build the
+      option template from.
+    - A reuse claim naming a method neither index has moves to "reuse_unknown".
+      The model reporting that a method exists is not evidence that it does, and
+      codegen told to call it would write a call to nothing; it now creates the
+      method like any other new one, with the compile gate as the backstop.
+    - A new operation in an existing module that gives no "why_new" is reported:
+      the reuse ladder asks for one, and its absence is what a reviewer checks.
+    """
+    notes = {"controls_added": [], "reuse_unknown": [], "reuse_unchecked": [],
+             "missing_why_new": []}
+    for key in ("option_enums", "reuse", "helper_web_methods"):
+        if not isinstance(plan.get(key), list):
+            plan[key] = []
+
+    pages = {p.get("class_name"): p for p in plan.get("web_pages") or [] if isinstance(p, dict)}
+    for enum in plan["option_enums"]:
+        if not isinstance(enum, dict) or not enum.get("control"):
+            continue
+        page = pages.get(enum.get("page"))
+        if page is None:
+            log(f"WARNING: option enum {enum.get('name')} is picked on {enum.get('page')!r}, "
+                f"which the plan has no page for — its options cannot be measured")
+            continue
+        needed = page.setdefault("locators_needed", [])
+        if enum["control"] not in needed:
+            needed.append(enum["control"])
+            notes["controls_added"].append(f"{enum.get('page')}.{enum['control']}")
+
+    kept = []
+    for entry in plan["reuse"]:
+        if not isinstance(entry, dict):
+            continue
+        ref = module_index.parse_member_reference(str(entry.get("existing") or ""))
+        if ref is None:
+            notes["reuse_unchecked"].append(str(entry.get("existing") or ""))
+            kept.append(entry)
+        elif module_index.is_known(known, *ref):
+            kept.append(entry)
+        else:
+            notes["reuse_unknown"].append(entry)
+    plan["reuse"] = kept
+    plan["reuse_unknown"] = notes["reuse_unknown"]
+
+    if existing:
+        notes["missing_why_new"] = [op.get("name") for op in plan["helper_web_methods"]
+                                    if isinstance(op, dict)
+                                    and not str(op.get("why_new") or "").strip()]
+
+    if notes["controls_added"]:
+        log(f"Option controls added to their pages' locators: {', '.join(notes['controls_added'])}")
+    for entry in notes["reuse_unknown"]:
+        log(f"WARNING: reuse of {entry.get('existing')!r} names a method that does not exist — "
+            f"it will be generated as a new method")
+    if notes["missing_why_new"]:
+        log(f"WARNING: new operation(s) in an existing module with no why_new: "
+            f"{', '.join(str(n) for n in notes['missing_why_new'])}")
+    return notes
+
+
 def normalize_module_name(raw: str) -> str:
     """Turn the input's `Module:` value into a legal Java package segment.
 
@@ -143,24 +218,45 @@ def normalize_module_name(raw: str) -> str:
 
 
 def module_exists(feature_name: str) -> bool:
-    """Check if the feature module already exists in Thanos-pw."""
+    """Check if the feature module already exists in the automation repo."""
     module_dir = AUTOMATION_FRAMEWORK_DIR / "src/main/java/automation/modules" / feature_name.lower()
     return module_dir.exists()
 
 
-def read_existing_module_files(feature_name: str) -> dict:
-    """Read existing module files to give Claude context when appending."""
-    module_dir = AUTOMATION_FRAMEWORK_DIR / "src/main/java/automation/modules" / feature_name.lower()
-    if not module_dir.exists():
-        return {}
-    files = {}
-    for f in module_dir.rglob("*.java"):
-        rel = f.relative_to(AUTOMATION_FRAMEWORK_DIR)
-        try:
-            files[str(rel)] = f.read_text()[:3000]  # truncate large files
-        except Exception:
-            pass
-    return files
+def module_paths(feature_name: str) -> list:
+    """The module's main and test source directories, repo-relative."""
+    name = feature_name.lower()
+    return [f"src/main/java/automation/modules/{name}", f"src/test/java/automation/{name}"]
+
+
+def _flow_summary(plan: dict, notes: dict) -> list:
+    """01-parse.md lines for the flow API: reuse first, then what is new and why."""
+    lines = ["", "## Reuse"]
+    lines += [f"- {e.get('how', '?')}: {e.get('existing')}"
+              + (f" — {e['change']}" if e.get("change") else "")
+              for e in plan.get("reuse") or []] or ["- (nothing reused)"]
+    for e in notes.get("reuse_unknown") or []:
+        lines.append(f"- ⚠️ not found, will be generated: {e.get('existing')}")
+    lines += ["", "## New Helper operations"]
+    lines += [f"- {op.get('kind', 'stage')} {op.get('name')}({', '.join(op.get('params') or [])})"
+              + (f" → {op['returns']}" if op.get("returns") else "")
+              + (f" = {' + '.join(op['composes'])}" if op.get("composes") else "")
+              + (f" — why new: {op['why_new']}" if op.get("why_new") else "")
+              for op in plan.get("helper_web_methods") or [] if isinstance(op, dict)] or ["- (none)"]
+    if notes.get("missing_why_new"):
+        lines.append(f"- ⚠️ no why_new given for: {', '.join(map(str, notes['missing_why_new']))}")
+    if plan.get("option_enums"):
+        lines += ["", "## Option enums"] + [
+            f"- {e.get('name')}: {e.get('chooses', '')} (control {e.get('page')}.{e.get('control')}, "
+            f"exercised {', '.join(e.get('exercised') or [])})"
+            for e in plan["option_enums"] if isinstance(e, dict)]
+    for key in ("web_test_methods", "api_test_methods"):
+        for method in plan.get(key) or []:
+            steps = method.get("steps") or []
+            lines += ["", f"## {method.get('method_name')} — {len(steps)} step(s)"]
+            lines += [f"{i}. {s.get('logstep') if isinstance(s, dict) else s}"
+                      for i, s in enumerate(steps, 1)]
+    return lines
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -169,16 +265,15 @@ def main() -> None:
     log(f"Reading input: {INPUT_FILE}")
     raw_text = INPUT_FILE.read_text()
 
-    # Load Jarvis CLAUDE.md (the single source of truth for framework conventions).
-    # For parsing we only need structure/naming rules, not full Java examples, so
-    # trim at the first ```java block to keep the prompt compact.
+    # The automation repo's CLAUDE.md, whole: the single source of truth for its
+    # conventions. It used to be cut at its first ```java block to keep this prompt
+    # small, which ended it before the Coding Rules — what a helper owns, how a test
+    # reads — so the plan was drawn up without the rules codegen is then held to.
     fw_claude_md_path = AUTOMATION_FRAMEWORK_DIR / "CLAUDE.md"
-    fw_claude_md_full = fw_claude_md_path.read_text() if fw_claude_md_path.exists() else ""
-    if not fw_claude_md_full:
+    claude_md = fw_claude_md_path.read_text() if fw_claude_md_path.exists() else ""
+    if not claude_md:
         log(f"WARNING: {fw_claude_md_path} not found — check FRAMEWORK_DIR, or "
             "WORKSPACE_DIR and GITHUB_REPO_AUTOMATION")
-    java_block_pos = fw_claude_md_full.find("```java")
-    claude_md = fw_claude_md_full[:java_block_pos].strip() if java_block_pos > 0 else fw_claude_md_full
 
     # The input's `Module:` line names the module — it decides the package and the
     # directory on disk. It is NOT a hint: letting the model pick its own
@@ -199,15 +294,24 @@ def main() -> None:
         log(f"No 'Module:' line in input — falling back to filename: '{module_name}'")
 
     existing = module_exists(module_name)
-    existing_files = read_existing_module_files(module_name) if existing else {}
     log(f"Module '{module_name}' exists: {existing}")
 
+    # What already exists, as an index rather than file contents: the model cannot
+    # reuse a method it never saw, and files cut at a few thousand characters hid
+    # every operation past the cut. Rule 9 walks the reuse ladder against these.
+    shared_paths = load_repo_config().get("shared_code") or []
+    existing_index = (module_index.describe(AUTOMATION_FRAMEWORK_DIR, module_paths(module_name))
+                      if existing else "")
+    shared_index = module_index.describe_shared(AUTOMATION_FRAMEWORK_DIR, shared_paths)
     existing_context = ""
-    if existing_files:
-        existing_context = "\n\n<existing_module_files>\n"
-        for path, content in existing_files.items():
-            existing_context += f"\n--- {path} ---\n{content}\n"
-        existing_context += "</existing_module_files>"
+    if existing_index:
+        existing_context += ("\n\n<existing_module_index>\nEvery public member this module "
+                             "already has, one per line, grouped by class:\n"
+                             f"{existing_index}\n</existing_module_index>")
+    if shared_index:
+        existing_context += ("\n\n<shared_code_index>\nThe framework's shared code that every "
+                             "module can call, one public member per line:\n"
+                             f"{shared_index}\n</shared_code_index>")
 
     prompt = f"""You are a QA automation planning agent for the automation repository whose conventions follow.
 
@@ -258,36 +362,43 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
       "method_name": "createAndVerifyPayment",
       "description": "Create a payment and verify it is returned by GET",
       "steps": [
-        "allocate Admin user",
-        "setAuthToken",
-        "build PaymentData with amount 100 and currency SGD",
-        "call createPayment and assertNotNull id  [source: user]",
-        "call getPayment by id and assertEquals status PENDING  [source: user]"
+        {{"logstep": "Create a payment of 100 SGD and verify the response carries an id",
+          "call": "payments.createPayment(payment) -> created",
+          "checks": ["assertNotNull created.id  [source: user]"]}},
+        {{"logstep": "Fetch the payment by its id and verify its status is PENDING",
+          "call": "payments.getPayment(created.id) -> fetched",
+          "checks": ["assertEquals fetched.status PENDING  [source: user]"]}}
       ]
     }}
   ],
   "web_pages": [
     {{
-      "class_name": "PaymentListPage",
-      "locators_needed": ["newPaymentButton", "paymentList"],
-      "actions_needed": ["clickNewPayment", "isPaymentVisible"]
+      "class_name": "PaymentFormPage",
+      "locators_needed": ["recipientField", "amountField", "submitButton"],
+      "actions_needed": ["fillPaymentDetails", "submit"]
     }},
     {{
-      "class_name": "PaymentFormPage",
-      "locators_needed": ["recipientField", "amountField", "currencyDropdown", "submitButton", "successMessage"],
-      "actions_needed": ["fillRecipient", "fillAmount", "selectCurrency", "submit", "isSuccessMessageVisible", "createPayment"]
+      "class_name": "PaymentMethodPage",
+      "locators_needed": ["paymentMethodOption", "totalDisplay", "cardNumberField", "payButton"],
+      "actions_needed": ["choosePaymentMethod", "getTotal", "fillCardDetails", "pay"]
+    }},
+    {{
+      "class_name": "ReceiptPage",
+      "locators_needed": ["receiptAmount"],
+      "actions_needed": ["getReceiptAmount"]
     }}
   ],
   "web_test_methods": [
     {{
-      "method_name": "createPaymentViaUI",
-      "description": "Create a payment via UI and verify success message",
+      "method_name": "payByCardAndVerifyReceipt",
+      "description": "Pay for a new payment by card and verify the receipt shows the total",
       "steps": [
-        "allocate Admin user",
-        "build PaymentData",
-        "doLogin -> DashboardPage",
-        "createPaymentViaUI(dashboard, payment) -> PaymentFormPage",
-        "assertTrue isSuccessMessageVisible  [source: user]"
+        {{"logstep": "Fill the payment form and submit it, and verify the total shown matches the amount entered",
+          "call": "payments.checkout(payment) -> total",
+          "checks": ["assertEquals total payment.amount  [source: user]"]}},
+        {{"logstep": "Pay by credit card and verify the receipt shows the same total",
+          "call": "payments.makePayment(PaymentMethod.CreditCard, payment) -> receipt",
+          "checks": ["assertEquals receipt.amount total  [source: user]"]}}
       ]
     }}
   ],
@@ -296,7 +407,23 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
     {{"name": "getPayment",     "endpoint_enum": "GetPayment",    "returns": "PaymentData", "path_param": "id"}}
   ],
   "helper_web_methods": [
-    {{"name": "createPaymentViaUI", "navigates_through": ["DashboardPage", "PaymentListPage", "PaymentFormPage"]}}
+    {{"name": "checkout", "kind": "stage", "params": ["PaymentData payment"], "returns": "String total",
+      "navigates_through": ["PaymentFormPage", "PaymentMethodPage"], "composes": [], "why_new": ""}},
+    {{"name": "enterPaymentDetails", "kind": "stage", "params": ["PaymentMethod method", "PaymentData payment"],
+      "returns": "void", "navigates_through": ["PaymentMethodPage"], "composes": [], "why_new": ""}},
+    {{"name": "confirmPayment", "kind": "stage", "params": [], "returns": "Receipt (amount, reference)",
+      "navigates_through": ["PaymentMethodPage", "ReceiptPage"], "composes": [], "why_new": ""}},
+    {{"name": "makePayment", "kind": "composed", "params": ["PaymentMethod method", "PaymentData payment"],
+      "returns": "Receipt", "navigates_through": [], "composes": ["enterPaymentDetails", "confirmPayment"],
+      "why_new": ""}}
+  ],
+  "reuse": [
+    {{"existing": "WaitHelper.waitForUrl(Config config, String urlPattern)", "how": "as_is", "change": ""}}
+  ],
+  "option_enums": [
+    {{"name": "PaymentMethod", "chooses": "the payment method picked on the payment method page",
+      "page": "PaymentMethodPage", "control": "paymentMethodOption", "exercised": ["CreditCard"],
+      "existing": false}}
   ],
   "web_steps_for_validation": [
     "Navigate to login page at the base URL",
@@ -345,14 +472,14 @@ Rules:
    asked about, and the failure then looks like something to be "fixed" by
    deleting it. An input that says "save, then verify the change persisted" wants
    exactly one assertion — that the change persisted.
-   Mark every verification you emit, in both "web_steps_for_validation" and the
-   "steps" of "web_test_methods", by appending a source tag:
+   Mark every verification you emit, in "web_steps_for_validation" and in the "checks"
+   of every test-method step (rule 11) and interleaved entry, by appending a source tag:
      "Verify the profile summary persisted after reload  [source: user]"
      "Verify a success toast appears                     [source: inferred]"
    Use "user" ONLY when the input actually asks for that check — quote-able back
    to a line the author wrote. Use "inferred" for anything you added yourself.
-   Tag verifications only; action steps need no tag. This is cross-checked against
-   the input text afterwards, so a mis-tag is caught rather than trusted.
+   Tag verifications only; action steps and a step's "logstep" need no tag. This is
+   cross-checked against the input text afterwards, so a mis-tag is caught rather than trusted.
 
 4c. KEEP WHAT A COMPARISON POINTS AT. When a verification compares with something
    from earlier in the flow ("same as we passed earlier", "matching the ones we
@@ -368,8 +495,8 @@ Rules:
    The wrong one has no source, so the check ends up comparing the page against a
    number copied from the page itself, and proves nothing. If the earlier value is
    only shown and never typed, reading and recording it at that earlier step is a
-   mechanic rule 4b allows, not an invented check. Keep the back-reference in
-   "web_test_methods" steps and "interleaved_steps" too: store the earlier value
+   mechanic rule 4b allows, not an invented check. Keep the back-reference in the
+   test-method steps' "checks" and in "interleaved_steps" too: store the earlier value
    under a name and compare with that name. Never replace it with a literal the
    input did not quote.
    A CHANGE check ("the total goes down after applying the voucher") compares one
@@ -446,6 +573,8 @@ Rules:
            {{"step": 2, "interface": "web", "description": "Login as Admin and navigate to Payments page"}},
            {{"step": 3, "interface": "web", "description": "Verify the payment appears in the payments list"}},
            {{"step": 4, "interface": "api", "description": "Fetch the payment by ID and verify status is PENDING"}}]
+        Each entry may also carry the "call" and "checks" of rule 11; "description" stays
+        the plain step the browser is shown.
         Also set "interleaved_test_method_name" to a single camelCase method name describing
         the whole flow (e.g. "createPaymentViaApiThenVerifyOnWeb"). When flow_style is
         "interleaved", leave "api_test_methods"/"web_test_methods" as [] — interleaved_steps
@@ -464,7 +593,57 @@ Rules:
    to true. Still plan the test for the EXPECTED result — that is what the regression test proves.
    If there is no Actual Result, or it matches the expected result, set "actual_result" to null
    and "is_known_product_defect" to false.
-9. Output ONLY valid JSON, no prose, no markdown wrapper.
+9. THE MODULE'S FLOW API — REUSE BEFORE ANYTHING NEW. The module's Helper is the API its tests
+   are written against: business operations a person would name (checkout, makePayment,
+   confirmOtp), each covering as many pages as the operation takes, so a test reads as one call
+   per step.
+   a) Walk this ladder for every operation and page method a step needs, in order:
+      1. An existing method does it: list it in "reuse" with "how": "as_is". Look in
+         <existing_module_index> and <shared_code_index> before naming anything new.
+      2. An existing method nearly does it: change it slightly, and list it with "how":
+         "extend" and the exact "change". Allowed changes: add an enum value and its case; add a
+         parameter through an overload whose old signature delegates with its former value;
+         read a new optional Data field, absent meaning today's behaviour; return a value where
+         it returned void; extract a private step both callers share. Never change what an
+         existing call does for its current callers, never remove or rename a public method or
+         enum value, and never edit an existing test method.
+      3. Only then add a new operation to "helper_web_methods", or a page method to
+         "web_pages". In an existing module every new operation states "why_new": what no
+         existing method could do even after a small change. A method that would differ from an
+         existing one only by a hard-coded value or choice is always case 2, never case 3.
+   b) A "stage" carries one business step and ends where the input checks something, so the
+      test can assert on what it returns. Then think one test ahead: for each run of stages a
+      later test would want as one call — paying is choosing the method, entering the details,
+      continuing and confirming — also add a "composed" operation that calls them in order
+      ("composes") and adds nothing else, even when THIS test checks between them. This test
+      calls the stages; the next one calls makePayment(PaymentMethod.Wallet, payment).
+   c) Name each operation with the business verb for what it does — checkout, makePayment,
+      confirmOtp, continueToBank — never the scenario (not payByCardWithVoucher) and never what
+      it returns (not continueAndGetBankAmount): the return type says that. Not get*/read*
+      either, which the narration check reads as data lookups. A choice among fixed options is
+      an enum parameter (rule 10); a value is a Data field.
+   d) Operations never assert. They return what the step's checks need: a value, or a small
+      result type when the checks need several.
+10. OPTION ENUMS. Every step that picks one of several options the page offers (a payment
+   method, a delivery speed, a plan tier) gets an entry in "option_enums": the enum "name", what
+   it "chooses", the "page" it is picked on, the "control" — the locator name, named for the
+   choice ("paymentMethodOption"), never for the value used ("creditCardOption") — and the values
+   this test "exercised", in CamelCase. Put the control in that page's "locators_needed". List
+   only the exercised values: the browser records every option the page offers, and the enum is
+   generated from that record. Set "existing": true when <existing_module_index> already has the
+   enum; a new value for it is then a case-2 change.
+11. TEST STEPS ARE BUSINESS STEPS. Every test method's "steps" is a list of objects, one per
+   business step, in the input's order:
+     {{"logstep": "<the action AND its expected outcome, as the run report should say it>",
+      "call": "<the ONE call that carries it out: a Helper operation, or one page method on a
+               page an earlier operation returned> -> <what it returns, when a check needs it>",
+      "checks": ["<each check the input asks for right after it, tagged per rule 4b>"]}}
+   A business step may merge several numbered input steps that are one operation (navigate,
+   open the form, fill it and submit is one checkout). Never split one into its clicks and
+   fills, and never list setup (constructing the helper, building data) as a step. A check
+   between two stages makes them two steps; with nothing checked in between, the composed
+   operation carries them as one.
+12. Output ONLY valid JSON, no prose, no markdown wrapper.
 """
 
     log("Calling Claude to parse input...")
@@ -565,6 +744,9 @@ Rules:
             if isinstance(s, dict) and s.get("interface") == "web" and s.get("description")]
 
     resolve_check_provenance(plan, raw_text)
+    known = module_index.known_members(
+        AUTOMATION_FRAMEWORK_DIR, (module_paths(module_name) if existing else []) + shared_paths)
+    flow_notes = settle_flow_plan(plan, existing, known)
 
     (AUDIT_DIR / "01-parse.json").write_text(json.dumps(plan, indent=2))
 
@@ -597,6 +779,7 @@ Rules:
             f"{s.get('step')}. [{s.get('interface', '?').upper()}] {s.get('description', '')}"
             for s in plan["interleaved_steps"]
         ]
+    summary_lines += _flow_summary(plan, flow_notes)
     (AUDIT_DIR / "01-parse.md").write_text("\n".join(summary_lines))
 
     log(f"Plan: {plan.get('feature_class')} | type={plan.get('test_type')} "

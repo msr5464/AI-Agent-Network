@@ -202,6 +202,34 @@ def _is_broader(before: str, after: str) -> bool:
     return False
 
 
+def _selector_literals(text: str) -> list:
+    """(literal, assembled) for each selector literal a locator call opens with."""
+    from shared.frameworks.base import literal_is_assembled
+    pattern = re.compile(rf"""(?:{_locator_calls()})\s*\(\s*(["'])((?:\\.|(?!\1).)*)\1""", re.I)
+    return [(m.group(2), literal_is_assembled(text, m.end(), m.group(2)))
+            for m in pattern.finditer(text or "")]
+
+
+def _template_collapsed(removed: str, added: str) -> tuple:
+    """(template prefix, literal) when an edit hard-codes one value into a template.
+
+    A locator built from an option's key — `"a[data-option='" + option.getKey() +
+    "']"` — serves every value of the option's enum. Only the value the failing
+    test used is ever exercised, so a fix that "repairs" it by writing that one
+    value out in full passes, and silently breaks every other option.
+    """
+    prefixes = [raw for raw, assembled in _selector_literals(removed) if assembled and raw]
+    if not prefixes:
+        return ()
+    for raw, assembled in _selector_literals(added):
+        if assembled:
+            continue
+        for prefix in prefixes:
+            if raw.startswith(prefix) and len(raw) > len(prefix):
+                return prefix, raw
+    return ()
+
+
 def no_selector_broadening(original: str, updated: str) -> tuple:
     """Reject an edit that replaces a selector with a looser one. (ok, reason).
 
@@ -209,6 +237,9 @@ def no_selector_broadening(original: str, updated: str) -> tuple:
     wrong-page failure gets papered over into a pass, and that is true whatever
     the diagnosis said — or whether one was made at all. validate_diagnosis_fit()
     calls this as its rule 2, so healing's behaviour is unchanged.
+
+    Narrowing a template to one of its values is rejected here too: it is the
+    same failure seen from the other options' side.
     """
     changed = [line for line in difflib.unified_diff(
         original.splitlines(), updated.splitlines(), lineterm="", n=0)
@@ -220,6 +251,12 @@ def no_selector_broadening(original: str, updated: str) -> tuple:
         if _is_broader(before, after):
             return False, (f"fix broadens the selector {before!r} to {after!r}, "
                            f"which would make the assertion weaker rather than correct")
+    collapsed = _template_collapsed("\n".join(removed), "\n".join(added))
+    if collapsed:
+        prefix, literal = collapsed
+        return False, (f"fix bakes one option's value into a selector the code builds for "
+                       f"every option ({prefix!r}… became {literal!r}) — fix the template's "
+                       f"fixed parts instead, so every option keeps working")
     return True, ""
 
 

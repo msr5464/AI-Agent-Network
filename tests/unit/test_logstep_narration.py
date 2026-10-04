@@ -236,3 +236,84 @@ class TestLogSteps:
             'Login, add {product.get("slug")} to cart, and navigate to cart',
             'Fetch a post ID that does not exist ({postId})',
             'Verify cart badge shows 1 item']
+
+
+class TestBusinessSteps:
+    """A plan step is now one business step: an operation plus the checks after it."""
+
+    def test_each_business_step_counts_once_whatever_verb_it_starts_with(self):
+        steps = [{"logstep": "Read the order details and verify the name matches",
+                  "call": "shop.readOrderDetails() -> details",
+                  "checks": ["assertEquals details.name order.name  [source: user]",
+                             "assertEquals details.phone order.phone  [source: user]"]},
+                 {"logstep": "Pay by credit card and verify the receipt total",
+                  "call": "shop.makePayment(PaymentMethod.CreditCard, order) -> receipt",
+                  "checks": []}]
+        assert ln.narratable_steps(steps) == [
+            "Read the order details and verify the name matches",
+            "Pay by credit card and verify the receipt total"]
+
+    def test_an_interleaved_entry_is_read_by_its_description_as_before(self):
+        steps = [{"step": 1, "interface": "api", "description": "Create a payment via POST"},
+                 {"step": 2, "interface": "web", "description": "Verify it appears in the list",
+                  "call": "shop.openPayments()", "checks": []}]
+        assert ln.narratable_steps(steps) == ["Create a payment via POST",
+                                              "Verify it appears in the list"]
+
+    def test_expected_from_plan_reads_business_steps(self):
+        plan = {"web_test_methods": [{"method_name": "pay", "steps": [
+            {"logstep": "Check out", "call": "shop.checkout(order)", "checks": []},
+            {"logstep": "Pay by card", "call": "shop.makePayment(m, order)", "checks": []}]}]}
+        assert ln.expected_from_plan(plan) == {"pay": ["Check out", "Pay by card"]}
+
+
+SHAPED = '''public class ShopWebTest extends TestBase
+{
+    @Test(description = "Pay by card", dataProvider = "getConfig", groups = {GROUP_REGRESSION, GROUP_WEB})
+    @TestVariables(automatedBy = QA.Someone)
+    public void payByCard(Config config)
+    {
+        ShopHelper shop = new ShopHelper(config);
+
+        config.logStep("Check out the order and verify the total");
+        CartPage cart = shop.openCart(order);
+        AssertHelper.assertEquals(config, cart.getTotal(), "10", "Total should match");
+
+        config.logStep("Enter the card details and pay");
+        cart.fillCardNumber("4111");
+        cart.fillExpiry("01/35");
+        cart.pay();
+    }
+
+    @Test(description = "Existing", dataProvider = "getConfig")
+    public void existing(Config config)
+    {
+        config.logStep("Do one thing");
+    }
+}
+'''
+
+
+class TestShape:
+    """Measured, never enforced: a test's length and steps that drive a page by hand."""
+
+    def test_body_lines_count_the_body_not_the_annotation_or_signature(self):
+        bodies = ln.test_bodies(SHAPED)
+        assert ln.body_lines(bodies["payByCard"]) == 11
+        assert "GROUP_WEB" not in bodies["payByCard"]
+
+    def test_a_step_that_drives_a_page_call_by_call_is_reported(self):
+        chains = ln.page_action_chains(ln.test_bodies(SHAPED)["payByCard"], {"CartPage"})
+        assert chains == [{"step": "Enter the card details and pay",
+                           "calls": ["cart.fillCardNumber", "cart.fillExpiry", "cart.pay"]}]
+
+    def test_reads_and_helper_calls_are_not_chains(self):
+        body = ln.test_bodies(SHAPED)["payByCard"]
+        assert ln.page_action_chains(body, set()) == []
+        first_step = body.split("Enter the card details")[0]
+        assert ln.page_action_chains(first_step, {"CartPage"}) == []
+
+    def test_shape_skips_methods_that_existed_before(self):
+        shaped = ln.shape(SHAPED, {"CartPage"}, skip={"existing"})
+        assert set(shaped) == {"payByCard"}
+        assert shaped["payByCard"]["body_lines"] == 11

@@ -55,7 +55,7 @@ from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_too
 from shared.log import log as _log      # noqa: E402  (shared, redacts known secrets)
 from shared.page_identity import (is_alternatives, is_dom_selector,  # noqa: E402
                                   qualified_locator_names)
-from shared import check_provenance, flow_map, proven_locators, value_match  # noqa: E402
+from shared import check_provenance, flow_map, option_sets, proven_locators, value_match  # noqa: E402
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -1649,6 +1649,11 @@ Begin executing the steps now using the browser tools.
         passed, unverified = enforce_value_checks(passed, unverified, value_checks)
         passed, unverified = promote_matched_values(passed, unverified, value_checks, found,
                                                     inputs)
+        # What else each choice offered, read off the same evidence the selectors
+        # were measured against. Fields typed into and elements only read are not
+        # choices, and a row of inputs would otherwise read as one.
+        offered = option_sets.from_selectors(
+            found, evidence, skip=set(inputs) | {c.get("element") for c in value_checks})
         return {
             "output":            output,
             "selectors":         found,
@@ -1666,6 +1671,7 @@ Begin executing the steps now using the browser tools.
             # same uniqueness guarantee the selector map does.
             "interaction_hints": reconcile_hints(parse_interaction_hints(output), found),
             "proven_preferred":  preferred,
+            "option_sets":       offered,
         }
 
     def _score(result, p: dict) -> tuple:
@@ -1785,6 +1791,7 @@ Begin executing the steps now using the browser tools.
             urls_visited=list(getattr(r, "navigated_urls", []) or []),
             final_attempt=final,
             proven_preferred=p.get("proven_preferred"),
+            option_sets=p.get("option_sets"),
         )
 
     attempt_notes = ""
@@ -1815,6 +1822,18 @@ Begin executing the steps now using the browser tools.
                 "Check .mcp.json in this audit dir and that --tools still admits "
                 "ToolSearch, which is what loads deferred MCP tool schemas.")
             _write_empty(reason="Playwright MCP tools unavailable — Claude fabricated the run instead of driving a browser")
+            sys.exit(1)
+        unavailable = result.browser_unavailable()
+        if unavailable:
+            # Tools were called, but no browser ever answered one: a ToolSearch
+            # followed by narration, or a browser that cannot launch and fails
+            # every call. Either way nothing was observed, and a retry launches
+            # the same browser, so stop here and name it.
+            log(f"ERROR: no browser answered — {unavailable}\n"
+                "       → FIX: see the claude-*.log in this audit dir; a browser that "
+                "is not installed names its install command there")
+            _write_result({}, [], [], status="error", attempts=attempt_num,
+                          reason=f"No browser answered — {unavailable}")
             sys.exit(1)
         parsed = _parsed(result.stdout)
         attempts.append((result, parsed))
@@ -1944,7 +1963,8 @@ def _write_result(selectors, steps_passed, steps_failed,
                   attempts=1, selector_counts=None, steps_unverified=None,
                   selector_visibles=None, rejected_selectors=None,
                   mechanisms=None, urls_visited=None, final_attempt=True,
-                  inputs_used=None, value_checks=None, proven_preferred=None) -> None:
+                  inputs_used=None, value_checks=None, proven_preferred=None,
+                  option_sets=None) -> None:
     # Every selector that survives parse_selector_output() was measured at exactly
     # one element, and every hint that survives reconcile_hints() is either backed
     # by one of those or measured itself. Assert it rather than trusting it: this
@@ -2002,6 +2022,10 @@ def _write_result(selectors, steps_passed, steps_failed,
         # name -> the selector the model reported and the proven one kept instead
         # (prefer_proven). Empty when the model chose the proven one itself.
         "proven_preferred":  proven_preferred or [],
+        # locator name -> every option the page offered beside the one the flow
+        # used (shared/option_sets.py). Step 03 generates option enums from it, so
+        # an enum lists what the page offered rather than what a model expects.
+        "option_sets":       option_sets or {},
         # False while a retry follows — the server keeps the chip running
         # instead of judging this snapshot as the step's outcome.
         "final_attempt":     final_attempt,
@@ -2042,6 +2066,15 @@ def _write_result(selectors, steps_passed, steps_failed,
             for c in value_checks or []:
                 lines.append(f"- {c['check']}: `{c['rendered']}` vs `{c['expected']}` "
                              f"({c['source']}) → **{c['relation'] or 'no match'}**")
+        if option_sets:
+            lines.append("")
+            lines.append("## Option sets seen")
+            for name, found in option_sets.items():
+                lines.append(f"- `{name}` ({found['attribute']}, chosen `{found['chosen']}`): "
+                             + ", ".join(f"{o['label'] or o['key']} (`{o['key']}`"
+                                         + (f", ×{o['occurrences']}" if o["occurrences"] > 1 else "")
+                                         + ")" for o in found["options"])
+                             + (" …truncated" if found.get("truncated") else ""))
         if mechanisms:
             lines.append("")
             lines.append("## Discovered Mechanisms")

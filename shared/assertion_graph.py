@@ -356,7 +356,8 @@ _NEW = re.compile(r"\bnew\s+([A-Z]\w*)\s*(?:<[^<>()]*>)?\s*\(")
 
 
 def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
-                 max_depth: int = MAX_DEPTH, follow_constructors: bool = False) -> Dict:
+                 max_depth: int = MAX_DEPTH, follow_constructors: bool = False,
+                 record_reached: bool = False) -> Dict:
     """Every assertion reachable from one test method, with how it is guarded.
 
     Returns {"asserts": {fp: {...}}, "unresolved": [...], "log_steps": [...]}.
@@ -366,6 +367,11 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
     the only step that reaches a page drops that check without a trace. Off by
     default: the authoring agent compares against assertions it froze without
     it, and must keep comparing like with like.
+
+    `record_reached` adds `"reached"`: every `fqcn#member` the walk entered.
+    Which tests execute a changed method is the same walk asked a different
+    question, so it is answered here rather than by a second call-graph reader.
+    Off by default, so stored fingerprints keep their shape.
     """
     result: Dict = {"asserts": {}, "unresolved": [], "log_steps": []}
     seen: Set[Tuple[str, str]] = set()
@@ -517,6 +523,8 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
 
     walk(class_simple, method, 0)
     result["unresolved"] = sorted(set(result["unresolved"]))
+    if record_reached:
+        result["reached"] = sorted(f"{owner}#{name}" for owner, name in seen)
     return result
 
 

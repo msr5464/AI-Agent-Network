@@ -89,6 +89,11 @@ the test class already uses (e.g. `config.logStep("…")`), that states the acti
 and its expected outcome. That is not bookkeeping: the
 contract that protects the *next* adaptation is derived from those strings.
 
+A helper operation other tests also call is shared. Change one only when the change
+holds for every caller — the product step it performs changed for all of them.
+When only the tests in your item need it, add an enum value, an overload that keeps
+the old signature, or an optional data field instead.
+
 ### When the right answer is "no"
 
 Return `adaptable: false` and say why, when:

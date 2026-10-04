@@ -833,6 +833,10 @@ def _inspect_parked_browser(ctx: dict, session: dict) -> dict:
             timeout=DOM_TIMEOUT_S,
             effort=BROWSER_EFFORT,
             allowed_tools=mcp_allowed_tools(),
+            # The browser and nothing else: allowed_tools only gates permission,
+            # and the user's own allow rules still admit built-ins past it.
+            tools="",
+            disable_slash_commands=True,
             mcp_config=str(mcp_path),
             strict_mcp_config=True,
         )
@@ -1007,6 +1011,10 @@ def inspect_live_dom(ctx: dict, url: str, workspace: Path, props: dict,
         timeout=DOM_TIMEOUT_S,
         effort=BROWSER_EFFORT,
         allowed_tools=mcp_allowed_tools(),
+        # The browser only, as in the parked-browser inspection above. This prompt
+        # can carry credentials, which makes a shell beside it worse, not better.
+        tools="",
+        disable_slash_commands=True,
         mcp_config=str(mcp_path),
         strict_mcp_config=True,
         stream_json=True,

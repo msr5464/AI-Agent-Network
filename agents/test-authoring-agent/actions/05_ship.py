@@ -339,6 +339,86 @@ def _read_original_test_case(plan: dict) -> str:
     return ""
 
 
+def _review_notes(gen_data: dict, regression: dict) -> str:
+    """The PR's review notes: what this run reused, changed and added. Never a gate.
+
+    An authoring PR is reviewed for its structure as much as its locators: which
+    existing code it called rather than rewrote, which existing methods it changed
+    — and whether the tests that already use them still pass — and why anything
+    new had to be new. Empty when there is nothing to say.
+    """
+    parts = []
+    reuse = gen_data.get("reuse") or []
+    if reuse:
+        parts.append("**Reused existing code**\n" + "".join(
+            f"- {'changed ' if e.get('how') == 'extend' else ''}`{e.get('existing')}`"
+            + (f" — {e['change']}" if e.get("change") else "") + "\n" for e in reuse))
+    unknown = gen_data.get("reuse_unknown") or []
+    if unknown:
+        parts.append("**Planned as reuse, but no such method exists — generated instead**\n"
+                     + "".join(f"- `{e.get('existing')}`\n" for e in unknown))
+
+    modified = gen_data.get("modified_existing") or {}
+    if modified or regression.get("changed"):
+        lines = []
+        for path, diff in sorted(modified.items()):
+            done = "; ".join(f"{kind} " + ", ".join(f"`{k}`" for k in keys)
+                             for kind, keys in diff.items() if keys)
+            lines.append(f"- `{Path(path).name}`: {done}")
+        for path, names in sorted((regression.get("changed") or {}).items()):
+            if path not in modified:
+                lines.append(f"- `{Path(path).name}` (changed by a fix): {', '.join(names)}")
+        results = regression.get("results") or {}
+        if regression.get("not_run_reason"):
+            lines.append(f"- ⚠️ Existing tests NOT re-run: {regression['not_run_reason']}")
+            lines += [f"  - `{t}`" for t in regression.get("tests") or []]
+        elif results:
+            lines += [f"- {'✅' if r['status'] == 'passed' else '❌'} re-ran `{t}`: {r['status']}"
+                      + (f" — `{r['first_error']}`" if r.get("first_error") else "")
+                      for t, r in sorted(results.items())]
+        elif regression.get("changed"):
+            lines.append("- No existing test reaches the changed code.")
+        parts.append("**Existing code changed by this run**\n" + "\n".join(lines) + "\n")
+
+    new_ops = [o for o in gen_data.get("new_operations") or [] if o.get("name")]
+    if new_ops:
+        parts.append("**New Helper operations**\n" + "".join(
+            f"- `{o['name']}` ({o.get('kind') or 'stage'})"
+            + (f" — why new: {o['why_new']}" if o.get("why_new") else "") + "\n" for o in new_ops))
+
+    warnings = (
+        ("**Possible duplicates**",
+         [f"`{d['new']}` repeats `{d['like']}` (similarity {d['ratio']})"
+          for d in gen_data.get("near_duplicates") or []]),
+        ("**Existing API removed or changed**",
+         [f"`{Path(p).name}`: {', '.join(gone)}"
+          for p, gone in (gen_data.get("changed_existing_api") or {}).items()]),
+        ("**Option enums vs what the page offered**",
+         [f"`{name}`: missing keys {gap['missing_keys']}, "
+          f"{gap['unobserved_constants']} constant(s) the page did not offer"
+          for name, gap in (gen_data.get("option_enum_gaps") or {}).items()]),
+        ("**Planned reuse the code never calls**",
+         [f"`{existing}`" for existing in gen_data.get("reuse_unused") or []]),
+    )
+    for heading, items in warnings:
+        if items:
+            parts.append(heading + "\n" + "".join(f"- ⚠️ {item}\n" for item in items))
+
+    shape = gen_data.get("test_shape") or {}
+    guideline = shape.get("guideline_lines") or 0
+    long_tests = [(name, m) for name, m in sorted((shape.get("methods") or {}).items())
+                  if (guideline and m["body_lines"] > guideline) or m["page_action_chains"]]
+    if long_tests:
+        parts.append(f"**Test length** (guideline: about {guideline} lines)\n" + "".join(
+            f"- `{name}`: {m['body_lines']} lines"
+            + (f"; {len(m['page_action_chains'])} step(s) drive a page object call by call"
+               if m["page_action_chains"] else "") + "\n" for name, m in long_tests))
+
+    if not parts:
+        return ""
+    return "### 🔎 Review notes (guidance, not a gate)\n\n" + "\n".join(parts) + "\n"
+
+
 def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tuple:
     """Push branch and create GitHub PR.
 
@@ -496,6 +576,8 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
             "say so in the test input and re-run.\n\n"
             + "".join(f"- {c}\n" for c in dropped_checks) + "\n")
 
+    review_section = _review_notes(gen_data, load_json("04-regression.json", required=False))
+
     status_tag = "PASSED" if test_passed else "NEEDS-REVIEW"
     status_summary = ("Generated test was verified and passed locally."
                       if test_passed
@@ -516,7 +598,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
 | **Fix Attempts** | `{fix_attempts}` |
 | **Session ID** | `{SESSION_ID}` |
 
-{test_case_section}{checks_section}### 🛠️ Changes Applied
+{test_case_section}{checks_section}{review_section}### 🛠️ Changes Applied
 
 {files_section}
 
@@ -698,7 +780,14 @@ def main() -> None:
     weakening_rejected = [r for r in (fix_data.get("fix_rejections") or [])
                           if "assertion_conservation" in str(r.get("reason", ""))]
     kept_unverified = gen_data.get("kept_unverified_checks") or []
-    honest = not kept_unverified and not weakening_rejected
+    # An existing test this run's change broke, or could not be re-run to prove it
+    # did not, is a change nobody has verified — the same reason as above.
+    regression = load_json("04-regression.json", required=False)
+    regression_failed = sorted(t for t, r in (regression.get("results") or {}).items()
+                               if r.get("status") == "failed")
+    regression_not_run = regression.get("not_run_reason") or ""
+    honest = (not kept_unverified and not weakening_rejected
+              and not regression_failed and not regression_not_run)
     # `fix_gate == "skipped"` means no test ever ran (an infra failure). That was
     # treated as APPROVED, which reads as "verified" for something never executed.
     ran_and_passed = test_passed
@@ -714,6 +803,12 @@ def main() -> None:
     if fix_gate == "defect":
         log("NEEDS-REVIEW: the test reproduces a product defect — the input documented it, "
             "or step 02 never saw the product do what the input asked.")
+    if regression_failed:
+        log(f"NEEDS-REVIEW: {len(regression_failed)} existing test(s) failed after this run "
+            f"changed code they use: {', '.join(regression_failed)}")
+    if regression_not_run:
+        log(f"NEEDS-REVIEW: existing tests that use the changed code were not re-run — "
+            f"{regression_not_run}")
     if fix_gate == "skipped":
         log("NEEDS-REVIEW: no test ever ran (infrastructure) — nothing was verified.")
     (AUDIT_DIR / ".verdict").write_text(verdict)
@@ -737,6 +832,8 @@ def main() -> None:
         "verdict":          verdict,
         "slack_notified":   slack_sent,
         "files_count":      len(files_written),
+        "regression_failed": regression_failed,
+        "regression_not_run": regression_not_run,
     }
     (AUDIT_DIR / "05-ship.json").write_text(json.dumps(result, indent=2))
 
@@ -772,6 +869,9 @@ def main() -> None:
             ship_detail or "(no further detail captured)",
             "```",
         ]
+    notes = _review_notes(gen_data, regression)
+    if notes:
+        md_lines += ["", notes]
     (AUDIT_DIR / "05-ship.md").write_text("\n".join(md_lines))
 
     log(f"Done — verdict={verdict} | PR={pr_url or 'none'}")

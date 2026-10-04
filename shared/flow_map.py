@@ -152,17 +152,15 @@ def facts_from_markers(page_enter: Dict, inventory: List[Dict]) -> Dict:
     }
 
 
-def count_in_inventory(selector: str, elements: List[Dict]) -> Optional[int]:
-    """How many inventory elements a selector matches, or None if unevaluable.
+def simple_parts(selector: str) -> Optional[Dict]:
+    """A selector taken apart into what an inventory element can be checked against.
 
-    `None` and `0` must stay distinct at every call site — the same rule
-    `page_identity.normalize_selector` documents. "I could not check" is not
-    "it matches nothing", and treating them alike is how an unverifiable guess
-    gets recorded as a verified absence.
+    `{"path", "tag", "ids", "classes", "attrs"}`, where `path` is the iframe hops
+    the selector enters (`frames.split`) and `attrs` is `(name, op, value)` with
+    `value` None for a bare `[name]`. None when the selector is richer than this
+    grammar can honestly evaluate — xpath, combinators, :has-text.
     """
-    # Inside an iframe, only that iframe's inventory entries are candidates.
     path, selector = frames.split(selector or "")
-    elements = [e for e in elements or [] if frames.prefix_path(e.get("frame") or "") == path]
     normalized = normalize_selector(selector)
     if not normalized:
         return None
@@ -170,14 +168,11 @@ def count_in_inventory(selector: str, elements: List[Dict]) -> Optional[int]:
     if not match:
         return None
 
-    tag = (match.group("tag") or "").lower()
     rest = match.group("rest") or ""
     # Ids and classes come from outside the [...] attribute parts only: SauceDemo's
     # `[data-test='add-to-cart-test.allthethings()-t-shirt-(red)']` otherwise
     # demanded a class "allthethings" and recounted a unique button as zero.
     bare = re.sub(r"\[(?:\"[^\"]*\"|'[^']*'|[^\]])*\]", "", rest)
-    ids = re.findall(r"#([\w-]+)", bare)
-    classes = re.findall(r"\.([\w-]+)", bare)
     # finditer, not findall: findall reports a non-participating alternation
     # branch as "" rather than None, so `[data-cy='go']` came back with an empty
     # expected value and matched nothing. Group participation is the signal here.
@@ -187,40 +182,73 @@ def count_in_inventory(selector: str, elements: List[Dict]) -> Optional[int]:
         value = next((g for g in (m.group(3), m.group(4), m.group(5))
                       if g is not None), None)
         attrs.append((name, op, value))
+    return {
+        "path": path,
+        "tag": (match.group("tag") or "").lower(),
+        "ids": re.findall(r"#([\w-]+)", bare),
+        "classes": re.findall(r"\.([\w-]+)", bare),
+        "attrs": attrs,
+    }
 
-    hits = 0
-    for element in elements or []:
-        if tag and str(element.get("tag", "")).lower() != tag:
+
+def element_value(element: Dict, name: str) -> Optional[str]:
+    """One attribute of an inventory element: top-level first, then `attributes`."""
+    actual = element.get(name)
+    if actual is None:
+        actual = (element.get("attributes") or {}).get(name)
+    return None if actual is None else str(actual)
+
+
+def _matches(element: Dict, parts: Dict) -> bool:
+    if parts["tag"] and str(element.get("tag", "")).lower() != parts["tag"]:
+        return False
+    if parts["ids"] and element.get("id") not in parts["ids"]:
+        return False
+    element_classes = set(str(element.get("class", "")).split())
+    if parts["classes"] and not set(parts["classes"]) <= element_classes:
+        return False
+    for name, op, value in parts["attrs"]:
+        actual = element_value(element, name)
+        if actual is None:
+            return False
+        if value is None:
             continue
-        if ids and element.get("id") not in ids:
-            continue
-        element_classes = set(str(element.get("class", "")).split())
-        if classes and not set(classes) <= element_classes:
-            continue
-        ok = True
-        for name, op, value in attrs:
-            actual = element.get(name)
-            if actual is None:
-                actual = (element.get("attributes") or {}).get(name)
-            if actual is None:
-                ok = False
-                break
-            if value is None:
-                continue
-            actual = str(actual)
-            if op == "*" and value not in actual:
-                ok = False
-            elif op == "^" and not actual.startswith(value):
-                ok = False
-            elif op == "$" and not actual.endswith(value):
-                ok = False
-            elif op == "" and actual != value:
-                ok = False
-            if not ok:
-                break
-        if ok:
-            hits += 1
-    return hits
+        if op == "*" and value not in actual:
+            return False
+        if op == "^" and not actual.startswith(value):
+            return False
+        if op == "$" and not actual.endswith(value):
+            return False
+        if op == "" and actual != value:
+            return False
+    return True
+
+
+def elements_matching(selector: str, elements: List[Dict]) -> Optional[List[Dict]]:
+    """The inventory elements a selector matches, or None if unevaluable.
+
+    Same contract as `count_in_inventory`, returning the elements themselves
+    for a caller that needs to look at what matched, not only how many.
+    """
+    parts = simple_parts(selector)
+    if parts is None:
+        return None
+    # Inside an iframe, only that iframe's inventory entries are candidates.
+    return [e for e in elements or []
+            if frames.prefix_path(e.get("frame") or "") == parts["path"]
+            and _matches(e, parts)]
+
+
+def count_in_inventory(selector: str, elements: List[Dict]) -> Optional[int]:
+    """How many inventory elements a selector matches, or None if unevaluable.
+
+    `None` and `0` must stay distinct at every call site — the same rule
+    `page_identity.normalize_selector` documents. "I could not check" is not
+    "it matches nothing", and treating them alike is how an unverifiable guess
+    gets recorded as a verified absence.
+    """
+    matched = elements_matching(selector, elements)
+    return None if matched is None else len(matched)
 
 
 def is_destructive(step: Dict) -> Optional[str]:

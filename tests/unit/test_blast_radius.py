@@ -170,3 +170,33 @@ class TestResolve:
         result = br.resolve(repo, affects=["automation.nosuch.*"])
         assert result["tiers"]["named"] == []
         assert result["budget"]["tests_to_verify"] == 0
+
+
+class TestTestsReaching:
+    """After a run changes existing code, which existing tests could it have broken?"""
+
+    def test_a_changed_page_reaches_its_modules_tests_and_no_other_module(self, repo):
+        result = br.tests_reaching(
+            repo, ["src/main/java/automation/modules/checkout/web/CartPage.java"])
+        assert result["tests"] == ["automation.checkout.CheckoutSmokeTest#smoke",
+                                   "automation.checkout.CheckoutWebTest#placeOrder"]
+
+    def test_named_members_narrow_to_the_tests_that_call_them(self, tmp_path):
+        """Every test of a module constructs its helper; a change to one operation
+        must re-run the tests that call that operation, not all of them."""
+        main = tmp_path / "src" / "main" / "java" / "automation" / "modules" / "shop"
+        test = tmp_path / "src" / "test" / "java" / "automation" / "shop"
+        _java(main / "ShopHelper.java", "automation.modules.shop", "ShopHelper",
+              "    public void pay() { }\n    public void refund() { }")
+        _java(test / "PayTest.java", "automation.shop", "PayTest",
+              "    @Test public void pays() { ShopHelper helper = new ShopHelper(); helper.pay(); }")
+        _java(test / "RefundTest.java", "automation.shop", "RefundTest",
+              "    @Test public void refunds() { ShopHelper helper = new ShopHelper(); helper.refund(); }")
+        br._cache.clear()
+        helper = "src/main/java/automation/modules/shop/ShopHelper.java"
+
+        narrowed = br.tests_reaching(str(tmp_path), [helper], {helper: ["pay"]})
+        assert narrowed["tests"] == ["automation.shop.PayTest#pays"]
+        # Without names the class is the unit: both tests construct the helper.
+        whole = br.tests_reaching(str(tmp_path), [helper])
+        assert whole["tests"] == ["automation.shop.PayTest#pays", "automation.shop.RefundTest#refunds"]

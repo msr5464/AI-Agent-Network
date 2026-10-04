@@ -457,3 +457,13 @@ class TestMeasuredEvidence:
         path.write_text(json.dumps(self.ROWS[0]) + "\n{\"page\": \"prod")
         assert len(fm.read_evidence(path)) == 1
         assert fm.read_evidence(tmp_path / "missing.jsonl") == []
+
+
+def test_elements_matching_returns_the_matched_elements_or_none():
+    from shared import flow_map
+    inventory = [{"tag": "a", "class": "option", "attributes": {"data-option": "card"}},
+                 {"tag": "a", "class": "option", "attributes": {"data-option": "wallet"}}]
+    matched = flow_map.elements_matching("a[data-option='card']", inventory)
+    assert matched == [inventory[0]]
+    assert flow_map.elements_matching("a:has-text('Card')", inventory) is None
+    assert flow_map.count_in_inventory("a.option", inventory) == 2

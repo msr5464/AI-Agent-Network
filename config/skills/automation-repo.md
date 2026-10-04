@@ -17,8 +17,14 @@ invent an API.
   behind the repo's own wrapper classes.
 - **Page objects**: one class per page, extending the repo's base page class.
   Navigation methods return the next page object.
-- **Helpers**: orchestrate several page objects; tests call helpers and page
-  objects, then assert.
+- **Helpers**: the module's flow API — business operations (check out, make a
+  payment, confirm an OTP) that cover as many pages as the operation takes and
+  take choices as parameters, often an option enum. A test calls one operation
+  per step, then asserts on what it returns.
+- **Reuse before anything new**: use an existing method as it is; otherwise
+  change one slightly so it serves both callers (a new enum value, an overload
+  that keeps the old signature, an optional data field) without changing what
+  it does for its current callers; only then write a new one.
 
 ---
 
@@ -86,33 +92,38 @@ repo), keep every hop as given, and never replace a hop with a position.
 - **Page objects and helpers**: the repo's comment-level logger
   (e.g. `Log.comment(config, "…")`) — never `logStep`.
 - Never `System.out.println`.
-- **One `logStep` per step, never one summary line.** The report prints one line
-  per `logStep`, so a scenario narrated once fails with a report that cannot say
-  which step broke. Each `logStep` goes immediately before the call(s) it
-  describes:
+- **One `logStep` per business step — never one summary line, never one per
+  click.** The report prints one line per `logStep`, so a scenario narrated once
+  fails with a report that cannot say which step broke. Each `logStep` goes
+  immediately before the one call that carries its step out, followed by that
+  step's checks:
 
 ```java
-// WRONG — one line for a four-step scenario
-config.logStep("Login, toggle the trailing dot in the summary, save, and verify it persists");
-String[] result = helper.toggleProfileSummaryDot(username, password);
+// WRONG — one line for the whole scenario
+config.logStep("Check out, pay by card, and verify the receipt");
+shop.checkoutAndPay(order);
 
-// RIGHT — one line per step, each in front of the calls that carry it out
-config.logStep("Login and open the profile page");
-ProfilePage profile = helper.loginAndOpenProfile(username, password);
+// WRONG — the page driven field by field from the test
+config.logStep("Enter the card number");
+cardPage.fillCardNumber(order.getCardNumber());
+config.logStep("Click Pay");
+cardPage.clickPay();
 
-config.logStep("Toggle the trailing dot in Profile Summary and save the change");
-String saved = profile.toggleTrailingDotAndSave();
+// RIGHT — one call per business step, its checks right after it
+config.logStep("Check out the order and verify the total matches the order amount");
+String total = shop.checkout(order);
+AssertHelper.assertEquals(config, total, order.getAmount(), "Total should match the order amount");
 
-config.logStep("Verify the summary shown after reload matches the saved value");
-AssertHelper.assertEquals(config, profile.reload().getProfileSummary(), saved,
-    "Profile Summary after reload should match the saved modified summary");
+config.logStep("Pay by credit card and verify the receipt charges the same total");
+ShopHelper.Receipt receipt = shop.makePayment(PaymentMethod.CreditCard, order);
+AssertHelper.assertEquals(config, receipt.getAmount(), total, "Receipt should charge the checkout total");
 ```
 
 (Illustrative names — use the repo's real classes and methods.)
 
 Setup lines (reading properties or credentials, constructing a helper) get no
-`logStep`. A helper may encapsulate one step; it must not swallow the whole
-scenario, because then there is nothing left for the test to narrate.
+`logStep`. Never unpack a helper operation into the page calls behind it to get
+more narration: a step is the operation, and its `logStep` names it.
 
 ---
 
@@ -130,6 +141,10 @@ add flags of your own.
 ## Edits
 
 - Change the minimum: a locator fix edits the locator string, nothing else.
+- A locator built from an option's key (`"a[data-option='" + option.getKey() + "']"`)
+  serves every value of that option's enum. Fix its fixed parts; never write one
+  value into it, which makes the other options stop working without any test
+  noticing.
 - Keep imports to what the file already uses; never import raw driver classes
   (`org.openqa.selenium.By`, `WebDriverWait`, …) to work around a wrapper.
 - Never hard-code a URL or credential in Java — they live in the repo's

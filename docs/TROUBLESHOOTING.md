@@ -98,8 +98,10 @@ live in `queue/<user-id>/`, not the queue root the CLI reads.)
 
 1. **Iterate with `CACHE_STEPS=true`** (the default) — steps 01–02 are restored from cache, so
    each run goes straight to Generate.
-2. **Raise `AUTHORING_FIX_RETRY_COUNT`** — only helps while attempts are still
-   exploring: the loop stops early once an attempt can bring nothing new (no
+2. **Raise `AUTHORING_FIX_RETRY_COUNT`** — it counts only attempts in a row that
+   made no progress (a fix that lets the test reach a new failure is not counted;
+   `AUTHORING_MAX_FIX_ATTEMPTS` is the ceiling). It only helps while attempts are
+   still exploring: the loop stops early once an attempt can bring nothing new (no
    edits, the same guard rejects twice, or an edit set repeats), and
    `.fix-passed` then says `stuck`.
 3. **Read the attempt:** `04-run-and-fix.md`, then the matching `claude-*.log`.

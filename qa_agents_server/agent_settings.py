@@ -374,10 +374,11 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "key": "authoring_fix_retry_count",
         "env_var": "AUTHORING_FIX_RETRY_COUNT",
         "label": "Fix Retry Count",
-        "description": "Fix-and-retry cycles for a failing generated test before shipping "
-                       "with a NEEDS-REVIEW verdict. The initial run is not counted. The "
-                       "loop also stops early on its own once an attempt can bring nothing "
-                       "new \u2014 so this is a ceiling, not a target.",
+        "description": "Fix attempts in a row that may make no progress before a failing "
+                       "generated test ships with a NEEDS-REVIEW verdict. An attempt that "
+                       "fixes one bug and lets the test reach the next is not counted, so "
+                       "the loop keeps fixing new bugs (up to AUTHORING_MAX_FIX_ATTEMPTS). "
+                       "It also stops early once an attempt can bring nothing new.",
         "type": "number",
         "category": "authoring",
         "default": 2,

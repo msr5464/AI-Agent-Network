@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-repo metadata, keyed by GITHUB_REPO_AUTOMATION. `framework` is a fallback for shared/frameworks/detect.py when the repo's build files do not settle it. `reference_files` are the repo-relative files the authoring agent shows the model as worked examples: one module end to end (data, builder, helper, API client, a page object with its real base-page import block, and a web and an API test). Missing files are skipped; with no list, the model works from the repo's CLAUDE.md alone.",
+  "_comment": "Per-repo metadata, keyed by GITHUB_REPO_AUTOMATION. `framework` is a fallback for shared/frameworks/detect.py when the repo's build files do not settle it. `reference_files` are the repo-relative files the authoring agent shows the model as worked examples: one module end to end (data, builder, helper, API client, page objects with their real base-page import block, and a web and an API test). Missing files are skipped; with no list, the model works from the repo's CLAUDE.md alone. `shared_code` lists the repo-relative directories or files of the framework's shared code (base page, waits, assertions, data helpers); the authoring agent indexes their public members so the model calls them instead of writing its own. Without it there is no shared index.",
   "Jarvis": {
     "framework": "TestNG + Playwright",
     "reference_files": [
@@ -8,9 +8,13 @@
       "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
       "src/main/java/automation/modules/saucedemo/api/SauceDemoApi.java",
       "src/main/java/automation/modules/saucedemo/web/LoginPage.java",
+      "src/main/java/automation/modules/saucedemo/web/ProductsPage.java",
       "src/main/java/automation/core/api/ApiHelper.java",
       "src/test/java/automation/saucedemo/SauceDemoApiTest.java",
       "src/test/java/automation/saucedemo/SauceDemoWebTest.java"
+    ],
+    "shared_code": [
+      "src/main/java/automation/core"
     ]
   },
   "Playwright-Automation-Framework": {
@@ -21,9 +25,13 @@
       "src/main/java/automation/modules/saucedemo/SauceDemoHelper.java",
       "src/main/java/automation/modules/saucedemo/api/SauceDemoApi.java",
       "src/main/java/automation/modules/saucedemo/web/LoginPage.java",
+      "src/main/java/automation/modules/saucedemo/web/ProductsPage.java",
       "src/main/java/automation/core/api/ApiHelper.java",
       "src/test/java/automation/saucedemo/SauceDemoApiTest.java",
       "src/test/java/automation/saucedemo/SauceDemoWebTest.java"
+    ],
+    "shared_code": [
+      "src/main/java/automation/core"
     ]
   },
   "Selenium-Automation-Framework": {

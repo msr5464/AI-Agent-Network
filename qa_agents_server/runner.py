@@ -64,7 +64,9 @@ AUDIT_POLL_INTERVAL = 0.5  # seconds
 # Whole-pipeline (run.sh, all 5 steps) kill timeout — not just one step's budget.
 # Worst case with current per-step defaults: step02 alone can now take up to
 # VALIDATE_WEB_TIMEOUT_S x (1+VALIDATE_WEB_RETRY_ATTEMPTS) = 1800x2 = 3600s;
-# step04's fix loop can take AUTHORING_FIX_RETRY_COUNT x ~600s = ~1200s; steps 01/03/05
+# step04's fix loop charges only attempts that make no progress to
+# AUTHORING_FIX_RETRY_COUNT, so a chain of real fixes runs up to
+# AUTHORING_MAX_FIX_ATTEMPTS (8) x ~600s at worst — typically far less; steps 01/03/05
 # add roughly another 1500s combined — so a 1800s default was already shorter
 # than step02 alone could legitimately take even before its retry loop existed.
 DEFAULT_RUN_TIMEOUT = 7200  # 2h

@@ -10,14 +10,18 @@ Two-phase design driven by FIX_ATTEMPT (set by run.sh):
   FIX_ATTEMPT>=1  (fix attempt N)
     Loads the previous failure output, calls Claude for a fix, applies it,
     THEN runs the test. Each fix attempt is an atomic (fix + verify) unit.
-    run.sh counts only these attempts against AUTHORING_FIX_RETRY_COUNT.
+    An attempt whose fix worked and let the test reach a failure not seen before
+    is progress and is not charged to AUTHORING_FIX_RETRY_COUNT, which counts only
+    attempts in a row that made none; AUTHORING_MAX_FIX_ATTEMPTS is the ceiling.
+    The decision is written to .fix-retry and run.sh loops on it.
 
 Reads:  $AUDIT_DIR/03-generate.json
         $AUDIT_DIR/04-run-and-fix.json  (previous attempt's test output)
 Writes: $AUDIT_DIR/04-run-and-fix.json
         $AUDIT_DIR/04-run-and-fix.md
         $AUDIT_DIR/04-run-and-fix-attempt-{N}.json  (fix attempts only, for per-step commits)
-        $AUDIT_DIR/.fix-passed          gate: true / false / skipped
+        $AUDIT_DIR/.fix-passed          gate: true / false / skipped / stuck / defect
+        $AUDIT_DIR/.fix-retry           "retry", or "stop" / "stop: <reason>"
 """
 
 import json
@@ -55,9 +59,14 @@ EFFORT       = os.environ.get("AUTHORING_EFFORT") or None
 ENVIRONMENT  = os.environ.get("AUTHORING_ENVIRONMENT", "staging")
 COUNTRY      = os.environ.get("AUTHORING_COUNTRY", "SG")
 FIX_ATTEMPT  = int(os.environ.get("FIX_ATTEMPT", "1"))
-# Display only — run.sh owns the loop bound. Kept in sync with its default so the
-# "attempt N/M" lines in the console match what the loop will actually do.
-MAX_ATTEMPTS = int(os.environ.get("AUTHORING_FIX_RETRY_COUNT", "2"))
+# Fix attempts in a row that may make NO progress before the loop gives up. An
+# attempt that fixes one bug and lets the test reach the next is progress, however
+# red the run still is: a test with three independent bugs needs three attempts that
+# all worked, and charging them as retries ran the budget out on success. Same rule
+# as the healing agent's HEALING_RETRY_COUNT.
+RETRY_COUNT = int(os.environ.get("AUTHORING_FIX_RETRY_COUNT", "2"))
+# The absolute ceiling, so that no amount of progress can spin forever.
+MAX_FIX_ATTEMPTS = int(os.environ.get("AUTHORING_MAX_FIX_ATTEMPTS", "8"))
 MAVEN_TEST_TIMEOUT_S = int(os.environ.get("MAVEN_TEST_TIMEOUT_S", "300"))
 # Wall-clock budget for the fix call. This step used to pass no timeout at all and
 # silently inherit call_claude_ex's 300s default — too tight for a fix that has to
@@ -166,6 +175,7 @@ from shared.edit_guards import (apply_edits, compute_diff, log_edits,
 # shipped green with `assertTrue(isSuccessToastVisible())` replaced by an `if` and
 # a `logWarning` — every guard above passed it. This is the one that would not.
 from shared import assertion_graph, intent
+from shared import blast_radius, module_index
 # How a page rendered the value an assertion expected — the one kind of failed
 # assertion whose comparator may move, and only to what the page was measured to do.
 from shared import value_match
@@ -214,8 +224,13 @@ def build_passed(returncode: int, output: str) -> bool:
     return returncode == 0 and _tests_actually_ran(output) is not False
 
 
-def run_maven_test(test_class: str, test_method: str) -> tuple:
-    """Run mvn test with real-time line-by-line streaming. Returns (passed, output)."""
+def run_maven_test(test_class: str, test_method: str, baseline_dir: Path = None) -> tuple:
+    """Run mvn test with real-time line-by-line streaming. Returns (passed, output).
+
+    `baseline_dir` sends the run's page fingerprints somewhere other than the
+    checkout — the regression re-run uses it, so existing tests it re-runs never
+    put baseline changes into this run's PR.
+    """
     test_arg = f"{test_class}#{test_method}" if test_method else test_class
 
     cmd = [
@@ -233,8 +248,9 @@ def run_maven_test(test_class: str, test_method: str) -> tuple:
     # Without it Baseline.java falls back to HEALING_BASELINE_DIR, which config/.env
     # points at the main checkout — so a worktree run promoted its fingerprints
     # there, ship read the worktree, found "none changed" and the PR had none.
+    pinned = {"baseline.dir": str(baseline_dir)} if baseline_dir else {}
     cmd[2:2] = [f"-D{key}={value}" for key, value in
-                _pin_baseline_dir(cmd, {}, AUTOMATION_FRAMEWORK_DIR).items()]
+                _pin_baseline_dir(cmd, pinned, AUTOMATION_FRAMEWORK_DIR).items()]
     # Same build markers the healing agent emits, so the dashboard can fold the
     # build output for either agent with one rule.
     log(f"[build:start] {' '.join(cmd)}")
@@ -538,6 +554,7 @@ def apply_fix(files_map: dict, edits_map: dict = None,
 
         full.parent.mkdir(parents=True, exist_ok=True)
         originals[rel_path] = original
+        _snapshot_before_fix(rel_path, original)
         full.write_text(updated)
         patched.append(rel_path)
         patched_contents[rel_path] = updated
@@ -1335,6 +1352,7 @@ def main() -> None:
         if passed:
             record_proven_locators(files_written, plan_data, f"{test_class}#{test_method}",
                                    run_started_at)
+            regression_check(_new_tests(test_class, test_method))
         _write_result({
             "attempt": 0,
             "test_class": test_class,
@@ -1362,7 +1380,7 @@ def main() -> None:
             prev_screenshot       = prev.get("screenshot_path", "")
             prev_summary_lines    = prev.get("summary_lines", [])
             prev_run_started_at   = float(prev.get("run_started_at") or 0)
-            log(f"Fix attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS} — loaded previous failure ({len(prev_output)} chars)"
+            log(f"Fix attempt {FIX_ATTEMPT} — loaded previous failure ({len(prev_output)} chars)"
                 + (f", location={prev_failure_location}" if prev_failure_location else ""))
         except Exception:
             prev_failure_message, prev_screenshot, prev_summary_lines = "", "", []
@@ -1392,6 +1410,7 @@ def main() -> None:
                 _write_gate("true")
                 record_proven_locators(files_written, plan_data, f"{test_class}#{test_method}",
                                        run_started_at)
+                regression_check(_new_tests(test_class, test_method))
                 _write_result({
                     "attempt": FIX_ATTEMPT,
                     "test_class": test_class,
@@ -1498,7 +1517,7 @@ def main() -> None:
             sanction = {"message": mismatch["message"], "relation": mismatch["relation"]}
 
     # CODE_ERROR — call Claude for a fix, apply it, then run the test
-    log(f"Fix attempt {FIX_ATTEMPT}/{MAX_ATTEMPTS}: calling Claude for a fix...")
+    log(f"Fix attempt {FIX_ATTEMPT}: calling Claude for a fix...")
     generated_files = read_generated_files(files_written)
     # Read Jarvis/CLAUDE.md — single source of truth for framework conventions.
     fw_claude_md_path = AUTOMATION_FRAMEWORK_DIR / "CLAUDE.md"
@@ -1880,21 +1899,25 @@ Output ONLY valid JSON.
         failure_ctx = build_failure_context(test_class, test_method, test_output, run_started_at)
         record_failed_locators(test_output, f"{test_class}#{test_method}", plan_data)
 
+    new_location = failure_ctx.get("failure_location", "")
     current = fix_history.record(
         FIX_ATTEMPT, root_cause, confidence, proposed, fixes_applied, fix_rejections,
-        fix_history.PASSED if passed else fix_history.FAILED,
-        failure_ctx.get("failure_location", ""))
+        fix_history.PASSED if passed else fix_history.FAILED, new_location)
+    # Progress: the fix landed and the test now fails somewhere this run has not
+    # failed before — the bug it was given is gone and the next one is showing.
+    # Back at an earlier failure is not progress: that is two fixes undoing each other.
+    current["targeted"] = prev_failure_location
+    current["progress"] = made_progress(passed, fixes_applied, new_location,
+                                        seen_failures(history, prev_failure_location))
     fix_history.append(AUDIT_DIR, current)
 
-    stuck_on_same_failure = bool(
-        not passed and fixes_applied and prev_failure_location
-        and failure_ctx.get("failure_location") == prev_failure_location
-    )
+    same_failure = bool(not passed and fixes_applied and prev_failure_location
+                        and new_location == prev_failure_location)
     # A fix that landed and ran still tells us nothing new when it only re-proposed an
-    # earlier attempt's edits. `stuck` above catches the same failure LOCATION; this
-    # catches the same PROPOSAL, which can fail somewhere else and still be a repeat.
+    # earlier attempt's edits — that next attempt provably cannot differ, so it stops
+    # the loop now rather than being charged to the budget.
     no_progress, no_progress_why = (False, "")
-    if not passed and not stuck_on_same_failure:
+    if not passed:
         no_progress, no_progress_why = fix_history.exhausted(history, current)
 
     if passed:
@@ -1902,26 +1925,25 @@ Output ONLY valid JSON.
         _write_gate("true")
         record_proven_locators(files_written, plan_data, f"{test_class}#{test_method}",
                                run_started_at)
-    elif stuck_on_same_failure:
-        log(f"Test still FAILED after fix attempt {FIX_ATTEMPT} — at the EXACT SAME location "
-            f"as before the fix ({prev_failure_location}). The applied fix had no effect on "
-            f"the actual failure point — stopping the fix loop rather than burning the "
-            f"remaining attempts on a diagnosis that isn't converging.")
-        # Distinct gate value from "skipped" — this test genuinely ran and genuinely
-        # failed (unlike a real infra skip, where it never got a fair shot), so it
-        # must NOT be treated as APPROVED/"not run" downstream in 05_ship.py the way
-        # "skipped" is. run.sh stops the retry loop on "stuck" exactly like "skipped".
-        _write_gate("stuck")
+        regression_check(_new_tests(test_class, test_method))
     elif no_progress:
         log(f"Test still FAILED after fix attempt {FIX_ATTEMPT} — and this attempt brought "
             f"nothing new: {no_progress_why}. Stopping the fix loop rather than paying for "
             f"an attempt that cannot differ from one already made.")
         _write_gate("stuck")
+    elif current["progress"]:
+        log(f"Test still FAILED after fix attempt {FIX_ATTEMPT}, but the fix worked: the test "
+            f"now gets past {prev_failure_location or 'the previous failure'} and fails at "
+            f"{new_location} instead. Progress — not charged to the retry budget.")
+        _write_gate("false")
     else:
-        log(f"Test still FAILED after fix attempt {FIX_ATTEMPT}")
+        log(f"Test still FAILED after fix attempt {FIX_ATTEMPT}"
+            + (f" — at the same place as before the fix ({prev_failure_location})"
+               if same_failure else "")
+            + f". No progress: counts against AUTHORING_FIX_RETRY_COUNT={RETRY_COUNT}.")
         _write_gate("false")
 
-    stopped_early = stuck_on_same_failure or no_progress
+    stopped_early = no_progress
     result_data = {
         "attempt": FIX_ATTEMPT,
         "test_class": test_class,
@@ -1933,10 +1955,8 @@ Output ONLY valid JSON.
         "fix_response_length": len(fix_response),
         "root_cause": root_cause,
         "confidence": confidence,
-        **({"stuck": True,
-            "reason": ("stuck on identical failure across fix attempts — see root_cause "
-                       "history in the per-attempt audit files" if stuck_on_same_failure
-                       else no_progress_why)} if stopped_early else {}),
+        "progress": current["progress"],
+        **({"stuck": True, "reason": no_progress_why} if stopped_early else {}),
         # The failure this attempt was triaged as, and the assertion it relaxed to
         # the relation the page was measured to satisfy — absent when neither.
         **({"value_mismatch": mismatch} if mismatch else {}),
@@ -1972,8 +1992,200 @@ def _stop_no_progress(current: dict, history: list, result: dict,
                   files_written, current.get("attempt", 0))
 
 
+# How many existing tests a run may re-run after changing code they use. The
+# server gives a whole run one slot of QA_AGENT_RUN_TIMEOUT_SECONDS (2 h by
+# default) and a web test can take minutes; adaptation's cap of 40 is sized for a
+# verify phase that is the point of its run, which this is not. Past the cap
+# nothing is re-run, and the verdict asks a human to.
+REGRESSION_MAX_TESTS = 10
+
+
+def _created_files() -> set:
+    """Files this run created, as step 03 recorded them."""
+    try:
+        gen = json.loads((AUDIT_DIR / "03-generate.json").read_text())
+    except Exception:
+        return set()
+    return set(gen.get("created_files") or [])
+
+
+def _snapshot_before_fix(rel_path: str, original: str) -> None:
+    """Keep the pre-run copy of an existing file a fix is about to change.
+
+    Step 03 copied every existing file it overwrote into pre-run/. A fix can also
+    change one step 03 never touched — a page object the new test shares with
+    others — and nothing earlier in this run changed that file, so its content
+    right now is its pre-run content.
+    """
+    if not original or not rel_path.endswith(".java"):
+        return
+    copy = AUDIT_DIR / "pre-run" / rel_path
+    if copy.exists() or rel_path in _created_files():
+        return
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    copy.write_text(original)
+
+
+def _simple_test(test: str) -> str:
+    """`pkg.Class#method` or `Class#method` → `Class#method`."""
+    klass, _, method = test.partition("#")
+    return f"{klass.rsplit('.', 1)[-1]}#{method}"
+
+
+def _new_tests(test_class: str, test_method: str) -> list:
+    """This run's own @Test methods: the one step 04 runs, and every new one step 03 wrote."""
+    try:
+        gen = json.loads((AUDIT_DIR / "03-generate.json").read_text())
+    except Exception:
+        gen = {}
+    shaped = list(((gen.get("test_shape") or {}).get("methods") or {}).keys())
+    return [f"{test_class}#{test_method}"] + shaped
+
+
+def regression_check(new_tests: list) -> dict:
+    """Re-run the existing tests that reach an existing method this run changed.
+
+    The reuse ladder lets a run change an existing method slightly — a new enum
+    case, an overload, an optional field — instead of writing a near-copy beside
+    it. Step 04 otherwise runs only the new test, so a change that broke an
+    existing caller would ship green. This is the proof the change was as small
+    as it says: every existing test that reaches a changed method still passes.
+
+    Changes are measured against pre-run/ (step 03's copies, plus any a fix
+    added). Tests are picked by call graph (blast_radius.tests_reaching), run
+    with the new test's environment and browser mode, and pinned to their own
+    baseline directory so their fingerprints never reach this run's PR. A
+    failure is retried once. Nothing is ever fixed here.
+
+    Writes 04-regression.json and .md; step 05 reads them for the verdict and
+    the PR body.
+    """
+    snap_dir = AUDIT_DIR / "pre-run"
+    result = {"seeds": [], "changed": {}, "tests": [], "results": {}, "not_run_reason": ""}
+    changes, direct = {}, set()
+    for copy in sorted(snap_dir.rglob("*.java")) if snap_dir.is_dir() else []:
+        rel = str(copy.relative_to(snap_dir))
+        current_path = AUTOMATION_FRAMEWORK_DIR / rel
+        current = current_path.read_text() if current_path.exists() else ""
+        before = copy.read_text()
+        diff = module_index.changed_methods(before, current)
+        if rel.startswith("src/test/"):
+            # An existing test method edited in place is re-run itself.
+            for key in diff["changed"]:
+                owner, _, name = key.split("(", 1)[0].rpartition(".")
+                direct.add(f"{owner.rsplit('.', 1)[-1]}#{name}")
+            continue
+        names = sorted({k.split("(", 1)[0].rsplit(".", 1)[-1] for k in diff["changed"]})
+        if diff["removed"] or module_index.changed_fields(before, current):
+            changes[rel] = None
+            result["changed"][rel] = ["(class-wide)"]
+        elif names:
+            changes[rel] = names
+            result["changed"][rel] = names
+    result["seeds"] = sorted(changes)
+
+    reached = set()
+    if changes:
+        reach = blast_radius.tests_reaching(str(AUTOMATION_FRAMEWORK_DIR), list(changes),
+                                            {r: n for r, n in changes.items() if n})
+        reached = {_simple_test(t) for t in reach["tests"]}
+    tests = sorted((reached | direct) - {_simple_test(t) for t in new_tests})
+    result["tests"] = tests
+
+    if not tests:
+        if changes or direct:
+            log("Regression: no existing test reaches what this run changed")
+    elif len(tests) > REGRESSION_MAX_TESTS:
+        result["not_run_reason"] = (f"{len(tests)} existing tests reach what this run changed — "
+                                    f"more than {REGRESSION_MAX_TESTS}; run them before merging")
+        log(f"Regression: NOT re-run — {result['not_run_reason']}")
+    else:
+        log(f"Regression: re-running {len(tests)} existing test(s) that reach changed code ...")
+        baselines = AUDIT_DIR / "regression-baselines"
+        for test in tests:
+            klass, _, method = test.partition("#")
+            passed, output = run_maven_test(klass, method, baseline_dir=baselines)
+            if not passed:
+                log(f"  {test} failed — retrying once before it counts")
+                passed, output = run_maven_test(klass, method, baseline_dir=baselines)
+            summary = [] if passed else _extract_failure_summary(output)
+            first = summary[0] if summary else ""
+            result["results"][test] = {"status": "passed" if passed else "failed",
+                                       "first_error": first}
+            log(f"  {test}: " + ("PASSED" if passed else f"FAILED — {first or 'see build output'}"))
+    _write_regression(result)
+    return result
+
+
+def _write_regression(result: dict) -> None:
+    (AUDIT_DIR / "04-regression.json").write_text(json.dumps(result, indent=2))
+    lines = ["# Regression re-run", ""]
+    if not result["changed"]:
+        lines.append("No existing method was changed by this run — nothing to re-run.")
+    else:
+        lines.append("Existing code this run changed:")
+        lines += [f"- `{Path(rel).name}`: {', '.join(names)}"
+                  for rel, names in sorted(result["changed"].items())]
+        lines.append("")
+        if result["not_run_reason"]:
+            lines.append(f"⚠️ Not re-run: {result['not_run_reason']}")
+            lines += [f"- {t}" for t in result["tests"]]
+        elif result["results"]:
+            lines += [f"- {t}: **{r['status']}**" + (f" — {r['first_error']}" if r["first_error"] else "")
+                      for t, r in sorted(result["results"].items())]
+        else:
+            lines.append("No existing test reaches the changed code.")
+    (AUDIT_DIR / "04-regression.md").write_text("\n".join(lines))
+
+
+def made_progress(passed: bool, fixes_applied: list, new_location: str,
+                  seen: set) -> bool:
+    """Whether an attempt's fix worked and the test moved on to a failure not seen before."""
+    return bool(not passed and fixes_applied and new_location and new_location not in seen)
+
+
+def seen_failures(history: list, current_target: str) -> set:
+    """Every failure location this run has had: what each attempt targeted, and where it ended."""
+    seen = {current_target}
+    for entry in history:
+        seen.add(entry.get("targeted") or "")
+        seen.add(entry.get("failure_location") or "")
+    return seen - {""}
+
+
+def no_progress_streak(history: list) -> int:
+    """Fix attempts in a row, newest last, that made no progress. Reset by any progress."""
+    streak = 0
+    for entry in reversed(history):
+        if entry.get("progress"):
+            break
+        streak += 1
+    return streak
+
+
+def retry_verdict(gate: str, streak: int, attempt: int) -> str:
+    """"retry", or why run.sh should stop running fix attempts.
+
+    Decided here because every input is here. Only attempts that made no progress
+    are charged to AUTHORING_FIX_RETRY_COUNT; AUTHORING_MAX_FIX_ATTEMPTS bounds the
+    rest. A gate other than "false" has already said why the loop ends.
+    """
+    if gate != "false":
+        return "stop"
+    if attempt >= MAX_FIX_ATTEMPTS:
+        return (f"stop: {attempt} fix attempts is the ceiling "
+                f"(AUTHORING_MAX_FIX_ATTEMPTS={MAX_FIX_ATTEMPTS})")
+    if streak >= RETRY_COUNT:
+        return (f"stop: {streak} fix attempt(s) in a row made no progress "
+                f"(AUTHORING_FIX_RETRY_COUNT={RETRY_COUNT})")
+    return "retry"
+
+
 def _write_gate(value: str) -> None:
+    """The gate, and with it whether run.sh should run another fix attempt."""
     (AUDIT_DIR / ".fix-passed").write_text(value)
+    streak = no_progress_streak(fix_history.load(AUDIT_DIR)) if FIX_ATTEMPT >= 1 else 0
+    (AUDIT_DIR / ".fix-retry").write_text(retry_verdict(value, streak, FIX_ATTEMPT))
 
 
 def record_failed_locators(test_output: str, test: str, plan: dict) -> list:

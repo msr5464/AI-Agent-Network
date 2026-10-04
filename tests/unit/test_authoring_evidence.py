@@ -2326,3 +2326,435 @@ def test_an_either_or_selector_is_dropped_and_the_click_refills_it(tmp_path, mon
     hints = [{"type": "button", "name": "payButton", "selector": "button.pay, a.pay",
               "text": "Pay", "count": 1}]
     assert mod.reconcile_hints(hints, found) == [], "an unconfirmed either/or hint is dropped"
+
+
+# ── Flow API, reuse ladder and option enums ──────────────────────────────────
+
+def _load_parse(tmp_path, monkeypatch):
+    input_file = tmp_path / "input.txt"
+    input_file.write_text("Module: shop\nType: web\n")
+    monkeypatch.setenv("INPUT_FILE", str(input_file))
+    return _load_action("01_parse.py", tmp_path, monkeypatch)
+
+
+class TestFlowPlan:
+    """Step 01's plan names what it reuses, what it adds, and which choices are enums."""
+
+    def test_an_option_control_is_added_to_the_page_it_is_picked_on(self, tmp_path, monkeypatch):
+        mod = _load_parse(tmp_path, monkeypatch)
+        plan = {"web_pages": [{"class_name": "PaymentPage", "locators_needed": ["payButton"]}],
+                "option_enums": [{"name": "PaymentMethod", "page": "PaymentPage",
+                                  "control": "paymentMethodOption", "exercised": ["CreditCard"]}]}
+        notes = mod.settle_flow_plan(plan, False, {})
+        assert plan["web_pages"][0]["locators_needed"] == ["payButton", "paymentMethodOption"]
+        assert notes["controls_added"] == ["PaymentPage.paymentMethodOption"]
+        assert plan["reuse"] == [] and plan["helper_web_methods"] == []
+
+    def test_a_reuse_claim_for_a_method_that_does_not_exist_is_set_aside(self, tmp_path, monkeypatch):
+        mod = _load_parse(tmp_path, monkeypatch)
+        known = {"WaitHelper": {"waitForUrl"}, "ShopHelper": {"checkout"}}
+        plan = {"reuse": [
+            {"existing": "WaitHelper.waitForUrl(Config config, String url)", "how": "as_is"},
+            {"existing": "ShopHelper.makePayment(PaymentMethod method)", "how": "extend",
+             "change": "add the wallet case"},
+            {"existing": "the login flow", "how": "as_is"}]}
+        notes = mod.settle_flow_plan(plan, True, known)
+        assert [e["existing"] for e in plan["reuse"]] == [
+            "WaitHelper.waitForUrl(Config config, String url)", "the login flow"]
+        assert [e["existing"] for e in plan["reuse_unknown"]] == [
+            "ShopHelper.makePayment(PaymentMethod method)"]
+        assert notes["reuse_unchecked"] == ["the login flow"]
+
+    def test_a_new_operation_in_an_existing_module_must_say_why(self, tmp_path, monkeypatch):
+        mod = _load_parse(tmp_path, monkeypatch)
+        plan = {"helper_web_methods": [{"name": "checkout", "why_new": "nothing checks out yet"},
+                                       {"name": "confirmOtp"}]}
+        assert mod.settle_flow_plan(plan, True, {})["missing_why_new"] == ["confirmOtp"]
+        new_module = {"helper_web_methods": [{"name": "confirmOtp"}]}
+        assert mod.settle_flow_plan(new_module, False, {})["missing_why_new"] == []
+
+    def test_provenance_is_read_from_a_business_steps_checks(self, tmp_path, monkeypatch):
+        """Before this, the visitor ran a regex over every step and raised on a dict."""
+        mod = _load_parse(tmp_path, monkeypatch)
+        plan = {"web_test_methods": [{"method_name": "pay", "steps": [
+            {"logstep": "Pay and verify the receipt  [source: user]", "call": "shop.pay()",
+             "checks": ["Verify the receipt shows the total  [source: user]"]}]}]}
+        mod.resolve_check_provenance(plan, "Pay, then verify the receipt shows the total")
+        step = plan["web_test_methods"][0]["steps"][0]
+        assert step["logstep"] == "Pay and verify the receipt"
+        assert step["checks"] == ["Verify the receipt shows the total"]
+        assert "Verify the receipt shows the total" in plan["check_provenance"]
+
+
+SHOP_HELPER = '''package automation.modules.shop;
+
+public class ShopHelper extends ApiHelper
+{
+    public String checkout(ShopData order)
+    {
+        CartPage cart = new CartPage(config);
+        cart.fillDetails(order);
+        cart.confirm();
+        return cart.submit().getTotal();
+    }
+
+    public void refund(ShopData order)
+    {
+        new OrdersPage(config).refund(order.getId());
+    }
+}
+'''
+
+
+class TestFlowApiCodegen:
+    def test_dropping_an_invented_check_keeps_its_business_step(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        shop_input = ("Module: shop\nType: web\n\nSteps:\n1. Open the profile page\n"
+                      "2. Change the summary and save it\n"
+                      "3. Verify the saved summary is shown after a reload\n")
+        plan = {"web_pages": [{"class_name": "ProfilePage",
+                               "locators_needed": ["saveButton", "successToast"],
+                               "actions_needed": ["saveSummary", "isSuccessToastVisible"]}],
+                "web_test_methods": [{"method_name": "editSummary", "steps": [
+                    {"logstep": "Save the summary", "call": "shop.saveSummary(text)",
+                     "checks": ["assertTrue isSuccessToastVisible on the returned ProfilePage"]}]}]}
+        web = {"selectors": {"saveButton": "#save"},
+               "steps_unverified": [f"{TOAST_CHECK}|no element confirmed|none"]}
+        out = mod.prune_unverified_checks(plan, web, shop_input)
+        assert out["dropped"] == [TOAST_CHECK]
+        step = plan["web_test_methods"][0]["steps"][0]
+        assert step["logstep"] == "Save the summary" and step["call"] == "shop.saveSummary(text)"
+        assert step["checks"] == []
+
+    def test_plan_files_add_the_enums_class_and_what_an_existing_module_extends(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("FRAMEWORK_DIR", raising=False)
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        module = mod.AUTOMATION_FRAMEWORK_DIR / "src/main/java/automation/modules/shop"
+        (module / "web").mkdir(parents=True)
+        (module / "ShopHelper.java").write_text(SHOP_HELPER)
+        (module / "web" / "PaymentPage.java").write_text("public class PaymentPage {}")
+        plan = {"web_pages": [], "data_fields": [{"name": "promo"}],
+                "option_enums": [{"name": "PaymentMethod", "control": "paymentMethodOption"}],
+                "reuse": [{"existing": "PaymentPage.choose(PaymentMethod method)", "how": "extend",
+                           "change": "add the wallet case"},
+                          {"existing": "WaitHelper.waitForUrl(Config config, String url)",
+                           "how": "as_is"}]}
+        files = mod._plan_files(plan, "web", True, "", "", "Shop", "shop")
+        base = "src/main/java/automation/modules/shop/"
+        for wanted in ("ShopEnums.java", "ShopData.java", "ShopBuilder.java", "web/PaymentPage.java"):
+            assert base + wanted in files
+        assert not any("WaitHelper" in f for f in files)      # shared code is never edited
+        assert len(files) == len(set(files))
+        assert mod._layer_of(base + "ShopEnums.java") < mod._layer_of(base + "ShopData.java") \
+            < mod._layer_of(base + "web/PaymentPage.java") < mod._layer_of(base + "ShopHelper.java")
+
+    def test_the_option_hint_lists_what_the_page_offered_and_how_to_select_any(self, tmp_path, monkeypatch):
+        from shared import frames
+        monkeypatch.setenv("AUTOMATION_FRAMEWORK", "playwright")
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        plan = {"option_enums": [
+            {"name": "PaymentMethod", "page": "PaymentPage", "control": "paymentMethodOption",
+             "exercised": ["CreditCard"]},
+            {"name": "Promo", "page": "PaymentPage", "control": "promoOption", "exercised": ["NoPromo"]}]}
+        web = {"option_sets": {"paymentMethodOption": {
+            "attribute": "data-option", "chosen": "card", "truncated": False,
+            "template": frames.join(["#pay"], "a[data-option='{key}']"),
+            "options": [{"key": "card", "label": "Card", "occurrences": 1},
+                        {"key": "wallet", "label": "Wallet", "occurrences": 2}]}}}
+        hint = mod.option_sets_hint(web, plan)
+        assert 'key "wallet", label "Wallet" — shown 2 times' in hint
+        assert '''locator("a[data-option='" + paymentMethod.getKey() + "']")''' in hint
+        assert "Promo (PaymentPage.promoOption): no alternatives were recorded" in hint
+        assert mod.option_sets_hint(web, {"option_enums": []}) == ""
+
+    def test_the_existing_file_banner_points_at_the_reuse_ledger(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("FRAMEWORK_DIR", raising=False)
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        existing = mod.AUTOMATION_FRAMEWORK_DIR / "src/main/java/X.java"
+        existing.parent.mkdir(parents=True)
+        existing.write_text("public class X {}")
+        banner = mod.read_existing_files_context(["src/main/java/X.java"])
+        assert '"extend"' in banner and "do not remove or rewrite" not in banner
+
+    def test_the_narration_repair_may_split_narration_but_not_change_calls(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        path = "src/test/java/automation/shop/ShopWebTest.java"
+        original = '''public class ShopWebTest extends TestBase
+{
+    @Test(dataProvider = "getConfig")
+    public void pay(Config config)
+    {
+        ShopHelper shop = new ShopHelper(config);
+        config.logStep("Check out, pay by card and verify the receipt");
+        String total = shop.checkout(order);
+        ShopHelper.Receipt receipt = shop.makePayment(PaymentMethod.CreditCard, order);
+        AssertHelper.assertEquals(config, receipt.getAmount(), total, "Receipt should charge the total");
+    }
+}
+'''
+        split_only = original.replace(
+            '        config.logStep("Check out, pay by card and verify the receipt");\n'
+            '        String total = shop.checkout(order);\n',
+            '        config.logStep("Check out the order");\n'
+            '        String total = shop.checkout(order);\n\n'
+            '        config.logStep("Pay by card and verify the receipt charges the total");\n')
+        unpacked = split_only.replace(
+            "        ShopHelper.Receipt receipt = shop.makePayment(PaymentMethod.CreditCard, order);\n",
+            "        CardPage card = new CardPage(config);\n        card.fillCardNumber(order.getCard());\n"
+            "        ShopHelper.Receipt receipt = card.pay();\n")
+        plan = {"web_test_methods": [{"method_name": "pay", "steps": [
+            {"logstep": "Check out the order", "call": "shop.checkout(order) -> total", "checks": []},
+            {"logstep": "Pay by card and verify the receipt", "call": "shop.makePayment(...)",
+             "checks": ["assertEquals receipt.amount total"]}]}]}
+        prompts = []
+
+        def answer(content):
+            def fake(prompt, label=""):
+                prompts.append(prompt)
+                return json.dumps({path: content})
+            return fake
+
+        monkeypatch.setattr(mod, "call_claude", answer(unpacked))
+        files, _ = mod._repair_step_narration({path: original}, plan)
+        assert files[path] == original, "a repair that unpacks an operation is rejected"
+        assert "<support_files>" not in prompts[0]
+
+        monkeypatch.setattr(mod, "call_claude", answer(split_only))
+        files, _ = mod._repair_step_narration({path: original}, plan)
+        assert files[path] == split_only
+
+    def test_review_records_name_what_changed_in_existing_code(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("FRAMEWORK_DIR", raising=False)
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        helper = "src/main/java/automation/modules/shop/ShopHelper.java"
+        enums = "src/main/java/automation/modules/shop/ShopEnums.java"
+        test = "src/test/java/automation/shop/ShopWebTest.java"
+        (mod.AUTOMATION_FRAMEWORK_DIR / helper).parent.mkdir(parents=True)
+        (mod.AUTOMATION_FRAMEWORK_DIR / helper).write_text(SHOP_HELPER)
+        after = SHOP_HELPER.replace("new OrdersPage(config).refund(order.getId());",
+                                    "new OrdersPage(config).refund(order.getId(), true);").replace(
+            "    public void refund(ShopData order)",
+            "    public String checkoutExpress(ShopData order)\n    {\n"
+            "        CartPage cart = new CartPage(config);\n        cart.fillDetails(order);\n"
+            "        cart.confirm();\n        return cart.submit().getTotal();\n    }\n\n"
+            "    public void refund(ShopData order)")
+        written = {
+            helper: after,
+            enums: ('public class ShopEnums { public enum PaymentMethod { CreditCard("card", "Card"), '
+                    'Cheque("cheque", "Cheque"); } }'),
+            test: ('public class ShopWebTest { @Test public void pay(Config config) { '
+                   'config.logStep("Check out"); shop.checkout(order); } }'),
+        }
+        plan = {"option_enums": [{"name": "PaymentMethod", "page": "PaymentPage",
+                                  "control": "paymentMethodOption"}],
+                "reuse": [{"existing": "ShopHelper.checkout(ShopData order)", "how": "as_is"},
+                          {"existing": "WaitHelper.waitForUrl(Config config, String url)",
+                           "how": "as_is"}]}
+        web = {"option_sets": {"paymentMethodOption": {"options": [
+            {"key": "card", "label": "Card", "occurrences": 1},
+            {"key": "wallet", "label": "Wallet", "occurrences": 1}]}}}
+        review = mod._review_records(written, {helper: SHOP_HELPER}, plan, web, "shop", "Shop")
+
+        assert review["modified_existing"][helper] == {
+            "changed": ["ShopHelper.refund(ShopData)"],
+            "added": ["ShopHelper.checkoutExpress(ShopData)"], "removed": []}
+        assert review["changed_existing_api"] == {}
+        assert review["near_duplicates"] == [{"new": "ShopHelper.checkoutExpress(ShopData)",
+                                              "like": "ShopHelper.checkout(ShopData)", "ratio": 1.0}]
+        assert review["option_enum_gaps"] == {"PaymentMethod": {"missing_keys": ["wallet"],
+                                                                "unobserved_constants": 0}}
+        assert set(review["test_shape"]["methods"]) == {"ShopWebTest#pay"}
+        assert review["reuse_unused"] == ["WaitHelper.waitForUrl(Config config, String url)"]
+
+
+def test_step_02_writes_the_option_sets_it_found(tmp_path, monkeypatch):
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    sets = {"paymentMethodOption": {
+        "attribute": "data-option", "chosen": "card", "template": "", "truncated": False,
+        "options": [{"key": "card", "label": "Card", "occurrences": 1},
+                    {"key": "wallet", "label": "Wallet", "occurrences": 2}]}}
+    mod._write_result({"paymentMethodOption": "a[data-option='card']"}, ["Pick the method"], [],
+                      selector_counts={"paymentMethodOption": 1}, option_sets=sets)
+    assert json.loads((tmp_path / "02-validate-web.json").read_text())["option_sets"] == sets
+    md = (tmp_path / "02-validate-web.md").read_text()
+    assert "## Option sets seen" in md and "Wallet (`wallet`, ×2)" in md
+
+
+class TestRegressionReRun:
+    """A slight change to an existing method is only safe if its existing callers
+    still pass, and step 04 otherwise runs only the new test."""
+
+    HELPER = '''package automation.modules.shop;
+
+public class ShopHelper {
+    public void pay() { }
+    public void refund() { }
+}
+'''
+
+    def _setup(self, tmp_path, monkeypatch):
+        from shared import blast_radius
+        monkeypatch.delenv("FRAMEWORK_DIR", raising=False)
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        root = mod.AUTOMATION_FRAMEWORK_DIR
+        helper = "src/main/java/automation/modules/shop/ShopHelper.java"
+        (root / helper).parent.mkdir(parents=True)
+        (root / helper).write_text(self.HELPER.replace("public void pay() { }",
+                                                       "public void pay() { confirm(); }"))
+        tests = root / "src/test/java/automation/shop"
+        tests.mkdir(parents=True)
+        for name, method, call in (("PayTest", "pays", "pay"), ("RefundTest", "refunds", "refund")):
+            (tests / f"{name}.java").write_text(
+                f"package automation.shop;\n\npublic class {name} {{\n"
+                f"    @Test public void {method}() {{ ShopHelper helper = new ShopHelper(); "
+                f"helper.{call}(); }}\n}}\n")
+        snapshot = tmp_path / "pre-run" / helper
+        snapshot.parent.mkdir(parents=True)
+        snapshot.write_text(self.HELPER)
+        blast_radius._cache.clear()
+        calls = []
+        return mod, calls
+
+    def test_only_tests_reaching_a_changed_method_rerun_with_their_own_baselines(self, tmp_path, monkeypatch):
+        mod, calls = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(mod, "run_maven_test",
+                            lambda k, m, baseline_dir=None: calls.append((k, m, baseline_dir)) or (True, ""))
+        result = mod.regression_check(["ShopWebTest#newOne"])
+        assert result["tests"] == ["PayTest#pays"]
+        assert calls == [("PayTest", "pays", tmp_path / "regression-baselines")]
+        saved = json.loads((tmp_path / "04-regression.json").read_text())
+        assert saved["results"] == {"PayTest#pays": {"status": "passed", "first_error": ""}}
+
+    def test_a_failure_is_retried_once_then_reported_with_its_first_error(self, tmp_path, monkeypatch):
+        mod, calls = self._setup(tmp_path, monkeypatch)
+        outputs = iter([(False, "[ERROR] flaky"),
+                        (False, "[ERROR]   PayTest.pays:3 » AssertionError Expected 1 but got 2")])
+        monkeypatch.setattr(mod, "run_maven_test",
+                            lambda k, m, baseline_dir=None: calls.append(m) or next(outputs))
+        result = mod.regression_check([])
+        assert calls == ["pays", "pays"]
+        assert result["results"]["PayTest#pays"]["status"] == "failed"
+        assert "AssertionError" in result["results"]["PayTest#pays"]["first_error"]
+
+    def test_over_the_cap_nothing_is_rerun_and_the_reason_is_recorded(self, tmp_path, monkeypatch):
+        mod, calls = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(mod, "REGRESSION_MAX_TESTS", 0)
+        monkeypatch.setattr(mod, "run_maven_test", lambda *a, **k: calls.append(a) or (True, ""))
+        result = mod.regression_check([])
+        assert calls == [] and result["not_run_reason"]
+
+    def test_a_fix_keeps_the_first_pre_run_copy_and_skips_files_this_run_created(self, tmp_path, monkeypatch):
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        (tmp_path / "03-generate.json").write_text(json.dumps({"created_files": ["src/main/java/New.java"]}))
+        mod._snapshot_before_fix("src/main/java/Old.java", "before")
+        mod._snapshot_before_fix("src/main/java/Old.java", "after a first fix")
+        mod._snapshot_before_fix("src/main/java/New.java", "generated")
+        assert (tmp_path / "pre-run/src/main/java/Old.java").read_text() == "before"
+        assert not (tmp_path / "pre-run/src/main/java/New.java").exists()
+
+
+class TestProgressIsNotARetry:
+    """A fix that works and lets the test reach the next bug is progress, not a failed
+    retry. Only attempts in a row that made none are charged to the budget."""
+
+    def test_reaching_a_new_failure_is_progress_and_going_back_is_not(self, tmp_path, monkeypatch):
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        history = [{"targeted": "ShopWebTest.java:20", "failure_location": "ShopWebTest.java:31"}]
+        seen = mod.seen_failures(history, "ShopWebTest.java:31")
+        assert mod.made_progress(False, ["Cart.java"], "ShopWebTest.java:40", seen)
+        assert not mod.made_progress(False, ["Cart.java"], "ShopWebTest.java:31", seen)  # same bug
+        assert not mod.made_progress(False, ["Cart.java"], "ShopWebTest.java:20", seen)  # undone
+        assert not mod.made_progress(False, [], "ShopWebTest.java:40", seen)            # nothing landed
+
+    def test_the_streak_counts_only_trailing_attempts_without_progress(self, tmp_path, monkeypatch):
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        assert mod.no_progress_streak([{"progress": False}, {"progress": True},
+                                       {"progress": False}, {}]) == 2
+        assert mod.no_progress_streak([{"progress": True}]) == 0
+
+    def test_the_verdict_charges_only_no_progress_and_keeps_a_ceiling(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AUTHORING_FIX_RETRY_COUNT", "2")
+        monkeypatch.setenv("AUTHORING_MAX_FIX_ATTEMPTS", "8")
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        assert mod.retry_verdict("false", 0, 5) == "retry"       # five attempts, all progress
+        assert mod.retry_verdict("false", 1, 1) == "retry"
+        assert "no progress" in mod.retry_verdict("false", 2, 3)
+        assert "ceiling" in mod.retry_verdict("false", 0, 8)
+        for gate in ("true", "stuck", "defect", "skipped"):
+            assert mod.retry_verdict(gate, 0, 1) == "stop"
+
+    def test_the_gate_writes_the_verdict_from_the_history_on_disk(self, tmp_path, monkeypatch):
+        from shared import fix_history
+        monkeypatch.setenv("FIX_ATTEMPT", "3")
+        monkeypatch.setenv("AUTHORING_FIX_RETRY_COUNT", "2")
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        for progress in (False, True, True):
+            fix_history.append(tmp_path, {"attempt": 1, "progress": progress})
+        mod._write_gate("false")
+        assert (tmp_path / ".fix-retry").read_text() == "retry"
+        fix_history.append(tmp_path, {"attempt": 4, "progress": False})
+        fix_history.append(tmp_path, {"attempt": 5, "progress": False})
+        mod._write_gate("false")
+        assert (tmp_path / ".fix-retry").read_text().startswith("stop: 2 fix attempt(s) in a row")
+
+    def test_a_failing_initial_run_asks_for_the_first_fix_attempt(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FIX_ATTEMPT", "0")
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        mod._write_gate("false")
+        assert (tmp_path / ".fix-retry").read_text() == "retry"
+        mod._write_gate("true")
+        assert (tmp_path / ".fix-retry").read_text() == "stop"
+
+
+class TestExistingTestsAreNotRewritten:
+    """Extending a module rewrites its test class with a new method appended. The
+    methods already there are shipped tests, and a repair pass once weakened one."""
+
+    BEFORE = '''public class ShopWebTest extends TestBase
+{
+    @Test(dataProvider = "getConfig")
+    public void pay(Config config)
+    {
+        config.logStep("Pay and verify the thank-you text");
+        AssertHelper.assertEquals(config, shop.pay(), "Thanks.See you", "Thank-you text should match");
+    }
+}
+'''
+    NEW_METHOD = '''
+    @Test(dataProvider = "getConfig")
+    public void refund(Config config)
+    {
+        config.logStep("Refund and verify the refund text");
+        AssertHelper.assertEquals(config, shop.refund(), "Refunded", "Refund text should match");
+    }
+}
+'''
+
+    def _setup(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("FRAMEWORK_DIR", raising=False)
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        path = "src/test/java/automation/shop/ShopWebTest.java"
+        (mod.AUTOMATION_FRAMEWORK_DIR / path).parent.mkdir(parents=True)
+        (mod.AUTOMATION_FRAMEWORK_DIR / path).write_text(self.BEFORE)
+        return mod, path
+
+    def test_a_changed_existing_test_method_is_restored_and_new_ones_kept(self, tmp_path, monkeypatch):
+        mod, path = self._setup(tmp_path, monkeypatch)
+        weakened = self.BEFORE.replace(
+            'AssertHelper.assertEquals(config, shop.pay(), "Thanks.See you", "Thank-you text should match");',
+            'AssertHelper.assertTrue(config, shop.pay() != null, "Thank-you text should show");')
+        generated = weakened.rstrip().rstrip("}") + self.NEW_METHOD
+        files, restored = mod._restore_existing_tests({path: generated})
+        assert restored == {path: ["pay"]}
+        assert '"Thanks.See you"' in files[path] and "public void refund" in files[path]
+
+    def test_reindenting_an_existing_test_is_not_a_change(self, tmp_path, monkeypatch):
+        mod, path = self._setup(tmp_path, monkeypatch)
+        reindented = self.BEFORE.replace("        config.logStep", "            config.logStep")
+        assert mod._restore_existing_tests({path: reindented})[1] == {}
+
+    def test_an_existing_tests_values_are_not_judged_against_this_runs_input(self, tmp_path, monkeypatch):
+        mod, path = self._setup(tmp_path, monkeypatch)
+        generated = self.BEFORE.rstrip().rstrip("}") + self.NEW_METHOD
+        assert mod.untraced_expected_values({path: generated}, "Refund the order", {}) == {
+            path: ["Refunded"]}

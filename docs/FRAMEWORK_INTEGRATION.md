@@ -196,7 +196,9 @@ repo, whatever the framework. Missing ones degrade a feature rather than break a
 | What | Where in the target repo | Used by |
 |------|--------------------------|---------|
 | An agent guide (framework APIs, wrappers, naming) | `CLAUDE.md` at the repo root | Authoring (parse/generate/fix) and healing fix — the model's source of truth for the repo's own APIs |
-| One `logStep("…")` per test step, stating action and expected outcome | test classes | Authoring's narration check (`shared/logstep_narration.py`), and adaptation's derived intent contracts |
+| One `logStep("…")` per business step, stating action and expected outcome, before the one call that carries it out | test classes | Authoring's narration check (`shared/logstep_narration.py`), and adaptation's derived intent contracts |
+| Helper business operations, and option enums in an optional per-module `<Feature>Enums` class | module helpers | Authoring generates tests as one call per step against them, and re-runs the existing tests that reach an operation it changes |
+| `shared_code` in `config/repo-map.json`: the framework's shared code directories | config | Authoring indexes their public members so the model calls them instead of writing its own |
 | Assertions through a helper, with the message as the last argument (e.g. `AssertHelper.*`) | tests and helpers | `shared/assertion_graph.py` — what a test proves, and whether an edit weakened it |
 | Per-environment properties `parameters/{environment}-{country}.properties` | `src/main/resources/` | Authoring writes URL and credential keys there instead of hard-coding them |
 | Element fingerprint script `locator-capture.js` | `src/main/resources/` | The healing Locate engine (`shared/locator_capture.py`) |
