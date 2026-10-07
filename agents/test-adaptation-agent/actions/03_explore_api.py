@@ -206,7 +206,7 @@ def main():
         endpoints = endpoints_from_repo(workspace, scope.get("edit_candidates") or [])
         log(f"{len(endpoints)} endpoint(s) declared in the repo's Api enums")
         base = plan.get("api_base_url", "")
-        note = plan.get("note_masked", "")
+        note = plan.get("note", "")
         steps = [probe(base, entry, note, i) for i, entry in enumerate(endpoints)]
         result["steps"] = steps
         result["ran"] = True

@@ -22,6 +22,7 @@ the framework already writes the failure-time DOM as plain HTML alongside. Human
 get the full picture by opening the zip in Playwright Trace Viewer.
 """
 
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -46,6 +47,22 @@ def failing_action(actions: List[Dict]) -> Optional[Dict]:
     return get_active_plugin().telemetry.failing_action(actions)
 
 
+_SECRET_FIELD = re.compile(r"pass(word|wd)?\b|pwd|otp|token|secret", re.IGNORECASE)
+
+
+def _typed_values(actions: List[Dict], limit: int = 25) -> List[tuple]:
+    """[(selector, value)] for each non-empty value typed into a field, last value
+    per field. A field that looks like a secret shows its length, not its value."""
+    last: Dict[str, str] = {}
+    for action in actions:
+        selector, value = action.get("selector") or "", action.get("value") or ""
+        if selector and value:
+            last.pop(selector, None)
+            last[selector] = (f"({len(value)} characters, not shown)"
+                              if _SECRET_FIELD.search(selector) else repr(value))
+    return list(last.items())[-limit:]
+
+
 def format_for_prompt(actions: List[Dict], max_actions: int = 40) -> str:
     """Render the timeline as the prompt section a fixer reads.
 
@@ -66,6 +83,17 @@ def format_for_prompt(actions: List[Dict], max_actions: int = 40) -> str:
                if failed.get("inferred") else "recorded as the failing call")
         lines.append(f"The selector that failed at runtime: {failed['selector']}")
         lines.append(f"  ({failed.get('action', '?')} — {failed.get('error', '')}; {how})")
+        lines.append("")
+
+    # Every value the test typed, however far back. The timeline below keeps only the
+    # last actions and shows a selector, never what went into it, so a test whose
+    # data had shifted one column (an address split at its comma, "India" typed as
+    # the card number) failed three fix attempts later on a promo that only renders
+    # for a valid card, and no fixer saw why.
+    typed = _typed_values(interesting)
+    if typed:
+        lines.append("Values the test typed, in order:")
+        lines += [f"  {selector}  <- {value}" for selector, value in typed]
         lines.append("")
 
     lines.append("Full action timeline (selectors that worked, then the one that did not):")

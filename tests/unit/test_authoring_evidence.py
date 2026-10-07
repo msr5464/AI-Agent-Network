@@ -129,6 +129,103 @@ class TestStepO2Parsers:
             "SELECTOR_FOUND: amountDisplay=#txn_amount|count=1|visible=1")
         assert selectors == {"amountDisplay": ".header-amount"}
 
+    def test_a_later_report_the_flow_clicked_replaces_an_unclicked_first(self, tmp_path,
+                                                                          monkeypatch):
+        """Observed: `promoCodeOption` was reported first as a "2 promos available"
+        banner on the payment-method list, then as the Flash Sale radio on the card
+        form, which the flow clicked. The banner was kept, and the test clicked it
+        on the card form, where it does not exist."""
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        banner = "#pay >> internal:control=enter-frame >> div.promo-button-wrapper"
+        radio = "#pay >> internal:control=enter-frame >> label[for='690']"
+        output = (f"SELECTOR_FOUND: promoCodeOption={banner}|count=1|visible=1\n"
+                  f"SELECTOR_FOUND: promoCodeOption={radio}|count=1|visible=1\n"
+                  "SELECTOR_FOUND: amountDisplay=.header-amount|count=1|visible=1\n"
+                  "SELECTOR_FOUND: amountDisplay=#txn_amount|count=1|visible=1")
+        rows = [{"clicked": {"sel": radio, "total": 1, "visible": 1,
+                             "text": "Promo Flash Sale (Credit-Card)"}}]
+        found, counts, visibles, _ = mod.parse_selector_output(output)
+        changed = mod.prefer_clicked(found, counts, visibles, output, rows)
+        assert changed == [{"name": "promoCodeOption", "reported_first": banner,
+                            "clicked": radio}]
+        assert found["promoCodeOption"] == radio
+        assert found["amountDisplay"] == ".header-amount", \
+            "a shown value is never clicked, so its first report stands"
+        assert mod.reported_again(output, found) == {"promoCodeOption": [banner],
+                                                     "amountDisplay": ["#txn_amount"]}
+        # When the first report was clicked too, nothing says the second is better.
+        rows.append({"clicked": {"sel": banner, "total": 1, "visible": 1,
+                                 "text": "2 promos available Use"}})
+        found, counts, visibles, _ = mod.parse_selector_output(output)
+        assert mod.prefer_clicked(found, counts, visibles, output, rows) == []
+        assert found["promoCodeOption"] == banner
+
+    # An overlay over a popup, both with a close button of the same class.
+    POPUP_X = "#pop >> internal:control=enter-frame >> div.close"
+    OVERLAY_X_REPORTED = "#pop >> internal:control=enter-frame >> .overlay .close"
+    OVERLAY_X_CLICKED = "#pop >> internal:control=enter-frame >> div.overlay div.close"
+
+    def _overlay_rows(self, counted_in_overlay=None):
+        """Overlay closed (the bare class is unique there), then open, then the
+        click on the overlay's close button."""
+        overlay_checks = {self.OVERLAY_X_REPORTED: {"total": 1, "visible": 1, "uid": "d:7"}}
+        overlay_checks.update(counted_in_overlay or {})
+        return [
+            {"inventory": [{"tag": "div"}], "checks": {
+                self.POPUP_X: {"total": 1, "visible": 1, "uid": "d:3"}}},
+            {"clicked": {"sel": "#pop >> internal:control=enter-frame >> div.details",
+                         "total": 1, "visible": 1, "uid": "d:5", "text": "Details"}},
+            {"inventory": [{"tag": "div"}], "checks": overlay_checks},
+            {"clicked": {"sel": self.OVERLAY_X_CLICKED, "total": 1, "visible": 1,
+                         "uid": "d:7", "text": ""}},
+        ]
+
+    def test_a_first_report_never_counted_where_it_was_clicked_gives_way(self, tmp_path,
+                                                                        monkeypatch):
+        """A bare close-button class was counted 1/1 only while an overlay was
+        closed, where it is the popup's own close button; with the overlay open it
+        matched two. The browser clicked the overlay's button through another
+        spelling, and the model reported a third. No two spellings were equal, so
+        the first report stood and the test failed on it."""
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        output = (f"SELECTOR_FOUND: closeOverlayButton={self.POPUP_X}|count=1|visible=1\n"
+                  f"SELECTOR_FOUND: closeOverlayButton={self.OVERLAY_X_REPORTED}|count=1|visible=1")
+        found, counts, visibles, _ = mod.parse_selector_output(output)
+        changed = mod.prefer_clicked(found, counts, visibles, output, self._overlay_rows())
+        assert changed == [{"name": "closeOverlayButton", "reported_first": self.POPUP_X,
+                            "clicked": self.OVERLAY_X_CLICKED}]
+        assert found["closeOverlayButton"] == self.OVERLAY_X_CLICKED
+
+    def test_a_first_report_counted_at_the_clicked_element_stands(self, tmp_path, monkeypatch):
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        output = (f"SELECTOR_FOUND: closeOverlayButton={self.OVERLAY_X_REPORTED}|count=1|visible=1")
+        found, counts, visibles, _ = mod.parse_selector_output(output)
+        assert mod.prefer_clicked(found, counts, visibles, output, self._overlay_rows()) == []
+        assert found["closeOverlayButton"] == self.OVERLAY_X_REPORTED
+
+    def test_unique_at_another_element_is_not_unique_where_used(self, tmp_path, monkeypatch):
+        """Counted 1/1 just before the click, but at a different element."""
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        output = (f"SELECTOR_FOUND: closeOverlayButton={self.POPUP_X}|count=1|visible=1\n"
+                  f"SELECTOR_FOUND: closeOverlayButton={self.OVERLAY_X_REPORTED}|count=1|visible=1")
+        rows = self._overlay_rows({self.POPUP_X: {"total": 1, "visible": 1, "uid": "d:3"}})
+        found, counts, visibles, _ = mod.parse_selector_output(output)
+        mod.prefer_clicked(found, counts, visibles, output, rows)
+        assert found["closeOverlayButton"] == self.OVERLAY_X_CLICKED
+
+    def test_without_element_identities_an_unspelled_click_links_nothing(self, tmp_path,
+                                                                         monkeypatch):
+        """Evidence from before identities were recorded: only the spelling links."""
+        mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+        rows = self._overlay_rows()
+        for row in rows:
+            for c in [row.get("clicked") or {}] + list((row.get("checks") or {}).values()):
+                c.pop("uid", None)
+        output = (f"SELECTOR_FOUND: closeOverlayButton={self.POPUP_X}|count=1|visible=1\n"
+                  f"SELECTOR_FOUND: closeOverlayButton={self.OVERLAY_X_REPORTED}|count=1|visible=1")
+        found, counts, visibles, _ = mod.parse_selector_output(output)
+        assert mod.prefer_clicked(found, counts, visibles, output, rows) == []
+
     def test_a_selector_containing_a_pipe_survives(self, tmp_path, monkeypatch):
         """The count is read from the END of the line, so a literal | in the
         selector is safe — the same trap that forced INTERACTION_HINT onto JSON."""
@@ -385,6 +482,18 @@ class TestFixResponseShapes:
         _, _, _, edits, _ = mod.extract_fix_response(mod.extract_json(reply.replace("```json", "")))
         assert list(edits) == ["A.java"]
 
+    def test_a_raw_line_break_inside_a_file_still_parses(self, tmp_path, monkeypatch):
+        # Observed codegen reply: every line break of a Java file escaped as \n but
+        # one, written raw. Strict parsing rejected it and the batch lost both files.
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+        reply = ('```json\n{"web/A.java": "String raw = getText(amount);\n        return raw;\\n}",'
+                 ' "web/B.java": "class B {}"}\n```')
+        files = mod.extract_json(reply)
+        assert list(files) == ["web/A.java", "web/B.java"]
+        assert files["web/A.java"] == "String raw = getText(amount);\n        return raw;\n}"
+        assert list(mod.extract_json(reply.replace("```json", "").replace("```", ""))) == \
+            ["web/A.java", "web/B.java"], "the brace scan tolerates it too"
+
 
 class TestBaselinesStayInTheRunCheckout:
     def test_the_test_run_pins_the_baseline_dir_to_its_checkout(self, tmp_path, monkeypatch):
@@ -472,6 +581,52 @@ class TestExistingHelperIsReused:
         assert mod._find_existing_helper("nomodule", "Nomodule") == ""
 
 
+class TestCopiedMethods:
+    """Observed: page objects are generated a batch at a time, and a run wrote the
+    same normalizeAmount() into four of them."""
+
+    NORMALIZE = ("    private String normalizeAmount(String raw)\n    {\n"
+                 "        String s = raw.replaceAll(\"[^0-9.]\", \"\");\n"
+                 "        int dot = s.lastIndexOf('.');\n"
+                 "        return dot < 0 ? s : s.substring(0, dot);\n    }\n")
+    HELPER = "src/main/java/automation/modules/shop/ShopHelper.java"
+
+    def _page(self, name, copy=True):
+        getter = ("return normalizeAmount(getText(amount));" if copy else "return getText(amount);")
+        return (f"public class {name} extends BasePage {{\n"
+                f"    public String getAmount()\n    {{\n        {getter}\n    }}\n"
+                + (self.NORMALIZE if copy else "") + "}\n")
+
+    def _files(self, copy=True, helper_body=""):
+        pages = {f"src/main/java/automation/modules/shop/web/{n}.java": self._page(n, copy)
+                 for n in ("CardPage", "BankPage")}
+        return {**pages, self.HELPER: f"public class ShopHelper extends ApiHelper {{\n{helper_body}}}\n"}
+
+    def test_one_copy_ends_up_in_the_helper(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        files = self._files()
+        fixed = self._files(copy=False, helper_body=self.NORMALIZE)
+        monkeypatch.setattr(mod, "call_claude", lambda prompt, label="": json.dumps(fixed))
+        out, left = mod._repair_copied_methods(files, "Shop")
+        assert left == [] and out == fixed
+
+    def test_a_repair_that_leaves_copies_changes_nothing(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        files = self._files()
+        half = dict(files)
+        half[self.HELPER] = self._files(helper_body=self.NORMALIZE)[self.HELPER]
+        monkeypatch.setattr(mod, "call_claude", lambda prompt, label="": json.dumps(half))
+        out, left = mod._repair_copied_methods(files, "Shop")
+        assert out == files and len(left) == 1
+
+    def test_without_a_generated_helper_it_is_left_for_review(self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        files = {k: v for k, v in self._files().items() if k != self.HELPER}
+        monkeypatch.setattr(mod, "call_claude", lambda prompt, label="": pytest.fail("no call"))
+        out, left = mod._repair_copied_methods(files, "Shop")
+        assert out == files and len(left) == 1
+
+
 class TestCsvTestData:
     def test_credential_sheets_are_never_planned_for_codegen(self, tmp_path, monkeypatch):
         mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
@@ -497,6 +652,57 @@ class TestCsvTestData:
     def test_credential_columns_are_recognised(self, tmp_path, monkeypatch, header, credential):
         mod = _load_action("03_generate.py", tmp_path, monkeypatch)
         assert mod._is_credential_csv(header) is credential
+
+    PAYMENT = "Steps:\n1. Navigate to the shop\n9. And enter Bank OTP: 112233\n"
+    LOGIN = "Steps:\n1. Login with username qa and password Secret1\n2. Enter OTP 1234\n"
+
+    def test_a_bank_otp_is_test_data_and_its_sheet_is_written_whole(self, tmp_path,
+                                                                    monkeypatch):
+        """Observed: a payment sheet holding the sandbox 3-D Secure OTP was refused
+        as a credential sheet, while the test that reads it was written anyway."""
+        from shared.credential_extraction import secret_columns
+        header = "checkout_key,amount,card_number,cvv,otp"
+        assert secret_columns(header, self.PAYMENT) == []
+        assert secret_columns(header, self.LOGIN) == ["otp"], "a login's OTP is a secret"
+        assert secret_columns(header, "") == ["otp"], "unknown flow: an OTP counts"
+
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        sheet = (f"{header}\ncheckout,50000,4111 1111 1111 1111,123,112233\n")
+        files = {"src/test/resources/shop/csvFiles/shop-data.csv": sheet}
+        files, moved, unmoved = mod._move_csv_secrets(files, "Shop", "staging-sg.properties",
+                                                      self.PAYMENT)
+        assert (moved, unmoved) == ({}, {})
+        assert files["src/test/resources/shop/csvFiles/shop-data.csv"] == sheet
+
+    def test_a_login_secret_leaves_the_sheet_for_the_properties_file(self, tmp_path,
+                                                                     monkeypatch):
+        monkeypatch.setenv("AUTHORING_ENVIRONMENT", "staging")
+        monkeypatch.setenv("AUTHORING_COUNTRY", "SG")
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        csv_path = "src/test/resources/shop/csvFiles/users.csv"
+        test_path = "src/test/java/automation/shop/ShopWebTest.java"
+        reads_csv = 'User u = new UserBuilder().withPassword(data.get("password")).build();\n'
+        reads_prop = ('User u = new UserBuilder().withPassword('
+                      'config.getRunTimeProperty("shop.password")).build();\n')
+        files = {csv_path: 'user_key,username,password,address\n'
+                           'buyer,qa,Secret1,"Bangalore, India"\n',
+                 test_path: reads_csv}
+        monkeypatch.setattr(mod, "call_claude",
+                            lambda prompt, label="": json.dumps({test_path: reads_prop}))
+        files, moved, unmoved = mod._move_csv_secrets(files, "Shop", "staging-sg.properties",
+                                                      self.LOGIN)
+        assert (moved, unmoved) == ({"password": "shop.password"}, {})
+        assert files[csv_path] == 'user_key,username,address\nbuyer,qa,"Bangalore, India"\n', \
+            "only the secret leaves, and a value with a comma stays quoted"
+        assert files[test_path] == reads_prop
+        props = (mod.AUTOMATION_FRAMEWORK_DIR / "parameters" / "staging-sg.properties").read_text()
+        assert "shop.password=Secret1" in props
+
+        # A repair that does not come back leaves a test reading a column that is gone.
+        files = {csv_path: "user_key,password\nbuyer,Secret1\n", test_path: reads_csv}
+        monkeypatch.setattr(mod, "call_claude", lambda prompt, label="": "")
+        _, _, unmoved = mod._move_csv_secrets(files, "Shop", "staging-sg.properties", self.LOGIN)
+        assert list(unmoved) == [test_path]
 
     def test_a_rewrite_may_add_rows_but_never_lose_one(self, tmp_path, monkeypatch):
         mod = _load_action("03_generate.py", tmp_path, monkeypatch)
@@ -725,7 +931,109 @@ class TestRuntimeEvidence:
         monkeypatch.setattr(mod, "TEST_RESULTS_DIR", tmp_path / "nope")
         out = mod.gather_runtime_evidence("noSuchTest")
         assert out == {"dom_section": "", "trace_section": "", "context_section": "",
-                       "dom_snapshot_path": "", "trace_path": ""}
+                       "step02_section": "", "dom_snapshot_path": "", "trace_path": ""}
+
+    BANNER = "#pay >> internal:control=enter-frame >> div.promo-button-wrapper"
+    RADIO = "#pay >> internal:control=enter-frame >> label[for='690']"
+
+    def test_a_locator_that_failed_in_an_iframe_is_shown_that_iframe(self, tmp_path,
+                                                                    monkeypatch):
+        """Observed: the promo locator failed inside the payment iframe. The saved
+        HTML lists the store page's own elements first and keeps 30, so the fixer
+        saw the store's settings form and none of the iframe's promo radios, and
+        concluded the promo never renders."""
+        dom_dir = tmp_path / "fw" / "test-output" / "dom"
+        dom_dir.mkdir(parents=True)
+
+        def el(tag, text, i):
+            return {"index": i, "tag": tag, "text": text, "accessible_name": text,
+                    "is_visible": True, "is_interactive": True, "area_norm": 0.01,
+                    "attrs": {}, "class_list": []}
+
+        store = [el("button", f"Setting {i}", i) for i in range(40)]
+        radios = [el("label", t, i) for i, t in enumerate(
+            ["Promo Flash Sale (Credit-Card)", "Proceed without promo"])]
+        base = dom_dir / "myTest_120000"
+        Path(f"{base}.fingerprints.json").write_text(json.dumps(
+            {"url": "https://shop.example.com/", "elements": store}))
+        Path(f"{base}.frames.json").write_text(json.dumps([{
+            "index": 1, "parent": 0, "ordinal": 0,
+            "html": "<label>Promo Flash Sale (Credit-Card)</label>"
+                    "<label>Proceed without promo</label>",
+            "fingerprints": {"elements": radios}}]))
+        Path(f"{base}.html").write_text(
+            '<!-- qa-agent-network:dom-snapshot test="myTest" url="https://shop.example.com/" '
+            f'fingerprints="{base}.fingerprints.json" frames="{base}.frames.json" -->\n'
+            "<html><body>" + "".join(f"<button>Setting {i}</button>" for i in range(40))
+            + '<iframe id="pay"></iframe></body></html>')
+
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        monkeypatch.setattr(mod, "TEST_RESULTS_DIR", tmp_path / "fw" / "test-output")
+        out = mod.gather_runtime_evidence(
+            "myTest", failure={"selector": self.BANNER, "element": "Promo Flash Sale promo"})
+        assert "Promo Flash Sale (Credit-Card)" in out["dom_section"]
+        assert "#pay >> internal:control=enter-frame >>" in out["dom_section"]
+        assert "Setting 0" not in out["dom_section"], "the store page is not where it failed"
+
+    def test_a_fix_may_not_put_a_login_secret_in_a_csv(self, tmp_path, monkeypatch):
+        """Step 03 moves a login secret out of the sheet; a fix is the other way one
+        gets in, and the guards only ran on files that already existed."""
+        monkeypatch.setenv("AUTHORING_ENVIRONMENT", "staging")
+        monkeypatch.setenv("AUTHORING_COUNTRY", "SG")
+        case = tmp_path / "case.txt"
+        case.write_text("1. Login with username qa and password Secret1\n")
+        monkeypatch.setenv("INPUT_FILE", str(case))
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        path = "src/test/resources/shop/csvFiles/users.csv"
+        ok, reason = mod._no_csv_secret(path, "", "user_key,password\nbuyer,Secret1\n")
+        assert not ok and 'config.getRunTimeProperty("shop.password")' in reason
+        props = (mod.AUTOMATION_FRAMEWORK_DIR / "parameters" / "staging-sg.properties").read_text()
+        assert "shop.password=Secret1" in props, "the property the reason names must exist"
+        assert mod._no_csv_secret(path, "", "user_key,amount\nbuyer,5\n") == (True, "")
+        # An existing credential sheet keeps its column: the fix did not add it.
+        sheet = "user_key,password\nbuyer,Secret1\n"
+        assert mod._no_csv_secret(path, sheet, sheet + "seller,Other2\n") == (True, "")
+        # A payment OTP is test data.
+        case.write_text("9. And enter Bank OTP: 112233\n")
+        assert mod._no_csv_secret(path, "", "checkout_key,otp\ncheckout,112233\n") == (True, "")
+
+    def test_a_csv_row_must_have_one_value_per_column(self, tmp_path, monkeypatch):
+        """Observed: an unquoted `Bangalore, India` moved every later column one
+        place, and the test typed "India" as the card number."""
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        path = "src/test/resources/shop/csvFiles/shop-data.csv"
+        ok, reason = mod._csv_rows_fit(path, "key,address,card\nc,Bangalore, India,4111\n")
+        assert not ok and "row 2 has 4 fields but the header has 3" in reason
+        assert mod._csv_rows_fit(path, 'key,address,card\nc,"Bangalore, India",4111\n') == \
+            (True, "")
+        assert mod._csv_rows_fit("Shop.java", "a,b\nc\n") == (True, "")
+
+    def test_the_fixer_is_given_the_test_cases_own_values(self, tmp_path, monkeypatch):
+        """Observed: a fix that rewrote the test data made up a name, an email, a
+        card number and an expired expiry for a test case that stated all four."""
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        case = ("Steps:\n1. Login as the buyer\n   Username: buyer1\n   Password: Secret1\n"
+                "   Name: Mukesh Rajput\n   Expiry: 01/35\n")
+        section = mod.test_case_data_section(case)
+        assert "Name: Mukesh Rajput" in section and "Expiry: 01/35" in section
+        assert "Secret1" not in section, "a login secret is named, not shown"
+        assert mod.test_case_data_section("Steps:\n1. Open the page\n") == ""
+
+    def test_what_step_02_reported_and_clicked_for_the_locator_is_shown(self, tmp_path,
+                                                                        monkeypatch):
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
+        (tmp_path / "02-validate-web.json").write_text(json.dumps({
+            "selectors": {"promoCodeOption": self.BANNER, "payButton": "#pay-now"},
+            "reported_again": {"promoCodeOption": [self.RADIO]}}))
+        (tmp_path / "02-web-evidence.jsonl").write_text(json.dumps({"clicked": {
+            "sel": self.RADIO, "total": 1, "visible": 1,
+            "text": "Promo Flash Sale (Credit-Card)"}}) + "\n")
+        assert mod._step02_names(self.BANNER) == ["promoCodeOption"]
+        section = mod.step02_locator_section(["promoCodeOption"])
+        assert f"also reported for this name: {self.RADIO}" in section
+        assert f'clicked while validating the flow: {self.RADIO} — text "Promo Flash Sale' \
+            in section
+        assert mod.step02_locator_section(["payButton"]) == "", "nothing else to show"
 
 
 class TestUniquenessReachesCodegen:
@@ -1516,6 +1824,15 @@ class TestEvidenceSurvivesARejectedAttempt:
         mod._write_result({"attempt": 0, "passed": True, "fixes_applied": []}, [], 0)
         assert json.loads((audit / "04-run-and-fix.json").read_text())["passed"] is True
 
+    def test_the_result_says_whether_another_attempt_follows(self, tmp_path, monkeypatch):
+        """Read off attempt 1's failing result, History showed "failed" while
+        attempt 2 ran. The gate is written first, so the result can say."""
+        mod, audit = self._mod(tmp_path, monkeypatch)
+        for verdict, final in (("retry", False), ("stop: 8 fix attempts is the ceiling", True)):
+            (audit / ".fix-retry").write_text(verdict)
+            mod._write_result({"attempt": 1, "passed": False, "fixes_applied": []}, [], 1)
+            assert json.loads((audit / "04-run-and-fix.json").read_text())["final_attempt"] is final
+
 
 class TestTheGeneratedCodeCompiles:
     """A wrong import is the cheapest failure in the pipeline and cost the most.
@@ -1682,7 +1999,7 @@ class TestValuesObservedAndAsserted:
                    {"check": "unmatched", "element": "x", "rendered": "a", "source": "literal",
                     "expected": "b", "relation": ""}]}
         hint = mod.value_contracts_hint(web)
-        assert "nameField = 'Test User'  (2 words)" in hint
+        assert "nameField = 'Test User'  (2 words: letters)" in hint
         assert "Never one token" in hint and "never a whole-name generator" in hint
         assert "plain number text" in hint and "element:cartTotal" in hint
         assert "string equality assertion" in hint, (
@@ -2134,6 +2451,48 @@ const page = { on() {}, url: () => 'https://shop.test/', frames: () => [main, pa
     assert got["before"]["tab"]["checked"] is True, "a selected option says so in the same count"
 
 
+def test_page_qa_records_element_identity_and_settling_in_the_evidence_only(tmp_path):
+    """Two things step 02 knew and never wrote down: which element a selector
+    resolved to (so two spellings of one element can be told apart from two
+    elements), and that the page kept working after an action. The model is shown
+    neither: an identity would cost tokens on every harvest."""
+    import shutil, subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    from shared.mcp_config import INIT_PAGE
+    evidence = tmp_path / "evidence.jsonl"
+    script = """
+const init = require(%s).default;
+const on = {};
+const main = { url: () => 'https://shop.test/', parentFrame: () => null,
+  evaluate: async () => [{ tag: 'button', sel: '#pay', total: 1, visible: 1, uid: 'd:1' }] };
+const loc = () => ({ count: async () => 1, nth: () => ({ isVisible: async () => true }),
+  first: () => ({ innerText: async () => 'Pay', isEditable: async () => false,
+    isChecked: async () => null, evaluate: async () => 'd:1' }) });
+const page = { on: (e, f) => { on[e] = f; }, url: () => 'https://shop.test/', frames: () => [main],
+  waitForTimeout: async () => {}, locator: loc, frameLocator: () => ({ locator: loc }),
+  exposeBinding: async () => {} };
+(async () => {
+  await init({ page });
+  const req = { resourceType: () => 'xhr' };
+  const out = await page.qa.step(async () => { on.request(req); on.requestfinished(req); },
+    { check: { pay: '#pay' }, quietMs: 0 });
+  console.log(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });
+""" % json.dumps(str(INIT_PAGE))
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30,
+                          env={**__import__("os").environ, "QA_EVIDENCE_FILE": str(evidence)})
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    assert out["requests"] == 1
+    assert "uid" not in out["check"]["pay"] and "uid" not in out["frames"][0]["result"][0], (
+        "identities go to the evidence file, not to the model")
+    row = [json.loads(line) for line in evidence.read_text().splitlines()][-1]
+    assert row["checks"]["#pay"]["uid"] == "d:1"
+    assert row["settled"]["requests"] == 1 and row["settled"]["ms"] >= 0
+
+
 def test_step_02_calls_the_helpers_instead_of_carrying_code():
     source = (ROOT / "agents" / "test-authoring-agent" / "actions" / "02_validate_web.py").read_text()
     assert "page.qa.step(" in source and "page.qa.check(" in source
@@ -2224,9 +2583,10 @@ def test_a_value_the_test_case_gives_is_used_as_written(tmp_path, monkeypatch):
     raw = ("3. Fill the form and click Checkout:\n   Address: Bangalore, India\n"
            "   Enter card number: 4111 1111 1111 1111\n")
     hint = mod.value_contracts_hint(web, raw)
-    assert "addressField = 'Bangalore, India'  (2 words)  GIVEN BY THE TEST CASE" in hint
-    assert "cardNumberField = '4111 1111 1111 1111'  (4 words)  GIVEN BY THE TEST CASE" in hint
-    assert "phoneField = '081234567890'  (1 word)\n" in hint, "a made-up value keeps the shape rule"
+    assert "addressField = 'Bangalore, India'  (2 words: letters, punctuation)  GIVEN BY THE TEST CASE" in hint
+    assert "cardNumberField = '4111 1111 1111 1111'  (4 words: digits)  GIVEN BY THE TEST CASE" in hint
+    assert "phoneField = '081234567890'  (1 word: 12 digits, nothing else)\n" in hint, \
+        "a made-up value keeps the shape rule"
     assert "Test data for the other fields keeps that SHAPE" in hint
 
 
@@ -2559,8 +2919,9 @@ class TestFlowApiCodegen:
             "changed": ["ShopHelper.refund(ShopData)"],
             "added": ["ShopHelper.checkoutExpress(ShopData)"], "removed": []}
         assert review["changed_existing_api"] == {}
-        assert review["near_duplicates"] == [{"new": "ShopHelper.checkoutExpress(ShopData)",
-                                              "like": "ShopHelper.checkout(ShopData)", "ratio": 1.0}]
+        assert review["near_duplicates"] == [{"methods": ["ShopHelper.checkout(ShopData)",
+                                                          "ShopHelper.checkoutExpress(ShopData)"],
+                                              "ratio": 1.0}]
         assert review["option_enum_gaps"] == {"PaymentMethod": {"missing_keys": ["wallet"],
                                                                 "unobserved_constants": 0}}
         assert set(review["test_shape"]["methods"]) == {"ShopWebTest#pay"}
@@ -2758,3 +3119,232 @@ class TestExistingTestsAreNotRewritten:
         generated = self.BEFORE.rstrip().rstrip("}") + self.NEW_METHOD
         assert mod.untraced_expected_values({path: generated}, "Refund the order", {}) == {
             path: ["Refunded"]}
+
+
+# ── What an action changed after it returned ────────────────────────────────────
+
+def _state(texts, settled=None, url="https://shop.test/"):
+    """One page state: an element per (class, text), in the checkout frame."""
+    row = {"url": url, "checks": {}, "inventory": [
+        {"tag": "div", "class": cls, "text": text, "frame": "#pay >> internal:control=enter-frame >> "}
+        for cls, text in texts]}
+    if settled:
+        row["settled"] = settled
+    return row
+
+
+def test_a_value_that_changed_after_typing_is_a_delayed_update(tmp_path, monkeypatch):
+    """Typing a card number set off a lookup; 2s later the total dropped and the
+    promo list was redrawn. Step 02 waited for that, the test did not, and its
+    next click was lost mid-redraw."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    card = "#pay >> internal:control=enter-frame >> #card"
+    total = "#pay >> internal:control=enter-frame >> div.total"
+    rows = [
+        _state([("total", "$50.00"), ("timer", "Pay within 23:59:26"), ("summary", "x" * 60)]),
+        {"typed": {"sel": card, "value": "4111 1111 1111 1111", "total": 1, "visible": 1}},
+        _state([("total", "$49.00"), ("timer", "Pay within 23:59:17"), ("summary", "y" * 60)],
+               settled={"ms": 2200, "requests": 2}),
+    ]
+    found = {"cardNumberField": card, "CardPage.totalDisplay": total}
+    assert mod.delayed_updates(rows, found) == [{
+        "after": ["cardNumberField"], "settled_ms": 2200, "requests": 2,
+        "changed": [{"element": "div.total", "names": ["CardPage.totalDisplay"],
+                     "before": "$50.00", "after": "$49.00"}]}], (
+        "a ticking timer and a container cut at the inventory's text limit are not changes")
+
+
+@pytest.mark.parametrize("settled,url,why", [
+    (None, "https://shop.test/", "no settle record: the page was never seen still working"),
+    ({"ms": 900, "requests": 1}, "https://shop.test/", "settled within the quiet window"),
+    ({"ms": 2200, "requests": 0}, "https://shop.test/", "no request of its own"),
+    ({"ms": 2200, "requests": 2}, "https://shop.test/next", "a navigation, not an update"),
+])
+def test_only_a_page_still_working_in_place_is_a_delayed_update(tmp_path, monkeypatch,
+                                                                 settled, url, why):
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    rows = [_state([("total", "$50.00")]),
+            {"clicked": {"sel": "#pay >> internal:control=enter-frame >> #apply",
+                         "total": 1, "visible": 1}},
+            _state([("total", "$49.00")], settled=settled, url=url)]
+    assert mod.delayed_updates(rows, {}) == [], why
+
+
+def test_an_order_is_measured_and_never_a_relation():
+    """"The total decreased" holds because its two sides differ, so relation()
+    is None for it. Recorded as an order, it reaches codegen as a contract, and
+    stays out of the relations a failing equality may be loosened to."""
+    from shared import value_match
+    assert value_match.order("$50.00", "$49.00") == "less"
+    assert value_match.order("$49.00", "$50.00") == "greater"
+    assert value_match.order("$50.00", "$50.00") is None
+    assert value_match.order("5 items", "4 orders") is None
+    assert not {"less", "greater"} & set(value_match.RELATIONS)
+    check = value_match.parse_value_check(
+        "Verify the total decreased|totalDisplay|$49.00|element:CartPage.totalDisplay|$50.00")
+    assert (check["relation"], check["order"]) == ("", "less")
+
+
+def test_an_order_claim_its_values_contradict_is_downgraded(tmp_path, monkeypatch):
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    went_up = {"check": "Verify the total decreased after the coupon", "relation": "",
+               "order": "greater"}
+    went_down = {**went_up, "check": "Verify the fee decreased", "order": "less"}
+    passed, unverified = mod.enforce_value_checks(
+        [went_up["check"], went_down["check"]], [], [went_up, went_down])
+    assert passed == [went_down["check"]] and unverified == [went_up["check"]]
+
+
+def test_codegen_is_told_the_order_contract_and_where_the_page_kept_working(tmp_path,
+                                                                           monkeypatch):
+    mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+    web = {"value_checks": [{"check": "Verify the total decreased", "element": "totalDisplay",
+                             "rendered": "$49.00", "source": "element:CartPage.totalDisplay",
+                             "expected": "$50.00", "relation": "", "order": "less"}],
+           "delayed_updates": [{"after": ["cardNumberField"], "settled_ms": 2200, "requests": 2,
+                                "changed": [{"element": "div.total",
+                                             "names": ["CartPage.totalDisplay"],
+                                             "before": "$50.00", "after": "$49.00"}]}]}
+    contracts = mod.value_contracts_hint(web)
+    assert "LESS than the other side's" in contracts
+    assert "read the other side from exactly the element named" in contracts
+    with_wait = mod.delayed_updates_hint(web, "static void waitForPageToSettle(Config config)")
+    assert "after cardNumberField: CartPage.totalDisplay '$50.00' → '$49.00'" in with_wait
+    assert "ends with WaitHelper.waitForPageToSettle(config)" in with_wait
+    assert "Never WaitHelper.waitForNetworkIdle" in with_wait
+    without = mod.delayed_updates_hint(web, "")
+    assert "waitForPageToSettle" not in without, (
+        "never name a wait the framework does not have: the compile gate would stop the run")
+    assert mod.delayed_updates_hint({}, "") == ""
+
+
+def test_the_fixer_is_shown_what_the_page_did_after_an_action(tmp_path, monkeypatch):
+    mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+    assert mod.step02_updates_section() == ""
+    (tmp_path / "02-validate-web.json").write_text(json.dumps({"delayed_updates": [
+        {"after": ["cardNumberField"], "settled_ms": 2200, "requests": 2,
+         "changed": [{"element": "div.total", "names": [], "before": "$50.00",
+                      "after": "$49.00"}]}]}))
+    section = mod.step02_updates_section()
+    assert "after cardNumberField the page kept working for 2200ms" in section
+    assert "div.total '$50.00' → '$49.00'" in section
+
+
+def test_a_field_typed_into_but_never_reported_is_confirmed_from_the_keystrokes(tmp_path,
+                                                                               monkeypatch):
+    """A bank page's one-time code was typed into a field the helpers counted 1/1,
+    the plan's name for it was never reported, and step 03 guessed a selector that
+    matched nothing."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    bank = "#pay >> internal:control=enter-frame >> iframe[title='3ds'] >> internal:control=enter-frame >> "
+    rows = [
+        {"typed": {"sel": bank + "#otp", "value": None, "password": True,
+                   "total": 1, "visible": 1, "uid": "b:4"}},
+        {"typed": {"sel": bank + "#card-cvv", "value": None, "password": True,
+                   "total": 1, "visible": 1, "uid": "b:2"}},
+        {"clicked": {"sel": bank + "button[name='ok']", "total": 1, "visible": 1, "text": "OK"}},
+    ]
+    found = {"cvvField": bank + "#card-cvv"}
+    counts, visibles = {"cvvField": 1}, {"cvvField": 1}
+    wanted = ["otpContainer", "otpAmountDisplay", "cvvField", "submitOtpButton"]
+    assert mod.recover_typed_locators(found, counts, visibles, rows, wanted) == ["otpContainer"]
+    assert found["otpContainer"] == bank + "#otp"
+    assert "otpAmountDisplay" not in found, "a displayed value is read, never typed into"
+    assert "submitOtpButton" not in found, "a button is clicked; the click recovery owns it"
+
+
+# ── A locator step 02 never confirmed, held to what it counted ───────────────────
+
+_BANK = "#pay >> internal:control=enter-frame >> iframe[title='3ds'] >> internal:control=enter-frame >> "
+_BANK_PAGE = '''public class BankPage extends BasePage
+{
+    private final Locator amountDisplay;
+    private final Locator codeField;
+
+    public BankPage(Config config)
+    {
+        super(config);
+        amountDisplay = page.frameLocator("#pay").frameLocator("iframe[title='3ds']").locator("#amount");
+        codeField = page.frameLocator("#pay").frameLocator("iframe[title='3ds']").locator("input[name='guess']");
+        assertPageLoaded(amountDisplay);
+    }
+}
+'''
+_BANK_ROWS = [
+    {"checks": {_BANK + "#amount": {"total": 1, "visible": 1, "tag": "p", "text": "49.00"},
+                _BANK + "label[for='code']": {"total": 1, "visible": 1, "tag": "label"},
+                _BANK + "span.hint": {"total": 2, "visible": 2, "tag": "span"}}},
+    {"typed": {"sel": _BANK + "#code", "value": None, "password": True, "total": 1, "visible": 1}},
+]
+
+
+def test_a_guess_step_02_counted_is_confirmed_and_one_it_never_counted_is_not(tmp_path,
+                                                                             monkeypatch):
+    """A bank page's code field was written as an attribute selector that matched
+    nothing, while step 02 had typed into that very field."""
+    mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+    path = "src/main/java/automation/modules/shop/web/BankPage.java"
+    guesses = mod.guessed_locators({path: _BANK_PAGE}, {"BankPage": ["amountDisplay", "codeField"]},
+                                   _BANK_ROWS)
+    assert {(g["name"], g["measured"]) for g in guesses} == {
+        ("amountDisplay", "unique"), ("codeField", "unmeasured")}
+    code = next(g for g in guesses if g["name"] == "codeField")
+    candidates = [sel for sel, _about in mod._locator_candidates(code, _BANK_ROWS)]
+    assert candidates[0] == _BANK + "#code", "the field typed into, sharing the name's word, first"
+    assert _BANK + "span.hint" not in candidates, "a selector that matched two is never offered"
+
+
+@pytest.mark.parametrize("written,result", [
+    ("#code", "repaired to " + _BANK + "#code"),
+    ("input.made-up", "still a guess"),
+])
+def test_a_repair_may_only_point_at_an_element_step_02_counted(tmp_path, monkeypatch,
+                                                             written, result):
+    mod = _load_action("03_generate.py", tmp_path, monkeypatch)
+    path = "src/main/java/automation/modules/shop/web/BankPage.java"
+    repaired = _BANK_PAGE.replace("input[name='guess']", written)
+    monkeypatch.setattr(mod, "call_claude", lambda *a, **k: json.dumps({path: repaired}))
+    guesses = mod.guessed_locators({path: _BANK_PAGE}, {"BankPage": ["amountDisplay", "codeField"]},
+                                   _BANK_ROWS)
+    files, out = mod._repair_guessed_locators({path: _BANK_PAGE}, guesses, _BANK_ROWS)
+    by_name = {g["name"]: g["result"] for g in out}
+    assert by_name == {"amountDisplay": "confirmed by step 02's counts", "codeField": result}
+    assert (files[path] == repaired) == (written == "#code")
+
+
+# ── A name the model compared or was handed, but never reported ─────────────────
+
+_HEADER = "#pay >> internal:control=enter-frame >> div.header-total"
+_BADGE = "#pay >> internal:control=enter-frame >> span.badge"
+
+
+def test_a_seed_counted_here_fills_a_name_the_run_never_reported(tmp_path, monkeypatch):
+    """An earlier run confirmed the header total as `PopupPage.totalDisplay`; this
+    plan calls it `totalDisplay`. The helpers counted it 1/1, the model never
+    reported it, and step 03 was left to guess."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    rows = [{"known": [{"name": "PopupPage.totalDisplay", "selector": _HEADER,
+                        "total": 1, "visible": 1}]}]
+    found, counts, visibles = {}, {}, {}
+    assert mod.fill_from_seeds(found, counts, visibles, rows, ["totalDisplay"]) == ["totalDisplay"]
+    assert found == {"totalDisplay": _HEADER}
+    rows[0]["known"].append({"name": "totalDisplay", "selector": _HEADER, "total": 2, "visible": 2})
+    found = {}
+    assert mod.fill_from_seeds(found, {}, {}, rows, ["totalDisplay"]) == [], (
+        "a seed that matched two somewhere is not this element")
+
+
+def test_the_element_a_value_check_compared_fills_its_name(tmp_path, monkeypatch):
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    rows = [{"checks": {_HEADER: {"total": 1, "visible": 1, "text": "$49.00"},
+                        _BADGE: {"total": 1, "visible": 1, "text": "2 offers"}}}]
+    checks = [{"check": "Verify the total decreased", "element": "totalDisplay",
+               "rendered": "$49.00", "source": "element:startTotal", "expected": "$50.00"}]
+    found, counts, visibles = {}, {}, {}
+    assert mod.fill_from_value_checks(found, counts, visibles, rows, checks,
+                                      ["totalDisplay"]) == ["totalDisplay"]
+    assert found == {"totalDisplay": _HEADER}
+    # Two elements showing the same text name neither.
+    rows[0]["checks"][_BADGE]["text"] = "$49.00"
+    found = {}
+    assert mod.fill_from_value_checks(found, {}, {}, rows, checks, ["totalDisplay"]) == []

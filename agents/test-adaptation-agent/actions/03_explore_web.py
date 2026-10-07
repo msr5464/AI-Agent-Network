@@ -137,7 +137,7 @@ and stop. A human will confirm that last step. Do not look for a way around this
     return f"""You are exploring a web application to record how one of its flows works NOW.
 
 ## The product change (written by a human on the team)
-{plan.get('note_masked', '')}
+{plan.get('note', '')}
 
 ## The change items, already classified
 {items}

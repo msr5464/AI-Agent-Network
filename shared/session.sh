@@ -233,6 +233,14 @@ finalize_metrics() {
   elif [[ -f "$AUDIT_DIR/.crashed" || $rc -ne 0 ]]; then
     run_status="failed"
   fi
+  # A run that stopped on a failing step leaves no verdict, so the session reader
+  # had nothing to tell it from one still going: a run whose step 02 exited 1
+  # replayed as "running", with no Cancel button because it had ended. The
+  # healing and adaptation agents' ERR traps write this with a line number; the
+  # authoring agent has no ERR trap, so it is written here for every agent.
+  if [[ $rc -ne 0 && ! -f "$AUDIT_DIR/.cancelled" && ! -f "$AUDIT_DIR/.crashed" ]]; then
+    echo "Exited with $rc" > "$AUDIT_DIR/.crashed"
+  fi
   RUN_STATUS="$run_status" AUDIT_DIR="$AUDIT_DIR" \
     python3 -m qa_agents_server.analytics "$AUDIT_DIR" >/dev/null 2>&1 || true
   return $rc

@@ -29,12 +29,10 @@ from shared import workspace as workspace_helper
 from shared.log import log as _log
 from shared.log import blocked
 from shared import baseline as baseline_store
-from shared import properties_file
+from shared import module_index, properties_file
 from shared.slack import send_slack as _send_slack
 from shared.git import run_git as _run_git
 from shared.github import create_pr
-from shared.credential_masking import mask_credentials
-from shared.credential_extraction import credentials_from_plan
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AUDIT_DIR  = Path(os.environ["AUDIT_DIR"])
@@ -388,8 +386,13 @@ def _review_notes(gen_data: dict, regression: dict) -> str:
 
     warnings = (
         ("**Possible duplicates**",
-         [f"`{d['new']}` repeats `{d['like']}` (similarity {d['ratio']})"
-          for d in gen_data.get("near_duplicates") or []]),
+         [module_index.describe_duplicates(d) for d in gen_data.get("near_duplicates") or []]),
+        ("**Locators still a guess** (step 02 never counted them at one visible element)",
+         [f"`{g['page']}.{g['name']}` = `{g['selector']}`"
+          for g in gen_data.get("guessed_locators") or [] if g.get("result") == "still a guess"]),
+        ("**Pages rebuilt mid-flow** (continue from the page the previous step returned)",
+         [f"`{r['method']}` constructs `{r['page']}`"
+          for r in gen_data.get("rebuilt_pages") or []]),
         ("**Existing API removed or changed**",
          [f"`{Path(p).name}`: {', '.join(gone)}"
           for p, gone in (gen_data.get("changed_existing_api") or {}).items()]),
@@ -407,12 +410,10 @@ def _review_notes(gen_data: dict, regression: dict) -> str:
     shape = gen_data.get("test_shape") or {}
     guideline = shape.get("guideline_lines") or 0
     long_tests = [(name, m) for name, m in sorted((shape.get("methods") or {}).items())
-                  if (guideline and m["body_lines"] > guideline) or m["page_action_chains"]]
+                  if guideline and m["body_lines"] > guideline]
     if long_tests:
         parts.append(f"**Test length** (guideline: about {guideline} lines)\n" + "".join(
-            f"- `{name}`: {m['body_lines']} lines"
-            + (f"; {len(m['page_action_chains'])} step(s) drive a page object call by call"
-               if m["page_action_chains"] else "") + "\n" for name, m in long_tests))
+            f"- `{name}`: {m['body_lines']} lines\n" for name, m in long_tests))
 
     if not parts:
         return ""
@@ -517,7 +518,7 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
             "Please review the generated code manually."
         )
 
-    # Original test case — masked and shown up top so a reviewer sees WHAT was
+    # Original test case, shown up top so a reviewer sees WHAT was
     # actually asked for before anything else, without needing to dig through
     # the audit trail. Best-effort: absent entirely if the input file can no
     # longer be found (see _read_original_test_case) or is empty.
@@ -530,13 +531,12 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
             plan = {}
         raw_case = _read_original_test_case(plan)
         if raw_case.strip():
-            masked_case = mask_credentials(raw_case, credentials_from_plan(plan))
             test_case_section = f"""### 🎯 Request / Context
 <details open>
-<summary>Original request (credentials masked)</summary>
+<summary>Original request</summary>
 
 ```
-{masked_case.strip()}
+{raw_case.strip()}
 ```
 </details>
 

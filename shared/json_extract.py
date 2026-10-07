@@ -2,22 +2,27 @@
 import json
 import re
 
+# strict=False lets a raw newline or tab inside a string value through. A codegen
+# reply escaped every line break of a Java file but one, and strict parsing threw
+# away both files of that batch over it.
+_DECODER = json.JSONDecoder(strict=False)
+
 
 def extract_json(text: str):
     # The closing fence is optional: models sometimes open ```json and never close it.
     m = re.search(r"```json\s*([\s\S]*?)\s*(?:```|$)", text or "")
     if m:
         try:
-            return json.loads(m.group(1))
+            return _DECODER.decode(m.group(1))
         except json.JSONDecodeError:
             pass
     # Prose before the object can carry braces of its own ("/cart/checkout/{uuid}"),
     # so decode from every "{" and keep the largest object, not the first match.
     text = text or ""
-    decoder, best, i = json.JSONDecoder(), None, text.find("{")
+    best, i = None, text.find("{")
     while i != -1:
         try:
-            obj, end = decoder.raw_decode(text, i)
+            obj, end = _DECODER.raw_decode(text, i)
         except json.JSONDecodeError:
             i = text.find("{", i + 1)
             continue

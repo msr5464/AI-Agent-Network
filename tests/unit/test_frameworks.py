@@ -280,6 +280,30 @@ def test_format_for_prompt_survives_sparse_records(framework, monkeypatch):
     assert isinstance(rendered, str)
 
 
+def test_the_values_a_test_typed_reach_the_prompt(tmp_path, monkeypatch):
+    """Observed: shifted test data typed "India" as a card number. The timeline
+    showed selectors only, and a keystroke-typed value was not even parsed, so
+    three fix attempts never saw it."""
+    import json, zipfile
+    monkeypatch.setenv("AUTOMATION_FRAMEWORK", "playwright")
+    monkeypatch.setenv("FRAMEWORK_DIR", "")
+    events = [{"type": "before", "callId": str(i), "class": "Frame", "method": m,
+               "params": {"selector": s, **p}, "startTime": i}
+              for i, (m, s, p) in enumerate([
+                  ("fill", "#address", {"value": "Bangalore"}),
+                  ("type", "#card-number", {"text": "India"}),
+                  ("fill", "#password", {"value": "Secret1"}),
+                  ("click", "label[for='690']", {})])]
+    trace = tmp_path / "t.zip"
+    with zipfile.ZipFile(trace, "w") as z:
+        z.writestr("trace.trace", "\n".join(json.dumps(e) for e in events))
+    from shared import telemetry
+    rendered = telemetry.format_for_prompt(telemetry.read_actions(trace))
+    assert "#card-number  <- 'India'" in rendered
+    assert "#address  <- 'Bangalore'" in rendered
+    assert "Secret1" not in rendered and "#password  <- (7 characters, not shown)" in rendered
+
+
 @ALL
 def test_discover_is_quiet_when_there_is_nothing(framework, tmp_path, monkeypatch):
     monkeypatch.setenv("AUTOMATION_FRAMEWORK", framework)

@@ -195,6 +195,10 @@ def _derive_status(session_dir: Path, ship_data: Optional[Dict],
     # The server stopped this run when it shut down or reaped it on boot.
     if (session_dir / ".interrupted").exists():
         return "interrupted"
+    # A step exited non-zero and the run stopped there (shared/session.sh). After
+    # cancelled and interrupted: either one also leaves a run that exited non-zero.
+    if (session_dir / ".crashed").exists():
+        return "failed"
 
     # No ship.json — check if any step JSON carries an error flag. A step that
     # says it is being retried is excluded: its file is a mid-run snapshot, and

@@ -200,3 +200,23 @@ class TestTestsReaching:
         # Without names the class is the unit: both tests construct the helper.
         whole = br.tests_reaching(str(tmp_path), [helper])
         assert whole["tests"] == ["automation.shop.PayTest#pays", "automation.shop.RefundTest#refunds"]
+
+    def test_a_page_method_called_through_the_helpers_field_narrows_too(self, tmp_path):
+        """A web test holds each page on its helper's field: `shop.cartPage.pay()`.
+        Unfollowed, that call kept every such test in, and a change to one page
+        method re-ran the whole module."""
+        main = tmp_path / "src" / "main" / "java" / "automation" / "modules" / "shop"
+        test = tmp_path / "src" / "test" / "java" / "automation" / "shop"
+        _java(main / "web" / "CartPage.java", "automation.modules.shop.web", "CartPage",
+              "    public void pay() { }\n    public void empty() { }")
+        _java(main / "ShopHelper.java", "automation.modules.shop", "ShopHelper",
+              "    public CartPage cartPage;")
+        _java(test / "PayTest.java", "automation.shop", "PayTest",
+              "    @Test public void pays() { ShopHelper shop = new ShopHelper(); shop.cartPage.pay(); }")
+        _java(test / "EmptyTest.java", "automation.shop", "EmptyTest",
+              "    @Test public void empties() { ShopHelper shop = new ShopHelper(); shop.cartPage.empty(); }")
+        br._cache.clear()
+        page = "src/main/java/automation/modules/shop/web/CartPage.java"
+
+        narrowed = br.tests_reaching(str(tmp_path), [page], {page: ["pay"]})
+        assert narrowed["tests"] == ["automation.shop.PayTest#pays"]

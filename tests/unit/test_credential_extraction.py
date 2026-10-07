@@ -1,4 +1,4 @@
-"""Credentials the run header masks must be credentials the pipeline can find.
+"""Credentials a test case states must be credentials the pipeline can find.
 
 The case these guard: an input file whose steps read
 
@@ -6,9 +6,8 @@ The case these guard: an input file whose steps read
     username=qa.user@example.com
     password=Sample@Pass123
 
-had both lines masked in the run header (credential_masking accepts `:` and `=`)
-and was then rejected by step 02 with "no credentials found in input file",
-because step 01's and step 02's own regexes only accepted `:` or whitespace.
+was rejected by step 02 with "no credentials found in input file", because step
+01's and step 02's own regexes only accepted `:` or whitespace.
 """
 import sys
 from pathlib import Path
@@ -19,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from shared.credential_extraction import (  # noqa: E402
     credentials_from_plan, extract_credentials, has_login_credentials)
-from shared.credential_masking import mask_credential_lines  # noqa: E402
 
 NAUKRI_INPUT = """Module: Naukari
 Type: web
@@ -84,43 +82,21 @@ class TestLoginReadiness:
         assert has_login_credentials("Username: eve\nPassword: p\n") is True
 
 
-class TestMaskingParity:
-    """Anything the masker treats as a credential line must be extractable —
-    the two disagreeing is exactly what caused the false error."""
+class TestLabelShapes:
+    """Every way a test case writes a credential label is extracted."""
 
     @pytest.mark.parametrize("line", [
         "username=carl@x.io", "Username: carl@x.io", "user name = carl@x.io",
         "email=carl@x.io", "USERNAME:carl@x.io",
     ])
-    def test_every_masked_username_line_is_also_extracted(self, line):
-        assert "***MASKED***" in mask_credential_lines(line)
+    def test_every_username_line_is_extracted(self, line):
         assert extract_credentials(line).get("username") == "carl@x.io"
 
     @pytest.mark.parametrize("line", [
         "password=hunter2", "Password: hunter2", "pwd = hunter2", "passwd:hunter2",
     ])
-    def test_every_masked_password_line_is_also_extracted(self, line):
-        assert "***MASKED***" in mask_credential_lines(line)
+    def test_every_password_line_is_extracted(self, line):
         assert extract_credentials(line).get("password") == "hunter2"
-
-    def test_every_secret_in_a_one_line_curl_is_masked(self):
-        # Queue files now carry curl snippets, and the PR body shows the input.
-        curl = ('curl -X POST https://api.x.io/pay -H "Authorization: Bearer abc123" '
-                '-H "x-api-key: k-999" -d \'{"password": "hunter2"}\'')
-        masked = mask_credential_lines(curl)
-        for secret in ("abc123", "k-999", "hunter2"):
-            assert secret not in masked, f"{secret} survived masking: {masked}"
-        assert "https://api.x.io/pay" in masked, "the request itself must stay readable"
-
-    def test_a_numeric_user_id_in_a_request_body_is_not_masked(self):
-        # The saucedemo_api_todos example logged `"userId": ***MASKED***`, eating the
-        # `1,` and printing a request body that no longer parses.
-        body = '-d \'{"id": 1, "userId": 1, "title": "Buy Sauce Labs Backpack"}\''
-        assert mask_credential_lines(body) == body
-
-    @pytest.mark.parametrize("line", ["otp: 123456", "password: 1234", '"api_key": 42'])
-    def test_a_numeric_secret_is_still_masked(self, line):
-        assert "***MASKED***" in mask_credential_lines(line)
 
 
 class TestCredentialsFromPlan:
@@ -170,14 +146,3 @@ class TestCredentialsFromPlan:
     def test_an_explicit_input_file_overrides_the_plans(self, tmp_path):
         plan = {"_input_file": str(tmp_path / "gone.txt")}
         assert credentials_from_plan(plan, self._input(tmp_path))["username"] == "qa.user@example.com"
-
-
-def test_card_details_are_masked_like_the_otp_beside_them():
-    """The run header printed a test case's card number and CVV while masking the
-    bank OTP next to them. A card number in digit groups is one value: masked a
-    token at a time, three of its four groups were left showing."""
-    text = ("Enter card number: 4111 1111 1111 1111\nExpiry: 01/35\nCVV: 123\n"
-            "Enter Bank OTP: 112233 to finish\nAddress: Bangalore, India")
-    assert mask_credential_lines(text) == (
-        "Enter card number: ***MASKED***\nExpiry: ***MASKED***\nCVV: ***MASKED***\n"
-        "Enter Bank OTP: ***MASKED*** to finish\nAddress: Bangalore, India")

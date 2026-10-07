@@ -16,7 +16,6 @@ import json
 import os
 import shlex
 
-from shared.credential_masking import mask_credential_lines
 import signal
 import subprocess
 import threading
@@ -71,6 +70,8 @@ class ClaudeResult(NamedTuple):
     browser_calls:  Optional[int] = None
     browser_ok:     Optional[int] = None
     browser_error:  str = ""
+    # How many times restart_if_slow killed a stalled stream and sent the call again.
+    slow_restarts:  int = 0
 
     @property
     def ok(self) -> bool:
@@ -220,6 +221,12 @@ class _StreamJsonDecoder:
         # Usage reported by the CLI in its `result` / `system.init` events. The
         # CLI computes cost itself, so no rate card is needed on our side.
         self.usage: dict = {}
+        # For the slow-stream watchdog: tokens seen arriving (answer text from
+        # partial messages, thinking from the CLI's running estimate), whether a
+        # tool is running, and when the CLI last started a retry of its own.
+        self.tokens_seen:   float = 0.0
+        self.awaiting_tool: bool = False
+        self.last_retry_at: float = float("-inf")
 
     def _note_navigation(self, block: dict) -> None:
         """Record the URL of a browser_navigate call, first occurrence wins.
@@ -280,6 +287,20 @@ class _StreamJsonDecoder:
         etype = ev.get("type")
         progress: list = []
 
+        if etype == "stream_event":
+            # --include-partial-messages: the answer as it is written. The whole
+            # message still arrives as an `assistant` event, which is what the text
+            # is rebuilt from, so a delta only counts towards the stream's speed.
+            delta = (ev.get("event") or {}).get("delta") or {}
+            written = delta.get("text") or delta.get("partial_json") or ""
+            if written:
+                self.tokens_seen += max(1.0, len(written) / 4)
+            return []
+
+        if etype == "system" and ev.get("subtype") == "thinking_tokens":
+            self.tokens_seen += float(ev.get("estimated_tokens_delta") or 0)
+            return []
+
         if etype == "assistant":
             content = (ev.get("message") or {}).get("content") or []
             for block in content:
@@ -292,6 +313,7 @@ class _StreamJsonDecoder:
                         progress.extend(text.splitlines())
                 elif block.get("type") == "tool_use":
                     self.tool_uses += 1
+                    self.awaiting_tool = True
                     self._note_navigation(block)
                     self._note_browser_call(block)
                     progress.append(f"→ {_describe_tool_use(block)}")
@@ -300,6 +322,7 @@ class _StreamJsonDecoder:
             content = (ev.get("message") or {}).get("content")
             for block in content if isinstance(content, list) else []:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
+                    self.awaiting_tool = False
                     self._note_browser_result(block)
 
         elif etype == "result":
@@ -322,6 +345,7 @@ class _StreamJsonDecoder:
                     )
 
         elif etype == "system" and ev.get("subtype") == "api_retry":
+            self.last_retry_at = time.monotonic()
             # The CLI retries an overloaded/rate-limited API up to max_retries,
             # and each retry regenerates the response FROM THE TOP. On a long
             # single-message call that is minutes of invisible rework, and an
@@ -344,6 +368,28 @@ class _StreamJsonDecoder:
         return self.result_text
 
 
+# ── Slow-stream watchdog ───────────────────────────────────────────────────────
+
+# Healthy single calls stream at a median of ~107 tokens/s, and 90% of them above
+# ~50. The stalls this exists for ran at 3-13 tokens/s for five to eleven minutes,
+# while the same request sent again ran at the usual speed.
+SLOW_WINDOW_S = 60
+SLOW_STREAM_TOKENS_PER_S = 20
+
+
+def _stream_rate(samples: list, now: float, decoder) -> Optional[float]:
+    """Tokens per second over the last SLOW_WINDOW_S, or None while that cannot be
+    judged: the window is not full yet, a tool is running, or the CLI is waiting out
+    a retry of its own."""
+    if decoder.awaiting_tool or now - decoder.last_retry_at < SLOW_WINDOW_S:
+        return None
+    before = [x for x in samples if x[0] <= now - SLOW_WINDOW_S]
+    if not before:
+        return None
+    then, seen = before[-1]
+    return (decoder.tokens_seen - seen) / (now - then)
+
+
 # ── Pipe streaming ─────────────────────────────────────────────────────────────
 
 def _stream_pipe(pipe, label: str, chunks: list, log_file, on_output=None,
@@ -351,7 +397,9 @@ def _stream_pipe(pipe, label: str, chunks: list, log_file, on_output=None,
     """Read lines from pipe, append to chunks, log, and call on_output callback."""
     for line in iter(pipe.readline, ""):
         chunks.append(line)
-        if log_file:
+        # A partial-message delta is a few characters of an answer the whole message
+        # repeats, one line each: thousands per call, and nothing to read afterwards.
+        if log_file and not line.startswith('{"type":"stream_event"'):
             log_file.write(f"[{label}] {line}")
             log_file.flush()
         if decoder is not None and label == "stdout":
@@ -382,6 +430,7 @@ def call_claude_ex(
     disable_slash_commands: bool = False,
     effort: str = None,
     setting_sources: str = None,
+    restart_if_slow: bool = False,
 ) -> ClaudeResult:
     """Call `claude -p <prompt> --model <model>` and report the full outcome.
 
@@ -413,6 +462,10 @@ def call_claude_ex(
       disable_slash_commands — pass --disable-slash-commands, dropping the user's
                           skills and slash commands from the system prompt. Nothing
                           run headless can invoke them anyway.
+      restart_if_slow   — with stream_json: when the stream has averaged under
+                          SLOW_STREAM_TOKENS_PER_S for SLOW_WINDOW_S, kill the call
+                          and send it once more. Only for calls whose tools return at
+                          once: a browser step's tool time would read as a stall.
       effort            — pass --effort (low | medium | high | xhigh | max). Unset,
                           the call inherits the effortLevel in whoever-runs-it's
                           ~/.claude/settings.json, so thinking time varies by machine.
@@ -469,9 +522,15 @@ def call_claude_ex(
         # (Google Drive, etc.), paying connection and tool-registry cost on every
         # step that only ever needs the browser.
         cmd.append("--strict-mcp-config")
+    watch = bool(stream_json and restart_if_slow)
     if stream_json:
         # --verbose is required by the CLI whenever stream-json is combined with -p.
         cmd.extend(["--output-format", "stream-json", "--verbose"])
+        if watch:
+            # The answer as it is written. Without it nothing arrives between the
+            # start of a message and its end, and a long healthy answer looks like
+            # a stall.
+            cmd.append("--include-partial-messages")
     else:
         # Plain `-p` prints the answer and nothing else — no usage, no cost. The
         # json envelope carries the same text in ev["result"] plus the accounting,
@@ -492,6 +551,7 @@ def call_claude_ex(
     stdout_chunks: list = []
     stderr_chunks: list = []
     timed_out = {"hit": False}
+    slow = {"rate": None, "restarts": 0}
     started = time.monotonic()
 
     def _run(log_file):
@@ -508,12 +568,7 @@ def call_claude_ex(
             start_new_session=True,
         )
         if log_file:
-            # The command line carries `-p <prompt>`, so a prompt holding a
-            # password put that password on disk. Mask the LOG COPY only — the
-            # prompt actually sent is untouched, because redacting that would
-            # silently break any flow that legitimately needs the value.
-            log_file.write(f"cwd: {cwd}\ncommand: "
-                           f"{mask_credential_lines(shlex.join(cmd))}\n\n")
+            log_file.write(f"cwd: {cwd}\ncommand: {shlex.join(cmd)}\n\n")
             log_file.flush()
 
         def _kill_group(sig=signal.SIGKILL):
@@ -566,11 +621,29 @@ def call_claude_ex(
 
         try:
             try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out["hit"] = True
-                _kill_group()
-                proc.wait()
+                began, samples = time.monotonic(), []
+                while True:
+                    try:
+                        proc.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    now = time.monotonic()
+                    if now - began >= timeout:
+                        timed_out["hit"] = True
+                        _kill_group()
+                        proc.wait()
+                        break
+                    if not watch or slow["restarts"]:
+                        continue
+                    samples.append((now, decoder.tokens_seen))
+                    samples = [x for x in samples if x[0] >= now - SLOW_WINDOW_S - 5]
+                    rate = _stream_rate(samples, now, decoder)
+                    if rate is not None and rate < SLOW_STREAM_TOKENS_PER_S:
+                        slow["rate"] = rate
+                        _kill_group()
+                        proc.wait()
+                        break
             except BaseException:
                 # Ctrl-C, or anything else unwinding this frame: never leave the
                 # child group running behind us.
@@ -594,11 +667,27 @@ def call_claude_ex(
             if proc.poll() is None:
                 _kill_group()
 
+    def _run_once_more_if_slow(log_file):
+        returncode = _run(log_file)
+        if slow["rate"] is None:
+            return returncode
+        note = (f"API retry — stream too slow: {slow['rate']:.0f} tokens/s over the last "
+                f"{SLOW_WINDOW_S}s (healthy calls run at ~100); sending the call again")
+        if on_output:
+            on_output("stdout", note)
+        if log_file:
+            log_file.write(f"\n--- {note} ---\n\n")
+        slow["restarts"] += 1
+        stdout_chunks.clear()
+        stderr_chunks.clear()
+        decoder.__init__()
+        return _run(log_file)
+
     if log_path:
         with log_path.open("w", encoding="utf-8") as log_file:
-            returncode = _run(log_file)
+            returncode = _run_once_more_if_slow(log_file)
     else:
-        returncode = _run(None)
+        returncode = _run_once_more_if_slow(None)
 
     stderr = "".join(stderr_chunks)
     duration = time.monotonic() - started
@@ -646,6 +735,7 @@ def call_claude_ex(
         browser_calls=decoder.browser_calls if decoder is not None else None,
         browser_ok=decoder.browser_ok if decoder is not None else None,
         browser_error=decoder.browser_error if decoder is not None else "",
+        slow_restarts=slow["restarts"],
     )
 
     # One choke point instruments every call site. Best-effort by construction —

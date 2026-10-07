@@ -95,6 +95,38 @@ def test_describe_lists_each_class_with_its_members(tmp_path):
     assert "wiring" not in text
 
 
+def test_describe_lists_a_helpers_page_fields_with_their_types(tmp_path):
+    module = tmp_path / "src/main/java/automation/modules/shop"
+    module.mkdir(parents=True)
+    (module / "ShopHelper.java").write_text(HELPER.replace(
+        "{\n    public ShopHelper(Config config)",
+        "{\n    public CartPage cartPage;\n    public static final String KEY = \"k\";\n"
+        "    private Wiring wiring;\n\n    public ShopHelper(Config config)", 1))
+    text = mi.describe_module(tmp_path, "src/main/java/automation/modules/shop")
+    assert "    page fields: CartPage cartPage" in text      # the page a test continues from
+    assert "KEY" not in text and "Wiring" not in text
+
+
+def test_a_page_constructed_mid_flow_is_a_rebuilt_page():
+    # Both operations build their own CartPage instead of continuing from the
+    # page the previous step returned.
+    assert mi.rebuilt_pages(HELPER, {"CartPage"}) == [
+        {"method": "ShopHelper.addToCart(Map<String,String>...)", "page": "CartPage"},
+        {"method": "ShopHelper.checkout(ShopData)", "page": "CartPage"},
+    ]
+    assert mi.rebuilt_pages(HELPER, {"CartPage"}, only=["ShopHelper.checkout(ShopData)"]) == [
+        {"method": "ShopHelper.checkout(ShopData)", "page": "CartPage"}]
+
+
+def test_the_first_page_after_navigating_is_not_rebuilt():
+    entry = HELPER.replace("CartPage cart = new CartPage(config);\n        cart.fillDetails",
+                           'BrowserHelper.navigateTo(config, url);\n'
+                           '        CartPage cart = new CartPage(config);\n        cart.fillDetails')
+    assert [r["method"] for r in mi.rebuilt_pages(entry, {"CartPage"})] == [
+        "ShopHelper.addToCart(Map<String,String>...)"]
+    assert mi.rebuilt_pages(HELPER, set()) == []       # not a page class: not a page
+
+
 def test_changed_methods_tells_a_changed_body_from_an_added_overload():
     after = HELPER.replace("cart.confirm();", "cart.confirm(true);").replace(
         "    private void wiring() {}",
@@ -129,8 +161,30 @@ def test_a_copy_with_only_literals_changed_is_a_near_duplicate():
         "    private void wiring() {}")
     found = mi.near_duplicates({"Shop.java": copy}, {"Shop.java": HELPER},
                                only={"Shop.java": ["ShopHelper.checkoutExpress(ShopData)"]})
-    assert found == [{"new": "ShopHelper.checkoutExpress(ShopData)",
-                      "like": "ShopHelper.checkout(ShopData)", "ratio": 1.0}]
+    assert found == [{"methods": ["ShopHelper.checkout(ShopData)",
+                                  "ShopHelper.checkoutExpress(ShopData)"], "ratio": 1.0}]
+
+
+def test_one_method_in_four_classes_is_one_finding():
+    """Observed: normalizeAmount() written into four page objects was logged as six
+    pairs. It is one method, written four times."""
+    body = ("    private String normalizeAmount(String raw)\n    {\n"
+            "        String s = raw.replaceAll(\"[^0-9.]\", \"\");\n"
+            "        int dot = s.lastIndexOf('.');\n"
+            "        return dot < 0 ? s : s.substring(0, dot);\n    }\n")
+    pages = {f"{name}.java": f"public class {name} extends BasePage {{\n{body}}}\n"
+             for name in ("SnapPage", "CardPage", "BankPage", "SuccessPage")}
+    found = mi.near_duplicates(pages, {})
+    assert found == [{"methods": sorted(f"{n}.normalizeAmount(String)"
+                                        for n in ("SnapPage", "CardPage", "BankPage", "SuccessPage")),
+                      "ratio": 1.0}]
+    assert mi.describe_duplicates(found[0]) == (
+        "`normalizeAmount(String)` is written 4 times (identical): "
+        "BankPage, CardPage, SnapPage, SuccessPage")
+    copies = mi.copied_methods(pages)
+    assert len(copies) == 1 and len(copies[0]) == 4
+    assert mi.copied_methods({"SnapPage.java": pages["SnapPage.java"]}) == [], \
+        "one file is not a copy"
 
 
 def test_methods_doing_different_things_are_not_duplicates():

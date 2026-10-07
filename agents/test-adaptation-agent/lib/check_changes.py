@@ -30,7 +30,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from shared import assertion_graph, code_analyzer, value_match
 from shared.code_analyzer import split_class_members, without_comments
-from shared.credential_masking import mask_credential_lines
 
 # Kinds that may change what a test checks — each one only because the note
 # says so, and only for the checks the model declares.
@@ -131,8 +130,8 @@ def list_lines(checks: List[dict], extra: Optional[Callable[[dict], str]] = None
 # ── What the explorer reported ────────────────────────────────────────────────
 
 def clean_observed(text) -> str:
-    """Page text as it may appear in a prompt or a PR: one short, masked line."""
-    text = mask_credential_lines(" ".join(str(text or "").split()))
+    """Page text as it may appear in a prompt or a PR: one short line."""
+    text = " ".join(str(text or "").split())
     return text[:OBSERVED_LIMIT] + ("…" if len(text) > OBSERVED_LIMIT else "")
 
 

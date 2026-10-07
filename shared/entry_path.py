@@ -125,6 +125,72 @@ _CSV_READ = re.compile(
     r"\b(\w*[Cc]sv\w*)\s*\(\s*\"([^\"]+)\"\s*,\s*\"([^\"]+)\"\s*,\s*\"([^\"]+)\"\s*(,[^;]*)?\)")
 
 
+def _tail_args(tail: str) -> List[tuple]:
+    """The arguments in `tail`, the text after a CSV read's key column from its
+    comma on, up to the call's own closing parenthesis.
+
+    [(text, start, end)]: `start` is the offset of the comma before the argument,
+    `end` the offset just past it. `_CSV_READ` runs on to the last `)` before a
+    `;`, so a chained `.get("x")` would otherwise be read as one more argument.
+    """
+    args, depth, quote, comma, i = [], 0, "", None, 0
+    while i < len(tail):
+        ch = tail[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            if comma is not None:
+                args.append((tail[comma + 1:i].strip(), comma, i))
+            comma = i
+        i += 1
+    if comma is not None:
+        args.append((tail[comma + 1:i].strip(), comma, i))
+    return args
+
+
+def csv_reads(source: str) -> List[Dict]:
+    """Every CSV row lookup in `source`, in order.
+
+    [{"module", "file", "column", "value", "environment_scoped", "filter_span"}].
+    `value` is the key value when it is a string literal, "" when it is a variable.
+    The environment-aware overload takes an argument after the key value and
+    requires the row's environment column to match it; the four-argument form
+    does not look at environment at all. `filter_span` is the (start, end) in
+    `source` of that extra argument with its leading comma, (0, 0) without one.
+    """
+    source = source or ""
+    reads = []
+    for match in _CSV_READ.finditer(source):
+        # A Javadoc or line-comment example is not a read.
+        if source[source.rfind("\n", 0, match.start()) + 1:match.start()].lstrip() \
+                .startswith(("*", "//", "/*")):
+            continue
+        _call, module, csv_file, column, tail = match.groups()
+        args = _tail_args(tail or "")
+        value = args[0][0] if args else ""
+        literal = len(value) >= 2 and value[0] == value[-1] == '"'
+        scoped = len(args) > 1
+        base = match.start(5)
+        reads.append({
+            "module": module, "file": csv_file, "column": column,
+            "value": value[1:-1] if literal else "",
+            "environment_scoped": scoped,
+            "filter_span": (base + args[1][1], base + args[-1][2]) if scoped else (0, 0),
+        })
+    return reads
+
+
 def _data_source(helper_source: str, data_method: str) -> Dict:
     """Where `data_method` actually reads its row from. {} when it cannot be read.
 
@@ -134,17 +200,16 @@ def _data_source(helper_source: str, data_method: str) -> Dict:
     test itself opens. Without it a caller has to scan for a file that looks
     right, and "looks right" is how you sign in as the wrong user.
     """
-    body = method_body(helper_source or "", data_method or "")
-    match = _CSV_READ.search(body)
-    if not match:
+    reads = csv_reads(method_body(helper_source or "", data_method or ""))
+    if not reads:
         return {}
-    _call, module, csv_file, column, extra = match.groups()
+    read = reads[0]
     return {
-        "kind": "csv", "module": module, "file": csv_file, "column": column,
-        # The environment-aware overload takes a fifth argument and requires the
-        # row to match it. The four-argument form does not look at environment
-        # at all, so demanding one would reject a perfectly good row.
-        "environment_scoped": bool(extra and extra.strip(" ,")),
+        "kind": "csv", "module": read["module"], "file": read["file"],
+        "column": read["column"],
+        # Demanding an environment of a four-argument read would reject a
+        # perfectly good row.
+        "environment_scoped": read["environment_scoped"],
     }
 
 

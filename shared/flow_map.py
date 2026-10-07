@@ -397,6 +397,41 @@ def read_evidence(path) -> List[Dict]:
     return rows
 
 
+# Words that name a control's kind, not which control it is.
+_CONTROL_WORDS = {"button", "btn", "field", "input", "icon", "link", "text", "label",
+                  "option", "tab", "the", "and"}
+
+
+def naming_words(text: str) -> set:
+    """camelCase or prose split into lowercase words. Plainer than
+    check_provenance.subject_words, which drops "checkout" as a form of "check"."""
+    return {w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+", text or "")
+            if len(w) >= 3} - _CONTROL_WORDS
+
+
+def clicked_controls(rows: List[Dict]) -> List[Dict]:
+    """Every click the helpers recorded on exactly one visible element, in order:
+    {"sel", "text", ...}, the selector counted where the control lives."""
+    clicks = [r["clicked"] for r in rows or [] if isinstance(r.get("clicked"), dict)]
+    return [c for c in clicks
+            if c.get("sel") and c.get("total") == 1 and c.get("visible") == 1]
+
+
+def clicks_named(rows: List[Dict], name: str) -> List[Dict]:
+    """The recorded clicks whose text shares a word with a locator name, one per
+    selector, most shared words first. Each carries "shared", the word count.
+
+    `PageName.field` is matched on the field. `buyNowButton` shares one word with
+    "Pay now" and two with "BUY NOW".
+    """
+    words, best = naming_words(name.rsplit(".", 1)[-1]), {}
+    for c in clicked_controls(rows):
+        n = len(words & naming_words(c.get("text") or ""))
+        if n and n > best.get(c["sel"], {}).get("shared", 0):
+            best[c["sel"]] = {**c, "shared": n}
+    return sorted(best.values(), key=lambda c: -c["shared"])
+
+
 def apply_evidence(flow: Dict, rows: List[Dict]) -> Dict:
     """Fold what the browser helpers measured into a parsed flow map.
 

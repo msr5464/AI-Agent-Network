@@ -324,11 +324,10 @@ def audit(source: str, expected: Dict[str, List[str]]) -> Dict[str, dict]:
 
 # How long a test method normally is, in lines between its braces. A guideline the
 # prompt states and the run measures and reports — never a gate. A longer method
-# usually means a sequence that belongs in a helper operation; sometimes the
-# input's own steps and checks really need the room.
+# usually means small page actions that belong in one page method, or a sequence
+# that belongs in a helper operation; sometimes the input's own steps and checks
+# really need the room.
 BODY_LINES_GUIDELINE = 30
-
-_DECLARED = re.compile(r"\b([A-Z]\w*)\s+([a-z]\w*)\s*=")
 
 
 def body_lines(body: str) -> int:
@@ -336,37 +335,13 @@ def body_lines(body: str) -> int:
     return len((body or "").strip("\n").splitlines()) if (body or "").strip() else 0
 
 
-def page_action_chains(body: str, page_classes) -> List[Dict]:
-    """Steps that drive a page object call by call instead of through an operation.
+def shape(source: str, skip=()) -> Dict[str, Dict]:
+    """{test method: {"body_lines"}} for the methods not in `skip`.
 
-    A step is everything from one logStep to the next. Within it, two or more
-    calls that act on variables declared as a page class (reads like
-    `getTotal()` excluded) are a sequence the module's helper should own.
+    A step that makes several page calls is not measured: a web test continues
+    from the page each step returned, so calling the next action on that page is
+    the shape it is meant to have.
     """
-    from shared.edit_guards import _QUERY_CALLEE
-    pages = set(page_classes or ())
-    if not pages:
-        return []
-    blanked = _blank_strings(body or "")
-    page_vars = {var for klass, var in _DECLARED.findall(blanked) if klass in pages}
-    if not page_vars:
-        return []
-    starts = [m.start() for m in LOG_STEP.finditer(body or "")]
-    bounds = list(zip([0] + starts, starts + [len(body or "")]))
-    chains = []
-    for begin, end in bounds:
-        calls = [f"{receiver}.{callee}" for receiver, callee
-                 in _CALL_ON_RECEIVER.findall(blanked[begin:end])
-                 if receiver in page_vars and not _QUERY_CALLEE.search(callee)]
-        if len(calls) >= 2:
-            narration = log_steps((body or "")[begin:end])
-            chains.append({"step": narration[0] if narration else "", "calls": calls})
-    return chains
-
-
-def shape(source: str, page_classes=(), skip=()) -> Dict[str, Dict]:
-    """{test method: {"body_lines", "page_action_chains"}} for the methods not in `skip`."""
     skipped = set(skip or ())
-    return {name: {"body_lines": body_lines(body),
-                   "page_action_chains": page_action_chains(body, page_classes)}
+    return {name: {"body_lines": body_lines(body)}
             for name, body in test_bodies(source).items() if name not in skipped}

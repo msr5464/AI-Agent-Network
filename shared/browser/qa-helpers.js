@@ -22,6 +22,18 @@ window.__qa = (() => {
   const text = el => (el.type === 'password' ? ''
     : (el.innerText || el.value || el.getAttribute('aria-label') || ''))
     .trim().replace(/\s+/g, ' ').slice(0, 60);
+  // Which element something resolved to, stable while it stays in this document,
+  // so Python can tell that two spellings name one element. A run kept a close
+  // button's selector that was unique only while an overlay was closed, for the
+  // overlay's own close button, which it had clicked through another selector.
+  // The document token keeps a reloaded frame's numbers from colliding.
+  const ids = new WeakMap();
+  const doc = Math.random().toString(36).slice(2, 8);
+  let lastId = 0;
+  const uid = el => {
+    if (!ids.has(el)) ids.set(el, doc + ':' + (++lastId));
+    return ids.get(el);
+  };
   const count = sel => {
     try {
       const m = [...document.querySelectorAll(sel)];
@@ -91,8 +103,9 @@ window.__qa = (() => {
     if (!window.__qaTyped || !el || !el.matches
         || !el.matches('input,textarea,select,[contenteditable]')) return;
     const password = el.type === 'password';
-    window.__qaTyped({ sel: best(el).sel, password, value: password ? null
-      : String(el.isContentEditable ? el.innerText : el.value).slice(0, 200) });
+    const b = best(el);
+    window.__qaTyped({ sel: b.sel, total: b.total, visible: b.visible, uid: uid(el), password,
+      value: password ? null : String(el.isContentEditable ? el.innerText : el.value).slice(0, 200) });
   };
   document.addEventListener('input', typed, true);
   document.addEventListener('change', typed, true);
@@ -105,12 +118,12 @@ window.__qa = (() => {
     let el = e.target;
     while (el && el.nodeType === 1 && el !== document.body && !control(el)) el = el.parentElement;
     if (!window.__qaClicked || !el || el.nodeType !== 1 || el === document.body) return;
-    window.__qaClicked({ ...best(el), text: text(el) });
+    window.__qaClicked({ ...best(el), text: text(el), uid: uid(el) });
   };
   document.addEventListener('click', clicked, true);
 
   return {
-    vis, count, text, best,
+    vis, count, text, best, uid,
 
     // Rule 2a + 2b + 2c in one call: every visible interactive element — and, with
     // `texts`, every visible element holding its own text, for reading values —
@@ -125,7 +138,7 @@ window.__qa = (() => {
         .filter(el => (control(el) || (texts && ownText(el))) && vis(el))
         .slice(0, limit)
         .map(el => {
-          const o = { tag: el.tagName.toLowerCase(), text: text(el), ...best(el) };
+          const o = { tag: el.tagName.toLowerCase(), text: text(el), ...best(el), uid: uid(el) };
           const type = el.getAttribute('type');
           if (type) o.type = type;
           // No unique selector of its own: what the user reads next to it, so a

@@ -72,7 +72,10 @@ class PlaywrightTelemetryParser(TelemetryParser):
                 "action": name,
                 "selector": params.get("selector", ""),
                 "url": params.get("url", ""),
-                "value": str(params.get("value", ""))[:60],
+                # fill() sends `value`; type() and pressSequentially() send `text`.
+                # Reading only the first left every keystroke-typed field blank in the
+                # timeline, which hid a card number field that was typed "India".
+                "value": str(params.get("value") or params.get("text") or "")[:60],
                 "error": error.splitlines()[0] if error else "",
                 "duration": duration,
             })

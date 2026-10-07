@@ -56,7 +56,9 @@ exports.default = async ({ page }) => {
     await page.exposeBinding('__qaTyped', async ({ frame }, t) => {
       const p = await prefix(frame).catch(() => null);
       note({ typed: { sel: t && t.sel && p !== null ? p + t.sel : null,
-                      value: t ? t.value : null, password: !!(t && t.password) } });
+                      value: t ? t.value : null, password: !!(t && t.password),
+                      total: t ? t.total : null, visible: t ? t.visible : null,
+                      uid: t ? t.uid : null } });
     }).catch(() => {});
     await page.exposeBinding('__qaClicked', async ({ frame }, c) => {
       const p = await prefix(frame).catch(() => null);
@@ -139,6 +141,13 @@ exports.default = async ({ page }) => {
     return useful.length ? useful : frames;
   };
 
+  // Element identities are for the evidence file only: returned to the model they
+  // would cost tokens on every harvest and tell it nothing.
+  const bare = frames => frames.map(fr => (Array.isArray(fr.result)
+    ? { ...fr, result: fr.result.map(({ uid, ...e }) => e) } : fr));
+  const bareCounts = counted => Object.fromEntries(Object.entries(counted || {})
+    .map(([k, { uid, ...c }]) => [k, c]));
+
   // Count each named selector — CSS or Playwright syntax, iframe chains hop by hop.
   const check = async named => {
     const out = {};
@@ -168,6 +177,13 @@ exports.default = async ({ page }) => {
           // model's own, the first on `#690`.
           const checked = await loc.first().isChecked({ timeout: 500 }).catch(() => null);
           if (checked !== null) result.checked = checked;
+          // Which element it is, to match against what a click or a keystroke landed on.
+          if (total === 1) {
+            try {
+              const id = await loc.first().evaluate(el => (window.__qa ? window.__qa.uid(el) : null));
+              if (id) result.uid = id;
+            } catch (e) { /* no identity: the count still stands */ }
+          }
         }
         out[name] = result;
       } catch (e) {
@@ -184,7 +200,10 @@ exports.default = async ({ page }) => {
   // a few seconds is a long poll or a beacon, not the page still loading.
   const inflight = new Map();
   const STREAMS = new Set(['websocket', 'eventsource', 'media']);
-  page.on('request', r => { if (!STREAMS.has(r.resourceType())) inflight.set(r, Date.now()); });
+  let requested = 0;
+  page.on('request', r => {
+    if (!STREAMS.has(r.resourceType())) { inflight.set(r, Date.now()); requested++; }
+  });
   page.on('requestfinished', r => inflight.delete(r));
   page.on('requestfailed', r => inflight.delete(r));
   const loading = () => [...inflight.values()].some(t => Date.now() - t < 5000);
@@ -213,7 +232,7 @@ exports.default = async ({ page }) => {
   // inventory (with its frame chain), the counts the caller asked for, and — once
   // per distinct state — a live count of every locator the repo already has.
   let lastKnown = '';
-  const evidence = async (tag, checks) => {
+  const evidence = async (tag, checks, settled) => {
     if (!EVIDENCE) return;
     const frames = await everyFrame(o => (window.__qa ? window.__qa.inventory(o) : []), {});
     const inventory = frames.flatMap(fr => (Array.isArray(fr.result) && fr.prefix !== null
@@ -225,7 +244,8 @@ exports.default = async ({ page }) => {
       const counted = await check(Object.fromEntries(KNOWN.map((k, i) => [i, k.selector])));
       known = KNOWN.map((k, i) => ({ ...k, ...counted[i] }));
     }
-    note({ page: tag || null, url: page.url(), inventory, checks, known });
+    note({ page: tag || null, url: page.url(), inventory, checks, known,
+           ...(settled ? { settled } : {}) });
   };
 
   // One step, one round trip: act, settle, then report — the named selectors
@@ -238,10 +258,15 @@ exports.default = async ({ page }) => {
     const t0 = Date.now();
     const out = { ok: true };
     if (opts.before) out.before = await check(opts.before);
+    const asked = requested;
     if (action) {
       try { await action(); } catch (e) { out.ok = false; out.error = short(e); }
     }
     out.settledMs = await settle(opts.maxMs, opts.quietMs);
+    // How long the page kept working after the action, and on how many requests:
+    // a card number typed here took 2.2s and a request to settle, and a test that
+    // clicked the next control at once lost the click to the re-render.
+    out.requests = requested - asked;
     out.url = page.url();
     if (opts.check) out.check = await check(opts.check);
     if (opts.harvest !== false) out.frames = await harvest(opts.scope, opts);
@@ -249,14 +274,20 @@ exports.default = async ({ page }) => {
     const harvested = {};
     for (const fr of out.frames || []) {
       for (const e of Array.isArray(fr.result) ? fr.result : []) {
-        if (e.sel && 'total' in e) harvested[e.sel] = { total: e.total, visible: e.visible, tag: e.tag };
+        if (e.sel && 'total' in e) {
+          harvested[e.sel] = { total: e.total, visible: e.visible, tag: e.tag,
+                               ...(e.total === 1 && e.uid ? { uid: e.uid } : {}) };
+        }
       }
     }
     await evidence(opts.page, {
       ...harvested,
       ...(out.before ? selectorsOf(opts.before, out.before) : {}),
       ...(out.check ? selectorsOf(opts.check, out.check) : {}),
-    });
+    }, action ? { ms: out.settledMs, requests: out.requests } : null);
+    if (out.frames) out.frames = bare(out.frames);
+    if (out.before) out.before = bareCounts(out.before);
+    if (out.check) out.check = bareCounts(out.check);
     out.ms = Date.now() - t0;
     return out;
   };
@@ -269,7 +300,7 @@ exports.default = async ({ page }) => {
   const checkOnly = async (named, opts = {}) => {
     const counted = await check(named);
     await evidence(opts.page, selectorsOf(named, counted));
-    return counted;
+    return bareCounts(counted);
   };
 
   // A screen that shows briefly and closes (a payment result, a toast): start
@@ -301,9 +332,12 @@ exports.default = async ({ page }) => {
     // Each element was counted while it was on screen: that is evidence too.
     note({ page: opts.page || null, url: page.url(), checks: Object.fromEntries(
       states.flatMap(s => s.els.filter(e => e.sel)
-        .map(e => [e.sel, { total: e.total, visible: e.visible, text: e.text }]))) });
-    return { action: await acted, states };
+        .map(e => [e.sel, { total: e.total, visible: e.visible, text: e.text,
+                            ...(e.total === 1 && e.uid ? { uid: e.uid } : {}) }]))) });
+    return { action: await acted,
+             states: states.map(st => ({ ...st, els: st.els.map(({ uid, ...e }) => e) })) };
   };
 
-  page.qa = { prefix, harvest, check: checkOnly, settle, step, record };
+  page.qa = { prefix, harvest: async (scope, opts) => bare(await harvest(scope, opts)),
+              check: checkOnly, settle, step, record };
 };

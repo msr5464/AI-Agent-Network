@@ -11,23 +11,21 @@ agree: a real run with
     password=Sample@Pass123
 
 was rejected with "no credentials found in input file" because both regexes matched
-only `:` or whitespace after the label, while credential_masking.py — which accepts
-`[:=]` — had already masked those same two lines in the run header. One extractor,
-used everywhere, is what keeps that from happening again.
+only `:` or whitespace after the label. One extractor, used everywhere, is what keeps
+that from happening again.
 
-This module owns the label vocabulary (LABELS); shared/credential_masking.py masks
-exactly the same one, so nothing extractable can be printed unredacted. Bare "user"
-is in neither — it false-positives on "Login as Admin user" — but "username" is.
+This module owns the label vocabulary (LABELS). Bare "user" is not in it — it
+false-positives on "Login as Admin user" — but "username" is.
 """
 
+import csv
+import io
 import os
 import re
 from pathlib import Path
 
 # Label alternatives per credential field. Ordered longest-first within each group
-# so "user name" wins over a bare "user*" prefix match. Public because
-# credential_masking.py masks exactly this vocabulary (plus its own secret-ish
-# labels): a value this module can extract is a value that module must redact.
+# so "user name" wins over a bare "user*" prefix match.
 LABELS = {
     "username": r"user\s*name|username|user\s*id|userid|login\s*id|e-?mail(?:\s*id)?",
     "password": r"password|passwd|pwd",
@@ -153,3 +151,74 @@ def mentions_login(text: str) -> bool:
     then: a checkout form asks for an email, and a bank page for an OTP."""
     lowered = (text or "").lower()
     return any(word in lowered for word in LOGIN_WORDS)
+
+
+# A column holding a login secret, matched on word boundaries so a `footprint`
+# column is not an `otp` one.
+_SECRET_COLUMN = re.compile(r"(?<![a-z])(?:" + "|".join(
+    (LABELS["password"], LABELS["api_key"], "token", "secret")) + r")(?![a-z])")
+_OTP_COLUMN = re.compile(r"(?<![a-z])(?:" + LABELS["otp"] + r")(?![a-z])")
+
+
+def secret_columns(header: str, test_case: str) -> list:
+    """The columns of a CSV header row that hold a login secret, as written.
+
+    A CSV is committed with the pull request; the properties file's secrets never
+    are. A password, API key, token or secret column always holds one. An OTP
+    column does only when the flow logs in: a bank page's 3-D Secure OTP is test
+    data, and a payment run whose sheet held the sandbox OTP had the whole sheet
+    refused. With no test case to tell, an OTP counts.
+    """
+    try:
+        columns = next(csv.reader([header or ""]))
+    except (csv.Error, StopIteration):
+        return []
+    otp_is_secret = mentions_login(test_case) or not (test_case or "").strip()
+    found = []
+    for column in columns:
+        name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column).strip().lower()
+        if _SECRET_COLUMN.search(name) or (otp_is_secret and _OTP_COLUMN.search(name)):
+            found.append(column.strip())
+    return found
+
+
+def secret_property_key(feature: str, column: str) -> str:
+    """The property a login-secret CSV column moves to: `{feature}.<column, snake_case>`."""
+    return (f"{feature.lower()}."
+            f"{re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', column.strip()).lower()}")
+
+
+# A cell the framework fills at read time ({randomString:8}): generated, not a secret.
+_PLACEHOLDER = re.compile(r"^\{[A-Za-z]+(?::[^}]*)?\}$")
+
+
+def take_secret_columns(content: str, columns: list) -> tuple:
+    """Take the named columns out of CSV text.
+
+    Returns (the CSV without them, {column: value}, {column: why it stayed}). A
+    column whose cells are placeholders is generated data and stays. So does one
+    holding several different values: one property cannot carry them.
+    """
+    rows = list(csv.reader(io.StringIO(content or "")))
+    if not rows:
+        return content, {}, {}
+    header = [c.strip() for c in rows[0]]
+    values, kept, strip = {}, {}, []
+    for column in columns:
+        if column not in header:
+            continue
+        i = header.index(column)
+        cells = {r[i].strip() for r in rows[1:] if len(r) > i and r[i].strip()}
+        if any(_PLACEHOLDER.match(v) for v in cells):
+            continue
+        if len(cells) > 1:
+            kept[column] = f"holds {len(cells)} different values; one property cannot carry them"
+            continue
+        strip.append(i)
+        values[column] = next(iter(cells), "")
+    if not strip:
+        return content, values, kept
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\n").writerows(
+        [c for j, c in enumerate(r) if j not in strip] for r in rows)
+    return out.getvalue(), values, kept

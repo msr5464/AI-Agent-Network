@@ -39,19 +39,47 @@ AUTOMATION_FRAMEWORK_DIR    = workspace_helper.resolve(
 MODEL = os.environ.get("AUTHORING_MODEL", "")
 # Set in config/.env. Empty → --effort is not passed and the runner's own effortLevel applies.
 EFFORT = os.environ.get("AUTHORING_EFFORT") or None
+# The plan is one call of ~20-24k output tokens, most of it hidden thinking: 2-4
+# minutes at the API's usual ~110 tok/s. An observed run streamed at 38 tok/s and
+# took 528s, which the old 600s budget would have killed on a slightly longer plan.
+PARSE_TIMEOUT = 1200
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 from shared.log import log as _log
 def log(msg: str) -> None: _log("01-parse", msg)
 
-from shared.claude import call_claude as _call_claude
+from shared.claude import call_claude_ex as _call_claude_ex
 def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, MODEL, str(REPO_ROOT), timeout=600, strict_mcp_config=True, log_dir=str(AUDIT_DIR),
-                          effort=EFFORT)
-    if not output:
-        log("ERROR: Claude CLI returned empty response")
-    return output
+    # Streamed so API retries reach the run log as they happen; buffered, a retry
+    # and a slow API both looked like one silent call.
+    def _on_output(label: str, line: str) -> None:
+        if label == "stdout" and line.startswith("API retry"):
+            log(f"  {line[:200]}")
+
+    result = _call_claude_ex(
+        prompt=prompt,
+        model=MODEL,
+        cwd=str(REPO_ROOT),
+        timeout=PARSE_TIMEOUT,
+        on_output=_on_output,
+        log_dir=str(AUDIT_DIR),
+        stream_json=True,
+        strict_mcp_config=True,
+        # Planning reads its whole context from the prompt, so the same trim as step
+        # 03: no built-in tools, no slash commands, no user settings (their plugins'
+        # SessionStart hooks inject a persona).
+        tools="",
+        disable_slash_commands=True,
+        setting_sources="project,local",
+        effort=EFFORT,
+        # A stalled stream is sent again rather than waited out (shared/claude.py).
+        restart_if_slow=True,
+    )
+    if not result.ok:
+        log(f"ERROR: Claude call {result.describe()}")
+        return ""
+    return result.stdout
 
 
 # Shared, so every step reads a reply the same way: an unclosed ```json fence and
@@ -394,11 +422,11 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
       "description": "Pay for a new payment by card and verify the receipt shows the total",
       "steps": [
         {{"logstep": "Fill the payment form and submit it, and verify the total shown matches the amount entered",
-          "call": "payments.checkout(payment) -> total",
-          "checks": ["assertEquals total payment.amount  [source: user]"]}},
+          "call": "payments.paymentMethodPage = payments.checkout(payment)",
+          "checks": ["assertEquals payments.paymentMethodPage.getTotal() payment.amount  [source: user]"]}},
         {{"logstep": "Pay by credit card and verify the receipt shows the same total",
-          "call": "payments.makePayment(PaymentMethod.CreditCard, payment) -> receipt",
-          "checks": ["assertEquals receipt.amount total  [source: user]"]}}
+          "call": "payments.paymentMethodPage.fillCardDetails(payment); payments.receiptPage = payments.paymentMethodPage.pay()",
+          "checks": ["assertEquals payments.receiptPage.getReceiptAmount() payment.amount  [source: user]"]}}
       ]
     }}
   ],
@@ -407,15 +435,12 @@ Analyze the input and produce a structured JSON generation plan. The plan must i
     {{"name": "getPayment",     "endpoint_enum": "GetPayment",    "returns": "PaymentData", "path_param": "id"}}
   ],
   "helper_web_methods": [
-    {{"name": "checkout", "kind": "stage", "params": ["PaymentData payment"], "returns": "String total",
+    {{"name": "checkout", "kind": "stage", "params": ["PaymentData payment"], "returns": "PaymentMethodPage",
       "navigates_through": ["PaymentFormPage", "PaymentMethodPage"], "composes": [], "why_new": ""}},
-    {{"name": "enterPaymentDetails", "kind": "stage", "params": ["PaymentMethod method", "PaymentData payment"],
-      "returns": "void", "navigates_through": ["PaymentMethodPage"], "composes": [], "why_new": ""}},
-    {{"name": "confirmPayment", "kind": "stage", "params": [], "returns": "Receipt (amount, reference)",
-      "navigates_through": ["PaymentMethodPage", "ReceiptPage"], "composes": [], "why_new": ""}},
     {{"name": "makePayment", "kind": "composed", "params": ["PaymentMethod method", "PaymentData payment"],
-      "returns": "Receipt", "navigates_through": [], "composes": ["enterPaymentDetails", "confirmPayment"],
-      "why_new": ""}}
+      "returns": "ReceiptPage", "navigates_through": ["PaymentMethodPage", "ReceiptPage"],
+      "composes": ["PaymentMethodPage.choosePaymentMethod", "PaymentMethodPage.fillCardDetails",
+                   "PaymentMethodPage.pay"], "why_new": ""}}
   ],
   "reuse": [
     {{"existing": "WaitHelper.waitForUrl(Config config, String urlPattern)", "how": "as_is", "change": ""}}
@@ -593,10 +618,11 @@ Rules:
    to true. Still plan the test for the EXPECTED result — that is what the regression test proves.
    If there is no Actual Result, or it matches the expected result, set "actual_result" to null
    and "is_known_product_defect" to false.
-9. THE MODULE'S FLOW API — REUSE BEFORE ANYTHING NEW. The module's Helper is the API its tests
-   are written against: business operations a person would name (checkout, makePayment,
-   confirmOtp), each covering as many pages as the operation takes, so a test reads as one call
-   per step.
+9. THE MODULE'S FLOW API — REUSE BEFORE ANYTHING NEW. The page objects chain: every page action
+   that leaves a page returns the next page object. The module's Helper holds one public field
+   per page, and the test stores each page it is handed on that field, so every step continues
+   from the page the previous step returned. The Helper's operations open the app and run whole
+   sequences; the pages' business-level actions carry the steps in between.
    a) Walk this ladder for every operation and page method a step needs, in order:
       1. An existing method does it: list it in "reuse" with "how": "as_is". Look in
          <existing_module_index> and <shared_code_index> before naming anything new.
@@ -611,19 +637,23 @@ Rules:
          "web_pages". In an existing module every new operation states "why_new": what no
          existing method could do even after a small change. A method that would differ from an
          existing one only by a hard-coded value or choice is always case 2, never case 3.
-   b) A "stage" carries one business step and ends where the input checks something, so the
-      test can assert on what it returns. Then think one test ahead: for each run of stages a
-      later test would want as one call — paying is choosing the method, entering the details,
-      continuing and confirming — also add a "composed" operation that calls them in order
-      ("composes") and adds nothing else, even when THIS test checks between them. This test
-      calls the stages; the next one calls makePayment(PaymentMethod.Wallet, payment).
+   b) A "stage" is the entry operation: it opens the app (navigate, log in, start a checkout),
+      crosses as many pages as it takes before the input's first check, and returns the page it
+      lands on ("returns" names that page class). It is the only place a page object is
+      constructed. Every later step is a page action on the page the previous step returned.
+      Then think one test ahead: for each run of page actions a later test would want as one
+      call — paying is choosing the method, entering the details, continuing and confirming —
+      also add a "composed" operation that runs them in order from the pages the Helper already
+      holds ("composes" lists them as Page.action) and returns the last page, even when THIS
+      test checks between them. This test calls the page actions; the next one calls
+      makePayment(PaymentMethod.Wallet, payment).
    c) Name each operation with the business verb for what it does — checkout, makePayment,
       confirmOtp, continueToBank — never the scenario (not payByCardWithVoucher) and never what
       it returns (not continueAndGetBankAmount): the return type says that. Not get*/read*
       either, which the narration check reads as data lookups. A choice among fixed options is
       an enum parameter (rule 10); a value is a Data field.
-   d) Operations never assert. They return what the step's checks need: a value, or a small
-      result type when the checks need several.
+   d) Operations and page actions never assert. They return the page they land on, and the
+      step's checks read that page's getters.
 10. OPTION ENUMS. Every step that picks one of several options the page offers (a payment
    method, a delivery speed, a plan tier) gets an entry in "option_enums": the enum "name", what
    it "chooses", the "page" it is picked on, the "control" — the locator name, named for the
@@ -635,14 +665,17 @@ Rules:
 11. TEST STEPS ARE BUSINESS STEPS. Every test method's "steps" is a list of objects, one per
    business step, in the input's order:
      {{"logstep": "<the action AND its expected outcome, as the run report should say it>",
-      "call": "<the ONE call that carries it out: a Helper operation, or one page method on a
-               page an earlier operation returned> -> <what it returns, when a check needs it>",
-      "checks": ["<each check the input asks for right after it, tagged per rule 4b>"]}}
+      "call": "<the calls that carry it out, continuing from the page the previous step
+               returned and storing the page each returns on the Helper's field:
+               shop.cartPage = shop.productsPage.goToCart()>",
+      "checks": ["<each check the input asks for right after it, read from the page the step
+                 ended on (shop.cartPage.getTotal()), tagged per rule 4b>"]}}
    A business step may merge several numbered input steps that are one operation (navigate,
    open the form, fill it and submit is one checkout). Never split one into its clicks and
-   fills, and never list setup (constructing the helper, building data) as a step. A check
-   between two stages makes them two steps; with nothing checked in between, the composed
-   operation carries them as one.
+   fills: several small actions on one page are ONE business-level page action
+   (fillCardDetails), and a step makes at most a few calls. Never list setup (constructing the
+   helper, building data) as a step. A check between two page actions makes them two steps;
+   with nothing checked in between, the composed operation carries them as one.
 12. Output ONLY valid JSON, no prose, no markdown wrapper.
 """
 

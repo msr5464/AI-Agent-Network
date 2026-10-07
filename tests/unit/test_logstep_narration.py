@@ -295,25 +295,13 @@ SHAPED = '''public class ShopWebTest extends TestBase
 
 
 class TestShape:
-    """Measured, never enforced: a test's length and steps that drive a page by hand."""
+    """Measured, never enforced: a test's length."""
 
     def test_body_lines_count_the_body_not_the_annotation_or_signature(self):
         bodies = ln.test_bodies(SHAPED)
         assert ln.body_lines(bodies["payByCard"]) == 11
         assert "GROUP_WEB" not in bodies["payByCard"]
 
-    def test_a_step_that_drives_a_page_call_by_call_is_reported(self):
-        chains = ln.page_action_chains(ln.test_bodies(SHAPED)["payByCard"], {"CartPage"})
-        assert chains == [{"step": "Enter the card details and pay",
-                           "calls": ["cart.fillCardNumber", "cart.fillExpiry", "cart.pay"]}]
-
-    def test_reads_and_helper_calls_are_not_chains(self):
-        body = ln.test_bodies(SHAPED)["payByCard"]
-        assert ln.page_action_chains(body, set()) == []
-        first_step = body.split("Enter the card details")[0]
-        assert ln.page_action_chains(first_step, {"CartPage"}) == []
-
     def test_shape_skips_methods_that_existed_before(self):
-        shaped = ln.shape(SHAPED, {"CartPage"}, skip={"existing"})
-        assert set(shaped) == {"payByCard"}
-        assert shaped["payByCard"]["body_lines"] == 11
+        shaped = ln.shape(SHAPED, skip={"existing"})
+        assert shaped == {"payByCard": {"body_lines": 11}}

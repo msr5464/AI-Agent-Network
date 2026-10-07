@@ -196,8 +196,8 @@ repo, whatever the framework. Missing ones degrade a feature rather than break a
 | What | Where in the target repo | Used by |
 |------|--------------------------|---------|
 | An agent guide (framework APIs, wrappers, naming) | `CLAUDE.md` at the repo root | Authoring (parse/generate/fix) and healing fix — the model's source of truth for the repo's own APIs |
-| One `logStep("…")` per business step, stating action and expected outcome, before the one call that carries it out | test classes | Authoring's narration check (`shared/logstep_narration.py`), and adaptation's derived intent contracts |
-| Helper business operations, and option enums in an optional per-module `<Feature>Enums` class | module helpers | Authoring generates tests as one call per step against them, and re-runs the existing tests that reach an operation it changes |
+| One `logStep("…")` per business step, stating action and expected outcome, before the calls that carry it out | test classes | Authoring's narration check (`shared/logstep_narration.py`), and adaptation's derived intent contracts |
+| Page objects that chain (an action that leaves a page returns the next page), a Helper with one public field per page plus its entry and composed operations, and option enums in an optional per-module `<Feature>Enums` class | module helpers and page objects | Authoring generates tests that store each returned page on the Helper's field and continue from it, and re-runs the existing tests that reach a method it changes |
 | `shared_code` in `config/repo-map.json`: the framework's shared code directories | config | Authoring indexes their public members so the model calls them instead of writing its own |
 | Assertions through a helper, with the message as the last argument (e.g. `AssertHelper.*`) | tests and helpers | `shared/assertion_graph.py` — what a test proves, and whether an edit weakened it |
 | Per-environment properties `parameters/{environment}-{country}.properties` | `src/main/resources/` | Authoring writes URL and credential keys there instead of hard-coding them |

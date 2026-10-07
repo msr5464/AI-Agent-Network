@@ -216,9 +216,9 @@ class TestReports:
         assert found["c1"] == {"verdict": "fail", "saw": "badge shows 2"}
         assert found["c2"] == {"verdict": "", "saw": "no verdict here"}
 
-    def test_page_text_is_one_short_masked_line(self):
-        text = cc.clean_observed("password: hunter2\n" + "x" * 500)
-        assert "hunter2" not in text and "\n" not in text
+    def test_page_text_is_one_short_line(self):
+        text = cc.clean_observed("Order total: 49,000\n" + "x" * 500)
+        assert text.startswith("Order total: 49,000 x") and "\n" not in text
         assert len(text) <= cc.OBSERVED_LIMIT + 1
 
     def test_a_report_is_fenced_as_untrusted_in_a_prompt(self):

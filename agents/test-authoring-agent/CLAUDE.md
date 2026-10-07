@@ -80,6 +80,39 @@ parent `span` instead, leaving a hint pointing at the element that does not work
 A run that confirms nothing is retried once; if it still confirms nothing, step 03
 aborts rather than generating from guesses (override with `ALLOW_MISSING_SELECTORS`).
 
+Walking the whole flow is not the same as naming every locator. The helpers measure
+everything the flow touches, but the map from the plan's names to selectors is the
+model's `SELECTOR_FOUND` lines, which it writes by hand. A run typed into a bank
+page's code field, then reported it as `INPUT_USED` under a name of its own and never
+reported a selector for the plan's name. The same run compared a header amount under
+the plan's own name in a `VALUE_CHECK` and never reported that selector either. So
+after the reports, step 02 fills a plan name still missing from what the browser
+measured, in this order, never over a report and never onto an element another name
+has:
+
+| Fill | From |
+|------|------|
+| `recover_clicked_locators` | a recorded click whose text shares the most words with the name |
+| `recover_typed_locators` | a recorded keystroke into a field whose selector shares the most words with the name (not for a name that reads as a button or a shown value) |
+| `prefer_proven` | this test case's proven locator for the name, counted 1/1 here |
+| `fill_from_seeds` | an earlier run's selector for the same name, or the same name under another page, counted 1/1 here and never more |
+| `fill_from_value_checks` | the one selector counted showing exactly the text a `VALUE_CHECK` says that name showed |
+
+Each takes one candidate or none: a tie fills nothing.
+
+A run that confirms most locators can still leave step 03 to write the rest from a
+guess (`unconfirmed_locators`). After codegen, `guessed_locators` looks up each
+guessed selector in step 02's counts. A guess counted at exactly one visible element,
+and never at more, is confirmed by that count. Any other guess gets one repair pass
+(`_repair_guessed_locators`). The pass offers only selectors step 02 counted at one
+visible element in the same frame, with the ones that share the name's words and
+that the flow typed into or clicked listed first. A replacement that is not on that
+list is rejected, and a locator nothing replaces stays "still a guess" in the PR's
+review notes. A run had typed into a bank page's code field under a name it never
+reported, and step 03 wrote an attribute selector that matched nothing. Step 02 now
+also recovers such a field from its keystrokes (`recover_typed_locators`), the way
+it recovers an unreported clicked control.
+
 Every dropped selector is recorded in `rejected_selectors` with its reason, so
 "why is there no locator for the toast?" has an answer in the audit trail rather
 than in a console line that has scrolled away.
@@ -178,7 +211,37 @@ fields without their iframe.
 
 A locator name the plan uses on more than one page (`amountDisplay` on a popup, a
 bank page and a success screen) is asked for as `IssuingBankPage.amountDisplay`,
-and a name reported twice keeps its first selector, never the last.
+and a name reported twice keeps its first selector, never the last. The exception
+is a control, because unique somewhere is not unique where the test uses it
+(`prefer_clicked`). The helpers record every click and keystroke with the selector
+they counted at that moment, and an identity for the element it landed on; every
+count of a selector records the identity of the element it found. A name's action is
+the one spelled like one of its reports, or landing on the element one of its reports
+was counted at. When the kept selector was not counted at that element, alone and
+visible, in the page state just before the action, the action's own selector replaces
+it. Two runs needed this:
+
+- A run reported a promo banner from the payment-method list first, then clicked a
+  promo radio on the card form. The banner was kept, and the test clicked it on the
+  card form, where it does not exist.
+- A run kept a bare close-button class for an overlay's close button. It counted 1/1
+  only while the overlay was closed, where it is the popup's own close button. With
+  the overlay open it matched two. The browser had clicked the overlay's button
+  through a selector scoped to the overlay, and the model had reported another scoped
+  one. No two of the three were spelled alike, so the first report stood and the test
+  failed on it.
+
+A first report the flow itself clicked or typed into stands. Evidence from before
+identities were recorded links by spelling only. A shown value is never clicked, so it
+keeps its first report. Every other selector reported for a name is kept as
+`reported_again`.
+
+When the test fails on a step 02 locator, step 04's fix prompt shows those other
+reports and the clicks step 02 recorded that share a word with the name. Its DOM
+section is read from the failure capture the way the healing agent reads it, ranked
+by the failing locator's name and scoped to its iframe. Read from the saved HTML,
+the top page's own elements came first and filled the 30 shown, and a fixer whose
+locator failed inside the payment iframe saw none of the iframe's controls.
 
 ### Assertions vs mechanisms
 
@@ -207,6 +270,27 @@ second after the last keystroke. When an action's named control is not visible, 
 02 discovers how the outcome actually happens (rule 2e) and reports
 `MECHANISM_FOUND: <action>|<kind>|<trigger>|<settles when>`, which step 03 generates
 from. An action step never becomes an unverified check.
+
+### When the page keeps working after an action
+
+Step 02's helpers wait after every action until every frame and the network have
+settled, so the flow it validates never acts on a page still updating. Nothing it
+reported said it had waited, and generated code acts at once. On a checkout, typing
+the card number set off a lookup, and about 2s later the header total dropped and the
+promo list was redrawn. Step 02 clicked a promo 9s later and it held. The test clicked
+it in the same second it typed the CVV, the redraw reset the selection, and three fix
+attempts could not tell why.
+
+| Where | What happens |
+|-------|--------------|
+| **02 Validate Web** | `page.qa.step` writes `settled` (`ms`, `requests`) with each page state that follows an action. `delayed_updates` compares that state's inventory with the one before the action. An update is recorded when the page took at least `SLOW_SETTLE_MS` (1500), made a request of its own, stayed on the same URL, and an element present once in both states shows different text. A ticking countdown, form fields and a container whose text changed with its child's are left out. Written to `02-validate-web.json` as `delayed_updates`, each with the actions, the time, the requests and what changed (with the locator names that select the changed element). |
+| **03 Generate**, in the prompt | UPDATES THAT FOLLOW AN ACTION lists them. The page method that performs such an action and stays on the same page ends with `WaitHelper.waitForPageToSettle(config)` when the framework's shared code has it, else a WaitHelper wait for the changed element. `waitForNetworkIdle` is named as wrong: it is `waitForLoadState(NETWORKIDLE)`, which returns at once on a page that has already loaded. A value shown before such an action can only be read before it. |
+| **04 Run & Fix** | Every fix prompt carries the same list (`step02_updates_section`). A fix for the lost click put its wait after the click, when the page was still redrawing from the action before it. |
+
+`waitForPageToSettle` is the framework's copy of the helpers' settle rule: no frame
+changing for 700ms and no request in flight. The framework tracks in-flight requests
+from the moment each page is created, so a request started before the wait began is
+still seen.
 
 ### What step 04 may not do
 
@@ -258,11 +342,15 @@ are `equal`, `formatting` (whitespace/case), `numeric` (`Rp20.000` = `20,000`), 
 (`081…` = `+6281…`) and `words` (the expected text appears as whole words). Anything else
 is `None`: a different value, which is a finding.
 
+Two amounts that differ have an `order` instead, `less` or `greater`: what "the total
+decreased" claims. An order is kept apart from the relations, so it can never sanction
+loosening an equality in step 04.
+
 | Where | What happens |
 |-------|--------------|
 | **01 Parse** | Rule 4: every value the input gives for a step stays in that step of `web_steps_for_validation`, as written. Reworded to "fill the fields with dummy data", a run's address and card number never reached the browser. Rule 4c: a comparison with something earlier in the flow ("same as we passed earlier") keeps that back-reference. The plan names the earlier value and where it was typed or read. A value that was only shown gets a read-and-record step at that earlier point. That run had reworded one to "matches the expected purchase amount", and step 02 then compared the page's `Rp20.000` with itself. |
-| **02 Validate Web** | The prompt's TEST DATA block lists every `Label: value` line of the raw test case (`shared/test_case.py`), so a value reaches the browser even when step 01 reworded it away. An `Email:` or `OTP:` goes there too unless the flow logs in; only then is it a CREDENTIAL. Rule 2g: `INPUT_USED: <field>\|<typed>` for every field filled, and `VALUE_CHECK: <step>\|<element>\|<shown>\|<input:field \| element:name \| literal>\|<other side>` for every comparison. Written to `02-validate-web.json` as `inputs_used` / `value_checks`, with the relation computed in Python. The values win in both directions. A comparison whose two sides match under no relation is downgraded to unverified. One the model reported unverified is promoted to passed when its two sides do match, the element's selector was confirmed, and the expected side traces to its source: the typed value, a measured element, or a literal in the step. A run had called `08123456789` against `+628123456789` a mismatch. A `literal` whose text is not in the test case was read off the page, and is dropped (`drop_untraced_sources`). "Record the amount shown" had come back as `literal\|20,000` and been generated as `assertEquals(amount, "20,000")`. |
-| **03 Generate**, in the prompt | VALIDATED INPUTS: a typed value the test case itself states is marked GIVEN BY THE TEST CASE and becomes that field's default exactly as written. Every other field's test data keeps the typed value's shape (word count, character classes, prefix), randomised inside it. CHECK CONTRACTS: each check is asserted with exactly its measured relation, with the expected side taken from its source, never a new literal. A contract overrides the plan's `assertEquals` wording. A `numeric` contract compares both amounts as plain number text through the string equality assertion. When it said "the two parsed numbers", the model wrote `assertEquals(config, long, long, …)`, which has no overload, and the compile gate stopped the run. |
+| **02 Validate Web** | The prompt's TEST DATA block lists every `Label: value` line of the raw test case (`shared/test_case.py`), so a value reaches the browser even when step 01 reworded it away. An `Email:` or `OTP:` goes there too unless the flow logs in; only then is it a CREDENTIAL. Rule 2g: `INPUT_USED: <field>\|<typed>` for every field filled, and `VALUE_CHECK: <step>\|<element>\|<shown>\|<input:field \| element:name \| literal>\|<other side>` for every comparison. Written to `02-validate-web.json` as `inputs_used` / `value_checks`, with the relation computed in Python. The values win in both directions. A comparison whose two sides match under no relation is downgraded to unverified. One the model reported unverified is promoted to passed when its two sides do match, the element's selector was confirmed, and the expected side traces to its source: the typed value, a measured element, or a literal in the step. A run had called `08123456789` against `+628123456789` a mismatch. A `literal` whose text is not in the test case was read off the page, and is dropped (`drop_untraced_sources`). "Record the amount shown" had come back as `literal\|20,000` and been generated as `assertEquals(amount, "20,000")`. An order claim its values contradict ("decreased" with an amount that went up) is downgraded the same way. |
+| **03 Generate**, in the prompt | VALIDATED INPUTS: a typed value the test case itself states is marked GIVEN BY THE TEST CASE and becomes that field's default exactly as written. Every other field's test data keeps the typed value's shape (word count, character classes, prefix), randomised inside it. CHECK CONTRACTS: each check is asserted with exactly its measured relation, with the expected side taken from its source, never a new literal. A contract overrides the plan's `assertEquals` wording. A `numeric` contract compares both amounts as plain number text through the string equality assertion. When it said "the two parsed numbers", the model wrote `assertEquals(config, long, long, …)`, which has no overload, and the compile gate stopped the run. An order contract (`less`/`greater`) says to read the other side from exactly the element named, where it is on screen. Order checks were once left out of the contracts. The plan then read "the total before the promo" after the card number had already lowered it, and the test compared an amount with itself. |
 | **03 Generate**, after codegen | An expected value (an assertion's whole string argument, or a CSV cell under an `expected*` header) that appears neither in the test case nor in anything step 02 typed, read or reported is untraced. One repair pass under `VALUE_REPAIR_MAX_DIFF_LINES` runs, and it is kept only if it removes some. Whatever remains goes in `03-generate.json` → `untraced_expected_values`. |
 | **04 Run & Fix** | A failure that is an `Expected/Actual` pair with a benign relation, pinned by its message to exactly one frozen assertion, is `VALUE_MISMATCH`. When its expected side is a string literal and the page only spaces or cases it differently, the fix is that literal, rewritten to exactly what the page shows (`literal_fix`). No sanction is given, so a comparator change is rejected: offered one, a fix wrapped both sides of a message check in `.replaceAll("\\s+", "").toLowerCase()`. Otherwise the prompt offers two fixes in order: (a) restore the data's validated shape, or (b) change **only** that assertion's comparator. `conserved(sanction=…)` accepts exactly (b): same place, same message, every compared expression and expected value still passed, no deeper condition. It is recorded as `relaxed_checks`. A frozen file without argument text (an older session) gets no sanction. |
 
@@ -316,6 +404,29 @@ context forward** rather than writing a result without it. Dropping it blanked t
 prompt's `<structured_failure_report>`, made the `stuck` check unreachable, and — via
 `run_started_at=0.0` — silently disabled `gather_runtime_evidence`'s freshness gate, so
 the next attempt was shown a DOM captured in a different session.
+
+### What the fixer sees, and what it may use
+
+A run spent three fix attempts on a promo click that timed out. The cause was test data
+that had shifted one column, so the test typed "India" into the card number field.
+Nothing the fixer was shown said so. Now:
+
+| Evidence | Why |
+|---|---|
+| The execution trace lists every value the test typed, per field, however early (`telemetry.format_for_prompt`). A secret-looking field shows only its length | The timeline showed selectors only, and `type()` values were not even parsed: Playwright sends them as `text`, not `value` |
+| The system prompt lists the values the test case states (`test_case_data_section`). Login secrets are named, not shown | A fix that rewrote the test data made up a name, an email, a card number and an expired expiry for a test case that stated all four |
+| A CSV a fix writes, new files included, must have one field per column in every row (`_csv_rows_fit`) | An unquoted `Bangalore, India` shifted every later column. The per-file guards only ran on files that already existed |
+
+The fix call loads only `Read`, `Grep` and `Glob`, with this run's worktree added and named
+in the prompt as the one place to read framework sources. With every built-in tool, a
+fixer ran `find` over the user's home directory, tried `find /`, and read the framework
+from the user's own checkout. Its edits come back as JSON, so it needs no write tool.
+
+Steps 01, 03 and 04 call the model with `restart_if_slow`. When a stream averages under
+20 tokens/s for 60s, the call is killed and sent once more (`shared/claude.py`). Healthy
+calls stream at about 107 tokens/s. The stalls ran at 3-13 tokens/s for five to eleven
+minutes, and the same request sent again ran normally. Step 02 is not watched: its
+browser tool time would read as a stall.
 
 ---
 
@@ -395,12 +506,12 @@ Web Steps:
 | `00-session-init.md` | run.sh | Session metadata, env snapshot |
 | `01-parse.json` + `.md` | Parse | Generation plan |
 | `02-validate-api.json` + `.md` | Validate API | Auth status, confirmed endpoint response shapes |
-| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms`, `inputs_used`, `value_checks`, `proven_preferred` (names whose reported selector was replaced by this test case's proven one), `option_sets` (every option each choice offered, read off the evidence) |
+| `02-validate-web.json` + `.md` | Validate Web | Selector map, step results (passed/failed/**unverified**), `rejected_selectors`, `mechanisms`, `inputs_used`, `value_checks`, `proven_preferred` (names whose reported selector was replaced by this test case's proven one), `clicked_preferred` (names whose first report, never counted at the element the flow clicked or typed into, was replaced by the selector counted there), `reported_again` (other selectors reported for a name), `option_sets` (every option each choice offered, read off the evidence), `delayed_updates` (what an action changed after it returned, while the page kept working) |
 | `claude-*.log` | Validate Web | Raw `claude -p` stream, for diagnosing empty runs |
 | `02-known-selectors.json` | Validate Web | The confirmed selectors seeded from an earlier run on the same host |
-| `02-web-evidence.jsonl` | Validate Web | What the browser helpers measured, one line per settled page state. Every `SELECTOR_FOUND` is checked against it |
+| `02-web-evidence.jsonl` | Validate Web | What the browser helpers measured, one line per settled page state, click and keystroke, with an identity for each element a click, keystroke or unique count landed on, and how long the page took to settle after each action. Every `SELECTOR_FOUND` is checked against it |
 | `03-system-prompt.txt`, `04-system-prompt.txt` | Generate, Run & Fix | The static half of each prompt — conventions, references, rules — sent once as `--system-prompt-file` instead of inside every batch or attempt |
-| `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators`, `untraced_expected_values`; the reuse ledger (`reuse`, `reuse_unknown`, `new_operations`), `created_files` / `pre_run_files`, and the review records `test_shape`, `modified_existing`, `changed_existing_api`, `near_duplicates`, `option_enum_gaps`, `reuse_unused`; `restored_existing_tests` (existing `@Test` methods step 03 changed and put back) |
+| `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators`, `guessed_locators` (what codegen wrote for each, and whether step 02's counts confirmed it, a repair replaced it, or it is still a guess), `untraced_expected_values`, `csv_lookup_problems` (CSV reads their sheet cannot answer); the reuse ledger (`reuse`, `reuse_unknown`, `new_operations`), `created_files` / `pre_run_files`, and the review records `test_shape`, `modified_existing`, `changed_existing_api`, `near_duplicates`, `rebuilt_pages`, `option_enum_gaps`, `reuse_unused`; `restored_existing_tests` (existing `@Test` methods step 03 changed and put back) |
 | `pre-run/` | Generate, Run & Fix | Every existing file this run changed, as it was before the run touched it — step 03's copies, plus any a step 04 fix added. What `modified_existing` and the regression re-run diff against |
 | `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes, `value_mismatch` / `relaxed_checks` when a failure was triaged as one |
 | `04-proven-locators.json` | Run & Fix | Only on a passing run: the locators that matched one visible element while it passed. Seeds later runs of step 02; also copied to `cache/<user>/<module>/` |
@@ -620,6 +731,32 @@ Credentials use the same properties file through `shared/credential_properties.p
 the opposite case: never committed. Both share `shared/properties_file.py` so the file
 location and the "never overwrite a human's value" rule exist in one place.
 
+A test-data CSV is committed with the PR, so a login secret never stays in one.
+`credential_extraction.secret_columns` decides what counts. A password, token, API key
+or secret column always counts. An OTP counts only when the flow logs in, because a bank
+page's 3-D Secure OTP is test data. Step 03 (`_move_csv_secrets`) takes each new secret
+column out of the sheet, writes its value to `{feature}.<column>` in the properties
+file, and runs one repair pass that points the code reading the column at the
+property. It writes the rest of the sheet. A column it cannot move, or a read the
+repair left, stops the run with `"error": "csv_secrets_unmoved"`. A test reading a
+column that is gone would only fail in step 04. An existing credential sheet is left
+as it is on disk. In step 04, `_no_csv_secret` refuses a fix that adds a secret column
+to a CSV, new files included. It writes the value to its property first, so the reason
+names a property the next attempt can read. This replaced a check that refused any
+sheet with an `otp` column and still wrote the test that reads it. A payment run lost
+every value of its test case that way, and step 04 then made up its own.
+
+The test and its sheet come out of one batch, and nothing compiled checks that they
+agree. Right after the secrets move, `_check_csv_lookups` holds every generated CSV
+read (`shared/entry_path.csv_reads`) to the sheet it reads: the generated copy, else
+the one on disk. A read that filters by environment, pointed at a sheet with no
+`environment` column, can never match a row. The model copies that read from a
+reference Helper whose sheets carry the column, and writes a new sheet of data that is
+the same in every environment and rightly has none. So the filter is dropped and a
+console line says so. A sheet nobody wrote, a key column the header lacks, or a literal
+key no row has is logged as a `WARNING` and recorded in `03-generate.json` →
+`csv_lookup_problems`; step 04 still runs.
+
 ---
 
 ## Locator baselines reach the PR
@@ -661,19 +798,37 @@ not the model's: the plan wrote test steps as page calls, the codegen rules capp
 helper at "one step", and the narration repair unpacked any helper call that covered
 two plan steps back into the page calls behind it.
 
-The module's Helper is now the API its tests are written against: business
-operations a person would name (check out, make a payment, confirm an OTP), each
-covering as many pages as the operation takes. A test reads as one call per step,
-followed by that step's checks — about 25-30 lines for a typical scenario.
+The fix after that run made every step one Helper call returning a value, and the
+chain broke instead. Each operation started with `new SomePage(config)` for a page
+the previous step had just returned, and no page object ever reached the test, so
+operations grew names for what they returned (`closeOrderDetailsAndGetAmount`).
+
+The page objects now chain, and the Helper holds them. Every page action that leaves
+a page returns the next page object. The Helper has one public field per page, and
+the test stores each page it is handed on that field, so every step continues from
+the page the previous step returned:
+
+```java
+shop.paymentMethodPage = shop.checkout(order);                  // entry operation
+AssertHelper.assertEquals(config, shop.paymentMethodPage.getTotal(), order.getAmount(), "...");
+shop.cardPage = (CardPage) shop.paymentMethodPage.choosePaymentMethod(PaymentMethod.CreditCard);
+shop.receiptPage = shop.cardPage.fillCardDetails(order).pay();
+```
+
+The Helper's own operations open the app and run whole sequences. Several small
+actions on one page are one business-level page method (`fillCardDetails`), which
+keeps a typical test at about 25-30 lines. Checks read the page's getters. A value a
+check compares in another form (an amount as plain number text) comes back converted
+from the getter, through the Helper's one `public static` converter.
 
 ### The plan (step 01)
 
 | Field | What it says |
 |-------|--------------|
 | `reuse` | Every existing method a step calls (`how: as_is`) or changes slightly (`how: extend`, with the exact `change`), from the module or the framework's shared code |
-| `helper_web_methods` | Only new operations: `kind` stage or composed, `params`, `returns`, `navigates_through`, `composes`, and in an existing module `why_new` |
+| `helper_web_methods` | Only new operations: `kind` stage or composed, `params`, `returns` (the page it lands on), `navigates_through`, `composes` (the `Page.action`s it runs), and in an existing module `why_new` |
 | `option_enums` | Each choice among options the page offers: `name`, what it `chooses`, the `page` and `control` it is picked with, the values this test `exercised` |
-| test-method `steps` | One object per business step: `logstep` (the action and its expected outcome), `call` (the one call that carries it out), `checks` (tagged per rule 4b) |
+| test-method `steps` | One object per business step: `logstep` (the action and its expected outcome), `call` (the calls that carry it out, each continuing from the page the previous one returned and storing the page it returns on the Helper's field), `checks` (read from that page, tagged per rule 4b) |
 
 The planner is shown what exists, not file contents cut at 3000 characters:
 `shared/module_index.py` indexes the existing module (one line per public member) and
@@ -686,16 +841,18 @@ then write a new one. A method that would differ from an existing one by a hard-
 value is never new. A `reuse` claim naming a method neither index has moves to
 `reuse_unknown`, and codegen writes it like any new method.
 
-A **stage** ends where the input checks something, so the check sits right after the
-value it checks. Planning also thinks one test ahead: a run of stages a later test would
-want as one call gets a **composed** operation (`makePayment` = choose the method, enter
-the details, continue, confirm), even when this test checks between them — this test
-calls the stages, the next calls `makePayment(PaymentMethod.Wallet, payment)`. Each
-operation is named with the business verb for what it does, never for what it returns
-(`continueToBank`, not `continueAndGetBankAmount`). Operations never assert; they return
-what the checks need, several values as a nested Lombok `@Value` class read through
-getters. Test data is one setup line: a `build*` helper method that does the CSV read and
-the Builder chain.
+A **stage** is the entry operation. It opens the app (navigate, log in, start a
+checkout), crosses the pages before the input's first check, and returns the page it
+lands on. It is the only place a page object is constructed, right after navigating.
+Every later step is a page action on the page the previous step returned. Planning also
+thinks one test ahead: a run of page actions a later test would want as one call gets a
+**composed** operation (`makePayment` = choose the method, enter the details, continue,
+confirm), even when this test checks between them. It continues from the pages already in
+the Helper's fields and returns the last one. This test calls the page actions; the next
+calls `makePayment(PaymentMethod.Wallet, payment)`. Each operation is named with the
+business verb for what it does, never for what it returns (`continueToBank`, not
+`continueAndGetBankAmount`). Operations and page actions never assert. Test data is one
+setup line: a `build*` helper method that does the CSV read and the Builder chain.
 
 ### Option enums come from the page, not the model
 
@@ -709,8 +866,11 @@ locator already written.
 
 The page object gets one selection method whose locator is the confirmed selector
 with only the key replaced, so the value the flow used rebuilds the measured selector
-byte for byte. The helper stage does the follow-up steps for each exercised value;
-every other value throws "not automated yet" rather than running guessed steps.
+byte for byte. When the option decides which page comes next, the method returns
+`BasePage`, constructs the page each exercised value lands on, and the caller casts
+(`(CardPage) paymentMethodPage.choosePaymentMethod(PaymentMethod.CreditCard)`). A typed
+return would block the reuse ladder's "add an enum value and its case". Every other
+value throws "not automated yet" rather than running guessed steps.
 
 | What the template gives up | Why that is acceptable |
 |----------------------------|------------------------|
@@ -726,7 +886,7 @@ re-runs the existing tests that reach anything it changed:
 | Part | How |
 |------|-----|
 | What changed | Every existing file is copied to `pre-run/` before step 03 overwrites it, or before a step 04 fix first touches it. `module_index.changed_methods` / `changed_fields` diff against those copies |
-| Which tests | `blast_radius.tests_reaching`: the class reference graph narrowed by the call graph `assertion_graph.fingerprints` walks, so a change to one helper method re-runs only the tests that call it. A changed field or removed method counts as the whole class |
+| Which tests | `blast_radius.tests_reaching`: the class reference graph narrowed by the call graph `assertion_graph.fingerprints` walks, so a change to one helper method re-runs only the tests that call it. The walk follows a call on a page the test holds on its helper's field (`shop.cartPage.pay()`) through that field's type; unfollowed, every such call kept the test in, and a change to one page method re-ran the whole module. A changed field or removed method counts as the whole class |
 | How they run | Step 04's own `run_maven_test` — same environment, country and browser mode as the new test — with `baseline.dir` pinned to `regression-baselines/`, so their fingerprints never reach the PR |
 | Outcome | A failure is retried once. Nothing is fixed. A failure, or more than `REGRESSION_MAX_TESTS` (10) tests, makes the verdict NEEDS-REVIEW; `.fix-passed` still means "the new test passed", which is what Analytics counts |
 
@@ -737,9 +897,21 @@ re-runs the existing tests that reach anything it changed:
 with its re-run results, new operations with their `why_new`, `near_duplicates` (a new
 method whose calls repeat an existing one's with only literals different),
 `changed_existing_api`, `option_enum_gaps`, `reuse_unused` (an `as_is` reuse no generated
-file calls), and `test_shape` — each new test's length
-against `BODY_LINES_GUIDELINE` (30, in `shared/logstep_narration.py`) and any step that
-drives a page object call by call. None of these is a gate.
+file calls), `rebuilt_pages` (a Helper method this run wrote that constructs a page object
+with no navigation before it, where it should continue from the page in its field), and
+`test_shape` — each new test's length against `BODY_LINES_GUIDELINE` (30, in
+`shared/logstep_narration.py`). A step that makes several page calls is not flagged:
+calling the next action on the page the previous step returned is the shape a test is
+meant to have. None of these is a gate.
+
+`near_duplicates` is a list of groups (`{"methods": [...], "ratio": ...}`), one line per
+group: a method written into four classes is one finding, not six pairs. Before any of
+this, step 03 repairs the clearest case itself (`_repair_copied_methods`). When this run
+wrote the same method, body for body, into several classes, one pass moves it into the
+Helper the run generated, as a public static method, and each page object calls that one
+copy where it called its own (rule 5f in the prompt). It applies all or nothing, and only
+when exactly one copy is left. Page objects are generated a batch at
+a time, and a run had written the same `normalizeAmount()` into four of them.
 
 ---
 

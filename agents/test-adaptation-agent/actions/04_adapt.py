@@ -295,7 +295,7 @@ def build_adapt_prompt(item: dict, plan: dict, scope: dict, flow: dict,
 {item.get('rationale', '')}
 
 ## The full change note (written by a human)
-{plan.get('note_masked', '')}
+{plan.get('note', '')}
 
 ## 🗺️ MEASURED PAGE OBJECTS
 Which page object each observed page turned out to be, measured against the

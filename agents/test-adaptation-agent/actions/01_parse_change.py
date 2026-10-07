@@ -34,7 +34,6 @@ from shared.log import log as _log
 def log(msg): _log("parse-change", msg)
 
 from shared.claude import call_claude_ex as _call_claude_ex
-from shared.credential_masking import mask_credential_lines
 from shared.flow_map import destructive_token
 from shared.json_extract import extract_json
 
@@ -295,7 +294,7 @@ def main():
         "outcome_is_destructive": bool(destructive),
         "destructive_token": destructive,
         "escalate_only_items": [i["index"] for i in items if i["escalate_only"]],
-        "note_masked": mask_credential_lines(note),
+        "note": note,
         "input_file": str(INPUT_FILE),
     }
     (AUDIT_DIR / "01-parse-change.json").write_text(json.dumps(plan, indent=2))

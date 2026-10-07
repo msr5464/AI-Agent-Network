@@ -23,6 +23,10 @@ The relations, tightest first:
 
 Anything else is None: a different value, which is a finding about the product
 and never something to loosen a comparison over.
+
+Two amounts that differ have an order instead (`order()`): `less` or `greater`,
+what "the total decreased" claims. An order is never a relation. It is not in
+RELATIONS, so it can never sanction loosening an equality.
 """
 
 from __future__ import annotations
@@ -47,14 +51,16 @@ MEANING = {
 ASSERT_WITH = {
     "equal": "exact equality",
     "formatting": "equality once whitespace and letter case are ignored",
-    "numeric": "equality of the two amounts as numbers — one helper in the module "
-               "reads each displayed amount and returns it as plain number text (no "
-               "currency, no grouping separators, no trailing decimal zeros), and the "
-               "two texts are compared with the string equality assertion. Never "
+    "numeric": "equality of the two amounts as numbers — one converter in the "
+               "module turns each displayed amount into plain number text (no "
+               "currency, no grouping separators, no trailing decimal zeros), the "
+               "getter that reads the amount returns it through that converter, and "
+               "the two texts are compared with the string equality assertion. Never "
                "assert on a parsed numeric type: the assertion helper may have no "
                "overload for it",
     "phone": "equality of the digits once a leading country code or trunk 0 is "
-             "dropped — one helper in the module",
+             "dropped — one converter in the module, which the getter that reads "
+             "the phone returns through",
     "words": "the shown text CONTAINS the expected text",
 }
 
@@ -164,6 +170,37 @@ def relation(expected, actual) -> Optional[str]:
     return None
 
 
+# What an order check is asserted with, said the same framework-neutral way.
+ORDER_ASSERT_WITH = {
+    "less": "the shown amount is LESS than the other side's: both read through the "
+            "module's one converter as plain number text, parsed as numbers, and "
+            "compared with the boolean assertion",
+    "greater": "the shown amount is GREATER than the other side's: both read through "
+               "the module's one converter as plain number text, parsed as numbers, "
+               "and compared with the boolean assertion",
+}
+
+
+def order(expected, actual) -> Optional[str]:
+    """`less` or `greater` — how the amount `actual` shows compares with the one
+    `expected` shows — when each holds one amount and they differ, else None.
+
+    "The total decreased after the promo" is satisfied by two different amounts,
+    so relation() calls it None, and a contract built only from relations dropped
+    it. Step 03 then read the amount before the promo at a point step 02 never
+    read it, after the card number had already lowered it, and the test compared
+    an amount with itself.
+    """
+    if expected is None or actual is None:
+        return None
+    a, b = _amount(_flat(str(expected))), _amount(_flat(str(actual)))
+    if not a or not b or a[0] == b[0]:
+        return None
+    if not (a[1] == b[1] or (_amount_like(a[1]) and _amount_like(b[1]))):
+        return None
+    return "less" if b[0] < a[0] else "greater"
+
+
 def triage(failure_text: str, messages, parse) -> Optional[Dict[str, str]]:
     """The failed assertion, when all it saw was its expected value rendered differently.
 
@@ -240,6 +277,7 @@ def parse_value_check(payload: str) -> Optional[Dict[str, str]]:
         source = f"{kind}:{name.strip()}"
     elif kind == "literal":
         source = "literal"
+    found = relation(expected, rendered) or ""
     return {"check": parts[0].strip(), "element": parts[1].strip(),
             "rendered": rendered, "source": source, "expected": expected,
-            "relation": relation(expected, rendered) or ""}
+            "relation": found, "order": "" if found else (order(expected, rendered) or "")}

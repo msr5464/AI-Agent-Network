@@ -55,7 +55,7 @@ from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_too
 from shared.log import log as _log      # noqa: E402  (shared, redacts known secrets)
 from shared.page_identity import (is_alternatives, is_dom_selector,  # noqa: E402
                                   qualified_locator_names)
-from shared import check_provenance, flow_map, option_sets, proven_locators, value_match  # noqa: E402
+from shared import check_provenance, flow_map, frames, option_sets, proven_locators, value_match  # noqa: E402
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -130,6 +130,33 @@ def parse_selector_output(output: str) -> tuple:
     anyone reads the PR.
     """
     selectors, counts, visibles, rejected = {}, {}, {}, {}
+    for name, selector, count, visible, problem in _selector_reports(output):
+        if problem:
+            log(f"WARNING: dropped {name} — {problem}")
+            rejected[name] = problem
+            continue
+        if visible is None:
+            log(f"NOTE: {name} was reported without |visible=, so it was never "
+                f"checked for visibility — keeping it, but step 03 cannot treat "
+                f"it as confirmed-visible.")
+
+        if selectors.get(name, selector) != selector:
+            # One name is one element. Keeping the last one silently gave three
+            # pages the payment-success amount, because the popup, the bank page
+            # and the success screen had all been reported as `amountDisplay`.
+            log(f"WARNING: {name} was reported again as {selector!r} — keeping the "
+                f"first, {selectors[name]!r}, unless the browser clicked only the "
+                f"second. A different element needs its own name.")
+            continue
+        selectors[name] = selector
+        counts[name] = count
+        visibles[name] = visible
+    return selectors, counts, visibles, rejected
+
+
+def _selector_reports(output: str):
+    """Every SELECTOR_FOUND line, in order, as (name, selector, count, visible,
+    problem). `problem` is why the selector cannot be confirmed, or ""."""
     for line in output.splitlines():
         line = line.strip()
         if not line.startswith("SELECTOR_FOUND:"):
@@ -153,53 +180,41 @@ def parse_selector_output(output: str) -> tuple:
             count = int(match.group(1))
             selector = selector[:match.start()].strip()
 
-        def drop(reason: str) -> None:
-            log(f"WARNING: dropped {name} — {reason}")
-            rejected[name] = reason
-
+        problem = ""
         if not is_dom_selector(selector):
-            drop(f"{selector!r} is not a usable DOM selector "
-                 f"(Playwright-MCP ref or pseudo-attribute)")
-            continue
-        if is_alternatives(selector):
+            problem = (f"{selector!r} is not a usable DOM selector "
+                       f"(Playwright-MCP ref or pseudo-attribute)")
+        elif is_alternatives(selector):
             # Counts 1 while only one alternative matches, and names no element: a run
             # reported `button:has-text("Buy Now"), a:has-text("Buy Now")` for a link.
             # A control the browser saw clicked is recovered from that click instead.
-            drop(f"{selector!r} is a list of alternatives, which is a guess: count each "
-                 f"alternative and report the one that matched.")
-            continue
-        if count is None:
-            drop(f"{selector!r} was reported without a |count=, so its uniqueness "
-                 f"was never measured. Re-report it with the count from the batch "
-                 f"check (rule 2c).")
-            continue
-        if count != 1:
-            drop(f"{selector!r} matched {count} element(s), not 1. Generating from "
-                 f"it would fail at runtime with a strict mode violation; narrow "
-                 f"the selector and re-report it.")
-            continue
-        if visible is not None and visible != 1:
-            drop(f"{selector!r} matched {count} element(s) but {visible} of them "
-                 f"were visible. A locator for an element nobody can see produces "
-                 f"a test that fails for an invisible reason — if the element is "
-                 f"genuinely absent, report the step, do not report a selector.")
-            continue
-        if visible is None:
-            log(f"NOTE: {name} was reported without |visible=, so it was never "
-                f"checked for visibility — keeping it, but step 03 cannot treat "
-                f"it as confirmed-visible.")
+            problem = (f"{selector!r} is a list of alternatives, which is a guess: count "
+                       f"each alternative and report the one that matched.")
+        elif count is None:
+            problem = (f"{selector!r} was reported without a |count=, so its uniqueness "
+                       f"was never measured. Re-report it with the count from the batch "
+                       f"check (rule 2c).")
+        elif count != 1:
+            problem = (f"{selector!r} matched {count} element(s), not 1. Generating from "
+                       f"it would fail at runtime with a strict mode violation; narrow "
+                       f"the selector and re-report it.")
+        elif visible is not None and visible != 1:
+            problem = (f"{selector!r} matched {count} element(s) but {visible} of them "
+                       f"were visible. A locator for an element nobody can see produces "
+                       f"a test that fails for an invisible reason — if the element is "
+                       f"genuinely absent, report the step, do not report a selector.")
+        yield name, selector, count, visible, problem
 
-        if selectors.get(name, selector) != selector:
-            # One name is one element. Keeping the last one silently gave three
-            # pages the payment-success amount, because the popup, the bank page
-            # and the success screen had all been reported as `amountDisplay`.
-            log(f"WARNING: {name} was reported again as {selector!r} — keeping the "
-                f"first, {selectors[name]!r}. A different element needs its own name.")
-            continue
-        selectors[name] = selector
-        counts[name] = count
-        visibles[name] = visible
-    return selectors, counts, visibles, rejected
+
+def reported_again(output: str, found: dict) -> dict:
+    """{name: [selectors]} the model also reported for a name, besides the one
+    kept. Step 04 shows them when a test fails on that name's locator."""
+    others: dict = {}
+    for name, selector, _count, _visible, problem in _selector_reports(output):
+        if not problem and name in found and selector != found[name] \
+                and selector not in others.get(name, []):
+            others.setdefault(name, []).append(selector)
+    return others
 
 
 def parse_step_results(output: str) -> tuple:
@@ -362,16 +377,214 @@ def verify_with_evidence(found: dict, counts: dict, visibles: dict,
     return found, counts, visibles, rejected, stats
 
 
-# Words that name a control's kind, not which control it is.
-_CONTROL_WORDS = {"button", "btn", "field", "input", "icon", "link", "text", "label",
-                  "option", "tab", "the", "and"}
+def _actions(rows: list) -> list:
+    """(row index, action) for every click and keystroke the helpers recorded on
+    exactly one visible element, in order. A keystroke row from before the helpers
+    counted them carries no count and is left out."""
+    out = []
+    for i, row in enumerate(rows or []):
+        act = row.get("clicked") or row.get("typed")
+        if isinstance(act, dict) and act.get("sel") and act.get("total") == 1 \
+                and act.get("visible") == 1:
+            out.append((i, act))
+    return out
 
 
-def _naming_words(text: str) -> set:
-    """camelCase or prose split into lowercase words. Plainer than
-    check_provenance.subject_words, which drops "checkout" as a form of "check"."""
-    return {w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+", text or "")
-            if len(w) >= 3} - _CONTROL_WORDS
+def _state_before(rows: list, i: int):
+    """The page state the helpers last measured before row `i`, or None."""
+    for j in range(i - 1, -1, -1):
+        if isinstance(rows[j].get("checks"), dict):
+            return rows[j]
+    return None
+
+
+def _same_element(action: dict, selectors: list, rows: list, i: int) -> bool:
+    """Whether one of `selectors` was counted, before row `i`, at exactly the one
+    visible element the action landed on: same frame, same element identity."""
+    uid = action.get("uid")
+    if not uid:
+        return False
+    frame = frames.split(action["sel"])[0]
+    for row in rows[:i]:
+        checks = row.get("checks") if isinstance(row.get("checks"), dict) else {}
+        for sel in selectors:
+            c = checks.get(sel)
+            if isinstance(c, dict) and c.get("total") == 1 and c.get("visible") == 1 \
+                    and c.get("uid") == uid and frames.split(sel)[0] == frame:
+                return True
+    return False
+
+
+def _unique_where_used(selector: str, action: dict, rows: list, i: int) -> bool:
+    """Whether `selector` was counted at the very element the action used, alone
+    and visible, in the page state just before it. Without element identities
+    (evidence from before they were recorded) nothing is proven."""
+    state = _state_before(rows, i)
+    c = (state or {}).get("checks", {}).get(selector)
+    return (isinstance(c, dict) and c.get("total") == 1 and c.get("visible") == 1
+            and bool(action.get("uid")) and c.get("uid") == action.get("uid"))
+
+
+def prefer_clicked(found: dict, counts: dict, visibles: dict, output: str,
+                   rows: list) -> list:
+    """For a control the flow clicked or typed into, keep a selector proven unique
+    where it was used. Returns what changed.
+
+    One name is one element, so a second report is otherwise ignored. That is right
+    for an element shown on several pages, and wrong for a control the model
+    reported early from a look at the page: a run reported `promoCodeOption` as a
+    "2 promos available" banner on the payment-method list, then clicked the Flash
+    Sale promo radio on the card form and reported that. The banner was kept, the
+    test clicked it on the card form, where it does not exist, and step 04 could
+    not see why. A click is what the flow did, so it decides. Shown values are
+    never clicked and still keep their first report.
+
+    A name's action is found by its reports: one spelled like the recorded action,
+    or one counted at the very element the action landed on (the helpers record
+    element identities). The second matters because a model rarely reports a
+    selector in the helpers' spelling. A run kept a bare close-button class for an
+    overlay's close button: it was counted 1/1 only while the overlay was closed,
+    where it is the popup's own close button, and with the overlay open it matched
+    two. The browser had clicked the overlay's button through a selector scoped to
+    the overlay, and the model had reported a scoped one too, but no two spellings
+    were equal, so the first report stood and the test failed on it. Being unique
+    somewhere is not being unique where the test uses it: a first report that was
+    not counted at that element, just before the action, gives way to the action's
+    own selector, which the helpers counted at the moment of use.
+
+    A first report the flow itself clicked or typed into stands: the name then has
+    an action spelled like it, and nothing says another is better.
+    """
+    actions = _actions(rows)
+    used = {a["sel"] for _, a in actions} | {c["sel"] for c in flow_map.clicked_controls(rows)}
+    reports: dict = {}
+    for name, selector, _count, _visible, problem in _selector_reports(output):
+        if not problem and selector not in reports.setdefault(name, []):
+            reports[name].append(selector)
+    changed = []
+    for name in list(found):
+        first = found[name]
+        if first in used:
+            continue
+        candidates = [first] + [s for s in reports.get(name, []) if s != first]
+        for i, action in actions:
+            if action["sel"] not in candidates and not _same_element(action, candidates, rows, i):
+                continue
+            if _unique_where_used(first, action, rows, i):
+                break
+            if action["sel"] in {s for n, s in found.items() if n != name}:
+                continue
+            changed.append({"name": name, "reported_first": first, "clicked": action["sel"]})
+            found[name], counts[name], visibles[name] = action["sel"], 1, 1
+            log(f"  CLICKED {name} = {action['sel']} — the selector the browser counted at "
+                f"the element the flow {'typed into' if 'value' in action else 'clicked'}; "
+                f"kept over {first}, which was never counted there")
+            break
+    return changed
+
+
+# settle() returns after 700ms with nothing changing, so a page that took this
+# long after an action, on requests of its own, was still updating in place.
+SLOW_SETTLE_MS = 1500
+# Their inventory text is what was typed into them.
+_FIELD_TAGS = {"input", "textarea", "select"}
+_INVENTORY_KEY = ("frame", "tag", "id", "class", "name", "role", "attributes")
+# A countdown ticks on its own: a timer's new digits are not something an action did.
+# qa-helpers.js text() cuts every text here.
+_INVENTORY_TEXT_CAP = 60
+_CLOCK = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
+
+
+def _inventory_texts(row: dict) -> dict:
+    """{element key: text} for the elements of one page state that appear once in
+    it, form fields left out."""
+    seen, texts = {}, {}
+    for e in row.get("inventory") or []:
+        if not isinstance(e, dict) or e.get("tag") in _FIELD_TAGS:
+            continue
+        key = json.dumps({k: e.get(k) for k in _INVENTORY_KEY}, sort_keys=True)
+        seen[key] = seen.get(key, 0) + 1
+        texts[key] = e.get("text") or ""
+    return {k: t for k, t in texts.items() if seen[k] == 1}
+
+
+def _element_names(key: str, found: dict) -> list:
+    """The locator names whose selector picks this inventory element out by its
+    tag, classes or id, in its frame."""
+    e = json.loads(key)
+    classes = (e.get("class") or "").split()
+    tag = e.get("tag") or ""
+    forms = {tag + "".join("." + c for c in classes), "".join("." + c for c in classes)}
+    if classes:
+        forms |= {f"{tag}.{classes[0]}", f".{classes[0]}"}
+    if e.get("id"):
+        forms |= {f"#{e['id']}", f"{tag}#{e['id']}", f"[id='{e['id']}']"}
+    frame = frames.prefix_path(e.get("frame") or "")
+    return [n for n, s in found.items()
+            if frames.split(s)[0] == frame and frames.split(s)[1] in forms - {""}]
+
+
+def delayed_updates(rows: list, found: dict) -> list:
+    """What an action changed on the page after it returned, while the page kept
+    working on requests of its own.
+
+    The helpers wait after every action until every frame and the network have
+    settled, so step 02 never acts on a page still updating, and nothing it reports
+    says it waited. A generated test does not wait unless told. A card number typed
+    on a checkout was followed 2s later by the header total dropping and the promo
+    list being redrawn: step 02 clicked a promo 9s later and it held, and the test
+    clicked it at once, mid-redraw, and the click was lost. Each entry names the actions, how long the page took, and what changed —
+    an element present once in the state before and after, with different text.
+
+    [{"after": [locator name or selector, ...], "settled_ms", "requests",
+      "changed": [{"element", "names", "before", "after"}]}]
+    """
+    names = {s: n for n, s in found.items()}
+    out, prev, pending = [], None, []
+    for row in rows or []:
+        act = row.get("clicked") or row.get("typed")
+        if isinstance(act, dict):
+            pending.append(act)
+            continue
+        if not row.get("inventory"):
+            continue
+        settled = row.get("settled") or {}
+        if prev is not None and pending and prev.get("url") == row.get("url") \
+                and settled.get("requests") and (settled.get("ms") or 0) >= SLOW_SETTLE_MS:
+            before, after = _inventory_texts(prev), _inventory_texts(row)
+            typed = [str(a["value"]) for a in pending if a.get("value")]
+            changed = []
+            for key in sorted(before.keys() & after.keys()):
+                old, new = before[key], after[key]
+                if _CLOCK.sub("#", old) == _CLOCK.sub("#", new) or not old \
+                        or any(t and t in new for t in typed):
+                    continue
+                e = json.loads(key)
+                changed.append({"element": e["tag"] + "".join(
+                                    "." + c for c in (e.get("class") or "").split()),
+                                "names": _element_names(key, found),
+                                "before": old, "after": new})
+            # A container's text changes with its child's: keep the child. Inventory
+            # text stops at 60 characters, so a container cut there is dropped when a
+            # shorter element changed too, even when the cut hides the child's text.
+            changed = [c for c in changed
+                       if not any(o is not c and len(o["before"]) < len(c["before"])
+                                  and ((o["before"] in c["before"] and o["after"] in c["after"])
+                                       or len(c["before"]) >= _INVENTORY_TEXT_CAP)
+                                  for o in changed)]
+            if changed:
+                acted = []
+                for a in pending:
+                    label = names.get(a.get("sel")) or a.get("sel")
+                    if label and label not in acted:
+                        acted.append(label)
+                out.append({"after": acted, "settled_ms": settled.get("ms"),
+                            "requests": settled.get("requests"), "changed": changed})
+                log(f"  DELAYED UPDATE after {', '.join(acted)}: "
+                    + "; ".join(f"{c['element']} {c['before']!r} → {c['after']!r}" for c in changed)
+                    + f" ({settled.get('ms')}ms, {settled.get('requests')} request(s))")
+        prev, pending = row, []
+    return out
 
 
 def recover_clicked_locators(found: dict, counts: dict, visibles: dict, rows: list,
@@ -386,25 +599,149 @@ def recover_clicked_locators(found: dict, counts: dict, visibles: dict, rows: li
     name is recovered only from one click, measured 1/1, whose text shares a word
     with the name, and never onto an element another name already has.
     """
-    clicks = [r["clicked"] for r in rows or [] if isinstance(r.get("clicked"), dict)]
-    clicks = [c for c in clicks if c.get("sel") and c.get("total") == 1 and c.get("visible") == 1]
     recovered = []
     for name in wanted:
         if name in found:
             continue
-        # The click sharing the most words wins: `buyNowButton` shares one with
-        # "Pay now" and two with "BUY NOW". A tie names nothing.
-        words, shared = _naming_words(name.rsplit(".", 1)[-1]), {}
-        for c in clicks:
-            n = len(words & _naming_words(c.get("text") or ""))
-            if n:
-                shared[c["sel"]] = max(shared.get(c["sel"], 0), n)
-        top = [sel for sel, n in shared.items() if shared and n == max(shared.values())]
+        # The click sharing the most words wins. A tie names nothing.
+        named = flow_map.clicks_named(rows, name)
+        top = [c["sel"] for c in named if c["shared"] == named[0]["shared"]]
         if len(top) != 1 or top[0] in found.values():
             continue
         found[name], counts[name], visibles[name] = top[0], 1, 1
         recovered.append(name)
         log(f"  RECOVERED {name} = {found[name]} — clicked in the browser, counted 1/1, "
+            f"but never reported")
+    return recovered
+
+
+def _unique_live(readings: list) -> bool:
+    """Counted at exactly one visible element in some state, and never at more."""
+    return (any(c.get("total") == 1 and c.get("visible") == 1 for c in readings)
+            and not any((c.get("total") or 0) > 1 for c in readings))
+
+
+def fill_from_seeds(found: dict, counts: dict, visibles: dict, rows: list,
+                    wanted: list) -> list:
+    """Fill a plan name the model never reported from a selector an earlier run
+    confirmed for it, when this run counted that selector live. Returns the names.
+
+    Earlier runs' selectors are counted on every page state (`known`), and only a
+    proven one could fill a missing name. A run that used a name in its own value
+    check, never reported a selector for it, and had been handed the right one by
+    an earlier run that called the page differently (`PaymentPopupPage.x` for this
+    plan's `x`) left the name to step 03 to guess. The name matches whole, or by
+    the part after the page; the seed must count one visible element here and never
+    more; and one candidate only.
+    """
+    by_name: dict = {}
+    readings: dict = {}
+    for row in rows or []:
+        for e in row.get("known") or []:
+            if isinstance(e, dict) and e.get("name") and e.get("selector") and "total" in e:
+                by_name.setdefault(e["name"], set()).add(e["selector"])
+                readings.setdefault(e["selector"], []).append(e)
+    filled = []
+    for name in wanted:
+        if name in found:
+            continue
+        bare = name.rsplit(".", 1)[-1]
+        options = {sel for seed, sels in by_name.items()
+                   if seed == name or seed.rsplit(".", 1)[-1] == bare for sel in sels}
+        options = {sel for sel in options if _unique_live(readings.get(sel) or [])
+                   and sel not in found.values()}
+        if len(options) != 1:
+            continue
+        found[name], counts[name], visibles[name] = options.pop(), 1, 1
+        filled.append(name)
+        log(f"  SEEDED {name} = {found[name]} — an earlier run confirmed it for this name, "
+            f"and it counted 1/1 here, but this run never reported it")
+    return filled
+
+
+def fill_from_value_checks(found: dict, counts: dict, visibles: dict, rows: list,
+                           value_checks: list, wanted: list) -> list:
+    """Fill a plan name the model compared a value on but never reported, from the
+    element the helpers counted showing exactly that value. Returns the names.
+
+    A VALUE_CHECK names the element and the text it showed, in the model's words;
+    the helpers record what each counted selector showed. A run compared a header
+    amount under the plan's name and never reported its selector. One selector
+    only, counted at one visible element showing that exact text, and never more.
+    """
+    readings: dict = {}
+    for row in rows or []:
+        for sel, c in (row.get("checks") or {}).items():
+            if isinstance(c, dict) and "total" in c:
+                readings.setdefault(sel, []).append(c)
+        for e in row.get("known") or []:
+            if isinstance(e, dict) and e.get("selector") and "total" in e:
+                readings.setdefault(e["selector"], []).append(e)
+    filled = []
+    for check in value_checks or []:
+        name, shown = check.get("element"), (check.get("rendered") or "").strip()
+        if not shown or name in found or name not in wanted:
+            continue
+        options = {sel for sel, taken in readings.items()
+                   if sel not in found.values() and _unique_live(taken)
+                   and any(c.get("total") == 1 and (c.get("text") or "").strip() == shown
+                           for c in taken)}
+        if len(options) != 1:
+            continue
+        found[name], counts[name], visibles[name] = options.pop(), 1, 1
+        filled.append(name)
+        log(f"  VALUE-CHECKED {name} = {found[name]} — it showed {shown!r} where this run "
+            f"compared {name}, but the run never reported its selector")
+    return filled
+
+
+# A name ending in one of these is something read or clicked, never typed into.
+_NOT_A_FIELD = {"button", "btn", "link", "tab", "option", "icon", "display", "label", "text",
+                "message", "title", "amount", "badge", "toast", "header"}
+
+
+def recover_typed_locators(found: dict, counts: dict, visibles: dict, rows: list,
+                           wanted: list) -> list:
+    """Confirm a plan field the model typed into but never reported, from the
+    keystrokes the browser recorded. Returns the names recovered.
+
+    The same gap as an unreported click, on a field: a run typed a bank page's
+    one-time code into a field the helpers counted 1/1, reported no selector for
+    the plan's name for it, and step 03 guessed one that matched nothing. A name
+    is recovered only from a field typed into while it was the one visible match
+    of its selector, sharing the most words with the name and no tie, and never
+    onto an element another name already has (by selector or by identity).
+    """
+    typed = {a["sel"]: a for _, a in _actions(rows) if "value" in a}
+    if not typed:
+        return []
+    taken = set(found.values())
+    taken_ids = {c.get("uid") for row in rows
+                 for sel, c in (row.get("checks") or {}).items()
+                 if sel in taken and isinstance(c, dict) and c.get("total") == 1 and c.get("uid")}
+    recovered = []
+    for name in wanted:
+        if name in found:
+            continue
+        bare = name.rsplit(".", 1)[-1]
+        parts = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+", bare)
+        if parts and parts[-1].lower() in _NOT_A_FIELD:
+            continue
+        words = flow_map.naming_words(bare)
+        scored = [(len(words & flow_map.naming_words(frames.split(sel)[1])), sel)
+                  for sel, a in typed.items()
+                  if sel not in taken and not (a.get("uid") and a["uid"] in taken_ids)]
+        scored = [(n, sel) for n, sel in scored if n]
+        if not scored:
+            continue
+        best = max(n for n, _ in scored)
+        top = [sel for n, sel in scored if n == best]
+        if len(top) != 1:
+            continue
+        found[name], counts[name], visibles[name] = top[0], 1, 1
+        taken.add(top[0])
+        recovered.append(name)
+        log(f"  RECOVERED {name} = {top[0]} — typed into in the browser, counted 1/1, "
             f"but never reported")
     return recovered
 
@@ -702,6 +1039,8 @@ def drop_untraced_sources(value_checks: list, web_steps: list, inputs: dict) -> 
 # is not null" has no second value at all — both were downgraded when every
 # VALUE_CHECK without a relation was.
 _EQUALITY = re.compile(r"\b(match(es|ed|ing)?|same|equals?|identical)\b", re.I)
+_DOWN = re.compile(r"decreas|\bless\b|\blower\b|fewer|\bdrops?\b|reduc", re.I)
+_UP = re.compile(r"increas|greater|\bhigher\b|more than|\brises?\b", re.I)
 _NOT_EQUALITY = re.compile(r"decreas|increas|\bless\b|greater|more than|fewer|lower|higher"
                            r"|not (null|empty|blank)|differ", re.I)
 
@@ -716,6 +1055,10 @@ def enforce_value_checks(passed: list, unverified: list, value_checks: list) -> 
     """
     unmatched = [c["check"] for c in value_checks if not c["relation"]
                  and _EQUALITY.search(c["check"]) and not _NOT_EQUALITY.search(c["check"])]
+    # The same for an order: "the total decreased" with a total that went up.
+    unmatched += [c["check"] for c in value_checks if c.get("order")
+                  and ((_DOWN.search(c["check"]) and c["order"] != "less")
+                       or (_UP.search(c["check"]) and c["order"] != "greater"))]
     if not unmatched:
         return passed, unverified
     kept, downgraded = [], list(unverified)
@@ -1067,7 +1410,7 @@ def main() -> None:
             "(':' and '=' both work):\n"
             "         Username: your_username\n"
             "         Password: your_password")
-        _write_empty(reason="login step detected but no credentials in input file — add Username/Password fields")
+        _write_error(reason="login step detected but no credentials in input file — add Username/Password fields")
         sys.exit(1)
 
     # Credentials only for a flow that logs in. Without one, an `Email:` is a form
@@ -1633,10 +1976,17 @@ Begin executing the steps now using the browser tools.
         evidence = flow_map.read_evidence(evidence_path)
         found, counts, visibles, rejected, measured = verify_with_evidence(
             found, counts, visibles, rejected, evidence)
+        clicked = prefer_clicked(found, counts, visibles, output, evidence)
         inputs = enforce_typed_fields(parse_inputs_used(output), found, counts, visibles,
                                       rejected, evidence)
         recover_clicked_locators(found, counts, visibles, evidence, all_locators)
+        recover_typed_locators(found, counts, visibles, evidence, all_locators)
         preferred = prefer_proven(found, counts, visibles, evidence, proven_here, all_locators)
+        # The map is the model's reports; a name it never reported is filled from what
+        # the browser measured, before step 03 is left to guess it.
+        fill_from_seeds(found, counts, visibles, evidence, all_locators)
+        value_checks = drop_untraced_sources(parse_value_checks(output), web_steps, inputs)
+        fill_from_value_checks(found, counts, visibles, evidence, value_checks, all_locators)
         if found or measured["dropped"]:
             log(f"Selectors measured live by the browser helpers: {measured['live']} of "
                 f"{measured['live'] + measured['claimed']} kept"
@@ -1645,7 +1995,6 @@ Begin executing the steps now using the browser tools.
                 + (f" — {measured['claimed']} rest on the marker's own count"
                    if measured["claimed"] else ""))
         passed, unverified = enforce_verification_evidence(passed, unverified, found)
-        value_checks = drop_untraced_sources(parse_value_checks(output), web_steps, inputs)
         passed, unverified = enforce_value_checks(passed, unverified, value_checks)
         passed, unverified = promote_matched_values(passed, unverified, value_checks, found,
                                                     inputs)
@@ -1671,7 +2020,10 @@ Begin executing the steps now using the browser tools.
             # same uniqueness guarantee the selector map does.
             "interaction_hints": reconcile_hints(parse_interaction_hints(output), found),
             "proven_preferred":  preferred,
+            "clicked_preferred": clicked,
+            "reported_again":    reported_again(output, found),
             "option_sets":       offered,
+            "delayed_updates":   delayed_updates(evidence, found),
         }
 
     def _score(result, p: dict) -> tuple:
@@ -1791,7 +2143,10 @@ Begin executing the steps now using the browser tools.
             urls_visited=list(getattr(r, "navigated_urls", []) or []),
             final_attempt=final,
             proven_preferred=p.get("proven_preferred"),
+            clicked_preferred=p.get("clicked_preferred"),
+            reported_again=p.get("reported_again"),
             option_sets=p.get("option_sets"),
+            delayed_updates=p.get("delayed_updates"),
         )
 
     attempt_notes = ""
@@ -1821,7 +2176,7 @@ Begin executing the steps now using the browser tools.
                 "       → FIX: the Playwright MCP tools never reached the model. "
                 "Check .mcp.json in this audit dir and that --tools still admits "
                 "ToolSearch, which is what loads deferred MCP tool schemas.")
-            _write_empty(reason="Playwright MCP tools unavailable — Claude fabricated the run instead of driving a browser")
+            _write_error(reason="Playwright MCP tools unavailable — Claude fabricated the run instead of driving a browser")
             sys.exit(1)
         unavailable = result.browser_unavailable()
         if unavailable:
@@ -1957,6 +2312,17 @@ def _write_empty(reason: str) -> None:
                   skipped=True, reason=reason, status="skipped", attempts=0)
 
 
+def _write_error(reason: str) -> None:
+    """Write the result of a validation that could not run, before exiting 1.
+
+    Not _write_empty: "skipped" is a test with nothing to validate, and a run whose
+    browser tools never reached the model, written that way, read as a benign skip
+    to everything that judges a session afterwards.
+    """
+    _write_result({}, [], [], page_elements={}, interaction_hints=[],
+                  skipped=False, reason=reason, status="error", attempts=0)
+
+
 def _write_result(selectors, steps_passed, steps_failed,
                   page_elements=None, interaction_hints=None,
                   skipped=False, reason=None, status="ok", raw_output="",
@@ -1964,7 +2330,8 @@ def _write_result(selectors, steps_passed, steps_failed,
                   selector_visibles=None, rejected_selectors=None,
                   mechanisms=None, urls_visited=None, final_attempt=True,
                   inputs_used=None, value_checks=None, proven_preferred=None,
-                  option_sets=None) -> None:
+                  clicked_preferred=None, reported_again=None, option_sets=None,
+                  delayed_updates=None) -> None:
     # Every selector that survives parse_selector_output() was measured at exactly
     # one element, and every hint that survives reconcile_hints() is either backed
     # by one of those or measured itself. Assert it rather than trusting it: this
@@ -2022,10 +2389,20 @@ def _write_result(selectors, steps_passed, steps_failed,
         # name -> the selector the model reported and the proven one kept instead
         # (prefer_proven). Empty when the model chose the proven one itself.
         "proven_preferred":  proven_preferred or [],
+        # name -> the selector the browser counted at the element the flow clicked
+        # or typed into, kept over a first report never counted there (prefer_clicked).
+        "clicked_preferred": clicked_preferred or [],
+        # name -> other selectors the model reported for it. Step 04 shows them when
+        # the test fails on that name's locator.
+        "reported_again":    reported_again or {},
         # locator name -> every option the page offered beside the one the flow
         # used (shared/option_sets.py). Step 03 generates option enums from it, so
         # an enum lists what the page offered rather than what a model expects.
         "option_sets":       option_sets or {},
+        # What an action changed on the page after it returned, while the page kept
+        # working (delayed_updates). Step 03 makes the page method that performs the
+        # action wait for the page to settle; step 04 shows them to the fixer.
+        "delayed_updates":   delayed_updates or [],
         # False while a retry follows — the server keeps the chip running
         # instead of judging this snapshot as the step's outcome.
         "final_attempt":     final_attempt,

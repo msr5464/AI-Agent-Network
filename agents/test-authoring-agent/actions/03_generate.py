@@ -139,6 +139,9 @@ def call_claude(prompt: str, label: str = "") -> str:
         # No user settings: with no tools, their permission allows buy nothing, and
         # their plugins' SessionStart hooks were injecting a persona into codegen.
         setting_sources="project,local",
+        # A batch whose stream stalls is sent again rather than waited out: two
+        # batches ran at 3 and 13 tokens/s for six and seven minutes (shared/claude.py).
+        restart_if_slow=True,
         # Conventions, references and rules are identical for every call in this run,
         # so main() writes them once and every batch and repair sends that file as the
         # system prompt. Picked up here rather than passed in, so no call site — and no
@@ -284,7 +287,8 @@ def write_file(rel_path: str, content: str) -> None:
 # CODE_ERROR failure, so the logic (and the file-location/key-naming rules it
 # encodes) exists in exactly one place.
 from shared.credential_properties import write_credential_property
-from shared.credential_extraction import LABELS as _CREDENTIAL_LABELS, credentials_from_plan  # noqa: E402
+from shared.credential_extraction import (credentials_from_plan, secret_columns,  # noqa: E402
+                                          secret_property_key, take_secret_columns)
 from shared.page_identity import is_dom_selector  # noqa: E402
 from shared.test_catalog import test_methods_in  # noqa: E402
 # URLs are the same story as credentials — one place decides the property file and
@@ -293,7 +297,7 @@ from shared import properties_file, url_properties  # noqa: E402
 from shared.edit_guards import validate_fix  # noqa: E402
 from shared import check_provenance, test_case  # noqa: E402
 from shared import logstep_narration  # noqa: E402
-from shared import assertion_graph, value_match  # noqa: E402
+from shared import assertion_graph, flow_map, frames, value_match  # noqa: E402
 from shared.code_analyzer import split_class_members, without_comments  # noqa: E402
 
 
@@ -500,6 +504,163 @@ def unconfirmed_locators(web_pages, selectors, interaction_hints, mechanisms) ->
     return gaps
 
 
+def _evidence_readings(rows: list) -> dict:
+    """{selector: [reading, ...]}: every count step 02's helpers took of it, a click's
+    or a keystroke's own count included (marked with `action`)."""
+    seen: dict = {}
+    for row in rows or []:
+        for sel, c in (row.get("checks") or {}).items():
+            if isinstance(c, dict) and "total" in c:
+                seen.setdefault(sel, []).append(c)
+        for e in row.get("known") or []:
+            if isinstance(e, dict) and e.get("selector") and "total" in e:
+                seen.setdefault(e["selector"], []).append(e)
+        for kind in ("clicked", "typed"):
+            a = row.get(kind)
+            if isinstance(a, dict) and a.get("sel") and a.get("total") is not None:
+                seen.setdefault(a["sel"], []).append({**a, "action": kind})
+    return seen
+
+
+def _measured(readings: list) -> str:
+    """What step 02's counts say of one selector: `unique` (1/1 visible, never more
+    than one match), `ambiguous` (more than one match somewhere), `hidden` (found,
+    never one visible) or `unmeasured`."""
+    if not readings:
+        return "unmeasured"
+    if any((c.get("total") or 0) > 1 for c in readings):
+        return "ambiguous"
+    if any(c.get("total") == 1 and c.get("visible") == 1 for c in readings):
+        return "unique"
+    return "hidden"
+
+
+def guessed_locators(files_map: dict, gaps: dict, rows: list) -> list:
+    """Each locator the plan asked for that step 02 never confirmed, as the
+    generated page object wrote it, held to what step 02's helpers counted.
+
+    unconfirmed_locators names the gap before codegen; this measures what codegen
+    put in it. A guess step 02 happened to count 1/1 (a header amount it read
+    under another name) is confirmed by that count. One it never counted is a
+    pure guess: a run wrote an attribute selector for a bank page's code field
+    that matched nothing, while step 02 had typed into that very field.
+
+    [{"path", "page", "name", "selector", "measured"}]
+    """
+    try:
+        from shared.frameworks import get_active_plugin
+        code = get_active_plugin().code
+    except Exception:
+        return []
+    readings = _evidence_readings(rows)
+    out = []
+    for path, content in files_map.items():
+        page = Path(path).stem
+        names = gaps.get(page) or []
+        if not names or not path.endswith(".java") or not content:
+            continue
+        for loc in code.extract_locators(content):
+            if loc.get("name") not in names or loc.get("approx") or not loc.get("raw"):
+                continue
+            out.append({"path": path, "page": page, "name": loc["name"], "selector": loc["raw"],
+                        "measured": _measured(readings.get(loc["raw"]) or [])})
+    return out
+
+
+def _locator_candidates(guess: dict, rows: list, limit: int = 25) -> list:
+    """Selectors step 02 counted at exactly one visible element, never more, in the
+    guessed locator's frame: what the element it means can be picked from. The
+    ones sharing a word with the name come first, and among those the ones the
+    flow typed into or clicked: a field's label shares its words too."""
+    readings = _evidence_readings(rows)
+    frame = frames.split(guess["selector"])[0]
+    words = flow_map.naming_words(guess["name"])
+    out = []
+    for sel, taken in readings.items():
+        if frames.split(sel)[0] != frame or _measured(taken) != "unique":
+            continue
+        tags = {c.get("tag") for c in taken if c.get("tag")}
+        texts = [c.get("text") for c in taken if c.get("text")]
+        acts = sorted({"typed into" if c.get("action") == "typed" else "clicked"
+                       for c in taken if c.get("action")})
+        about = ", ".join([*sorted(tags), *([f"showed {texts[-1][:40]!r}"] if texts else []), *acts])
+        shared = len(words & flow_map.naming_words(frames.split(sel)[1] + " " + " ".join(texts)))
+        out.append((shared, bool(acts), sel, about))
+    out.sort(key=lambda c: (-c[0], not c[1]))
+    return [(sel, about) for _shared, _acted, sel, about in out[:limit]]
+
+
+def _repair_guessed_locators(files_map: dict, guesses: list, rows: list) -> tuple:
+    """Point a guessed locator step 02 never counted at an element it did.
+
+    One repair pass over the page objects concerned, offering only selectors step
+    02 counted at exactly one visible element in the same frame. A replacement is
+    kept only if it is one of those, and the file passes validate_fix; anything
+    else stays as generated and is reported. Returns (files_map, [guess, ...]) with
+    each guess's outcome in "result".
+    """
+    needs = [g for g in guesses if g["measured"] != "unique"]
+    for g in guesses:
+        if g["measured"] == "unique":
+            g["result"] = "confirmed by step 02's counts"
+    if not needs:
+        return files_map, guesses
+    log(f"GUARD: {len(needs)} locator(s) step 02 never confirmed were written from a guess "
+        f"it did not count at one visible element — repairing:")
+    offered, lines = {}, []
+    for g in needs:
+        cands = _locator_candidates(g, rows)
+        offered[(g["path"], g["name"])] = {sel for sel, _ in cands}
+        log(f"  {g['page']}.{g['name']} = {g['selector']} ({g['measured']})")
+        lines.append(f"  - {g['page']}.{g['name']} in {g['path']} is {g['selector']} — "
+                     + {"unmeasured": "step 02 never counted it",
+                        "ambiguous": "step 02 counted more than one match for it",
+                        "hidden": "step 02 never found it visible"}[g["measured"]] + ".\n"
+                     + ("    Counted at exactly one visible element in its frame:\n"
+                        + "".join(f"      {sel}   ({about})\n" for sel, about in cands)
+                        if cands else "    Step 02 counted nothing unique in its frame.\n"))
+    paths = sorted({g["path"] for g in needs})
+    files = "".join(f"\n--- {p} ---\n{files_map[p]}\n" for p in paths)
+    prompt = f"""These page-object locators were written from a guess. The browser run that
+validated this flow never confirmed a selector for them, and the guess is not one
+it counted at exactly one visible element:
+{''.join(lines)}
+For each, if one of the listed selectors is the element the locator's name means,
+rewrite that locator to it, in the locator syntax the file already uses (an
+iframe hop `A >> internal:control=enter-frame >> B` is a frame locator for A
+holding B). If none of them is that element, leave the locator exactly as it is.
+Change NOTHING else: same fields, methods, signatures and comments.
+{files}
+Return ONLY a JSON object mapping each file path you changed to its complete new
+contents. No prose.
+"""
+    repaired = extract_json(call_claude(prompt, label=" [locator-repair]")) or {}
+    for path, content in repaired.items():
+        if path not in paths or not (content or "").strip():
+            continue
+        ok, reason = validate_fix(files_map[path], content, Path(path).name,
+                                  URL_REPAIR_MAX_DIFF_LINES)
+        if not ok:
+            log(f"  locator-repair REJECTED for {Path(path).name} — {reason}")
+            continue
+        after = {g["name"]: g["selector"] for g in guessed_locators(
+            {path: content}, {Path(path).stem: [g["name"] for g in needs if g["path"] == path]}, rows)}
+        mine = [g for g in needs if g["path"] == path]
+        if any(after.get(g["name"], g["selector"]) not in offered[(path, g["name"])] | {g["selector"]}
+               for g in mine):
+            log(f"  locator-repair REJECTED for {Path(path).name} — it wrote a selector "
+                f"step 02 did not offer")
+            continue
+        files_map[path] = content
+        for g in mine:
+            if after.get(g["name"], g["selector"]) != g["selector"]:
+                g["result"] = f"repaired to {after[g['name']]}"
+                log(f"  locator-repair: {g['page']}.{g['name']} = {after[g['name']]}")
+    for g in needs:
+        g.setdefault("result", "still a guess")
+    return files_map, guesses
+
+
 def _warn_page_coverage(web_pages, selectors, interaction_hints) -> list:
     """Flag individual pages that step 02 never confirmed a single locator for.
 
@@ -635,6 +796,81 @@ contents. No prose.
     return files_map, remaining
 
 
+def _repair_copied_methods(files_map: dict, feature_class: str) -> tuple:
+    """Keep one copy of a method this run wrote into several classes.
+
+    Rule 5f asks for it, but page objects are generated a batch at a time, and a run
+    still wrote the same normalizeAmount() into four of them. One repair pass moves
+    it into the Helper as a public static method, and each page object calls that one
+    copy where it called its own. All or nothing: half a move leaves a page calling a
+    copy that is gone. Only into a Helper this run generated: an existing one is
+    somebody's shipped code, and a move into it is for a reviewer.
+
+    Returns (files_map, [copied group, ...]) — what is still copied afterwards.
+    """
+    sources = {p: c for p, c in files_map.items()
+               if p.startswith("src/main/") and p.endswith(".java") and c}
+
+    def copies(contents: dict) -> list:
+        new = {p: (module_index.changed_methods(read_existing_file(p), c)["added"]
+                   if read_existing_file(p) else module_index.method_keys(c))
+               for p, c in contents.items()}
+        return module_index.copied_methods(contents, only=new)
+
+    groups = copies(sources)
+    if not groups:
+        return files_map, []
+    described = [module_index.describe_duplicates(
+        {"methods": [i.split("::", 1)[1] for i in g], "ratio": 1.0}) for g in groups]
+    log(f"GUARD: {len(groups)} method(s) written into several classes — keeping one copy:")
+    for line in described:
+        log(f"  {line.replace('`', '')}")
+    helper = next((p for p in sources if p.endswith(f"/{feature_class}Helper.java")), None)
+    if not helper or read_existing_file(helper):
+        log("  no Helper generated by this run to move it into — left for review")
+        return files_map, groups
+
+    involved = sorted({i.split("::", 1)[0] for g in groups for i in g} | {helper})
+    files = "".join(f"\n--- {p} ---\n{files_map[p]}\n" for p in involved)
+    copied = "".join(f"  - {line}\n" for line in described)
+    prompt = f"""These generated classes each carry their own copy of the same method:
+{copied}
+Keep ONE copy, as a public static method of {Path(helper).stem}. Remove the copies from
+the page objects, and make each place that called its own copy call
+{Path(helper).stem}.<method>(...) instead, so every value a page getter or an operation
+returns stays what it is now and the tests do not change.
+
+Change NOTHING else: same public methods and signatures, same locators, same comments.
+{files}
+Return ONLY a JSON object mapping each file path you changed to its complete new
+contents. No prose.
+"""
+    repaired = extract_json(call_claude(prompt, label=" [copy-repair]")) or {}
+    moving = {}
+    for group in groups:
+        for place in group:
+            path, key = place.split("::", 1)
+            moving.setdefault(path, set()).add(key.split(".", 1)[1].split("(", 1)[0])
+    candidate = dict(files_map)
+    for path, content in repaired.items():
+        if path not in involved or not (content or "").strip():
+            continue
+        # The same budget as the URL repair: one method moved, its callers repointed.
+        ok, reason = validate_fix(files_map[path], content, Path(path).name,
+                                  URL_REPAIR_MAX_DIFF_LINES, may_remove=moving.get(path, ()))
+        if not ok:
+            log(f"  copy-repair REJECTED for {Path(path).name} — {reason}; "
+                f"keeping every file as generated")
+            return files_map, groups
+        candidate[path] = content
+    left = copies({p: candidate[p] for p in sources})
+    if not repaired or left:
+        log("  copy-repair did not leave one copy — keeping every file as generated")
+        return files_map, groups
+    log(f"  copy-repair applied: one copy, in {Path(helper).name}")
+    return candidate, []
+
+
 # ── What step 02 typed and compared ───────────────────────────────────────────
 
 def _lower_camel(name: str) -> str:
@@ -680,6 +916,21 @@ def option_sets_hint(web_data: dict, plan: dict) -> str:
     return "\n".join(lines)
 
 
+def _typed_shape(value) -> str:
+    """A typed value's shape, said precisely enough to generate another like it:
+    `1 word: 10 digits, nothing else`, `2 words: letters, punctuation`."""
+    text = str(value)
+    words = len(text.split())
+    head = f"{words} word{'' if words == 1 else 's'}"
+    if text.isdigit():
+        return f"{head}: {len(text)} digits, nothing else"
+    if re.fullmatch(r"[^@\s]+@[^@\s]+\.\w+", text):
+        return f"{head}: an email address"
+    kinds = [kind for kind, pattern in (("letters", r"[A-Za-z]"), ("digits", r"\d"),
+                                        ("punctuation", r"[^\w\s]")) if re.search(pattern, text)]
+    return f"{head}: {', '.join(kinds)}" if kinds else head
+
+
 def value_contracts_hint(web_data: dict, raw_input: str = "") -> str:
     """The prompt section built from what step 02 typed and compared.
 
@@ -692,15 +943,15 @@ def value_contracts_hint(web_data: dict, raw_input: str = "") -> str:
     case gave with generated ones.
     """
     inputs = web_data.get("inputs_used") or {}
-    checks = [c for c in web_data.get("value_checks") or [] if c.get("relation")]
+    checks = [c for c in web_data.get("value_checks") or []
+              if c.get("relation") or c.get("order")]
     given = {f for f, v in inputs.items() if test_case.is_given(v, raw_input)}
     out = ""
     if inputs:
         out += ("\n\nVALIDATED INPUTS — step 02 typed exactly these, and the checks below "
                 "held for them:\n")
         for field, value in inputs.items():
-            words = len(str(value).split())
-            out += (f"  {field} = {value!r}  ({words} word{'' if words == 1 else 's'})"
+            out += (f"  {field} = {value!r}  ({_typed_shape(value)})"
                     + ("  GIVEN BY THE TEST CASE" if field in given else "") + "\n")
         if given:
             out += ("A value marked GIVEN BY THE TEST CASE is the test's own data: make it "
@@ -713,23 +964,71 @@ def value_contracts_hint(web_data: dict, raw_input: str = "") -> str:
                 "name + ' ' + a random last name for a two-word name. Never one token "
                 "such as a prefix plus random letters, and never a whole-name generator: "
                 "those add titles and suffixes ('Dr.', 'MD'), and a product that keeps "
-                "two words showed 'Alica Bednar' for 'Alica Bednar MD'. Data of another "
-                "shape is a flow step 02 never saw.\n")
+                "two words showed 'Alica Bednar' for 'Alica Bednar MD'. A shared data "
+                "generator whose output you have not seen is not that shape either: a "
+                "phone-number generator gave '(305) 203-8102' for a field typed "
+                "'9876543210', and the page showed '(305)2038102'. Build such a value "
+                "from its parts, random digits of that length for a digits-only field. "
+                "Data of another shape is a flow step 02 never saw.\n")
     if checks:
         out += ("\n\nCHECK CONTRACTS — how the live page rendered each compared value. "
                 "Assert every one of these checks with exactly the comparison given; it "
                 "replaces the comparison the plan's wording implies, which was chosen "
                 "before anything was observed:\n")
         for c in checks:
+            how = (value_match.ASSERT_WITH[c["relation"]] if c.get("relation")
+                   else value_match.ORDER_ASSERT_WITH[c["order"]])
             out += (f"  - {c['check']}\n"
                     f"      {c['element']} showed {c['rendered'][:120]!r}; the other side "
                     f"({c['source']}) was {c['expected'][:120]!r}\n"
-                    f"      → assert with {value_match.ASSERT_WITH[c['relation']]}\n")
+                    f"      → assert with {how}\n")
         out += ("The expected side always comes from the source named: `input:<field>` "
                 "is the test-data value the test typed into that field, `element:<name>` "
                 "is a value the test reads from that element earlier in the flow, and "
                 "`literal` is text quoted in the test case. Never write a new literal as "
                 "an expected value.\n")
+        if any(c.get("order") and c["source"].startswith("element:") for c in checks):
+            out += ("For a LESS/GREATER check, read the other side from exactly the element "
+                    "named, at the point in the flow where that element is on screen, and "
+                    "keep it in a variable until the comparison. Never substitute another "
+                    "element that shows a similar amount later: a page can change that "
+                    "amount on its own in between (see UPDATES THAT FOLLOW AN ACTION), and "
+                    "a run read 'the total before the promo' after the card number had "
+                    "already lowered it, then compared the amount with itself.\n")
+    return out
+
+
+def delayed_updates_hint(web_data: dict, shared_index: str = "") -> str:
+    """The prompt section for what step 02 saw the page do after an action
+    returned. "" when it saw nothing.
+
+    Step 02's browser helper waits after every action until the page settles, so
+    the flow it validated never acted mid-update. Generated code acts at once
+    unless told: a promo clicked in the same second the card number was typed was
+    lost to the redraw the card number set off.
+    """
+    updates = web_data.get("delayed_updates") or []
+    if not updates:
+        return ""
+    wait = ("WaitHelper.waitForPageToSettle(config)" if "waitForPageToSettle(" in (shared_index or "")
+            else "a WaitHelper wait from <shared_code_index> that holds until the changed "
+                 "element shows its new value")
+    out = ("\n\nUPDATES THAT FOLLOW AN ACTION — step 02 saw the page keep working after "
+           "these actions returned, on requests of its own, and change what is listed. It "
+           "waited for that before its next action; generated code must too:\n")
+    for u in updates:
+        changed = "; ".join(
+            f"{'/'.join(c.get('names') or []) or c['element']} {c['before']!r} → {c['after']!r}"
+            for c in u.get("changed") or [])
+        out += (f"  - after {', '.join(u.get('after') or [])}: {changed} "
+                f"(settled after {u.get('settled_ms')}ms, {u.get('requests')} request(s))\n")
+    out += (f"The page method that performs such an action and stays on the same page ends "
+            f"with {wait}, so the next action is not taken mid-update — a click then is "
+            f"lost — and a value read next is the updated one. A method that returns another "
+            f"page needs nothing more: that page's load check waits. Never "
+            f"WaitHelper.waitForNetworkIdle for this: it returns at once on a page that has "
+            f"already loaded. A value shown BEFORE such an action (the left side above) can "
+            f"only be read before it, in an earlier step.\n")
     return out
 
 
@@ -1437,6 +1736,9 @@ def main() -> None:
     # What step 02 typed and how the page rendered each compared value. The plan
     # says "assertEquals" because English said "matches"; the page is what decides.
     value_hint = value_contracts_hint(web_data, raw_input)
+    # What the page kept doing after an action returned: step 02 waited for it,
+    # and the generated code has to as well.
+    settle_hint = delayed_updates_hint(web_data, shared_index)
 
     # A check the user asked for that the browser could not confirm. It stays in
     # the test at full strength — the model needs to be told that on purpose, or
@@ -1549,7 +1851,8 @@ def main() -> None:
                       for k, v in url_props.items()))
 
     # Determine which files to generate / update
-    files_to_generate = _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, feature)
+    files_to_generate = _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class,
+                                    feature, test_case=raw_input)
 
     # Read current content of files that already exist so Claude can extend them
     existing_files_context = read_existing_files_context(files_to_generate)
@@ -1600,22 +1903,34 @@ Rules (MANDATORY — violations will cause compilation failures):
      auth comes only from plan["api_auth"] (rule 5b) and properties. A token in code is a leaked secret.
 5. Helper: extends ApiHelper (import automation.core.api.ApiHelper). Pass customBaseUrl to super(config, BASE_URL).
    API methods call execute()/executeAndVerify()/executeRaw().
-   WEB: the Helper is the module's flow API — the business operations
-   generation_plan["helper_web_methods"] lists, which the tests are written against:
-     a) A "stage" carries one business step, across as many pages as it takes. It constructs
-        the page object it starts on (that constructor checks the page loaded) and returns
-        what the step's checks need.
-     b) A "composed" operation calls its stages in order and adds nothing of its own. Write
-        every one the plan lists, even though this test calls the stages: it is for the next
-        test, which wants the whole run as one call.
+   WEB: the page objects chain and the Helper holds them. Every page action that leaves a page
+   returns the next page object, and the Helper has ONE PUBLIC FIELD PER PAGE of the module,
+   named for its class (`public PaymentMethodPage paymentMethodPage;`, no initialiser). The
+   test stores each page it is handed on that field, so every step continues from the page
+   the previous step returned. The Helper's operations are generation_plan["helper_web_methods"]:
+     a) A "stage" is the entry operation: it navigates (rule 6b), constructs the first page —
+        the ONLY page object a Helper ever constructs, right after navigating — stores it on
+        its field, chains through the pages the operation crosses, storing each one, and
+        returns the page it lands on.
+     b) A "composed" operation continues from the pages already in the Helper's fields, runs
+        the page actions the plan lists in order, storing each page it passes through, and
+        returns the last one. It adds nothing of its own. Write every one the plan lists, even
+        though this test calls the page actions: it is for the next test, which wants the
+        whole run as one call. Never `new XPage(config)` mid-flow: the page the previous step
+        returned is already in its field, and rebuilding it is the chain break this rule exists
+        to prevent.
      c) Choices are parameters — an option enum (rule 18) or a Data field — never part of a
         method's name, and neither is what it returns: continueToBank(), not
         continueAndGetBankAmount().
-     d) Operations never assert; the test asserts on what they return.
-     e) When a step's checks need several values, return a small result type nested in the
-        Helper and read through getters: `@Value public static class Receipt {{ String amount;
-        String orderId; }}` (Lombok). Page objects return plain values; only the Helper
-        assembles result types.
+     d) Operations and page actions never assert; the test asserts on the pages they return.
+     e) No result types: a check reads its value from the page the step ended on, through that
+        page's getter.
+     f) A page getter returns what the page shows. When a check compares it in another form (an
+        amount as plain number text, a phone as its digits), the getter converts it through the
+        Helper's ONE `public static` converter — `return {feature_class}Helper.toPlainAmount(getText(
+        totalDisplay, "Total"));` — written once in the Helper.
+        Never a private converter copied into several page objects: page objects are generated
+        a batch at a time, and a run wrote the same normalizeAmount() into four of them.
 5b. API AUTH — source this ONLY from plan["api_auth"].type below; never invent a different auth
    mechanism or guess at field names not present in api_auth:
    a) type == "none": no auth headers at all — do not call setAuthToken or add any auth logic.
@@ -1638,7 +1953,10 @@ Rules (MANDATORY — violations will cause compilation failures):
    an option control's selection method (rule 18c), which builds its locator from the key.
    End the constructor with the page-loaded check <framework_conventions> prescribes.
    All interactions use BasePage methods (click, fillText, getText, isElementDisplayed).
-   Navigation methods return the next page object.
+   Page objects chain: an action that leaves the page returns the next page object
+   (`return new ReceiptPage(config);`), and an action that stays on it returns `this`. When the
+   option chosen decides which page comes next, the selection method returns BasePage (rule
+   18c) and the caller casts. A getter returns a value.
 6b. NAVIGATION — never drive the browser's navigation API directly. Use
    BrowserHelper.navigateTo(config, url), which logs the action and waits for the
    page to load afterwards.
@@ -1663,13 +1981,16 @@ Rules (MANDATORY — violations will cause compilation failures):
      - hybrid flow: groups={{GROUP_REGRESSION, GROUP_WEB, GROUP_API}}
    Every @Test method has @TestVariables(automatedBy = QA.Mukesh).
    STRICT GUARDRAILS for @Test methods:
-     - One call per step: each step is ONE call — a Helper operation, or one page method on a
-       page object an operation returned — followed by that step's AssertHelper checks. Never
-       chain page-object actions in a test, and never construct a page object in one. No loops,
-       Java Stream filtering or JSONPath extraction (see rule 14c).
+     - Each step continues the chain: it calls a Helper operation or a business-level page
+       action on the page the previous step returned, stores the page that call returns on the
+       Helper's field for it — `shop.receiptPage = shop.paymentMethodPage.pay();` — and is
+       followed by that step's AssertHelper checks, read from that page. Never hold a page in a
+       local variable, and never construct a page object in a test. No loops, Java Stream
+       filtering or JSONPath extraction (see rule 14c).
      - Short: about {BODY_LINES_GUIDELINE} lines between the method's braces is normal. Go past
-       it only when the input's own steps and checks need it; a longer test usually means a
-       sequence that belongs in a Helper operation.
+       it only when the input's own steps and checks need it; a longer test usually means small
+       page actions that belong in one page method (rule 14a), or a sequence that belongs in a
+       Helper operation.
      - Hide API intricacies: never build a request body (new XBuilder()...) or chain dependent API
        calls inside @Test — the Helper does it and returns the result.
      - Test data is ONE setup line: a Helper method that reads the module's data and returns the
@@ -1680,7 +2001,9 @@ Rules (MANDATORY — violations will cause compilation failures):
        that use the same entity share one sheet. A CSV listed under "Files to generate" is
        OPTIONAL: return it only if a generated test reads from it. When extending an existing CSV,
        return the whole file with every existing row unchanged and new rows appended. Never put
-       credentials in a CSV — they come from properties (see WEB LOGIN CREDENTIALS).
+       a login secret in a CSV — a password, token or API key, or an OTP the login asks for;
+       those come from properties (see WEB LOGIN CREDENTIALS). Other values the flow types, a
+       card number or a bank page's OTP among them, are test data and go in the CSV.
      - State isolation: one user per test; never share an account between test methods.
    LOGGING — decided by the KIND of class, never by what you want to say:
      - test class  -> config.logStep("...")            NEVER Log.step / Log.comment
@@ -1696,7 +2019,7 @@ Rules (MANDATORY — violations will cause compilation failures):
      by its "checks", with a blank line between steps.
    - Setup lines — reading properties or credentials, building data, constructing the
      helper — get no logStep.
-   - A check that sits between two stages means calling the stages in separate steps; use
+   - A check that sits between two page actions means calling them in separate steps; use
      the composed operation only when nothing is checked in between.
    WRONG — page objects driven click by click from the test, one logStep per field:
      config.logStep("Enter the card number");
@@ -1705,14 +2028,16 @@ Rules (MANDATORY — violations will cause compilation failures):
      cardPage.fillExpiry(order.getCardExpiry());
      config.logStep("Click Pay and open the receipt");
      ReceiptPage receipt = cardPage.clickPay();
-   RIGHT — one call per business step, its checks right after it:
+   RIGHT — each business step continues from the page the previous one returned, stored on the
+   Helper's field, with its checks right after it:
      config.logStep("Check out the order and verify the total matches the order amount");
-     String total = shop.checkout(order);
-     AssertHelper.assertEquals(config, total, order.getAmount(), "Total should match the order amount");
+     shop.paymentMethodPage = shop.checkout(order);
+     AssertHelper.assertEquals(config, shop.paymentMethodPage.getTotal(), order.getAmount(), "Total should match the order amount");
 
      config.logStep("Pay by credit card and verify the receipt charges the same total");
-     ShopHelper.Receipt receipt = shop.makePayment(PaymentMethod.CreditCard, order);
-     AssertHelper.assertEquals(config, receipt.getAmount(), total, "Receipt should charge the checkout total");
+     shop.cardPage = (CardPage) shop.paymentMethodPage.choosePaymentMethod(PaymentMethod.CreditCard);
+     shop.receiptPage = shop.cardPage.fillCardDetails(order).pay();
+     AssertHelper.assertEquals(config, shop.receiptPage.getAmount(), order.getAmount(), "Receipt should charge the checkout total");
    WEB LOGIN CREDENTIALS (not API auth — see rule 5b for that) — follow this priority order:
    a) For EXISTING modules: scan every @Test method in the existing test class shown in
       <existing_file_contents> and find how they load credentials. Copy that pattern exactly.
@@ -1768,15 +2093,16 @@ Rules (MANDATORY — violations will cause compilation failures):
     a) PAGE OBJECTS: several small actions on the SAME page in a row (filling a form's five fields)
        become ONE higher-level method on that page object — `fillCheckoutDetails(data)` — and the
        test calls that once.
-    b) HELPERS (business operations): a step that crosses pages, or takes several actions before
-       the input checks something, is a Helper operation (rule 5). The same sequence is never
-       written twice — not in two tests, and not in two operations.
+    b) HELPERS (business operations): opening the app and crossing pages before the first check
+       is the entry operation, and a run of page actions a later test wants as one call is a
+       composed operation (rule 5). The same sequence is never written twice — not in two
+       tests, and not in two operations.
     c) HELPERS (non-trivial logic): JSON extraction (`response.jsonPath().getList(...)`), Java
        Stream filtering/mapping, loops and multi-step data preparation live in the Helper, which
        returns what the test asserts on. Never do them inside the @Test method.
     d) Do NOT add a thin wrapper: a method that only renames one existing call and adds nothing —
-       no navigation, read, wait or result of its own. A stage that returns what its step
-       produced is not one, and neither is a composed operation.
+       no navigation, read, wait or page of its own. An entry operation is not one, and neither
+       is a composed operation.
 15. INTERLEAVED FLOWS — when generation_plan["flow_style"] == "interleaved", generate exactly ONE
     test method (do NOT split into separate Api/Web test classes) in the single test class listed
     under "Files to generate". Follow generation_plan["interleaved_steps"] IN ORDER: for each step,
@@ -1814,9 +2140,12 @@ Rules (MANDATORY — violations will cause compilation failures):
     c) The page object has ONE selection method for the control. Its locator is the confirmed
        selector with only the key replaced, as the OPTION SETS hint shows, so the value the flow
        used rebuilds the measured selector exactly. A native <select> takes getKey() in its
-       select call instead.
-    d) The Helper stage that takes the choice does the follow-up steps for each value this test
-       exercised, and every other value reaches
+       select call instead. When the choice keeps the user on this page, it returns `this`.
+       When it decides which page comes next, it returns BasePage, switching on the value to
+       construct the page each exercised value lands on; the caller casts —
+       `shop.cardPage = (CardPage) shop.paymentMethodPage.choosePaymentMethod(PaymentMethod.CreditCard);`.
+    d) The selection method, and any composed operation that takes the choice, does the
+       follow-up steps for each value this test exercised, and every other value reaches
        `default -> throw new UnsupportedOperationException(method.getLabel() + " is not automated yet");`
        — never guessed steps for an option nobody ran.
     e) The choice is the enum wherever it travels: a parameter, or a Data field.
@@ -1830,7 +2159,7 @@ Rules (MANDATORY — violations will cause compilation failures):
 <generation_plan>
 {json.dumps(plan, indent=2)}
 </generation_plan>
-{selector_hint}{option_hint}{mechanism_hint}{value_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
+{selector_hint}{option_hint}{mechanism_hint}{value_hint}{settle_hint}{kept_unverified_hint}{dom_context}{api_hint}{url_property_hint}
 
 Generate the following files (Java source, plus CSV test data where a test reads data) and return them as a single JSON object where
 keys are relative file paths (from the automation repo root) and values are the complete
@@ -1941,6 +2270,45 @@ Return ONLY a JSON object, no prose:
         log(f"WARNING: {len(untraced_values)} file(s) still expect a value nobody "
             f"stated or saw — recorded in 03-generate.json")
 
+    # Rule 5f: a conversion lives once, in the Helper. Page objects come a batch at a
+    # time, and each batch can copy what the last one wrote.
+    files_map, _still_copied = _repair_copied_methods(files_map, feature_class)
+
+    # A locator step 02 never confirmed was written from a guess. Held to what step
+    # 02's helpers counted: confirmed by a count, or pointed at an element they did
+    # count, or reported as still a guess.
+    guesses = []
+    if locator_gaps:
+        evidence_rows = flow_map.read_evidence(AUDIT_DIR / "02-web-evidence.jsonl")
+        files_map, guesses = _repair_guessed_locators(
+            files_map, guessed_locators(files_map, locator_gaps, evidence_rows), evidence_rows)
+
+    # A CSV is committed with the PR. A login secret in one leaves the sheet for the
+    # properties file, and the code that read it is pointed at the property. What
+    # cannot be moved stops the run here: a test reading a column that is no longer
+    # in its sheet would only fail in step 04.
+    files_map, csv_secrets, unmoved_secrets = _move_csv_secrets(
+        files_map, feature, props_file_name, raw_input)
+    if unmoved_secrets:
+        log("ERROR: login secrets in the generated test data could not be moved out of "
+            "the CSV into the properties file:")
+        for path, problems in unmoved_secrets.items():
+            for problem in problems:
+                log(f"  - {Path(path).name}: {problem}")
+        (AUDIT_DIR / "03-generate.json").write_text(json.dumps({
+            "error": "csv_secrets_unmoved",
+            "csv_secrets_unmoved": unmoved_secrets,
+            "csv_secrets_moved": csv_secrets,
+        }, indent=2))
+        sys.exit(1)
+
+    # After the secrets move, which takes columns out of the sheets: each CSV read
+    # is held to the sheet it will actually read.
+    files_map, csv_lookup_problems = _check_csv_lookups(files_map)
+    for path, problems in csv_lookup_problems.items():
+        for problem in problems:
+            log(f"WARNING: {Path(path).name} {problem} — recorded in 03-generate.json")
+
     # The mirror-image failure: code that reads a URL property nobody ever wrote.
     # getRunTimeProperty returns null, navigation goes nowhere, and step 04 sees a
     # page that never loaded rather than a missing setting. Recover what the browser
@@ -2022,11 +2390,12 @@ Return ONLY a JSON object, no prose:
         except ValueError:
             log(f"  BLOCKED: path escapes Thanos-pw root: {rel_path}")
             continue
-        if rel_path.endswith(".csv") and _is_credential_csv(content.split("\n", 1)[0]):
-            # Credentials live in the properties file, which is never committed. A CSV
-            # holding them would ride into the PR with the rest of this run's files.
-            log(f"  BLOCKED: {rel_path} has a credential column — credentials belong in "
-                f"the properties file, not a committed CSV")
+        if rel_path.endswith(".csv") and _is_credential_csv(
+                read_existing_file(rel_path).split("\n", 1)[0], raw_input):
+            # An existing credential sheet, which tests read as it is on disk. A model
+            # rewriting it can mangle real passwords. New secret columns never get
+            # here: _move_csv_secrets took them out of every sheet it was given.
+            log(f"  KEPT: {rel_path} is an existing credential sheet — left as it is on disk")
             continue
         if rel_path.endswith(".csv"):
             lost_rows = _lost_csv_rows(read_existing_file(rel_path), content)
@@ -2102,6 +2471,9 @@ Return ONLY a JSON object, no prose:
         # class -> locator names the plan wanted that nothing confirmed. Named
         # individually so "why did this locator get guessed?" has an answer.
         "unconfirmed_locators": locator_gaps,
+        # What codegen wrote for each of those, held to step 02's counts: confirmed by
+        # a count, repaired to a counted element, or still a guess.
+        "guessed_locators": guesses,
         # Checks step 02 could not observe: what was dropped because nobody asked
         # for it, and what was kept because someone did (those tests fail on
         # purpose — 05 puts them in the PR body). kept_unmeasured_checks is the
@@ -2135,6 +2507,11 @@ Return ONLY a JSON object, no prose:
         # Expected values neither the test case states nor step 02 saw, left after
         # the repair pass. Empty is the normal case.
         "untraced_expected_values": untraced_values,
+        # {column: property key} for login secrets moved out of a generated CSV.
+        "csv_secrets_moved": csv_secrets,
+        # {path: [problem, ...]} for CSV reads their sheet cannot answer. Empty is
+        # the normal case.
+        "csv_lookup_problems": csv_lookup_problems,
         # Which files existed before this run (their pre-run copies are in
         # pre-run/ beside this file) and which it created. Step 04 re-runs the
         # existing tests that reach a changed method of the former.
@@ -2202,10 +2579,7 @@ def _review_summary(review: dict) -> list:
     if methods:
         lines += ["", "## Test Method Shape",
                   f"Guideline: about {BODY_LINES_GUIDELINE} lines between the braces."]
-        lines += [f"- `{name}` — {m['body_lines']} lines"
-                  + (f"; {len(m['page_action_chains'])} step(s) drive a page object call by call"
-                     if m["page_action_chains"] else "")
-                  for name, m in sorted(methods.items())]
+        lines += [f"- `{name}` — {m['body_lines']} lines" for name, m in sorted(methods.items())]
     notes = []
     for path, diff in (review.get("modified_existing") or {}).items():
         parts = [f"{kind} {', '.join(f'`{k}`' for k in keys)}"
@@ -2213,8 +2587,11 @@ def _review_summary(review: dict) -> list:
         notes.append(f"- existing `{Path(path).name}`: " + "; ".join(parts))
     for path, gone in (review.get("changed_existing_api") or {}).items():
         notes.append(f"- ⚠️ `{Path(path).name}` lost existing API: {', '.join(gone)}")
-    for pair in review.get("near_duplicates") or []:
-        notes.append(f"- ⚠️ `{pair['new']}` repeats `{pair['like']}` (similarity {pair['ratio']})")
+    for group in review.get("near_duplicates") or []:
+        notes.append(f"- ⚠️ {module_index.describe_duplicates(group)}")
+    for found in review.get("rebuilt_pages") or []:
+        notes.append(f"- ⚠️ `{found['method']}` constructs `{found['page']}` mid-flow instead of "
+                     f"continuing from the page the previous step returned")
     for name, gap in (review.get("option_enum_gaps") or {}).items():
         notes.append(f"- ⚠️ enum `{name}`: missing keys {gap['missing_keys']}, "
                      f"{gap['unobserved_constants']} constant(s) the page did not offer")
@@ -2284,8 +2661,11 @@ def _review_records(written_contents: dict, pre_run: dict, plan: dict, web_data:
                     feature: str, feature_class: str) -> dict:
     """What a reviewer needs to know about this run's code. Notes, never gates.
 
-    - test_shape: each new @Test's length and any step that drives a page object
-      call by call. About BODY_LINES_GUIDELINE lines is the norm, not a limit.
+    - test_shape: each new @Test's length. About BODY_LINES_GUIDELINE lines is the
+      norm, not a limit.
+    - rebuilt_pages: a Helper method this run wrote that constructs a page object
+      mid-flow, where it should continue from the page the previous step returned
+      (rule 5): the chain break the page fields exist to prevent.
     - modified_existing: per existing file, the methods this run changed, added or
       removed. A slight change is allowed; a reviewer still has to see it.
     - changed_existing_api: public signatures and enum constants that disappeared.
@@ -2308,7 +2688,7 @@ def _review_records(written_contents: dict, pre_run: dict, plan: dict, web_data:
     for path, content in written_contents.items():
         if path.startswith("src/test/") and path.endswith(".java"):
             prior = set(test_methods_in(pre_run.get(path, "")))
-            for name, measured in logstep_narration.shape(content, page_classes, prior).items():
+            for name, measured in logstep_narration.shape(content, prior).items():
                 test_shape[f"{Path(path).stem}#{name}"] = measured
 
     modified, lost = {}, {}
@@ -2337,6 +2717,9 @@ def _review_records(written_contents: dict, pre_run: dict, plan: dict, web_data:
             elif rel not in written_contents:
                 existing_sources[rel] = f.read_text(encoding="utf-8", errors="ignore")
     near = module_index.near_duplicates(new_sources, existing_sources, only=only)
+    rebuilt = [{"file": Path(p).name, **found}
+               for p, c in sorted(new_sources.items()) if p.endswith("Helper.java")
+               for found in module_index.rebuilt_pages(c, page_classes, only=only.get(p))]
 
     gaps = {}
     enums_path = f"{module_rel}/{feature_class}Enums.java"
@@ -2364,19 +2747,19 @@ def _review_records(written_contents: dict, pre_run: dict, plan: dict, web_data:
         if ref and not re.search(rf"\b{re.escape(ref[1])}\s*\(", generated):
             unused.append(entry.get("existing"))
 
-    long_tests = {k: v for k, v in test_shape.items()
-                  if v["body_lines"] > BODY_LINES_GUIDELINE or v["page_action_chains"]}
+    long_tests = {k: v for k, v in test_shape.items() if v["body_lines"] > BODY_LINES_GUIDELINE}
     for name, measured in long_tests.items():
-        log(f"NOTE: {name} is {measured['body_lines']} lines (guideline ~{BODY_LINES_GUIDELINE})"
-            + (f"; {len(measured['page_action_chains'])} step(s) drive a page object call by call"
-               if measured["page_action_chains"] else ""))
+        log(f"NOTE: {name} is {measured['body_lines']} lines (guideline ~{BODY_LINES_GUIDELINE})")
+    for found in rebuilt:
+        log(f"WARNING: {found['method']} constructs {found['page']} mid-flow instead of "
+            f"continuing from the page the previous step returned")
     for path, diff in modified.items():
         log(f"NOTE: existing {Path(path).name} — changed {len(diff['changed'])}, "
             f"added {len(diff['added'])}, removed {len(diff['removed'])} method(s)")
     for path, gone in lost.items():
         log(f"WARNING: {Path(path).name} lost existing API: {', '.join(gone)}")
-    for pair in near:
-        log(f"WARNING: new {pair['new']} repeats {pair['like']} (similarity {pair['ratio']})")
+    for group in near:
+        log(f"WARNING: {module_index.describe_duplicates(group).replace('`', '')}")
     for name, gap in gaps.items():
         log(f"WARNING: enum {name} — missing keys {gap['missing_keys']}, "
             f"{gap['unobserved_constants']} constant(s) the page did not offer")
@@ -2387,6 +2770,7 @@ def _review_records(written_contents: dict, pre_run: dict, plan: dict, web_data:
         "modified_existing": modified,
         "changed_existing_api": lost,
         "near_duplicates": near,
+        "rebuilt_pages": rebuilt,
         "option_enum_gaps": gaps,
         "reuse_unused": unused,
     }
@@ -2432,19 +2816,85 @@ def _find_existing_test_class(feature_lower: str, test_type: str) -> str:
     return ""  # "both"/parallel → caller handles api + web separately
 
 
-# A column that makes a CSV a credential sheet, matched on word boundaries so a
-# `footprint` column is not an `otp` one. Same vocabulary credential_extraction uses.
-_CREDENTIAL_COLUMN = re.compile(
-    r"(?<![a-z])(?:" + "|".join((_CREDENTIAL_LABELS["password"], _CREDENTIAL_LABELS["otp"],
-                                  _CREDENTIAL_LABELS["api_key"], "token", "secret"))
-    + r")(?![a-z])")
+def _is_credential_csv(header: str, test_case: str = "") -> bool:
+    """Whether a CSV header row has a login-secret column (secret_columns)."""
+    return bool(secret_columns(header, test_case))
 
 
-def _is_credential_csv(header: str) -> bool:
-    """Whether a CSV header row has a credential column — password, otp, api key, token."""
-    columns = (re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column).strip().lower()
-               for column in (header or "").split(","))
-    return any(_CREDENTIAL_COLUMN.search(column) for column in columns)
+def _move_csv_secrets(files_map: dict, feature: str, props_file_name: str,
+                      test_case: str) -> tuple:
+    """Move login secrets out of generated CSVs into the properties file.
+
+    A CSV is committed with the PR, and the properties file's secrets never are.
+    Refusing the whole sheet was the old answer, and it left the test that reads it
+    pointing at a file that was never written: a payment run lost every value of
+    its test case that way, and step 04 then made up its own. Now only the secret
+    columns leave. Their values go to `{feature}.<column>` properties, the rest of
+    the sheet is written, and one repair pass points the code that read each column
+    at its property. A column the sheet on disk already had is left alone.
+
+    Returns (files_map, {column: key} moved, {path: [problem, ...]} unresolved).
+    The caller aborts on anything unresolved: a test reading a column that is no
+    longer there would only fail in step 04.
+    """
+    moved, values, unresolved = {}, {}, {}
+    for path, content in list(files_map.items()):
+        if not path.endswith(".csv") or not content:
+            continue
+        already = set(secret_columns(read_existing_file(path).split("\n", 1)[0], test_case))
+        new = [c for c in secret_columns(content.split("\n", 1)[0], test_case)
+               if c not in already]
+        stripped, taken, kept = take_secret_columns(content, new)
+        for column, why in kept.items():
+            unresolved.setdefault(path, []).append(
+                f"column {column!r} {why}; move them to parameters/{props_file_name} by hand")
+        if not taken:
+            continue
+        files_map[path] = stripped
+        for column, value in taken.items():
+            moved[column] = secret_property_key(feature, column)
+            values[moved[column]] = value
+        log(f"  Moved login secret column(s) {', '.join(taken)} out of {Path(path).name} "
+            f"into parameters/{props_file_name}")
+    if not moved:
+        return files_map, moved, unresolved
+    properties_file.upsert(properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR), values,
+                           f"{feature} test secrets (auto-added by test-authoring-agent)", log)
+
+    readers = {p: c for p, c in files_map.items()
+               if p.endswith(".java") and c and any(f'"{col}"' in c for col in moved)}
+    if readers:
+        table = "".join(f'  "{col}" -> config.getRunTimeProperty("{key}")\n'
+                        for col, key in moved.items())
+        files = "".join(f"\n--- {p} ---\n{c}\n" for p, c in readers.items())
+        prompt = f"""These CSV columns hold login secrets. A CSV is committed with the pull
+request, so they were taken out of the CSV and put in parameters/{props_file_name}, which
+is not committed:
+
+{table}
+Rewrite each file below so it reads each of these values from its property instead of
+from the CSV row. Change NOTHING else: same methods, same signatures, same data flow.
+{files}
+Return ONLY a JSON object mapping each file path above to its complete corrected
+contents. No prose.
+"""
+        repaired = extract_json(call_claude(prompt, label=" [csv-secret-repair]")) or {}
+        for path, content in repaired.items():
+            if path not in readers or not (content or "").strip():
+                continue
+            # The same budget as the URL repair: a property lookup swapped in for a read.
+            ok, reason = validate_fix(readers[path], content, Path(path).name,
+                                      URL_REPAIR_MAX_DIFF_LINES)
+            if ok:
+                files_map[path] = content
+            else:
+                log(f"  csv-secret-repair REJECTED for {Path(path).name} — {reason}")
+    for path, content in files_map.items():
+        still = [col for col in moved if path.endswith(".java") and f'"{col}"' in (content or "")]
+        if still:
+            unresolved.setdefault(path, []).append(
+                f"still reads {', '.join(still)} from the CSV row instead of its property")
+    return files_map, moved, unresolved
 
 
 def _lost_csv_rows(existing: str, updated: str) -> list:
@@ -2474,7 +2924,70 @@ def _lost_csv_rows(existing: str, updated: str) -> list:
     return lost
 
 
-def _plan_csv_files(feature_lower: str) -> list:
+# The column the environment-aware CSV read matches its extra argument against.
+_CSV_ENVIRONMENT_COLUMN = "environment"
+
+
+def _csv_path(module: str, csv_file: str) -> str:
+    """Where a module's CSV read by name lives, relative to the framework root."""
+    return f"src/test/resources/{module}/csvFiles/{csv_file}.csv"
+
+
+def _check_csv_lookups(files_map: dict) -> tuple:
+    """Hold every generated CSV read to the sheet it reads, before anything runs.
+
+    The test and its sheet come out of one batch, and nothing compiled checks that
+    they agree, so a mismatch only showed in step 04 as "CSV row not found". The
+    one that recurs is the environment-aware read, copied from a reference Helper
+    whose sheets carry an environment column, pointed at a new sheet with none: no
+    row can ever match. Data the same in every environment is right not to have
+    the column, so the filter is what goes. The rest — a sheet nobody wrote, a key
+    column the header lacks, a literal key no row has — are recorded, not guessed.
+
+    Returns (files_map, {path: [problem, ...]}).
+    """
+    from shared.entry_path import csv_reads
+
+    def table(text):
+        rows = [[field.strip() for field in row] for row in csv.reader(io.StringIO(text or ""))
+                if any(field.strip() for field in row)]
+        return (rows[0], rows[1:]) if rows else ([], [])
+
+    problems = {}
+    for path, content in list(files_map.items()):
+        if not path.endswith(".java") or not content:
+            continue
+        name = Path(path).name
+        for read in reversed(csv_reads(content)):
+            sheet = _csv_path(read["module"], read["file"])
+            on_disk = read_existing_file(sheet)
+            header, rows = table(files_map.get(sheet) or on_disk)
+            label = f"{read['file']}.csv"
+            if not header:
+                problems.setdefault(path, []).append(
+                    f"reads {label}, which neither this run nor the repository has")
+                continue
+            if read["environment_scoped"] and _CSV_ENVIRONMENT_COLUMN not in header \
+                    and _CSV_ENVIRONMENT_COLUMN not in table(on_disk)[0]:
+                start, end = read["filter_span"]
+                content = content[:start] + content[end:]
+                log(f"  CSV lookup in {name} filters by environment, but {label} has no "
+                    f"{_CSV_ENVIRONMENT_COLUMN} column — dropped the filter")
+            if read["column"] not in header:
+                problems.setdefault(path, []).append(
+                    f"looks rows up by {read['column']!r}, which {label} has no column for")
+                continue
+            column = header.index(read["column"])
+            if read["value"] and not any(
+                    len(row) > column and row[column].lower() == read["value"].lower()
+                    for row in rows):
+                problems.setdefault(path, []).append(
+                    f"looks up {read['column']}={read['value']!r}, which no row of {label} has")
+        files_map[path] = content
+    return files_map, problems
+
+
+def _plan_csv_files(feature_lower: str, test_case: str = "") -> list:
     """The module's test-data CSVs codegen may extend, or the one it may create.
 
     Credential sheets are left out: a model regenerating one can mangle real
@@ -2488,9 +3001,9 @@ def _plan_csv_files(feature_lower: str) -> list:
                 header = handle.readline()
         except OSError:
             continue
-        if not _is_credential_csv(header):
+        if not _is_credential_csv(header, test_case):
             data.append(str(path.relative_to(AUTOMATION_FRAMEWORK_DIR)))
-    return data or [f"src/test/resources/{feature_lower}/csvFiles/{feature_lower}-data.csv"]
+    return data or [_csv_path(feature_lower, f"{feature_lower}-data")]
 
 
 def _find_existing_helper(feature_lower: str, feature_class: str) -> str:
@@ -2531,7 +3044,8 @@ def _extended_files(plan: dict, feature_lower: str) -> list:
     return found
 
 
-def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, feature) -> list:
+def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, feature,
+                test_case: str = "") -> list:
     """Build the list of files that need to be generated or updated."""
     files = []
     feature_lower = feature.lower()
@@ -2583,7 +3097,7 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
             files.append(existing_flow)
         else:
             files.append(f"src/test/java/automation/{feature_lower}/{feature_class}FlowTest.java")
-        return files + _plan_csv_files(feature_lower)
+        return files + _plan_csv_files(feature_lower, test_case)
 
     if test_type in ("api", "both"):
         existing_api = _find_existing_test_class(feature_lower, "api") if existing else ""
@@ -2601,7 +3115,7 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
         else:
             files.append(f"src/test/java/automation/{feature_lower}/{feature_class}WebTest.java")
 
-    return files + _plan_csv_files(feature_lower)
+    return files + _plan_csv_files(feature_lower, test_case)
 
 
 def _infer_test_class(written: list, test_type: str) -> str:

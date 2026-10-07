@@ -82,7 +82,7 @@ class TestParseValueCheck:
                          "element": "customerNameLabel",
                          "rendered": "Test User sample_last_name",
                          "source": "input:nameField", "expected": "Test User",
-                         "relation": "words"}
+                         "relation": "words", "order": ""}
 
     def test_quotes_and_source_case_are_normalised(self):
         check = vm.parse_value_check(

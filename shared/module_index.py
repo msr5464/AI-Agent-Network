@@ -150,6 +150,18 @@ def _field_names(owner: Dict) -> List[str]:
             if m["kind"] == "field" and m["name"] and "static" not in _modifiers(m["head"])]
 
 
+def _public_fields(owner: Dict) -> List[str]:
+    """`CartPage cartPage` for each public instance field: the pages a Helper holds."""
+    out = []
+    for m in owner["members"]:
+        if (m["kind"] != "field" or not m["name"] or not _is_public(m, owner["kind"])
+                or "static" in _modifiers(m["head"])):
+            continue
+        declared = _signature(m["head"].split("=", 1)[0]).split()
+        out.append(" ".join(declared[-2:]) if len(declared) >= 2 else m["name"])
+    return out
+
+
 def _describe_file(path: Path, rel: str) -> List[str]:
     try:
         source = path.read_text(encoding="utf-8", errors="ignore")
@@ -173,6 +185,11 @@ def _describe_file(path: Path, rel: str) -> List[str]:
             fields = _field_names(owner)
             if fields:
                 lines.append(f"    fields: {', '.join(fields)}")
+        # A Helper's public fields hold the pages its tests continue from.
+        elif name.endswith("Helper"):
+            fields = _public_fields(owner)
+            if fields:
+                lines.append(f"    page fields: {', '.join(fields)}")
         for signature in signatures.get(name) or []:
             lines.append(f"    {signature}")
     return lines
@@ -346,7 +363,7 @@ def near_duplicates(new_sources: Dict[str, str], existing_sources: Dict[str, str
             if not method["constructor"]:
                 pool.setdefault(f"{path}::{key}", _call_sequence(method["body"]))
 
-    found, seen = [], set()
+    pairs, seen = [], set()
     for new_id, calls in candidates.items():
         if len(calls) < MIN_DUPLICATE_CALLS:
             continue
@@ -359,9 +376,95 @@ def near_duplicates(new_sources: Dict[str, str], existing_sources: Dict[str, str
             ratio = difflib.SequenceMatcher(None, calls, other).ratio()
             if ratio >= DUPLICATE_RATIO:
                 seen.add(pair)
-                found.append({"new": new_id.split("::", 1)[1], "like": other_id.split("::", 1)[1],
-                              "ratio": round(ratio, 2)})
+                pairs.append((pair, ratio))
+    return _group_pairs(pairs)
+
+
+def _group_pairs(pairs: List[tuple]) -> List[Dict]:
+    """Pairs of alike methods as groups: `{"methods": [...], "ratio": lowest}`.
+
+    Reported a pair at a time, one method written into four classes read as six
+    separate findings.
+    """
+    parent: Dict[str, str] = {}
+
+    def root(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for (a, b), _ratio in pairs:
+        parent[root(a)] = root(b)
+    groups: Dict[str, Dict] = {}
+    for (a, _b), ratio in pairs:
+        group = groups.setdefault(root(a), {"ids": set(), "ratio": 1.0})
+        group["ids"] |= {a, _b}
+        group["ratio"] = min(group["ratio"], ratio)
+    return [{"methods": [i.split("::", 1)[1] for i in sorted(g["ids"])],
+             "ratio": round(g["ratio"], 2)} for g in groups.values()]
+
+
+def describe_duplicates(group: Dict) -> str:
+    """One line for a group of alike methods."""
+    methods = group.get("methods") or []
+    alike = "identical" if group.get("ratio") == 1.0 else f"similarity {group.get('ratio')}"
+    names = {m.split(".", 1)[-1] for m in methods}
+    if len(names) == 1:
+        owners = ", ".join(m.split(".", 1)[0] for m in methods)
+        return f"`{names.pop()}` is written {len(methods)} times ({alike}): {owners}"
+    return f"{', '.join(f'`{m}`' for m in methods)} repeat one another ({alike})"
+
+
+_NEW_TYPE = re.compile(r"\bnew\s+([A-Z]\w*)\s*\(")
+# Whatever the framework names it: navigate(), navigateTo(), goto().
+_NAVIGATION = re.compile(r"\b(?:navigate\w*|goto)\s*\(")
+
+
+def rebuilt_pages(source: str, page_classes: Iterable[str],
+                  only: Optional[Iterable[str]] = None) -> List[Dict]:
+    """Helper methods that construct a page mid-flow instead of continuing the chain.
+
+    Page objects chain: an action that leaves a page returns the next one, and the
+    Helper keeps each page on its field. The one page a Helper constructs is the
+    first, right after navigating. A `new SomePage(...)` with no navigation before
+    it in the same method rebuilds a page the previous step already returned.
+
+    Returns [{"method": "Type.name(Params)", "page": "SomePage"}], limited to the
+    methods in `only` when it is given (the ones this run wrote).
+    """
+    pages = set(page_classes or ())
+    wanted = set(only) if only is not None else None
+    found = []
+    for key, method in _methods(source).items():
+        if wanted is not None and key not in wanted:
+            continue
+        body = _STRING.sub('""', method["body"])
+        for match in _NEW_TYPE.finditer(body):
+            if match.group(1) in pages and not _NAVIGATION.search(body[:match.start()]):
+                found.append({"method": key, "page": match.group(1)})
     return found
+
+
+def copied_methods(sources: Dict[str, str],
+                   only: Optional[Dict[str, Iterable[str]]] = None) -> List[List[str]]:
+    """Methods written out in full in more than one file, body for body.
+
+    Each group is `["path::Type.name(Params)", ...]`. Narrower than near_duplicates,
+    which also matches a copy that changed a literal: only an exact copy can be
+    reduced to one without deciding which variant is right. `only` limits which
+    methods count, per path, as near_duplicates does.
+    """
+    by_body: Dict[str, List[str]] = {}
+    for path, source in (sources or {}).items():
+        methods = _methods(source)
+        wanted = set(only.get(path) or ()) if only is not None else set(methods)
+        for key in sorted(wanted & set(methods)):
+            method = methods[key]
+            if not method["constructor"] and len(_call_sequence(method["body"])) >= MIN_DUPLICATE_CALLS:
+                by_body.setdefault(method["body"], []).append(f"{path}::{key}")
+    return [ids for ids in by_body.values() if len({i.split("::", 1)[0] for i in ids}) > 1]
 
 
 def known_members(root, paths: Iterable[str]) -> Dict[str, set]:

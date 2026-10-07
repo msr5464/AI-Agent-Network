@@ -321,6 +321,63 @@ class TestWhatCountsAsAHole:
             "over-reporting was the bug; under-reporting would be worse")
 
 
+class TestPagesHeldOnAHelperField:
+    """A web test stores each page it is handed on its helper's field and calls
+    the next action there: `shop.cartPage.checkout()`. Read as a bare
+    `cartPage.checkout()`, the receiver is neither a local nor a field of the
+    test, so every such call was a hole, and a test with holes is re-run on any
+    change to any class it can reach."""
+
+    def _repo(self, tmp_path, test_body):
+        _write(tmp_path, "automation.shop", "ShopTest", test_body)
+        _write(tmp_path, "automation.shop", "ShopHelper", textwrap.dedent("""\
+            public CartPage cartPage;
+
+            public CartPage openCart() {
+                return cartPage;
+            }
+        """))
+        _write(tmp_path, "automation.shop", "CartPage", textwrap.dedent("""\
+            public void verifyTotal() {
+                AssertHelper.assertEquals(testConfig, "Cart total", total, "42.00");
+            }
+        """))
+        return _index(tmp_path)
+
+    def test_a_call_through_the_helpers_page_field_is_followed(self, tmp_path):
+        index = self._repo(tmp_path, textwrap.dedent("""\
+            public void pay() {
+                ShopHelper shop = new ShopHelper();
+                shop.cartPage = shop.openCart();
+                shop.cartPage.verifyTotal();
+            }
+        """))
+        fps = ag.fingerprints("ShopTest", "pay", index)
+        assert fps["unresolved"] == []
+        assert [a["via"] for a in fps["asserts"].values()
+                if a["callee"] == "AssertHelper.assertEquals"] == ["shop.cartPage.verifyTotal()"]
+
+    def test_a_field_the_helper_does_not_declare_is_still_reported(self, tmp_path):
+        index = self._repo(tmp_path, textwrap.dedent("""\
+            public void pay() {
+                ShopHelper shop = new ShopHelper();
+                shop.paymentPage.pay();
+            }
+        """))
+        fps = ag.fingerprints("ShopTest", "pay", index)
+        assert any("shop.paymentPage.pay()" in u for u in fps["unresolved"])
+
+    def test_a_package_qualified_static_call_still_resolves(self, tmp_path):
+        index = self._repo(tmp_path, textwrap.dedent("""\
+            public void pay() {
+                shop.ShopHelper.audit();
+            }
+        """))
+        fps = ag.fingerprints("ShopTest", "pay", index)
+        assert any("ShopHelper#audit (method not found)" in u for u in fps["unresolved"]), (
+            "the qualifier is a package, so the call is the type's static method")
+
+
 class TestCommentsAreNotCode:
     def test_a_commented_out_assertion_is_not_counted_as_live(self, tmp_path):
         """Commenting a check out is the cheapest disguise of all.

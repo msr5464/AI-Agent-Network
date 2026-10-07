@@ -74,7 +74,10 @@ _PARAM_DECL = re.compile(
 # know when the chain leaves the code we can see.
 _EXTENDS = re.compile(r"\bclass\s+\w+(?:<[^>]*>)?\s+extends\s+([A-Z]\w*)")
 _STRING = re.compile(r'"(?:\\.|[^"\\])*"')
-_CALL = re.compile(r"\b(?:(\w+)\s*\.\s*)?(\w+)\s*\(")
+# `receiver.method(`, and `qualifier.receiver.method(` for a page a test holds on
+# its helper's field (`shop.cartPage.checkout()`): the qualifier names the object
+# whose field the receiver is. One level deep, which is all that convention needs.
+_CALL = re.compile(r"\b(?:(?:(\w+)\s*\.\s*)?(\w+)\s*\.\s*)?(\w+)\s*\(")
 
 MAX_DEPTH = 4
 
@@ -321,6 +324,34 @@ def _resolve_callee(receiver: Optional[str], method: str, klass: Dict,
     return None
 
 
+def _resolve_through(qualifier: str, receiver: str, method: str, klass: Dict,
+                     index: Dict[str, Dict],
+                     locals_: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Where `qualifier.receiver.method()` lands: `receiver` is a field of
+    whatever `qualifier` is — a page a test holds on its helper's field.
+
+    Falls back to resolving `receiver` on its own, as a call without the
+    qualifier would be, whenever the qualifier does not lead to a field of
+    ours: a package-qualified type (`core.Log.comment()`) or a field the
+    qualifier's class does not declare.
+    """
+    if qualifier in ("this", "super"):
+        return _resolve_callee(receiver, method, klass, index, locals_)
+    owner_name = _resolve_callee(qualifier, receiver, klass, index, locals_)
+    if owner_name == AMBIGUOUS:
+        return AMBIGUOUS
+    owner = index.get(owner_name) if owner_name else None
+    if owner is not None:
+        for ancestor in _ancestry(owner, index)[0]:
+            if receiver in ancestor["fields"]:
+                type_name = ancestor["fields"][receiver]
+                if type_name not in index:
+                    return type_name         # a library type: walk() stops there
+                entry = _lookup(type_name, ancestor, index)
+                return entry["fqcn"] if entry else AMBIGUOUS
+    return _resolve_callee(receiver, method, klass, index, locals_)
+
+
 def asserts_in(text: str, site: str) -> List[Dict]:
     """The assertions written in one member's text, in source order.
 
@@ -469,15 +500,18 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
             result["asserts"][f"{base}_{occurrences[base]}"] = info
 
         for match in _CALL.finditer(text):
-            receiver, name = match.group(1), match.group(2)
+            qualifier, receiver, name = match.group(1), match.group(2), match.group(3)
             if name in ("if", "for", "while", "switch", "catch", "return", "new"):
                 continue
             if ASSERT_CALL.match(text[match.start():]):
                 continue
-            target = _resolve_callee(receiver, name, klass, index, locals_)
+            target = (_resolve_through(qualifier, receiver, name, klass, index, locals_)
+                      if qualifier else _resolve_callee(receiver, name, klass, index, locals_))
+            # What the call reads as in a report: the field chain, when there is one.
+            called = ".".join(p for p in (qualifier, receiver, name) if p)
             if target == AMBIGUOUS:
                 result["unresolved"].append(
-                    f"{simple}#{member_name} -> {receiver}.{name}() (ambiguous class name)")
+                    f"{simple}#{member_name} -> {called}() (ambiguous class name)")
                 continue
             if target is None:
                 # A capitalised receiver this repo does not define is a static
@@ -496,11 +530,9 @@ def fingerprints(class_simple: str, method: str, index: Dict[str, Dict],
                                 and receiver[:1].islower()
                                 and receiver not in klass["fields"]))
                 if receiver and receiver not in ("this", "super") and not external:
-                    result["unresolved"].append(
-                        f"{simple}#{member_name} -> {receiver}.{name}()")
+                    result["unresolved"].append(f"{simple}#{member_name} -> {called}()")
                 continue
-            walk(target, name, depth + 1,
-                 via or f"{receiver + '.' if receiver else ''}{name}()")
+            walk(target, name, depth + 1, via or f"{called}()")
 
         if not follow_constructors:
             return

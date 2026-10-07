@@ -63,8 +63,10 @@ def test_review_notes_show_reuse_changes_reruns_and_length():
             "changed": ["ShopHelper.choose(PaymentMethod)"], "added": [], "removed": []}},
         "new_operations": [{"name": "confirmOtp", "kind": "stage", "why_new": "nothing confirms an OTP"}],
         "test_shape": {"guideline_lines": 30, "methods": {
-            "ShopWebTest#pay": {"body_lines": 41, "page_action_chains": []},
-            "ShopWebTest#refund": {"body_lines": 12, "page_action_chains": []}}},
+            "ShopWebTest#pay": {"body_lines": 41},
+            "ShopWebTest#refund": {"body_lines": 12}}},
+        "rebuilt_pages": [{"file": "ShopHelper.java", "method": "ShopHelper.pay(ShopData)",
+                           "page": "CartPage"}],
     }
     regression = {"changed": {"src/main/java/automation/modules/shop/ShopHelper.java": ["choose"]},
                   "tests": ["ShopWebTest#refund"], "not_run_reason": "",
@@ -75,6 +77,7 @@ def test_review_notes_show_reuse_changes_reruns_and_length():
     assert "❌ re-ran `ShopWebTest#refund`: failed — `[ERROR] boom`" in notes
     assert "why new: nothing confirms an OTP" in notes
     assert "`ShopWebTest#pay`: 41 lines" in notes and "ShopWebTest#refund`: 12" not in notes
+    assert "- ⚠️ `ShopHelper.pay(ShopData)` constructs `CartPage`" in notes
     assert ship._review_notes({}, {}) == ""
 
 

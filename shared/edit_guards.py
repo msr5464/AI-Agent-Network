@@ -18,6 +18,7 @@ so its own callers and tests keep working unchanged.
 
 import difflib
 import re
+from typing import Iterable
 
 from shared.code_analyzer import split_class_members
 from shared.dom_snapshot import selector_visibility
@@ -90,11 +91,14 @@ def apply_edits(original: str, edits: list) -> tuple:
 
 
 def validate_fix(original: str, updated: str, filename: str,
-                 max_diff_lines: int = DEFAULT_MAX_DIFF_LINES) -> tuple:
+                 max_diff_lines: int = DEFAULT_MAX_DIFF_LINES, *,
+                 may_remove: Iterable[str] = ()) -> tuple:
     """Reject a 'locator fix' that is actually a rewrite. Returns (ok, reason).
 
     The model only ever sees part of a large file, so a change far bigger than a
     locator is the signature of it regenerating content it never read.
+    `may_remove` names the methods the edit is meant to take out — a copy moved
+    to one place — so only those may disappear.
     """
     if not updated.strip():
         return False, "fix produced an empty file"
@@ -117,7 +121,7 @@ def validate_fix(original: str, updated: str, filename: str,
                       if m["kind"] in ("method", "constructor") and m["name"]}
             after = {m["name"] for m in split_class_members(updated)
                      if m["kind"] in ("method", "constructor") and m["name"]}
-            lost = before - after
+            lost = before - after - set(may_remove)
             if lost:
                 return False, f"fix removed method(s): {', '.join(sorted(lost))}"
         except Exception:

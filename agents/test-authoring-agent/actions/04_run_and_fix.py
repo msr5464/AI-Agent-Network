@@ -24,6 +24,8 @@ Writes: $AUDIT_DIR/04-run-and-fix.json
         $AUDIT_DIR/.fix-retry           "retry", or "stop" / "stop: <reason>"
 """
 
+import csv
+import io
 import json
 import os
 import re
@@ -132,6 +134,19 @@ def call_claude(prompt: str) -> str:
         # Generating a fix is pure text-in/text-out — no MCP server is needed, and
         # inheriting the user's global config just pays connection cost per attempt.
         strict_mcp_config=True,
+        # Reading framework sources helps a fix; nothing else does. With every
+        # built-in tool loaded, a fixer ran `find` over the user's home directory,
+        # tried `find /`, and read the framework from the user's own checkout
+        # instead of this run's worktree. Its edits come back as JSON, so it needs
+        # no write tool. With read-only tools the user's permission allows buy
+        # nothing, and their plugins' SessionStart hooks inject a persona.
+        tools="Read,Grep,Glob",
+        add_dir=str(AUTOMATION_FRAMEWORK_DIR),
+        disable_slash_commands=True,
+        setting_sources="project,local",
+        # Its tools answer at once, so a slow stream is a stall: sent again rather
+        # than waited out. A fix call ran at 6 tokens/s for eleven minutes.
+        restart_if_slow=True,
         # Conventions and rules travel as the system prompt file main() writes just
         # before this call; only the failure evidence is in the prompt itself. Picked
         # up here rather than passed in, so no call site or test fake has to know.
@@ -146,7 +161,9 @@ def call_claude(prompt: str) -> str:
     return result.stdout
 
 from shared.credential_properties import write_credential_property
-from shared.credential_extraction import credentials_from_plan
+from shared.credential_extraction import (credentials_from_plan, input_text, secret_columns,
+                                          secret_property_key, take_secret_columns)
+from shared.test_case import given_values
 from shared.test_catalog import test_methods_in
 from shared import properties_file, url_properties
 # Evidence readers shared with test-healing-agent. The framework already writes a
@@ -156,7 +173,9 @@ from shared import properties_file, url_properties
 from shared import diagnosis as _diagnosis
 from shared import failure_context as _failure_context
 from shared.dom_snapshot import (find_snapshot, distill as distill_dom,
-                                 format_for_prompt as format_dom)
+                                 format_for_prompt as format_dom,
+                                 load_fingerprints, candidates_from_fingerprints)
+from shared import failure_identity, flow_map
 from shared.telemetry import (read_actions, failing_action, discover as discover_traces,
                                      format_for_prompt as format_trace)
 # Mechanical guards, shared with test-healing-agent and test-adaptation-agent.
@@ -490,6 +509,74 @@ def _run_guards(original: str, updated: str, rel_path: str, capture: dict = None
     return True, ""
 
 
+def test_case_data_section(test_case: str) -> str:
+    """The values the test case states, for the system prompt.
+
+    A fix that writes test data had nothing else to take it from. Step 03's CSV
+    was refused, and the fix that rewrote it made up a name, an email, a different
+    card number and an expiry already past, for a test case that gave all four.
+    A login secret is named, not shown: it is read from the properties file.
+    """
+    given = given_values(test_case)
+    if not given:
+        return ""
+    lines = "".join(
+        f"  {label}: "
+        + ("(a login secret: read it from the properties file)"
+           if secret_columns(label, test_case) else value) + "\n"
+        for label, value in given)
+    return ("\nTEST DATA THE TEST CASE STATES. Test data a fix writes, a CSV row or a "
+            "Builder default, uses each of these exactly as written, never a sample value "
+            "in its place:\n" + lines)
+
+
+def _csv_rows_fit(rel_path: str, updated: str) -> tuple:
+    """Refuse a CSV with a row that has more or fewer fields than its header.
+
+    A fix wrote `Bangalore, India` unquoted. The comma split it, every later column
+    moved one place, and the test typed "India" as the card number. Nothing failed
+    until a promo that only renders for a valid card timed out three steps later.
+    """
+    if not rel_path.endswith(".csv"):
+        return True, ""
+    rows = [r for r in csv.reader(io.StringIO(updated or "")) if any(c.strip() for c in r)]
+    for n, row in enumerate(rows[1:], 2):
+        if len(row) != len(rows[0]):
+            return False, (f"row {n} has {len(row)} fields but the header has {len(rows[0])}. "
+                           "Each row needs one value per column: quote a value that holds a "
+                           'comma, "Bangalore, India".')
+    return True, ""
+
+
+def _no_csv_secret(rel_path: str, original: str, updated: str) -> tuple:
+    """Refuse a fix that adds a login-secret column to a CSV. Returns (ok, reason).
+
+    Step 03 moves such a column into the properties file before anything is
+    written (_move_csv_secrets); a fix is the other way one gets in, and the CSV is
+    committed with the PR. The value is written to its property first, so the
+    reason names a property the next attempt can read.
+    """
+    if not rel_path.endswith(".csv"):
+        return True, ""
+    test_case = input_text({})
+    before = set(secret_columns(original.split("\n", 1)[0], test_case))
+    added = [c for c in secret_columns(updated.split("\n", 1)[0], test_case) if c not in before]
+    _, taken, _ = take_secret_columns(updated, added)
+    if not taken:
+        return True, ""
+    parts = Path(rel_path).parts
+    feature = parts[parts.index("resources") + 1] if "resources" in parts[:-2] else ""
+    keys = {c: secret_property_key(feature or Path(rel_path).stem, c) for c in taken}
+    properties_file.upsert(properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR),
+                           {keys[c]: v for c, v in taken.items()},
+                           f"{feature} test secrets (auto-added by test-authoring-agent)", log)
+    return False, ("a CSV is committed with the PR, so it may not hold a login secret. "
+                   "Leave the column out and read each value from its property instead: "
+                   + "; ".join(f'{c} -> config.getRunTimeProperty("{k}")'
+                               for c, k in keys.items())
+                   + ". Each value is already in the properties file.")
+
+
 def apply_fix(files_map: dict, edits_map: dict = None,
               test_class: str = "", test_method: str = "",
               sanction: dict = None, capture: dict = None) -> tuple:
@@ -543,14 +630,18 @@ def apply_fix(files_map: dict, edits_map: dict = None,
             if not updated.strip():
                 continue
 
-        if original:
+        # A new file too: a CSV a fix creates is read and committed like one it edits.
+        ok, reason = _csv_rows_fit(rel_path, updated)
+        if ok:
+            ok, reason = _no_csv_secret(rel_path, original, updated)
+        if ok and original:
             ok, reason = _run_guards(original, updated, rel_path, capture)
-            if not ok:
-                log(f"  REJECTED {rel_path} — {reason}")
-                rejections.append({"file": rel_path, "reason": reason,
-                                   "diff": compute_diff(original, updated,
-                                                        Path(rel_path).name)})
-                continue
+        if not ok:
+            log(f"  REJECTED {rel_path} — {reason}")
+            rejections.append({"file": rel_path, "reason": reason,
+                               "diff": compute_diff(original, updated,
+                                                    Path(rel_path).name)})
+            continue
 
         full.parent.mkdir(parents=True, exist_ok=True)
         originals[rel_path] = original
@@ -825,7 +916,88 @@ def advisory_diagnosis(test_class: str, test_method: str, dom_snapshot_path: str
     )
 
 
-def gather_runtime_evidence(test_method: str, newer_than: float = 0.0) -> dict:
+def _step02_names(selector: str) -> list:
+    """The step 02 locator names whose confirmed selector is `selector`, or []."""
+    from shared.page_identity import normalize_selector
+    if not selector:
+        return []
+    try:
+        step02 = json.loads((AUDIT_DIR / "02-validate-web.json").read_text()).get("selectors") or {}
+    except (OSError, ValueError):
+        return []
+    norm = lambda s: normalize_selector(s or "") or (s or "").strip()
+    return [n for n, s in step02.items() if s and norm(s) == norm(selector)]
+
+
+def step02_locator_section(names: list) -> str:
+    """What step 02 did with the locator the test failed on, for the fix prompt.
+
+    Step 02 confirmed the selector where it saw it, which may not be where the test
+    used it. A run kept a promo banner from the payment-method list for
+    `promoCodeOption`, while it had also reported, and clicked, the promo radio on
+    the card form. The test failed on the card form, and the fixer, shown neither,
+    concluded the promo never renders. The other selectors step 02 reported for the
+    name and the controls it clicked that share a word with it are the leads.
+    """
+    if not names:
+        return ""
+    try:
+        step02 = json.loads((AUDIT_DIR / "02-validate-web.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    rows = flow_map.read_evidence(AUDIT_DIR / "02-web-evidence.jsonl")
+    lines = []
+    for name in names:
+        kept = (step02.get("selectors") or {}).get(name, "")
+        others = [s for s in (step02.get("reported_again") or {}).get(name) or [] if s != kept]
+        clicks = [c for c in flow_map.clicks_named(rows, name) if c["sel"] != kept][:5]
+        if not others and not clicks:
+            continue
+        lines.append(f"`{name}` — step 02 confirmed {kept}")
+        lines += [f"    also reported for this name: {s}" for s in others]
+        lines += [f"    clicked while validating the flow: {c['sel']} — text "
+                  f"\"{(c.get('text') or '').strip()[:80]}\"" for c in clicks]
+    if not lines:
+        return ""
+    return ("\n## WHAT STEP 02 DID WITH THIS LOCATOR (the browser validation run)\n"
+            "The failing locator came from step 02, which counted it at one visible "
+            "element on the page where it reported it. That need not be the page this "
+            "test failed on. These are the other elements step 02 reported or "
+            "clicked for the same name, each counted at one visible element:\n"
+            + "\n".join(lines) + "\n")
+
+
+def step02_updates_section() -> str:
+    """What step 02 saw the page change after an action returned, for the fixer.
+
+    Step 02 waits after every action until the page settles, and this list is the
+    only record that it had to. A fix for a click that "did nothing" put the wait
+    after the click, when the page was still redrawing from the action before it,
+    and the same failure came back. The wait belongs after the action listed here.
+    """
+    try:
+        updates = json.loads((AUDIT_DIR / "02-validate-web.json").read_text()).get(
+            "delayed_updates") or []
+    except (OSError, ValueError):
+        return ""
+    if not updates:
+        return ""
+    lines = [f"- after {', '.join(u.get('after') or [])} the page kept working for "
+             f"{u.get('settled_ms')}ms on {u.get('requests')} request(s), and changed: "
+             + "; ".join(f"{'/'.join(c.get('names') or []) or c['element']} "
+                         f"{c['before']!r} → {c['after']!r}" for c in u.get("changed") or [])
+             for u in updates]
+    return ("\n## WHAT THE PAGE DID AFTER AN ACTION (step 02, the browser validation run)\n"
+            "Step 02 waited after each of these actions until the page settled. A test that "
+            "acts or reads straight after one is acting on a page still updating: a click "
+            "then can be lost, and a value read is the old one. The wait belongs at the end "
+            "of the page method that performs the action listed, before anything else "
+            "happens, and WaitHelper.waitForNetworkIdle is not one: it returns at once on a "
+            "page that has already loaded.\n" + "\n".join(lines) + "\n")
+
+
+def gather_runtime_evidence(test_method: str, newer_than: float = 0.0,
+                            failure: dict = None) -> dict:
     """Read the DOM, failure context and trace the framework wrote at failure.
 
     `newer_than` bounds the lookup to artefacts this run actually produced. A run
@@ -834,11 +1006,22 @@ def gather_runtime_evidence(test_method: str, newer_than: float = 0.0) -> dict:
     a DOM and a failing selector from an entirely different failure, which is worse
     than showing it nothing.
 
+    `failure` is failure_identity.identify() of the failing run: its selector and
+    element ranks the DOM's candidates, and step 02's record of that locator is
+    added as its own section.
+
     Every lookup is independently best-effort: a missing or unreadable artefact
     must degrade the fix prompt, never break the fix path.
     """
     out = {"dom_section": "", "trace_section": "", "context_section": "",
-           "dom_snapshot_path": "", "trace_path": ""}
+           "step02_section": "", "dom_snapshot_path": "", "trace_path": ""}
+    failure = failure or {}
+    failed_selector = failure.get("selector") or ""
+    step02_names = _step02_names(failed_selector)
+    try:
+        out["step02_section"] = step02_locator_section(step02_names)
+    except Exception as e:                       # pragma: no cover - defensive
+        log(f"Evidence: step 02 record unavailable ({e})")
     if not test_method:
         return out
 
@@ -857,7 +1040,25 @@ def gather_runtime_evidence(test_method: str, newer_than: float = 0.0) -> dict:
             snap = None
         if snap:
             out["dom_snapshot_path"] = str(snap)
-            distilled = distill_dom(snap.read_text(errors="ignore"))
+            text = snap.read_text(errors="ignore")
+            names = [n for n in step02_names + [failure.get("element") or ""] if n]
+            # The capture first, as test-healing-agent reads it: the HTML lists the
+            # top page's own elements first and keeps 30, so a fixer whose locator
+            # failed inside a payment iframe was shown 30 of the store page's
+            # settings and none of the iframe's controls. The capture keeps the
+            # failing locator's iframe and ranks its elements by the names.
+            distilled = {}
+            prints = load_fingerprints(snap)
+            if prints.get("elements"):
+                from shared.page_identity import parse as _parse_dom
+                distilled = candidates_from_fingerprints(
+                    prints, names, failed_selector, soup=_parse_dom(text))
+                if distilled.get("error"):
+                    log(f"Evidence: capture unusable ({distilled['error']}) — "
+                        f"reading the saved HTML")
+                    distilled = {}
+            if not distilled:
+                distilled = distill_dom(text, names)
             body = format_dom(distilled)
             if body.strip():
                 out["dom_section"] = (
@@ -1390,7 +1591,8 @@ def main() -> None:
     # Read the DOM, failure context and trace the previous attempt's run left on
     # disk. These describe the exact failure this attempt is being asked to fix,
     # and step 04 ignored all three until now.
-    evidence = gather_runtime_evidence(test_method, newer_than=prev_run_started_at)
+    evidence = gather_runtime_evidence(test_method, newer_than=prev_run_started_at,
+                                       failure=failure_identity.identify(prev_output))
 
     # Every attempt so far, not just the last one. `04-run-and-fix.json` is overwritten
     # each attempt, so on its own it gives attempt 3 no way to know what attempt 1 tried.
@@ -1564,7 +1766,9 @@ def main() -> None:
     # verdict on that page.
     structured_section += (evidence["trace_section"]
                            + evidence["dom_section"]
-                           + evidence["context_section"])
+                           + evidence["context_section"]
+                           + evidence["step02_section"]
+                           + step02_updates_section())
 
     failed_selector = ""
     try:
@@ -1758,7 +1962,11 @@ is structural), fall back to whole-file replacement instead:
 If this is a framework-level issue you cannot fix from the files you can see, return
 "edits": [] and explain that clearly in root_cause rather than guessing at a workaround.
 Output ONLY valid JSON.
-"""
+
+This run's checkout of the automation repository is {AUTOMATION_FRAMEWORK_DIR}. Read,
+Grep and Glob work there; read framework sources from that path only, never from
+another checkout.
+{test_case_data_section(input_text(plan_data))}"""
     SYSTEM_PROMPT_FILE.write_text(static_system_prompt)
 
     # Per attempt: the evidence. Everything that holds for the whole run is in the
@@ -2201,23 +2409,17 @@ def record_failed_locators(test_output: str, test: str, plan: dict) -> list:
     cache hands out. Every failing run is read, not only the first: a fix that
     gets past one failure can reach an element the test never got to before.
     """
-    from shared import failure_identity, proven_locators
-    from shared.page_identity import normalize_selector
+    from shared import proven_locators
 
     failure = failure_identity.identify(test_output)
     if not failure.get("available"):
         return []
-    try:
-        step02 = json.loads((AUDIT_DIR / "02-validate-web.json").read_text()).get("selectors") or {}
-    except (OSError, ValueError):
-        return []
-    norm = lambda s: normalize_selector(s or "") or (s or "").strip()
     path = AUDIT_DIR / proven_locators.FAILED_FILE
     recorded = proven_locators.selectors(path)
-    names = [n for n, s in step02.items()
-             if s and norm(s) == norm(failure["selector"]) and n not in recorded]
+    names = [n for n in _step02_names(failure["selector"]) if n not in recorded]
     if not names:
         return []
+    step02 = json.loads((AUDIT_DIR / "02-validate-web.json").read_text()).get("selectors") or {}
     try:
         earlier = json.loads(path.read_text()).get("locators") or []
     except (OSError, ValueError):
@@ -2325,6 +2527,14 @@ def _write_result(data: dict, files_written: list, attempt: int) -> None:
         for key in _CARRIED_FORWARD:
             if not out.get(key) and prev.get(key):
                 out[key] = prev[key]
+    # Whether run.sh is done with this step, in the protocol step 02 already speaks
+    # (audit_reader._step_unfinished). Every exit writes the gate first, so this is
+    # the decision just made. Without it, attempt 1's failing result read as the
+    # session's verdict while attempt 2 was running, and History showed "failed".
+    try:
+        out["final_attempt"] = (AUDIT_DIR / ".fix-retry").read_text().strip() != "retry"
+    except OSError:
+        out["final_attempt"] = True
     data = out
     (AUDIT_DIR / "04-run-and-fix.json").write_text(json.dumps(data, indent=2))
 
