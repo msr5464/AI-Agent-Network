@@ -278,6 +278,18 @@ class TestClaudeInvocation:
         assert recorded[0]["allowed_tools"] is None
         assert recorded[0]["add_dir"] is None
 
+    def test_the_fix_call_can_read_source_and_run_nothing(self, fix, recorded, tmp_path):
+        # With a shell the fix call could read the repository's history, where
+        # the answer to a locator someone broke on purpose is written down — and
+        # what it could run at all depended on the machine's permission settings.
+        assert set(fix.FIX_TOOLS) == {"Read", "Grep", "Glob"}
+        fix.call_claude("p", tmp_path, artifact_dir="/shots",
+                        allowed_tools=list(fix.FIX_TOOLS), tools=",".join(fix.FIX_TOOLS))
+        assert recorded[0]["allowed_tools"] == ["Read", "Grep", "Glob"]
+        # `tools` is what stops a tool being loaded at all; `allowed_tools` only
+        # gates permission for one that is.
+        assert recorded[0]["tools"] == "Read,Grep,Glob"
+
 
 class TestReapParkedBrowser:
     """Closing the browser a repair run parked.
@@ -353,3 +365,136 @@ def test_repo_conventions_are_not_cut_mid_file(fix, tmp_path, monkeypatch):
     (tmp_path / "CLAUDE.md").write_text(body + "## Patterns to Never Use\n")
     loaded = fix.load_repo_conventions(tmp_path)
     assert loaded.endswith("## Patterns to Never Use\n")
+
+
+CART_PAGE = '''public class CartPage extends BasePage {
+    private final Locator cartTable;
+    private final Locator cartBadge;
+    private final Locator orderTotal;
+    public CartPage(Config config) {
+        cartTable = page.locator("table.cart");
+        cartBadge = page.locator(".badge");
+        orderTotal = page.frameLocator("#pay-frame").locator("div.order-total");
+        assertPageLoaded(cartTable);
+    }
+    public void verifyBadge() {
+        AssertHelper.assertElementText(config, cartBadge, "1", "badge shows one");
+    }
+}
+'''
+
+
+class TestAssertedValuesNeverChange:
+    """A locator fix changes how an element is found, never what is asserted.
+
+    Repairing a locator an assertion reads is only safe if the assertion itself
+    comes through untouched. This is what holds that, for an edit Locate proved
+    and an edit the model wrote alike.
+    """
+
+    def test_changing_only_the_locator_is_fine(self, fix):
+        ok, reason = fix.assertions_unchanged(
+            CART_PAGE, CART_PAGE.replace('".badge"', '".cart-badge"'))
+        assert ok, reason
+
+    def test_changing_the_expected_value_is_rejected(self, fix):
+        ok, reason = fix.assertions_unchanged(
+            CART_PAGE, CART_PAGE.replace('"1", "badge', '"2", "badge'))
+        assert not ok
+        assert "changes an assertion" in reason and "never what the test verifies" in reason
+
+    def test_swapping_what_is_compared_is_rejected(self, fix):
+        ok, _ = fix.assertions_unchanged(
+            CART_PAGE, CART_PAGE.replace("config, cartBadge,", "config, cartTable,"))
+        assert not ok
+
+    def test_dropping_the_check_is_rejected(self, fix):
+        line = '        AssertHelper.assertElementText(config, cartBadge, "1", "badge shows one");\n'
+        ok, reason = fix.assertions_unchanged(CART_PAGE, CART_PAGE.replace(line, ""))
+        assert not ok and "removes an assertion" in reason
+
+    def test_adding_a_check_is_rejected_too(self, fix):
+        extra = CART_PAGE.replace(
+            "    public void verifyBadge() {",
+            "    public void verifyBadge() {\n"
+            "        AssertHelper.assertElementVisible(config, cartBadge, \"badge\");")
+        ok, reason = fix.assertions_unchanged(CART_PAGE, extra)
+        assert not ok and "adds an assertion" in reason
+
+    def test_a_commented_out_assertion_is_not_one(self, fix):
+        noted = CART_PAGE.replace(
+            "    public void verifyBadge() {",
+            "    // was: AssertHelper.assertElementText(config, cartBadge, \"0\", \"x\");\n"
+            "    public void verifyBadge() {")
+        ok, reason = fix.assertions_unchanged(CART_PAGE, noted)
+        assert ok, reason
+
+    def test_a_page_load_anchor_is_governed_by_its_own_rules(self, fix):
+        # Its anchor is how the page is recognised; a stale one is a locator to
+        # repair, and the page-identity rules decide whether that is allowed.
+        ok, reason = fix.assertions_unchanged(
+            CART_PAGE, CART_PAGE.replace("assertPageLoaded(cartTable)",
+                                         "assertPageLoaded(cartBadge)"))
+        assert ok, reason
+
+
+class TestTheCaptureStaysInPlayForALocatorInAnIframe:
+    """The capture is set aside once the failing selector is gone from the file.
+
+    "Gone" was a substring test, and a locator inside an iframe is reported as a
+    chain of hops that is a literal nowhere in the source. So for every such
+    locator the capture was dropped, and a replacement that matched nothing on
+    the page went to a test run instead of being rejected as a guess.
+    """
+
+    CHAIN = "#pay-frame >> internal:control=enter-frame >> div.order-total"
+    GUESS = CART_PAGE.replace(
+        'page.frameLocator("#pay-frame").locator("div.order-total")',
+        'page.locator("#not-on-the-page")')
+
+    def _soup(self):
+        return page_identity.parse(
+            "<html><body><table class='cart'></table></body></html>")
+
+    def test_a_guess_is_still_rejected(self, fix):
+        ok, reason = fix.validate_diagnosis_fit(
+            CART_PAGE, self.GUESS, "LOCATOR_STALE", self._soup(),
+            failing_selector=self.CHAIN)
+        assert not ok
+        assert "matches nothing in the DOM captured at failure" in reason
+
+    def test_a_selector_really_gone_from_the_file_still_sets_the_capture_aside(self, fix):
+        ok, reason = fix.validate_diagnosis_fit(
+            CART_PAGE, self.GUESS, "LOCATOR_STALE", self._soup(),
+            failing_selector="#pay-frame >> internal:control=enter-frame >> div.repaired")
+        assert ok, reason
+
+    def test_an_edit_aimed_at_another_page_is_judged_against_the_capture(self, fix):
+        # The failing selector is not in the file being edited because the edit
+        # is to a different page object — not because an earlier edit repaired
+        # it. It is still declared where it always was, so the capture is still
+        # the failure in hand, and a selector for a page the test never reached
+        # is a guess.
+        other = ORIGINAL_OTHER_PAGE
+        guess = other.replace('"#card-code-old"', '"#card-code"')
+        ok, reason = fix.validate_diagnosis_fit(
+            other, guess, "LOCATOR_STALE", self._soup(),
+            failing_selector=self.CHAIN, declaring_source=CART_PAGE)
+        assert not ok
+        assert "matches nothing in the DOM captured at failure" in reason
+
+    def test_without_the_declaring_source_that_edit_goes_to_the_test_run(self, fix):
+        other = ORIGINAL_OTHER_PAGE
+        guess = other.replace('"#card-code-old"', '"#card-code"')
+        ok, reason = fix.validate_diagnosis_fit(
+            other, guess, "LOCATOR_STALE", self._soup(), failing_selector=self.CHAIN)
+        assert ok, reason
+
+
+ORIGINAL_OTHER_PAGE = '''public class CardFormPage extends BasePage {
+    private final Locator cardCode;
+    public CardFormPage(Config config) {
+        cardCode = page.locator("#card-code-old");
+    }
+}
+'''

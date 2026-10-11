@@ -148,6 +148,19 @@ checkout's `branch` and `dirty` flag; **503** if the repo is not found.
 (`test, source, proves, verifies, checks, identity, unresolved_count`); 400 unless
 `test` names a single method.
 
+Both take an optional `?branch=<name>`, and the panels send the tree their run
+will execute in: the base branch when auto-push is on, nothing when it is off.
+
+| `branch` | Tree read | Extra fields on `/tests` |
+|---|---|---|
+| absent | the local checkout, uncommitted changes included | `branch`, `dirty`, `source: "checkout"` |
+| given | `origin/<branch>`, fetched (tip cached 60 s) and unpacked without moving the checkout | `branch`, `sha`, `dirty: false`, `source: "branch"` |
+
+400 for a name that is not a valid branch, **404** `{error, detail}` when the
+branch cannot be read (`detail` says whether it does not exist or the remote
+could not be reached). A workspace that is not a git checkout is listed as it
+stands whatever `branch` says.
+
 ### Start a run
 
 ```

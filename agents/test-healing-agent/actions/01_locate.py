@@ -228,8 +228,49 @@ def _failure_capture(issue: dict) -> tuple[dict, dict]:
         return header, {}
 
 
+def _flat(value) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _unsettled_anchors(stored: dict, locators: list, field: str, soup) -> dict:
+    """Hint attributes this page changed on a locator that still works, with the
+    witness for each: {attribute: sentence}.
+
+    A repair is proved unique against one capture, which is one moment of the
+    page. A value the page rewrites as it is used — a placeholder blanked while
+    its field has focus — is unique in that moment and gone in the next, so a
+    selector built on it finds the element right up until the test touches it.
+
+    The capture cannot show that about the element being repaired. Its
+    neighbours can: a field whose own locator still finds exactly one element,
+    holding a different value than the last good run recorded, is the page
+    showing that it changes that attribute. The failing field is never its own
+    witness — its locator is the one that broke.
+    """
+    recorded = stored.get("fingerprints") or {}
+    out: dict = {}
+    for locator in locators:
+        name = locator.get("name") or ""
+        was = recorded.get(name)
+        # A locator narrowed by an accessible name is not judged by its selector
+        # alone, so "exactly one node" would not mean "that element".
+        if not was or name == field or locator.get("accessible_name"):
+            continue
+        found = dom_snapshot.select_nodes(locator.get("selector") or "", soup)
+        if not found or len(found[0]) != 1 or found[0][0].name != was.get("tag"):
+            continue
+        node = found[0][0]
+        for attribute in emit_mod.HINT_ANCHORS:
+            before, now = _flat(was.get(attribute)), _flat(node.get(attribute))
+            if before != now and attribute not in out:
+                out[attribute] = (f"{name} still matches, and its {attribute} was "
+                                  f"{before!r} on the last good run and is {now!r} "
+                                  f"in the failure capture")
+    return out
+
+
 def _emit_offline(el: dict, vol: Volatility, soup, prints: dict,
-                  frame_path: list | None = None) -> dict | None:
+                  frame_path: list | None = None, unsettled=()) -> dict | None:
     """The first selector on the ladder that matches THIS element and only it.
 
     `locator_emit.emit` asks a live page the same question with `count()`.
@@ -242,7 +283,8 @@ def _emit_offline(el: dict, vol: Volatility, soup, prints: dict,
     spells the attribute `data-test`. That candidate scores (0, 0) and the ladder
     moves on, exactly as the live count used to make it.
     """
-    for cand in emit_mod.candidates_for(el, vol, frame_path=frame_path):
+    for cand in emit_mod.candidates_for(el, vol, frame_path=frame_path,
+                                        unsettled=unsettled):
         if emit_mod.VOLATILE_SELECTOR.search(cand["sel"]):
             continue
         # A framework that cannot put this rung inside an iframe emits no code for
@@ -255,7 +297,7 @@ def _emit_offline(el: dict, vol: Volatility, soup, prints: dict,
 
 
 def _resolve_offline(baseline: dict, prints: dict, soup, cfg: dict, vol: Volatility,
-                     frame: tuple = (None, None)):
+                     frame: tuple = (None, None), unsettled=()):
     """Rank every captured element against the baseline, then write a locator.
 
     Returns (emitted, candidate, decision). `emitted` is None when the decision
@@ -289,10 +331,32 @@ def _resolve_offline(baseline: dict, prints: dict, soup, cfg: dict, vol: Volatil
     pool = [c for c in ranked[:cfg["budgets"]["candidates_to_verify"]]
             if decision.top.score - c.score < cfg["thresholds"]["margin"]]
     for cand in pool:
-        emitted = _emit_offline(cand.el, vol, soup, prints, frame_path)
+        emitted = _emit_offline(cand.el, vol, soup, prints, frame_path, unsettled)
         if emitted:
             return emitted, cand, decision
     return None, None, decision
+
+
+def _no_fingerprint_reason(class_name: str, field: str, stored: dict) -> str:
+    """Why a recorded page has nothing to compare this locator against.
+
+    Three different things, and they used to share one sentence — "it did not
+    resolve on the last good run" — which was false for the commonest of them: a
+    locator the page-load count shows matching, whose fingerprint simply was not
+    captured. Said that way, a hole in the baseline read as evidence about the
+    element.
+    """
+    count = (stored.get("coverage") or {}).get(field)
+    head = f"{class_name} has a baseline but no fingerprint for {field} — "
+    if isinstance(count, int) and count > 0:
+        return head + (f"it matched {count} element(s) on the last good run and was "
+                       f"not fingerprinted: the baseline is incomplete, which says "
+                       f"nothing about the element")
+    if count == 0:
+        return head + ("it matched nothing when the page loaded on the last good "
+                       "run, and the test did not use it afterwards")
+    return head + ("it could not be evaluated when the page loaded on the last good "
+                   "run, and the test did not use it afterwards")
 
 
 def _heals_in_window(baseline: dict, cfg: dict) -> int:
@@ -359,11 +423,17 @@ def _already_tried(previous_fix: dict, previous_locate: list) -> set:
     selector again and this step would resolve it to the same answer, for ever.
     The retry exists to try something ELSE, which is the model's job — so refuse
     here rather than hand Fix an answer it has already disproved.
+
+    Disproved once is disproved for the session. The refusal replaces the answer
+    in the file, so an attempt later than the next one finds no answer to match
+    against — and without the record of what was tried it resolved the selector
+    afresh and offered the same thing again.
     """
     healed = {r.get("failed_selector") for r in previous_locate
               if r.get("verdict") == HEALED}
-    return {f.get("failed_selector") for f in (previous_fix.get("failed_fixes") or [])
-            if f.get("status") == "test_failed" and f.get("failed_selector") in healed}
+    fresh = {f.get("failed_selector") for f in (previous_fix.get("failed_fixes") or [])
+             if f.get("status") == "test_failed" and f.get("failed_selector") in healed}
+    return fresh | {r.get("failed_selector") for r in previous_locate if "tried" in r}
 
 
 def _merge(previous: list, current: list) -> list:
@@ -379,8 +449,33 @@ def _merge(previous: list, current: list) -> list:
     return list(keyed.values())
 
 
-def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
+def locate_one(issue: dict, sources: dict, assertion_used: dict, cfg: dict,
                vol: Volatility, workspace: Path) -> dict:
+    """One locator, with the rule for locators an assertion reads applied on top.
+
+    Pointed at a different element, a presence check passes on anything visible
+    and a caught regression becomes a green build. So a locator an assertion
+    reads is repaired only when the fingerprint proves the replacement is the
+    same element. Every other outcome is reported under one verdict that Fix
+    honours without asking the model — the one path that can pick an element
+    nothing proved.
+    """
+    record = _locate(issue, sources, assertion_used, cfg, vol, workspace)
+    site = assertion_used.get(record.get("field") or "")
+    if not site or locator_assertions.heal_mode(cfg) != locator_assertions.PROVEN:
+        return record
+    if record["verdict"] == HEALED:
+        record["assertion_site"] = site
+        return record
+    why = record.get("reason") or record.get("classification") or record["verdict"]
+    record["unproven_as"] = record.get("classification") or record["verdict"]
+    record["verdict"], record["classification"] = NO_HEAL, "ASSERTION_LOCATOR"
+    record["reason"] = locator_assertions.unproven(site, why)
+    return record
+
+
+def _locate(issue: dict, sources: dict, assertion_used: dict, cfg: dict,
+            vol: Volatility, workspace: Path) -> dict:
     """One locator: identify it, rank it against the failure capture, write it."""
     failed = issue.get("failed_selector") or ""
     record = {
@@ -391,7 +486,9 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
         "locator_id": "",
     }
     if not failed:
-        record["reason"] = "no failing selector recorded — not a locator failure"
+        # What is missing, not what it means: an absent selector is a gap in the
+        # evidence, and says nothing about which kind of failure this was.
+        record["reason"] = "no failing selector recorded — nothing to locate"
         return record
 
     owner = _owner_hint(issue)
@@ -414,10 +511,11 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
     record["locator_id"] = f"{class_name}#{field}"
     record["page_object"], record["field"] = class_name, field
 
-    # Heal how a test FINDS an element; never what it VERIFIES. A healed assertion
-    # locator turns a caught regression into a green build, which is the exact
-    # failure this whole system exists to avoid.
-    if field in assertion_used and not cfg["classify"].get("heal_assertions", False):
+    # Configured never to touch a locator an assertion reads: refuse before
+    # spending anything on it. The default — repair on proof — is decided by the
+    # caller, once there is a resolution to judge.
+    if (field in assertion_used
+            and locator_assertions.heal_mode(cfg) == locator_assertions.NEVER):
         record["verdict"], record["classification"] = NO_HEAL, "ASSERTION_LOCATOR"
         record["reason"] = ("locator is read by an assertion — reported for review, "
                             "never auto-healed")
@@ -482,9 +580,10 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
 
     baseline = engine.baseline_for(class_name, field, raw, stored)
     if baseline is None:
-        record["verdict"] = "NO_BASELINE"
-        record["reason"] = (f"{class_name} has a baseline but no fingerprint for "
-                            f"{field} — it did not resolve on the last good run")
+        # Its own name: the page was recorded, this one locator was not. Counted
+        # with "no recorded good run", a hole in a baseline read as a missing one.
+        record["verdict"], record["classification"] = "NO_BASELINE", "NO_FINGERPRINT"
+        record["reason"] = _no_fingerprint_reason(class_name, field, stored)
         return record
 
     healed_before = _heals_in_window(baseline, cfg)
@@ -504,8 +603,8 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
     # report — and on a page object whose only evaluable locator is the broken
     # one it made "nothing matches" the verdict every time, refusing a page the
     # test was demonstrably on.
-    coverage = page_identity.locator_coverage(
-        page_identity.extract_locators(sources.get(class_name, "")), soup)
+    declared = page_identity.extract_locators(sources.get(class_name, ""))
+    coverage = page_identity.locator_coverage(declared, soup)
     details = {d["name"]: d["count"] for d in coverage.get("details") or []
                if d.get("name") and d["name"] != field and isinstance(d.get("count"), int)}
     comparison = baseline_store.diff(
@@ -530,9 +629,17 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
             return record
         frame = (frame_path, getattr(doc, "qa_prints", None) or {})
 
+    unsettled = _unsettled_anchors(stored, declared, field, soup)
     started = time.time()
-    emitted, cand, decision = _resolve_offline(baseline, prints, soup, cfg, vol, frame)
+    emitted, cand, decision = _resolve_offline(baseline, prints, soup, cfg, vol, frame,
+                                               unsettled)
     record["elapsed_ms"] = int((time.time() - started) * 1000)
+    # Only the ones that changed the answer: an attribute the chosen element does
+    # not carry was never going to be its anchor.
+    chosen = cand.el if cand is not None else (decision.top.el if decision.top else {})
+    passed_over = {a: why for a, why in unsettled.items() if chosen.get(a)}
+    if passed_over:
+        record["anchors_passed_over"] = passed_over
     record["rejected"] = [
         {"tag": r.el["tag"], "name": r.el.get("accessible_name"),
          "score": round(r.score, 3), "tier": r.best_tier}
@@ -544,6 +651,10 @@ def locate_one(issue: dict, sources: dict, assertion_used: set, cfg: dict,
             record["classification"] = "NO_STABLE_LOCATOR"
             record["reason"] = ("found the element but could not express it as a stable "
                                 "unique locator — it needs a test id")
+            if passed_over:
+                record["reason"] += ("; " + ", ".join(passed_over) + " not used, "
+                                     "because the page changes it: "
+                                     + "; ".join(passed_over.values()))
         elif decision.outcome == decide_mod.NONE:
             record["classification"] = "ELEMENT_GONE"
             record["reason"] = decision.reason
@@ -607,7 +718,8 @@ def main() -> int:
               for source in sources.values()
               for declared in page_identity.extract_locators(source)
               if declared.get("name")}
-    assertion_used = locator_assertions.assertion_fields(sources, fields)
+    assertion_used = locator_assertions.assertion_sites_by_field(sources, fields)
+    assertion_mode = locator_assertions.heal_mode(cfg)
 
     # One broken locator fails every test that walks past it. Fix already clusters
     # on that; Locate did not, and ran the identical search five times over for one
@@ -621,8 +733,10 @@ def main() -> int:
               if FIX_ATTEMPT > 1 else "from the handoff")
     log(f"{len(issues)} issue(s) {source}, {len(groups)} distinct locator(s); "
         f"mode={HEALING_LOCATE_MODE}")
-    if assertion_used:
-        log(f"{len(assertion_used)} locator(s) are read by assertions and will not be healed")
+    if assertion_used and assertion_mode != locator_assertions.ALWAYS:
+        log(f"{len(assertion_used)} locator(s) are read by an assertion — "
+            + ("reported, never repaired" if assertion_mode == locator_assertions.NEVER
+               else "repaired only on proof that it is the same element"))
 
     resolutions = []
     for members in groups.values():
@@ -631,13 +745,35 @@ def main() -> int:
         issue = next((m for m in members if _snapshot_path(m)), members[0])
         failed = issue.get("failed_selector") or ""
         if failed in tried:
+            # Whose locator it was and what was written for it, from the answer
+            # this replaces — a refusal that names neither reads as if nothing
+            # had been found.
+            earlier = next((r for r in previous_locate
+                            if r.get("failed_selector") == failed), {})
+            answer = (earlier.get("tried") or earlier.get("new_expression")
+                      or earlier.get("new_locator") or "")
             resolution = {
                 "test_name": issue.get("test_name", ""), "failed_selector": failed,
-                "verdict": NO_HEAL, "classification": "ALREADY_TRIED", "locator_id": "",
-                "reason": ("this answer was applied on an earlier attempt and the test "
-                           "still failed on the same element — the retry needs a "
-                           "different approach, not the same selector again"),
+                "verdict": NO_HEAL, "classification": "REVERTED",
+                "locator_id": earlier.get("locator_id", ""), "tried": answer,
+                "reason": ((f"{answer} was" if answer else "this answer was")
+                           + " applied on an earlier attempt, the test still failed "
+                             "on the same element and the edit was reverted — the "
+                             "retry needs a different approach, not the same "
+                             "selector again"),
             }
+            resolution.update({key: earlier[key] for key in ("page_object", "field")
+                               if earlier.get(key)})
+            # The proved answer did not hold, so there is no proof left — and a
+            # locator an assertion reads is not repaired without one.
+            site = next((r.get("assertion_site") for r in previous_locate
+                         if r.get("failed_selector") == failed and r.get("assertion_site")), "")
+            if site and assertion_mode == locator_assertions.PROVEN:
+                resolution["assertion_site"] = site
+                resolution["classification"] = "ASSERTION_LOCATOR"
+                resolution["reason"] = locator_assertions.unproven(
+                    site, "the answer proved from the fingerprint was applied and "
+                          "the test still failed on this element")
             _log_resolution(resolution)
             for member in members:
                 resolutions.append({**resolution, "test_name": member.get("test_name", "")})
@@ -694,6 +830,8 @@ def _log_resolution(r: dict) -> None:
         log(f"{name}  {r.get('classification')}  score {r.get('score')} "
             f"margin {r.get('margin'):+} tier {r.get('tier')} — {r.get('verification')}")
         log(f"  -> {r.get('new_expression', '')[:110]}")
+        for attribute, why in (r.get("anchors_passed_over") or {}).items():
+            log(f"  not anchored on {attribute}: {why} — the page changes it")
         for rejected in (r.get("rejected") or [])[:2]:
             log(f"  rejected: <{rejected['tag']}> {str(rejected['name'])[:28]!r} "
                 f"score {rejected['score']}")

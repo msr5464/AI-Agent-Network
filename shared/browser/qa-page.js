@@ -232,20 +232,33 @@ exports.default = async ({ page }) => {
   // inventory (with its frame chain), the counts the caller asked for, and — once
   // per distinct state — a live count of every locator the repo already has.
   let lastKnown = '';
-  const evidence = async (tag, checks, settled) => {
-    if (!EVIDENCE) return;
+  // Whether this caller files what it measures under page ids at all. One that
+  // does and then records a brief screen without one is told so (see `record`).
+  let named = false;
+  const measure = async (tag, checks, settled, mark) => {
+    if (tag) named = true;
+    if (!EVIDENCE) return null;
     const frames = await everyFrame(o => (window.__qa ? window.__qa.inventory(o) : []), {});
     const inventory = frames.flatMap(fr => (Array.isArray(fr.result) && fr.prefix !== null
       ? fr.result.map(e => (fr.prefix ? { ...e, frame: fr.prefix } : e)) : []));
     let known;
-    const key = page.url() + '|' + await fingerprint();
-    if (KNOWN.length && key !== lastKnown) {
-      lastKnown = key;
+    // Per page name: the same state measured under a second name is that page's
+    // only record, and written without counts the page fell back to a guess.
+    const key = (tag || '') + '|' + page.url() + '|' + await fingerprint();
+    // A brief screen's row may never be written (see `record`), so it must not
+    // count as "this state's locators were counted": the step that measures the
+    // same state next would then write none.
+    if (KNOWN.length && (mark || key !== lastKnown)) {
+      if (!mark) lastKnown = key;
       const counted = await check(Object.fromEntries(KNOWN.map((k, i) => [i, k.selector])));
       known = KNOWN.map((k, i) => ({ ...k, ...counted[i] }));
     }
-    note({ page: tag || null, url: page.url(), inventory, checks, known,
-           ...(settled ? { settled } : {}) });
+    return { page: tag || null, url: page.url(), inventory, checks, known,
+             ...(settled ? { settled } : {}), ...(mark || {}) };
+  };
+  const evidence = async (tag, checks, settled) => {
+    const row = await measure(tag, checks, settled);
+    if (row) note(row);
   };
 
   // One step, one round trip: act, settle, then report — the named selectors
@@ -303,38 +316,90 @@ exports.default = async ({ page }) => {
     return bareCounts(counted);
   };
 
+  // How many states of one recording are measured in full. Each is an inventory
+  // and a count of the repo's locators, taken while the state is still up.
+  const BRIEF_STATES = 5;
+  // A state that lasted this long was a screen, not the flicker between two.
+  const BRIEF_MIN_MS = 1000;
+
   // A screen that shows briefly and closes (a payment result, a toast): start
   // recording, then act — not awaited, so recording runs even if the action hangs —
   // and return every new state of every frame for `ms`, each element counted while
   // it was on screen.
+  // `opts.page` names the screen, as on a step. Named, it is written to the
+  // evidence file the way a step's page is — a screen that closes by itself
+  // otherwise leaves no inventory, and a page with none cannot be verified or
+  // matched to its page object however much of it was read here.
+  // The screen is what came and went while this recorded. Each state is measured
+  // when it appears, the only moment it can be, and filed once the recording knows
+  // what it was: not the flicker before the screen, when something lasted longer,
+  // and not the page left showing at the end, which is the next page and is
+  // measured by the step after this one.
   const record = async (action, ms = 20000, opts = {}) => {
     const grab = async () => located(await everyFrame(
       o => (window.__qa ? window.__qa.harvest(null, o) : []), { texts: true, limit: 80 }));
     const id = (fr, e) => fr.frame + ' ' + e.sel + ' ' + e.text;
     const before = new Set((await grab()).flatMap(fr =>
       Array.isArray(fr.result) ? fr.result.map(e => id(fr, e)) : []));
-    const t0 = Date.now();
+    const t0 = Date.now(), url0 = page.url();
     const acted = Promise.resolve().then(action).then(() => 'ok', short);
     const states = [], seen = new Set();
+    // Every distinct state of the whole page in the window, in order: when it was
+    // first and last seen, and what was measured of it.
+    const shown = [];
+    let current = null, measuring = false, measured = 0;
     while (Date.now() - t0 < ms) {
+      const at = Date.now() - t0, whole = [];
       for (const fr of await grab()) {
         if (!Array.isArray(fr.result)) continue;
         const fresh = fr.result.filter(e => !before.has(id(fr, e)));
         // Digits ignored here only, so a ticking countdown is not a new state.
         const key = fresh.map(e => id(fr, e)).join('|').replace(/\d/g, '');
+        if (fresh.length) whole.push(key);
         if (fresh.length && !seen.has(key)) {
           seen.add(key);
           states.push({ ms: Date.now() - t0, frame: fr.frame, els: fresh });
         }
       }
+      const now = whole.join(' || ');
+      if (!now) current = null;                    // back to what was there before
+      else if (current && current.key === now) current.to = at;
+      else {
+        current = { key: now, from: at, to: at, row: null };
+        shown.push(current);
+        // Not awaited: the next state must not be missed while this one is taken.
+        // Another address is another page, so nothing past a redirect is measured.
+        if (opts.page && EVIDENCE && !measuring && measured < BRIEF_STATES
+            && page.url() === url0) {
+          measuring = true; measured++;
+          current.row = measure(opts.page, undefined, null, { brief: true })
+            .catch(() => null).then(row => { measuring = false; return row; });
+        }
+      }
       await page.waitForTimeout(150);
     }
+    const taken = [];
+    for (const state of shown) {
+      const row = state.row && await state.row;
+      if (row) taken.push({ state, row });
+    }
+    const ended = taken.filter(t => t.state !== current);
+    const lasting = ended.filter(t => t.state.to - t.state.from >= BRIEF_MIN_MS);
+    // Nothing that came and went lasted: the screen never closed, and is what is
+    // still showing. Only when that was not measured is a flicker better than
+    // leaving a named page with no record at all.
+    const still = taken.filter(t => t.state === current);
+    for (const t of (lasting.length ? lasting : still.length ? still
+                     : ended.length ? ended : taken)) note(t.row);
     // Each element was counted while it was on screen: that is evidence too.
     note({ page: opts.page || null, url: page.url(), checks: Object.fromEntries(
       states.flatMap(s => s.els.filter(e => e.sel)
         .map(e => [e.sel, { total: e.total, visible: e.visible, text: e.text,
                             ...(e.total === 1 && e.uid ? { uid: e.uid } : {}) }]))) });
     return { action: await acted,
+             ...(opts.page ? { page: opts.page } : named ? { unnamed:
+               "no page id was passed, so nothing this screen showed is filed under a "
+               + "page: record it as page.qa.record(action, ms, { page: '<pageId>' })" } : {}),
              states: states.map(st => ({ ...st, els: st.els.map(({ uid, ...e }) => e) })) };
   };
 

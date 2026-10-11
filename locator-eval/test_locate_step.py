@@ -225,9 +225,14 @@ def test_located_fix_has_the_same_shape_as_a_model_fix(tmp_path, world):
     assert not error, error
     assert fix_json["fixable"] is True
     assert fix_json["target_file"] == str(po)
-    assert len(fix_json["edits"]) == 1
     assert "loginButton" in fix_json["edits"][0]["old_string"]
     assert "getByRole" in fix_json["edits"][0]["new_string"]
+    # The declaration, and the one import its expression needs and the page
+    # object lacks: an answer that left the file not compiling would fail its
+    # own verification run and be reverted as if the locator were wrong.
+    assert len(fix_json["edits"]) == 2
+    assert "import com.microsoft.playwright.options.AriaRole;" in \
+        fix_json["edits"][1]["new_string"]
     # Locate proves uniqueness only; the description must not claim more, and
     # must say the test run is what verifies the edit.
     assert "This run is what verifies it" in fix_json["fix_description"]

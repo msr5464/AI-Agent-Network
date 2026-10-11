@@ -72,3 +72,29 @@ class TestForHandoff:
     def test_the_old_tail_slice_would_have_counted_nothing(self):
         summary = step_provenance.summarize(RUN[-4000:])
         assert summary["steps"] == 0 and summary["actions"] == 0
+
+
+class TestOnlyMarkupIsStripped:
+    """Anything in angle brackets used to be treated as a tag.
+
+    A constructor's stack frame is `Page.<init>(Page.java:26)`. With `<init>`
+    gone the frame matched no reader, the failure was attributed to the NEXT
+    frame down — the page before the one that failed — and the fix step was
+    handed that page's method name as the broken element.
+    """
+
+    def test_a_constructor_frame_survives(self):
+        frame = "\tat shop.web.CheckoutPage.<init>(CheckoutPage.java:26)"
+        assert narration.plain(frame) == frame
+
+    def test_a_static_initialiser_frame_survives(self):
+        frame = "\tat shop.core.Settings.<clinit>(Settings.java:12)"
+        assert narration.plain(frame) == frame
+
+    def test_generics_and_asserted_values_survive(self):
+        line = "expected:<true> but was:<false> in Map<String, Object>"
+        assert narration.plain(line) == line
+
+    def test_markup_beside_them_is_still_dropped(self):
+        assert narration.plain("<span class='k'>at</span> shop.A.<init>(A.java:1)") == \
+            "at shop.A.<init>(A.java:1)"

@@ -134,7 +134,9 @@ sel, total, visible }] }] } — each element counted while it was on screen, wit
 its frame chain on. These are real observations: report them exactly as you would
 a live one. A screen that is not in the result did not appear within 20 seconds of
 the action; raise the 20 seconds only when the step says the screen takes longer
-to show up.
+to show up. Where your instructions have you name pages, name this screen too, as a
+third argument — page.qa.record(action, 20000, { page: '<pageId>' }) — so that what
+it showed is filed under it.
 """
 
 

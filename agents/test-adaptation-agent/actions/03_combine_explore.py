@@ -72,6 +72,9 @@ def main():
         # measured between them — what a `relax` declaration is confirmed by.
         "value_checks": web_flow.get("value_checks") or [],
         "notes": web_flow.get("notes") or [],
+        # What the browser recorded being clicked or typed that no step reports.
+        # For the reader of the report and the PR; never a step.
+        "unreported_actions": web_flow.get("unreported_actions") or [],
         # Carried through rather than dropped. Every consumer of the combined flow
         # that wants to recount a selector, recognise a page, or build a negative
         # document keys off this — and the adapt step reads the combined file, not
@@ -80,6 +83,10 @@ def main():
         # an empty list, exactly as it had been in every other agent.
         "_inventories": web_flow.get("_inventories") or {},
     }
+    # Set only when the operator asserted a disposable environment and the walk
+    # was allowed past controls the checker flags by name.
+    if web_flow.get("sandbox"):
+        combined["sandbox"] = True
 
     # Only halves that actually ran get a vote. A web-only change note leaves the
     # API half "skipped", and taking the worst status across both reported a
@@ -103,6 +110,8 @@ def main():
         "unexplained_failures": unexplained,
         "flow": combined,
     }
+    if web.get("sandbox_note"):
+        result["sandbox_note"] = web["sandbox_note"]
     (AUDIT_DIR / "03-explore.json").write_text(json.dumps(result, indent=2))
 
     md = ["# Explore", "",

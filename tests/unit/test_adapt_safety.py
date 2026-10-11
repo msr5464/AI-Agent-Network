@@ -325,6 +325,80 @@ class TestChecksInThePullRequest:
                            {"status": "rejected", "check_changes": [self.ROW]}]}
         assert ship.declared_rows(adapt) == [self.ROW]
 
+    @pytest.mark.parametrize("adapt,expected", [
+        ({"items": [{"index": 1, "kind": "locator", "status": "applied"}]},
+         "Tests were updated to match"),
+        ({"items": [{"index": 1, "kind": "locator", "status": "proposed"}]},
+         "Nothing was written."),
+        ({"items": [], "escalations": [{"what": "scope", "why": "no tests"}]},
+         "Nothing was changed — scope."),
+        ({"items": [{"index": 1, "kind": "locator", "status": "escalated"}]},
+         "Nothing was changed."),
+    ])
+    def test_the_first_line_says_what_the_run_did(self, ship, adapt, expected):
+        # One sentence for every outcome told a reader that tests were updated on
+        # a run that had changed nothing.
+        status_line = ship.build_body({}, {}, {}, adapt, "").splitlines()[2]
+        assert expected in status_line
+        if expected != "Tests were updated to match":
+            assert "Tests were updated" not in status_line
+
+    def test_a_sandbox_assertion_is_reproduced_with_its_reason(self, ship):
+        body = ship.build_body({}, {}, {"sandbox_note": "demo store, test payments only"},
+                               {}, "")
+        assert "Explored as a sandbox" in body and "demo store, test payments only" in body
+        assert "Explored as a sandbox" not in ship.build_body({}, {}, {}, {}, "")
+
+
+class TestGatesBeforeTheModel:
+    """Stops decided from the audit files alone, with no model call."""
+
+    STEP = {"index": 0, "page": {"id": "home"},
+            "action": {"verb": "click", "target": {"accessible_name": "BUY NOW"}},
+            "result": {"outcome": "refused", "category": "destructive_refused",
+                       "destructive_token": "buy"}}
+
+    def _run(self, tmp_path, monkeypatch, scope, explore):
+        adapt = _load("adapt_gate", "actions/04_adapt.py", tmp_path, monkeypatch)
+        (tmp_path / "01-parse-change.json").write_text(json.dumps({"items": []}))
+        (tmp_path / "02-scope.json").write_text(json.dumps(scope))
+        (tmp_path / "03-explore.json").write_text(json.dumps(explore))
+        monkeypatch.setattr(adapt, "_call_claude_ex", None, raising=False)
+        adapt.main()
+        result = json.loads((tmp_path / "04-adapt.json").read_text())
+        return result, (tmp_path / ".skip-reason").read_text()
+
+    def test_a_scope_stop_that_never_got_to_look_stays_one(self, tmp_path, monkeypatch):
+        # Rewritten as "no-work", an infra stop consumed the change note and was
+        # counted as a decision about the change.
+        (tmp_path / ".skip-reason").write_text("infra")
+        result, reason = self._run(tmp_path, monkeypatch,
+                                   {"skipped": True, "reason": "not on this branch"}, {})
+        assert reason == "infra"
+        assert result["escalations"][0]["why"] == "not on this branch"
+
+    def test_a_scope_stop_with_nothing_to_do_is_still_no_work(self, tmp_path, monkeypatch):
+        (tmp_path / ".skip-reason").write_text("no-work")
+        assert self._run(tmp_path, monkeypatch, {"skipped": True}, {})[1] == "no-work"
+
+    def test_an_unsafe_walk_names_what_was_walked_and_the_way_out(self, tmp_path, monkeypatch):
+        flow = {"steps": [{**self.STEP, "result": {"outcome": "ok"}}],
+                "violations": [{"index": 0, "token": "buy", "target": "BUY NOW"}]}
+        result, reason = self._run(tmp_path, monkeypatch, {"workspace": str(tmp_path)},
+                                   {"status": "unsafe", "flow": flow})
+        why = result["escalations"][0]["why"]
+        assert reason == "unsafe"
+        assert "BUY NOW ('buy')" in why and "ADAPTATION_SANDBOX" in why
+
+    def test_a_walk_refused_before_it_saw_anything_stops_here(self, tmp_path, monkeypatch):
+        # Every item would be declined for want of evidence; the model call that
+        # arrived at that answer could not say which control stopped the walk.
+        result, reason = self._run(tmp_path, monkeypatch, {"workspace": str(tmp_path)},
+                                   {"status": "partial", "flow": {"steps": [self.STEP]}})
+        why = result["escalations"][0]["why"]
+        assert reason == "unreachable"
+        assert "BUY NOW" in why and "'buy'" in why and "ADAPTATION_SANDBOX" in why
+
 
 class TestCarryForward:
     """A retry must not drop what an earlier attempt applied: its edit is still

@@ -3154,6 +3154,23 @@ def test_a_value_that_changed_after_typing_is_a_delayed_update(tmp_path, monkeyp
         "a ticking timer and a container cut at the inventory's text limit are not changes")
 
 
+def test_a_brief_screens_record_is_not_the_state_an_action_settled_into(tmp_path, monkeypatch):
+    """A screen recorded while it showed briefly is written with an inventory too.
+    Taken as a settled state it would become the "before" of the next step and
+    drop the actions still waiting to be explained."""
+    mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
+    card = "#pay >> internal:control=enter-frame >> #card"
+    typed = {"typed": {"sel": card, "value": "4111 1111 1111 1111", "total": 1, "visible": 1}}
+    before = _state([("total", "$50.00")])
+    after = _state([("total", "$49.00")], settled={"ms": 2200, "requests": 2})
+    brief = {**_state([("total", "Thank you")]), "brief": True, "page": "receipt"}
+    found = {"cardNumberField": card}
+    plain = mod.delayed_updates([before, typed, after], found)
+    assert plain and plain[0]["changed"][0]["after"] == "$49.00"
+    assert mod.delayed_updates([before, typed, brief, after], found) == plain
+    assert mod.delayed_updates([before, brief, typed, after], found) == plain
+
+
 @pytest.mark.parametrize("settled,url,why", [
     (None, "https://shop.test/", "no settle record: the page was never seen still working"),
     ({"ms": 900, "requests": 1}, "https://shop.test/", "settled within the quiet window"),

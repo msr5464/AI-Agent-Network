@@ -87,3 +87,115 @@ class TestLocatorShaped:
 
     def test_a_compile_error_is_not(self):
         assert fi.is_locator_shaped("[ERROR] cannot find symbol: method foo()") is False
+
+
+# A locator inside an iframe prints as a chain of hops, with spaces in it.
+FRAMED_PAGE_LOAD = ("java.lang.AssertionError: Failed to load Element "
+                    "Locator@#pay-frame >> internal:control=enter-frame >> div.order-total "
+                    "in CheckoutPage\n"
+                    "\tat shop.web.CheckoutPage.<init>(CheckoutPage.java:26)\n"
+                    "\tat shop.web.CartPage.checkout(CartPage.java:42)")
+FRAMED_CHAIN = "#pay-frame >> internal:control=enter-frame >> div.order-total"
+
+CARD_CODE = ("Failed to enter data in element 'Card code field' with locator: "
+             "Locator@#pay-frame >> internal:control=enter-frame >> #card-code: Error {\n"
+             "\tat shop.web.CardFormPage.fillCard(CardFormPage.java:39)")
+
+
+class TestAPageLoadSelectorWithSpaces:
+    """The page-load reader took one whitespace-free token as the selector.
+
+    A descendant selector has spaces in it, and so does a locator inside an
+    iframe. Neither matched, the failure came back unidentifiable, and an edit
+    that had moved the test two pages further was reverted as having changed
+    nothing — once per attempt, until the retry budget ran out.
+    """
+
+    def test_an_iframe_chain_is_read_whole(self):
+        found = fi.identify(FRAMED_PAGE_LOAD)
+        assert found["available"] is True
+        assert found["selector"] == FRAMED_CHAIN
+        assert found["page_object"] == "CheckoutPage"
+        assert found["kind"] == fi.PAGE_LOAD
+
+    def test_a_descendant_selector_is_read_whole(self):
+        found = fi.identify("Failed to load Element Locator@div.cart tr td.total in CartPage")
+        assert found["selector"] == "div.cart tr td.total"
+        assert found["page_object"] == "CartPage"
+
+    def test_the_owner_is_the_last_word_not_the_first_in(self):
+        found = fi.identify(
+            "Failed to load Element Locator@button:has-text('Sign in here') in LoginPage")
+        assert found["selector"] == "button:has-text('Sign in here')"
+        assert found["page_object"] == "LoginPage"
+
+    def test_several_anchors_are_split_and_the_first_stands_for_them(self):
+        anchors, owner = fi.page_load_anchors(
+            "Failed to load Element Locator@img.avatar, Locator@div.welcome banner "
+            "in HomePage")
+        assert anchors == ["img.avatar", "div.welcome banner"]
+        assert owner == "HomePage"
+
+    def test_getting_past_the_page_is_progress(self):
+        assert fi.same_locator(fi.identify(FRAMED_PAGE_LOAD), fi.identify(CARD_CODE)) is False
+
+    def test_the_same_page_failing_to_load_on_another_anchor_is_not_progress(self):
+        # A replacement anchor that is also absent changes the message and
+        # nothing about the outcome.
+        again = FRAMED_PAGE_LOAD.replace("div.order-total", "div.order-sum")
+        assert fi.same_locator(fi.identify(FRAMED_PAGE_LOAD), fi.identify(again)) is True
+
+    def test_a_different_page_failing_to_load_is_progress(self):
+        nxt = "Failed to load Element Locator@#receipt in ReceiptPage"
+        assert fi.same_locator(fi.identify(FRAMED_PAGE_LOAD), fi.identify(nxt)) is False
+
+
+class TestConstructorFrames:
+    def test_a_constructor_frame_names_its_page_object(self):
+        # A page-load assertion is raised from a constructor: `<init>`, no method.
+        found = fi.identify("Failed to click on element 'Pay' with locator: Locator@#pay\n"
+                            "\tat shop.web.CheckoutPage.<init>(CheckoutPage.java:26)\n"
+                            "\tat shop.web.CartPage.checkout(CartPage.java:42)")
+        assert found["page_object"] == "CheckoutPage"
+
+
+class TestFailingSelector:
+    """The selector a failure is filed under, when no trace named one."""
+
+    def test_the_message_names_it(self):
+        assert fi.failing_selector(FRAMED_PAGE_LOAD) == FRAMED_CHAIN
+
+    def test_the_recorded_anchor_names_it_when_the_message_does_not(self):
+        context = {"anchors": [{"selector": "Locator@div.cart tr", "count": 0}]}
+        assert fi.failing_selector("BUILD FAILURE", context) == "div.cart tr"
+
+    def test_the_message_wins_over_the_context(self):
+        context = {"anchors": [{"selector": "Locator@#other", "count": 0}]}
+        assert fi.failing_selector(CARD_CODE, context) == \
+            "#pay-frame >> internal:control=enter-frame >> #card-code"
+
+    def test_nothing_named_is_an_empty_answer_not_a_guess(self):
+        assert fi.failing_selector("BUILD FAILURE", {"anchors": []}) == ""
+        assert fi.failing_selector("") == ""
+
+
+class TestIdentityOfARecord:
+    def test_a_carried_identity_outlives_the_text_it_came_from(self):
+        carried = fi.identify(FRAMED_PAGE_LOAD)
+        record = {"error_message": "the tail of a build log", "failure_identity": carried}
+        assert fi.of_issue(record) == carried
+
+    def test_the_text_is_read_when_nothing_was_carried(self):
+        assert fi.of_issue({"error_message": CARD_CODE})["element"] == "Card code field"
+
+    def test_the_selector_it_was_filed_under_is_the_last_resort(self):
+        record = {"error_message": "wording nothing recognises", "failed_selector": "#old"}
+        found = fi.of_issue(record, {"page_object": "CheckoutPage",
+                                     "kind": "PAGE_NOT_LOADED"})
+        assert found["available"] is True
+        assert found["selector"] == "#old"
+        assert found["page_object"] == "CheckoutPage"
+        assert found["kind"] == fi.PAGE_LOAD
+
+    def test_a_record_with_nothing_stays_unidentified(self):
+        assert fi.of_issue({"error_message": "BUILD FAILURE"})["available"] is False

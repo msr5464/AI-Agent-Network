@@ -49,6 +49,12 @@ def testid_attribute(el: dict) -> str:
                 "data-testid")
 
 
+# Attributes that hold what the user is shown rather than what the element is.
+# They rank above an id because they read well, and they are the ones a page
+# rewrites while it is being used: a placeholder blanked on focus, a title moved
+# aside by a tooltip. Each is also the name of its rung on the ladder.
+HINT_ANCHORS = ("placeholder", "alt", "title")
+
 VOLATILE_SELECTOR = re.compile(
     r"(nth-child|nth-of-type|/html\[|\[\d+\]|css-[0-9a-z]{5,}|jss\d+|sc-[0-9a-z]{6,})", re.I)
 
@@ -188,12 +194,19 @@ def scoped_by_context(ctx, el: dict, expect_index: int, snap: dict | None) -> di
     return None
 
 
-def candidates_for(el: dict, vol: Volatility, frame_path: list | None = None) -> list[dict]:
+def candidates_for(el: dict, vol: Volatility, frame_path: list | None = None,
+                   unsettled=()) -> list[dict]:
     """The preference ladder, most maintainable first.
 
     `frame_path` (shared/frames.py) puts every rung inside those iframes: the
     probe becomes a chain and the code enters the frames first. Without it an
     element found in a frame was written back as a top-document locator.
+
+    `unsettled` names the hint attributes (HINT_ANCHORS) this page has been seen
+    to change by itself; their rungs are left out, and so is role+name when the
+    accessible name is only that attribute read through another API. A selector
+    is proved unique against one moment of the page, and a value the page rewrites
+    is unique in that moment only.
 
     Two different things are produced per candidate, and the distinction is the
     whole reason this reads the way it does:
@@ -217,6 +230,8 @@ def candidates_for(el: dict, vol: Volatility, frame_path: list | None = None) ->
     role, acc = el.get("role"), el.get("accessible_name")
 
     def add(strategy: str, sel: str, **emit_kwargs) -> None:
+        if strategy in unsettled:
+            return
         snippet = code.emit_locator(**emit_kwargs, frame_path=frame_path)
         candidate = {"strategy": strategy, "sel": frames.join(frame_path, sel),
                      "python": snippet.get("python", ""),
@@ -243,23 +258,30 @@ def candidates_for(el: dict, vol: Volatility, frame_path: list | None = None) ->
             sel = f'[{attribute}={_css(t)}]'
             add("testid", sel, selector=sel)
 
-    if role and acc and role not in ("generic", "presentation"):
+    named_by_unsettled = any(el.get(a) == acc for a in unsettled)
+    if role and acc and role not in ("generic", "presentation") and not named_by_unsettled:
         jrole = code.map_role(role)
         if jrole:
             add("role+name", f'internal:role={role}[name={_q(acc)}s]',
                 role=jrole, name=acc, exact=True)
 
+    # `exact` on each of these, because the selector beside it is. What gets
+    # proved unique is `sel`; what gets written into the page object is the
+    # snippet, and a builder that matches by substring is a different locator.
+    # `[placeholder='123']` matched one field, the builder emitted for it also
+    # matched the field whose placeholder was "1234 1234 1234 1234", and an
+    # answer reported as proved failed its first run on an ambiguous locator.
     if el.get("placeholder"):
         v = el["placeholder"]
-        add("placeholder", f'[placeholder={_css(v)}]', placeholder=v)
+        add("placeholder", f'[placeholder={_css(v)}]', placeholder=v, exact=True)
 
     if el.get("alt"):
         v = el["alt"]
-        add("alt", f'[alt={_css(v)}]', alt=v)
+        add("alt", f'[alt={_css(v)}]', alt=v, exact=True)
 
     if el.get("title"):
         v = el["title"]
-        add("title", f'[title={_css(v)}]', title=v)
+        add("title", f'[title={_css(v)}]', title=v, exact=True)
 
     _id = el.get("id")
     if _id and not vol.id_is_generated(_id):

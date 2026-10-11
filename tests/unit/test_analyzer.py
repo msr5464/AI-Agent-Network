@@ -106,6 +106,36 @@ class TestExtractElementNames:
         # the selector, and a selector with a colon in it would swallow the rest.
         assert not any("Error" in name for name in self._names(self.CLICK))
 
+    FRAMED_PAGE_LOAD = (
+        "Failed to load Element Locator@#pay-frame >> internal:control=enter-frame >> "
+        "div.order-total in CheckoutPage\n"
+        "\tat shop.web.CheckoutPage.<init>(CheckoutPage.java:26)\n"
+        "\tat shop.web.CartPage.fillDetailsAndCheckout(CartPage.java:42)")
+
+    def test_a_stack_frame_is_not_an_element(self):
+        # `CartPage.fillDetailsAndCheckout(` is the method that was RUNNING, on
+        # the page before the one that failed. It used to head the list, and it
+        # matched no declaration anywhere.
+        names = self._names(self.FRAMED_PAGE_LOAD)
+        assert not any("fillDetailsAndCheckout" in name for name in names)
+
+    def test_a_field_reference_is_still_an_element(self):
+        names = self._names("not visible: CheckoutPage.orderTotal after 30s")
+        assert "orderTotal" in names
+
+    def test_a_locator_in_an_iframe_is_named_the_way_the_source_spells_it(self):
+        # Reported as one chain of hops, declared as several calls: the chain is
+        # a literal nowhere in the source. Its last hop is.
+        names = self._names(self.FRAMED_PAGE_LOAD)
+        assert names[0] == "div.order-total"
+        assert "#pay-frame >> internal:control=enter-frame >> div.order-total" in names
+
+    def test_an_interaction_inside_an_iframe_too(self):
+        names = self._names(
+            "Failed to enter data in element 'Card code field' with locator: "
+            "Locator@#pay-frame >> internal:control=enter-frame >> #card-code: Error {")
+        assert "Card code field" in names and "#card-code" in names
+
     def test_extraction_does_not_depend_on_the_classification(self):
         # It used to return nothing unless the failure was already classified
         # ELEMENT_NOT_FOUND or TIMEOUT, which made the evidence conditional on

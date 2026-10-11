@@ -69,12 +69,73 @@ RULES_FILE = REPO_ROOT / "config" / "prompts" / "explore.md"
 SYSTEM_PROMPT = REPO_ROOT / "config" / "skills" / "automation-repo.md"
 
 
-def load_explore_rules() -> str:
-    if RULES_FILE.exists():
-        text = RULES_FILE.read_text(encoding="utf-8")
-        marker = re.search(r"^## Instructions\s*$", text, re.MULTILINE)
-        return text[marker.start():] if marker else text
-    return "## Instructions\nExplore the flow and emit FLOW_STEP markers.\n"
+# Rule 4 is written twice in the rules file; one variant is sent.
+_RULE_4 = re.compile(r"<!-- rule-4: default -->\n(.*?)<!-- rule-4: sandbox -->\n(.*?)"
+                     r"<!-- rule-4: end -->\n?", re.DOTALL)
+
+
+def load_explore_rules(sandbox_note: str = "") -> str:
+    """The static rules, with the destructive-action rule that fits this run.
+
+    Without a sandbox assertion the explorer refuses, and is told the words the
+    checker flags so the two agree. With one, it is told to finish the flow.
+    """
+    if not RULES_FILE.exists():
+        return "## Instructions\nExplore the flow and emit FLOW_STEP markers.\n"
+    text = RULES_FILE.read_text(encoding="utf-8")
+    marker = re.search(r"^## Instructions\s*$", text, re.MULTILINE)
+    text = text[marker.start():] if marker else text
+
+    def pick(match):
+        if sandbox_note:
+            return match.group(2).replace("{sandbox_note}", sandbox_note)
+        return match.group(1).replace("{destructive_words}",
+                                      ", ".join(flow_map.DESTRUCTIVE_WORDS))
+    return _RULE_4.sub(pick, text)
+
+
+def start_url(plan: dict, scope: dict, workspace) -> str:
+    """Where the walk begins: the note's URL, else the one the framework is
+    configured with for this module. "" when neither says.
+
+    The properties file keys a module's URL by a name of its own, which is as
+    often the test's package as the note's `Module:`, so both are tried.
+    """
+    if plan.get("web_base_url"):
+        return plan["web_base_url"]
+    names = [plan.get("module", "")]
+    for test in (scope or {}).get("verify") or []:
+        package = test.split("#", 1)[0].split(".")
+        if len(package) >= 2:
+            names.append(package[-2])
+    for name in dict.fromkeys(n for n in names if n):
+        url = mint_session.entry_url(workspace, name)
+        if url:
+            return url
+    return ""
+
+
+def walk_section(scope: dict) -> str:
+    """The test's own step log and the data it types, as step 02 read them."""
+    walks = (scope or {}).get("test_walks") or []
+    steps = [w for w in walks if w.get("steps")]
+    data = [w for w in walks if w.get("data")]
+    out = ""
+    if steps:
+        out += ("\n## What the test does today\n"
+                "Its own step log, in order. Walk these steps in this order, changing "
+                "only what the change note says changes.\n")
+        for walk in steps:
+            out += f"\n`{walk['test']}`\n" + "\n".join(
+                f"{n}. {text}" for n, text in enumerate(walk["steps"], 1)) + "\n"
+    if data:
+        out += ("\n## The values the test types\n"
+                "The data row the test loads. Type these, exactly.\n")
+        for walk in data:
+            for row in walk["data"]:
+                out += f"\n`{row['file']}`\n" + "\n".join(
+                    f"- {column}: {value}" for column, value in row["row"].items()) + "\n"
+    return out
 
 
 def known_locators(sources: list) -> list:
@@ -114,7 +175,10 @@ def checks_section(scope: dict) -> str:
 
 
 def build_prompt(plan: dict, rules: str, attempt_notes: str, stop_before: str,
-                 scope: dict = None) -> str:
+                 scope: dict = None, start: dict = None) -> str:
+    """`start` is `{"url", "signed_in"}` — where the walk begins and whether the
+    browser opens with a saved session."""
+    start = start or {}
     # GET /agents/<a>/artifact serves from the audit dir; the workspace's
     # test-output does not survive the automation repo being re-cloned.
     shots = AUDIT_DIR / "screenshots"
@@ -134,6 +198,9 @@ including that final action. When you reach it, emit:
 
 and stop. A human will confirm that last step. Do not look for a way around this.
 """
+    signed = ("The browser is already signed in through a saved session."
+              if start.get("signed_in") else
+              "The browser starts signed out: this flow does not sign in.")
     return f"""You are exploring a web application to record how one of its flows works NOW.
 
 ## The product change (written by a human on the team)
@@ -147,9 +214,9 @@ SCREENSHOT DIR: {shots}
 Anything you save elsewhere cannot be shown next to the run.
 
 ## Where to start
-URL: {plan.get('web_base_url') or '(use the module entry point)'}
-The browser is already signed in through a saved session.
-
+URL: {start.get('url') or plan.get('web_base_url') or '(use the module entry point)'}
+{signed}
+{walk_section(scope)}
 ## What the flow is supposed to achieve
 {plan.get('expected_outcome') or '(not stated — record what the flow does)'}
 {checks_section(scope)}{destructive_note}{attempt_notes}
@@ -159,12 +226,49 @@ The browser is already signed in through a saved session.
 """
 
 
+def inventory_note(uninventoried: list) -> str:
+    """What a second walk is told when the first left pages it acted on unmeasured.
+
+    It names both calls that measure a page. Told only about the step call, a walk
+    whose unmeasured page was a screen that closes by itself had no way to fix it,
+    and one such walk came back with no FLOW_STEP lines at all.
+    """
+    return ("\n## You skipped the inventory\nYou emitted PAGE_ENTER for "
+            + ", ".join(uninventoried)
+            + " but never measured them. Make every step one "
+              "page.qa.step(action, { page: '<pageId>' }) call, with the "
+              "pageId of the page the step lands on — the helpers inventory "
+              "that page and count its selectors for you. A screen that "
+              "closes by itself is measured only by the call that records "
+              "it, so name it there: page.qa.record(action, ms, "
+              "{ page: '<pageId>' }). Without it the selectors you report "
+              "cannot be verified and the page cannot be matched to its "
+              "page object.\n\nWalk the flow as before otherwise: a "
+              "PAGE_ENTER for every page and a FLOW_STEP for every action. "
+              "A walk with no FLOW_STEP lines records nothing.\n")
+
+
+def silent_note() -> str:
+    """What a second walk is told when the first drove the browser and reported
+    no step. Two walks did that: one never wrote a step line, the other left them
+    all for one block at the end."""
+    return ("\n## You reported no steps\nYour last walk drove the browser — its "
+            "pages were measured — but wrote no FLOW_STEP line, so nothing it did "
+            "was recorded. Walk the flow again. After every action, the moment it "
+            "returns, write its line exactly as `FLOW_STEP: {...}` on one line, "
+            "and a PAGE_ENTER for every page you reach. Do not leave them for a "
+            "summary at the end.\n")
+
+
 def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
-                stop_before: str, scope: dict = None, evidence_path: Path = None) -> tuple:
+                stop_before: str, scope: dict = None, evidence_path: Path = None,
+                start: dict = None, sandbox: bool = False) -> tuple:
     """One exploration. Returns (flow, ClaudeResult).
 
     The flow map is built from the model's markers AND what the browser helpers
     measured (`evidence_path`): inventories and live counts it never had to type.
+    `sandbox` — the explorer was told to finish the flow, so a flagged control it
+    walked is not a violation.
     """
     seen = {"steps": 0}
 
@@ -186,7 +290,7 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
 
     log("  Sending to Claude for exploration...")
     result = call_claude_ex(
-        prompt=build_prompt(plan, rules, notes, stop_before, scope),
+        prompt=build_prompt(plan, rules, notes, stop_before, scope, start),
         model=MODEL, effort=EFFORT, cwd=str(REPO_ROOT), timeout=TIMEOUT_S,
         on_output=on_output, log_dir=str(AUDIT_DIR),
         allowed_tools=mcp_allowed_tools(),
@@ -204,7 +308,7 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
     evidence = flow_map.read_evidence(evidence_path) if evidence_path else []
     if evidence:
         log(f"  {len(evidence)} measured page state(s) from the browser helpers")
-    flow = flow_map.build(result.stdout or "", evidence)
+    flow = flow_map.build(result.stdout or "", evidence, sandbox=sandbox)
     if result.status != "ok" and flow["status"] == "ok":
         flow["status"] = "partial"
     return flow, result
@@ -297,16 +401,32 @@ def main():
         log(f"Session: {session['path'].name} "
             f"({session['report'].get('cookies', 0)} cookies, valid)")
 
+    # The assertion covers the whole walk, not only a destructive last step: a
+    # flow can pass through controls the checker flags by name long before its
+    # outcome, and the checker has to be told as well as the explorer.
+    sandbox_note = SANDBOX_NOTE.strip() if SANDBOX else ""
+    if SANDBOX and not sandbox_note:
+        log("ADAPTATION_SANDBOX=true is ignored — ADAPTATION_SANDBOX_NOTE is empty, "
+            "and the assertion needs its reason")
     stop_before = ""
-    if plan.get("outcome_is_destructive"):
-        if SANDBOX and SANDBOX_NOTE:
-            log(f"ADAPTATION_SANDBOX=true — operator asserts a disposable environment: "
-                f"{SANDBOX_NOTE}")
-            result["sandbox_note"] = SANDBOX_NOTE
-        else:
-            stop_before = plan.get("destructive_token", "the final action")
-            log(f"Flow ends in '{stop_before}' — exploration will stop before it "
-                f"and the terminal step will be escalated, not adapted")
+    if sandbox_note:
+        log(f"ADAPTATION_SANDBOX=true — operator asserts a disposable environment: "
+            f"{sandbox_note}")
+        result["sandbox_note"] = sandbox_note
+    elif plan.get("outcome_is_destructive"):
+        stop_before = plan.get("destructive_token", "the final action")
+        log(f"Flow ends in '{stop_before}' — exploration will stop before it "
+            f"and the terminal step will be escalated, not adapted")
+
+    start = {"url": start_url(plan, scope, workspace),
+             "signed_in": bool(session.get("path"))}
+    if start["url"]:
+        log(f"Start URL: {start['url']}"
+            + ("" if plan.get("web_base_url") else " (the module's configured URL)"))
+    else:
+        log("WARNING: no start URL — the note has no URL: line and the framework's "
+            "properties name none for this module, so the explorer has to find the "
+            "entry point itself")
 
     # Every page object in scope, not just the ones step 02's noun filter
     # nominated: measurement is cheap, and narrowing it to the guess would leave a
@@ -329,7 +449,7 @@ def main():
     log(f"{len(known)} locator(s) from {len(sources)} page object(s) will be counted live "
         f"on every page")
 
-    rules = load_explore_rules()
+    rules = load_explore_rules(sandbox_note)
     best, best_score, notes = None, None, ""
     for attempt in range(1, ATTEMPTS + 2):
         log(f"Exploration attempt {attempt}/{ATTEMPTS + 1} (budget {TIMEOUT_S}s)")
@@ -348,7 +468,8 @@ def main():
                 + ("storage-state reused (no credential in the prompt)"
                    if session.get("path") else "no session — this flow does not sign in"))
         flow, claude = run_attempt(plan, rules, notes, mcp_path, stop_before, scope,
-                                   evidence_path)
+                                   evidence_path, start=start,
+                                   sandbox=bool(sandbox_note))
         status, raw = claude.status, claude.stdout or ""
         if status == "usage_limit":
             # An empty flow map here would be read as "the flow could not be
@@ -398,6 +519,19 @@ def main():
         failures = [s for s in flow["steps"]
                     if (s.get("result") or {}).get("outcome") == "failed"]
         categories = {(s.get("result") or {}).get("category") for s in failures}
+        # The browser was driven — pages were measured — and no step was reported.
+        # Such a walk ended as "empty" and the run stopped for want of a flow map,
+        # having paid for a walk that happened.
+        silent = not flow["steps"] and bool(flow.get("_inventories"))
+        if silent:
+            log(f"  WARNING: the walk measured {len(flow['_inventories'])} page(s) "
+                f"and reported no steps — nothing it did is recorded")
+        if silent and flow.get("violations"):
+            # The browser's own record shows what it clicked. Walked again, it
+            # would click the same controls again.
+            log("  not walking again — the browser recorded it acting on a control "
+                "named as destructive")
+            silent = False
         if attempt > ATTEMPTS:
             break
         if categories and categories <= {"login_failed", "skipped",
@@ -405,9 +539,11 @@ def main():
             log("  not retrying — every failure was a login or a refusal, and a "
                 "retry would reproduce both exactly")
             break
-        if not failures and not uninventoried:
+        if not failures and not uninventoried and not silent:
             break
         notes = ""
+        if silent:
+            notes += silent_note()
         if failures:
             notes += ("\n## Previous attempt\nThese steps failed; try a different "
                       "approach for them:\n"
@@ -418,14 +554,7 @@ def main():
             # Worth a whole attempt: without an inventory nothing downstream can
             # verify a selector or recognise the page, so the walk is unusable
             # however complete it looked.
-            notes += ("\n## You skipped the inventory\nYou emitted PAGE_ENTER for "
-                      + ", ".join(uninventoried)
-                      + " but never measured them. Make every step one "
-                        "page.qa.step(action, { page: '<pageId>' }) call, with the "
-                        "pageId of the page the step lands on — the helpers inventory "
-                        "that page and count its selectors for you. Without it the "
-                        "selectors you report cannot be verified and the page cannot "
-                        "be matched to its page object.\n")
+            notes += inventory_note(uninventoried)
 
     # Guess -> measure -> edit. Step 02 nominated page objects by name
     # similarity; now that the pages have actually been looked at, measure which
@@ -467,6 +596,20 @@ def main():
     if not ok:
         log("Flow map problems: " + "; ".join(problems[:4]))
         result["problems"] = problems
+    # What the browser recorded being done that the explorer's step list leaves
+    # out. Listed for whoever reads the run; not steps, and not shown to step 04.
+    unreported = flow.get("unreported_actions") or []
+    for action in unreported[:flow_map.UNREPORTED_SHOWN]:
+        log(f"  done in the browser, not reported as a step: {action['kind']} "
+            f"{action['name']}" + (f" (on {action['page']})" if action.get("page") else ""))
+    if len(unreported) > flow_map.UNREPORTED_SHOWN:
+        log(f"  … and {len(unreported) - flow_map.UNREPORTED_SHOWN} more")
+    # Name what stopped the walk and what would let it through. "3 destructive
+    # action(s)" sends the reader to the JSON to find out which.
+    if flow.get("violations"):
+        log(f"  flagged by name: {flow_map.violations_text(flow)}")
+    if (flow.get("violations") or flow.get("refusals")) and not sandbox_note:
+        log(f"  {flow_map.SANDBOX_HINT}")
     write(result)
     log(f"Wrote {AUDIT_DIR / '03-explore-web.json'}")
 

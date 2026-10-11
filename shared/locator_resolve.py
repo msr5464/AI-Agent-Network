@@ -34,6 +34,7 @@ from shared import locator_candidates as candidates
 from shared import locator_classify as classify
 from shared import locator_decide as decide_mod
 from shared import locator_emit as emit_mod
+from shared import locator_assertions
 from shared import locator_patch, locator_verify as verify_mod
 from shared.locator_score import Volatility
 
@@ -334,28 +335,51 @@ def heal(page, baseline: dict, cfg: dict, url: str, *, post=None, llm=None,
          assertion_fields: set | None = None,
          page_comparison: dict | None = None,
          failure_elements: list | None = None) -> HealResult:
+    """Resolve one locator, with the rule for locators an assertion reads on top.
+
+    Pointed at a different element, a presence check passes on anything visible
+    and a caught regression becomes a green build. So such a locator is repaired
+    only on proof — which here is this resolver's own verified answer — and is
+    reported, never handed on, when there is none.
+
+    `assertion_fields` is read out of the real source by locator_assertions; the
+    `usage` flag is the fixture-level equivalent. Either is enough.
+    """
+    t0 = time.time()
+    field = baseline["locator_id"].split("#")[-1]
+    verified_by = (baseline.get("usage") == "assertion"
+                   or bool(assertion_fields and field in assertion_fields))
+    mode = locator_assertions.heal_mode(cfg)
+    if verified_by and mode == locator_assertions.NEVER:
+        res = HealResult(NO_HEAL, "not attempted", locator_id=baseline["locator_id"])
+        res.classification = "ASSERTION_LOCATOR"
+        res.reason = ("locator is read by an assertion — reported for review, "
+                      "never auto-healed")
+        res.elapsed_ms = int((time.time() - t0) * 1000)
+        return res
+
+    res = _heal(page, baseline, cfg, url, post=post, llm=llm, explain=explain,
+                session=session, browser=browser, storage_state=storage_state,
+                replay=replay, page_comparison=page_comparison,
+                failure_elements=failure_elements)
+    if verified_by and mode == locator_assertions.PROVEN and res.verdict != HEALED:
+        res.reason = locator_assertions.unproven(
+            "an assertion", res.reason or res.classification or res.verdict)
+        res.classification = "ASSERTION_LOCATOR"
+    return res
+
+
+def _heal(page, baseline: dict, cfg: dict, url: str, *, post=None, llm=None,
+          explain: bool = False, session: "HealSession | None" = None,
+          browser=None, storage_state=None, replay=None,
+          page_comparison: dict | None = None,
+          failure_elements: list | None = None) -> HealResult:
     t0 = time.time()
     vol = Volatility(cfg)
     raw, action = baseline["raw_locator"], baseline.get("action", "click")
     res = HealResult(NO_HEAL, "not attempted", locator_id=baseline["locator_id"])
     if post is None:
         post = verify_mod.post_from_spec(baseline.get("post"))
-
-    # Heal how a test FINDS an element; never what it VERIFIES. A healed
-    # assertion locator turns a caught regression into a green build, which is
-    # the exact failure this whole system exists to avoid.
-    #
-    # `assertion_fields` is read out of the real source by locator_assertions;
-    # the `usage` flag is the fixture-level equivalent. Either is enough.
-    field = baseline["locator_id"].split("#")[-1]
-    verified_by = (baseline.get("usage") == "assertion"
-                   or bool(assertion_fields and field in assertion_fields))
-    if verified_by and not cfg["classify"].get("heal_assertions", False):
-        res.classification = "ASSERTION_LOCATOR"
-        res.reason = ("locator is read by an assertion — reported for review, "
-                      "never auto-healed")
-        res.elapsed_ms = int((time.time() - t0) * 1000)
-        return res
 
     # Suite-level circuit breaker: twenty broken locators is a deploy failure or
     # a redesign, not twenty independent heals.

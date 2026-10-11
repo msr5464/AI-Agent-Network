@@ -444,6 +444,18 @@ def split_class_members(content: str) -> List[Dict[str, str]]:
 # A locator's toString, `<Type>@<selector>` (e.g. `Locator@#login`).
 _TO_STRING_PREFIX = re.compile(r"^[A-Z][A-Za-z]*@")
 
+
+def _selector_forms(selector: str) -> List[str]:
+    """A reported selector, as the source may spell it.
+
+    A locator inside an iframe is reported as one chain of hops, and declared as
+    several calls — so the chain is a literal nowhere in the source and matches no
+    declaration. Its last hop is: that is the string the page object holds.
+    """
+    from shared import frames
+    frame_path, inner = frames.split(selector)
+    return [inner, selector] if frame_path and inner else [selector]
+
 class CodeAnalyzer:
     """Analyzes test code structure and locates test files"""
 
@@ -766,8 +778,13 @@ class CodeAnalyzer:
         # A stack trace is full of "ProductsPage.java:19", so source-file suffixes
         # and Java keywords are excluded — otherwise every failure reports an
         # element helpfully named "java", which then matches no page object at all.
+        # A name followed by "(" is a call, which in a failure is a stack frame:
+        # the method that was RUNNING, usually on the page before the one that
+        # failed. Reading it as an element put a caller's method name at the head
+        # of the list, where it matched no declaration anywhere.
         _NOT_FIELDS = {"java", "kt", "class", "this", "new", "init", "super"}
-        pattern3 = re.compile(r"([A-Za-z][\w]*Page)\.([a-z][\w]*)", re.IGNORECASE)
+        pattern3 = re.compile(r"([A-Za-z][\w]*Page)\.([a-z][\w]*)\b(?!\s*\()",
+                              re.IGNORECASE)
         for match in pattern3.finditer(combined_text):
             page_name = match.group(1)
             field_name = match.group(2)
@@ -779,6 +796,16 @@ class CodeAnalyzer:
         # Pattern 3b: the framework prints the locator itself, often through a
         # `<Type>@<selector>` toString:
         #   "Failed to load Element Locator@.product-page-heading in ProductsPage"
+        # A selector with spaces in it — a descendant selector, a locator inside
+        # an iframe — is read by the page-load parser, which takes everything up
+        # to the owner rather than one whitespace-free token.
+        from shared import failure_identity
+        for line in combined_text.splitlines():
+            anchors, owner = failure_identity.page_load_anchors(line)
+            for selector in anchors:
+                element_names.extend(_selector_forms(selector))
+                if owner:
+                    element_names.append(f"{owner}:{selector}")
         pattern3b = re.compile(
             r"\b[A-Z][A-Za-z]*@(\S+?)\s+in\s+([A-Za-z][\w]*)|"
             r"Failed to load Element\s+(\S+?)\s+in\s+([A-Za-z][\w]*)")
@@ -805,7 +832,7 @@ class CodeAnalyzer:
             r"(?:[A-Z][A-Za-z]*@)?(.+?)(?=:\s*Error|\s*$)", re.MULTILINE)
         for match in pattern3c.finditer(combined_text):
             element_names.append(match.group(1).strip())
-            element_names.append(match.group(2).strip())
+            element_names.extend(_selector_forms(match.group(2).strip()))
 
         # Pattern 4: the first quoted name on a line the framework itself reports
         # as a locator that did not resolve.
@@ -935,3 +962,31 @@ class CodeAnalyzer:
             )
         logger.info(f"Found {len(page_objects)} page object files for locators")
         return page_objects
+
+    def page_object_by_name(self, repo_path: str, class_name: str,
+                            focus: Optional[List[str]] = None,
+                            max_chars: int = 2000) -> Optional[Dict[str, str]]:
+        """The source file declaring `class_name`, shaped like a locator match.
+
+        For a failure that names its own page object. Ranking files by the element
+        names a failure quotes finds nothing when the selector is no literal in
+        the source, and the owner is then the only thing left that says where the
+        declaration lives.
+        """
+        if not class_name:
+            return None
+        repo = Path(repo_path)
+        for root in source_roots(repo_path):
+            for source_file in _iter_source_files(root):
+                if source_file.stem != class_name:
+                    continue
+                content = read_source(source_file)
+                if not content:
+                    continue
+                return {
+                    'path': str(source_file.relative_to(repo)),
+                    'element_matches': [],
+                    'snippet': self._extract_relevant_block(content, max_chars,
+                                                            focus=focus or []),
+                }
+        return None

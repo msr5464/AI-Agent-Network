@@ -21,6 +21,8 @@ import logging
 import math
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -301,10 +303,15 @@ def agent_branches(agent: str):
     return jsonify({"branches": branches, "default": default_branch()})
 
 
-# ── Test catalogue (healing only) ─────────────────────────────────────────────
+# ── Test catalogue (healing and adaptation) ───────────────────────────────────
 @qa_bp.route(f"{_BASE}/tests", methods=["GET"])
 def tests_list(agent: str):
-    """Classes and @Test methods in the automation repo, for the UI picker."""
+    """Classes and @Test methods in the automation repo, for the UI picker.
+
+    `?branch=<name>` lists that branch as it stands on the remote; without it,
+    the local checkout. The panel sends whichever the run it is about to start
+    will execute against — see _catalog_tree.
+    """
     spec, err = _resolve(agent)
     if err:
         return err
@@ -322,13 +329,21 @@ def tests_list(agent: str):
                       f"GITHUB_REPO_AUTOMATION, in config/.env.",
         }), 503
 
+    tree, described, failed = _catalog_tree(
+        workspace, (request.args.get("branch") or "").strip())
+    if failed:
+        return failed
+
     try:
         with _REPO_LOCK:
-            _refresh_source_caches(str(workspace))
-            payload = test_catalog.list_tests(str(workspace))
+            _refresh_source_caches(str(tree))
+            payload = test_catalog.list_tests(str(tree))
         # Copied, not mutated: `payload` is test_catalog's cached dict, and the
-        # checkout fields are computed fresh on every request.
-        return jsonify({**payload, **_checkout_state(workspace)})
+        # checkout fields are computed fresh on every request. `workspace` stays
+        # the automation repo — where a snapshot was unpacked is nobody's concern.
+        return jsonify({**payload, "workspace": str(workspace),
+                        **(described or {**_checkout_state(workspace),
+                                         "source": "checkout"})})
     except Exception as e:
         return jsonify({"error": "could not read the test catalogue",
                         "detail": str(e)}), 500
@@ -365,7 +380,10 @@ def _automation_workspace():
 # validation in read_source is not enough on its own: the file-list and
 # test-file caches are per-tree, so an added or deleted file is invisible to
 # them until they are dropped wholesale.
-_REPO_STATE: dict = {"repo": None, "signature": None}
+# Keyed by repo path, because there is more than one tree now: the checkout and
+# a snapshot per branch being browsed (see _branch_snapshot). One slot would have
+# every switch between them read as "the repo changed".
+_REPO_STATE: dict = {}
 _REPO_LOCK = threading.Lock()
 
 
@@ -377,12 +395,10 @@ def _refresh_source_caches(repo_path: str) -> str:
     rebuild would otherwise be reading half-way through, and two requests
     arriving together should not both pay for the same re-parse.
     """
-    global _REPO_STATE
     signature = code_analyzer.repo_signature(repo_path)
-    cached = _REPO_STATE
-    if cached["repo"] != repo_path or cached["signature"] != signature:
+    if _REPO_STATE.get(repo_path) != signature:
         code_analyzer.invalidate_tree()
-        _REPO_STATE = {"repo": repo_path, "signature": signature}
+        _REPO_STATE[repo_path] = signature
     return signature
 
 
@@ -407,6 +423,119 @@ def _checkout_state(workspace: Path) -> dict:
     return {"branch": branch, "dirty": dirty}
 
 
+# ── Reading a branch that is not the one checked out ──────────────────────────
+#
+# Where a run executes is decided in runner.start_run, for every agent alike:
+# with auto-push on, a worktree cut from origin/<base>; with it off, this
+# checkout. The picker only ever read the checkout, so a run based on another
+# branch was offered tests that branch does not have and none of the ones it
+# does. The panel now names the branch its run will use, and that branch is read
+# here without moving the checkout: its tip is unpacked once into a directory of
+# its own, and the readers above are pointed at that directory unchanged.
+#
+# A snapshot is named by commit, so its contents never change and the caches
+# keyed on a repo's signature stay right for as long as it exists.
+_SNAPSHOT_KEEP = 5
+_SNAPSHOT_LOCK = threading.Lock()
+# Fetching is a network round trip, and a panel asks for the catalogue and then
+# for one intent per test picked. Remembered for as long as the branch list is.
+_BRANCH_TIPS: dict = {}
+
+
+def _snapshot_root() -> Path:
+    # Not under the runner's worktree directory: its start-up sweep treats every
+    # subdirectory there as a worktree some dead run left behind.
+    return Path(tempfile.gettempdir()) / "qa-catalog-snapshots"
+
+
+def _branch_snapshot(workspace: Path, branch: str) -> dict:
+    """The tip of origin/<branch>, unpacked. {ok, path, sha} or {ok, reason}.
+
+    One lock for the lot, so three panels mounting at once pay for one fetch
+    and one export between them rather than racing to do the same work.
+    """
+    key = (str(workspace), branch)
+    with _SNAPSHOT_LOCK:
+        now = time.time()
+        tip = _BRANCH_TIPS.get(key)
+        sha = tip["sha"] if tip and now - tip["at"] < _BRANCH_CACHE_TTL else ""
+        try:
+            if not sha:
+                # The same call the agents make before basing work on a branch,
+                # so "what the picker lists" and "what the run gets" are one
+                # definition: origin/<branch> made current, HEAD left alone.
+                prepared = workspace_helper.prepare_base(
+                    workspace, os.environ.get("GITHUB_ORG", ""),
+                    os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+                    os.environ.get("GITHUB_TOKEN", ""), branch)
+                if not prepared["ok"]:
+                    return {"ok": False, "reason": prepared["reason"]}
+                sha = prepared["sha"]
+                _BRANCH_TIPS[key] = {"at": now, "sha": sha}
+            path = _snapshot_root() / sha
+            if path.is_dir():
+                os.utime(path)          # most recently used, for the eviction below
+            else:
+                exported = workspace_helper.export_tree(workspace, sha, path)
+                if not exported["ok"]:
+                    return {"ok": False, "reason": exported["reason"]}
+                _evict_snapshots(path)
+        except Exception as e:
+            # Only the kind is logged or returned: a git timeout's message is
+            # the command line, and that carries the authenticated URL.
+            logger.debug("could not read branch %s: %s", branch, type(e).__name__)
+            return {"ok": False,
+                    "reason": f"could not read branch '{branch}' from the automation repo"}
+    return {"ok": True, "path": path, "sha": sha}
+
+
+def _evict_snapshots(keep: Path) -> None:
+    """Drop all but the most recently used snapshots, and what was cached of them."""
+    try:
+        found = [d for d in _snapshot_root().iterdir()
+                 if d.is_dir() and not d.name.startswith(".")]
+    except OSError:
+        return
+    found.sort(key=lambda d: (d == keep, d.stat().st_mtime), reverse=True)
+    stale = found[_SNAPSHOT_KEEP:]
+    if not stale:
+        return
+    with _REPO_LOCK:
+        for old in stale:
+            shutil.rmtree(old, ignore_errors=True)
+            _REPO_STATE.pop(str(old), None)
+            _MEMBER_INDEX.pop(str(old), None)
+            test_catalog._cache.pop(str(old), None)
+        # The text of every file read from a snapshot is held against its path.
+        # Nothing narrower than this clears it, and what it costs is one re-read
+        # of the trees still in use.
+        code_analyzer.reset_caches()
+
+
+def _catalog_tree(workspace: Path, branch: str):
+    """Which tree a catalogue request reads: (tree, described, error).
+
+    `described` is what to tell the panel about a branch read, and None for the
+    checkout, whose state the caller reads for itself.
+    """
+    if not branch:
+        return workspace, None, None
+    try:
+        wanted = workspace_helper.normalise_branch(branch)
+    except ValueError as e:
+        return None, None, (jsonify({"error": f"branch: {e}"}), 400)
+    # A workspace that is not a git checkout has no branches, and still has
+    # tests worth listing — the same promise _checkout_state makes.
+    if _checkout_state(workspace)["branch"] is None:
+        return workspace, None, None
+    snapshot = _branch_snapshot(workspace, wanted)
+    if not snapshot["ok"]:
+        return None, None, (jsonify({"error": "could not read that branch",
+                                     "detail": snapshot["reason"]}), 404)
+    return snapshot["path"], {"branch": wanted, "sha": snapshot["sha"],
+                              "dirty": False, "source": "branch"}, None
+
+
 # `pkg.sub.Class#method`. The method half is required, not optional: `intent.derive`
 # splits on the last dot, so a bare `automation.saucedemo.SauceDemoWebTest` is read
 # as class `saucedemo`, method `SauceDemoWebTest` and returns an empty contract
@@ -418,20 +547,20 @@ _TEST_IDENT = re.compile(r"^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*#[A-Za-z_$][\w$
 # member_index() re-reads every source file in the repo (~0.2s here). That is fine
 # once and wrong on every keystroke in a picker, so it is cached against the same
 # signature everything else here keys on: an edited test shows up without a
-# server restart. Replaced as one dict so a concurrent request either sees the
-# whole old entry or the whole new one — the server runs threaded.
-_MEMBER_INDEX: dict = {"repo": None, "stamp": None, "index": None}
+# server restart. One entry per repo path, each replaced as one dict so a
+# concurrent request either sees the whole old entry or the whole new one — the
+# server runs threaded.
+_MEMBER_INDEX: dict = {}
 
 
 def _member_index(repo_path: str) -> dict:
-    global _MEMBER_INDEX
     with _REPO_LOCK:
         stamp = _refresh_source_caches(repo_path)
-        cached = _MEMBER_INDEX
-        if cached["repo"] == repo_path and cached["stamp"] == stamp:
+        cached = _MEMBER_INDEX.get(repo_path)
+        if cached and cached["stamp"] == stamp:
             return cached["index"]
         index = assertion_graph.member_index(repo_path)
-        _MEMBER_INDEX = {"repo": repo_path, "stamp": stamp, "index": index}
+        _MEMBER_INDEX[repo_path] = {"stamp": stamp, "index": index}
         return index
 
 
@@ -467,11 +596,18 @@ def tests_intent(agent: str):
                       f"GITHUB_REPO_AUTOMATION, in config/.env.",
         }), 503
 
+    # The same tree the pickers were filled from, or the pane would describe a
+    # test as it stands on one branch while the list beside it is of another.
+    tree, _described, failed = _catalog_tree(
+        workspace, (request.args.get("branch") or "").strip())
+    if failed:
+        return failed
+
     try:
         # Constructors followed, as the adaptation agent measures — the panel
         # should list the checks a change note can actually touch.
-        contract = intent.for_test(str(workspace), test,
-                                   _member_index(str(workspace)),
+        contract = intent.for_test(str(tree), test,
+                                   _member_index(str(tree)),
                                    follow_constructors=True)
     except Exception as e:
         return jsonify({"error": "could not read the test's intent",

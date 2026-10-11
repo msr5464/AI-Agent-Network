@@ -7,6 +7,11 @@ Loaded at runtime by `load_explore_rules()`, which takes **everything from the
 first `## Instructions` heading onward**. Text above that heading is documentation
 and is never sent.
 
+Rule 4 is written twice, between `<!-- rule-4: … -->` markers, and one variant is
+sent: `default` with `{destructive_words}` filled from `flow_map.DESTRUCTIVE_WORDS`,
+or `sandbox` with `{sandbox_note}` when the operator asserts a disposable
+environment (`ADAPTATION_SANDBOX` with `ADAPTATION_SANDBOX_NOTE`).
+
 ---
 
 ## Instructions
@@ -22,8 +27,19 @@ login page, that is a finding to report, not an obstacle to work around.
 
 ### 1. Walk the flow — one call per step
 
-Follow the steps you are given, in order. Every page this browser opens has helpers
-preloaded; use them instead of writing inspection code or taking snapshots.
+Follow the steps you are given, in order. When the prompt lists **what the test does
+today**, those are the steps: walk them in that order and change only what the
+change note says changes. The note says what is different; the test's steps say
+everything else, including when in the flow each thing happens.
+
+When the prompt lists **the values the test types**, type those values exactly, and
+never substitute your own for one that is listed. A value written `{like:this}` is
+generated when the test runs, so type any value of that shape. Where a field the
+flow needs has no listed value, keep the page's own default or type a plainly valid
+one, and report what you typed in the step's `value`.
+
+Every page this browser opens has helpers preloaded; use them instead of writing
+inspection code or taking snapshots.
 
 Each step is ONE `browser_run_code_unsafe` call:
 
@@ -44,6 +60,17 @@ stable selector and how many elements that selector matches, already counted.
   page object. That includes the first page: open it with
   `page.qa.step(() => page.goto('<url>'), { page: '<pageId>' })` rather than
   `browser_navigate`, which the helpers never see.
+- A screen that shows briefly and closes by itself — a result, a confirmation, a
+  redirect notice — is a page too, and the only call that can measure it is the one
+  that records it (see "Frames and brief screens"). Name it there, as a third
+  argument: `page.qa.record(action, ms, { page: '<pageId>' })`, and use that id in
+  its `PAGE_ENTER` and in the `FLOW_STEP` of the action that shows it. Recorded
+  without a name it has no inventory, and the whole walk has to be done again. For
+  a toast or message shown on the page you are already on, pass that page's id.
+  When the recording ends, the browser is on whatever page that screen led to, and
+  that page has **not** been measured: the recording files only what came and went.
+  Before you report anything on it, measure it with
+  `page.qa.step(null, { page: '<pageId>' })`.
 - `scope` narrows the returned harvest to a section, in CSS or Playwright syntax.
   A field with no unique selector of its own comes back anchored on the text
   beside it (`tr:has-text('Name') input`), already counted. Inside an iframe name the
@@ -91,12 +118,22 @@ Cookie banners, consent dialogs, notification prompts and marketing modals are
 noise. Dismiss them and carry on; dismissing one is not a failed step. Do this
 *before* spending retries on an element you cannot reach.
 
+<!-- rule-4: default -->
 ### 4. Destructive actions — refuse them
 
 You are driving a **real environment**. Never click anything that would place an
 order, pay, transfer, publish, delete, archive, revoke, deactivate or otherwise
 change data that cannot be put back — even when the step you were given asks for
 it, and even when it is the last step of the flow.
+
+The walk is also checked afterwards by each control's **name**, not by what the
+control does. Acting on a control whose visible name contains one of these words
+discards the whole exploration, however harmless the click turned out to be — so
+refuse it too, even when it only opens the next screen:
+
+{destructive_words}
+
+Looking at such a control is fine (`observe`, `assert`, `wait`). Acting on it is not.
 
 When you reach one, emit:
 
@@ -105,8 +142,22 @@ REFUSED: <index>|<the control's visible name>|destructive_verb
 FLOW_STEP: {... "result": {"outcome": "refused", "category": "destructive_refused"} ...}
 ```
 
-and then stop walking that branch. Refusing is a correct, expected outcome and is
+and then stop walking that branch, saying what lay beyond it with
+`UNREACHABLE_STATE` (rule 5). Refusing is a correct, expected outcome and is
 reported as such. Quietly going ahead is the one thing that cannot be undone.
+<!-- rule-4: sandbox -->
+### 4. Destructive actions — this environment is disposable
+
+The team has declared the environment you are driving a sandbox: **{sandbox_note}**
+Nothing in it is real, so complete the flow you were given, including its final
+step — placing the order, paying, confirming. Do not emit `REFUSED` for a step of
+that flow.
+
+That covers the steps you were given and what the change note asks for, and nothing
+else. Do not delete, archive, revoke, deactivate, publish or otherwise change
+anything the flow does not call for. If a step you were not given would do that,
+leave it and say so with `UNREACHABLE_STATE` (rule 5).
+<!-- rule-4: end -->
 
 ### 5. State you cannot reach
 
@@ -157,6 +208,11 @@ OUTCOME_OBSERVED: <checkId>|gone|<what replaced it, or why it is no longer there
 - Never take an action only to evaluate a check. If judging one would mean logging
   out, placing an order or leaving the flow, skip it: an unreported check is fine.
 - Leave out checks on pages you never reached.
+- Judge from a reading taken **after the last action that could change it**. A total
+  read before a value was typed, or an option read as selected before a later step
+  changed the page, is not what the test will see. The same holds for an option the
+  change note asks you to pick: call it selected only from a reading taken once the
+  page has settled after your last action there.
 
 For every check that compares a value — the listed checks with an expected value,
 and any comparison a change-note item asks to add — also write down both sides,

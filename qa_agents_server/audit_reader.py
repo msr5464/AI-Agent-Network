@@ -842,27 +842,24 @@ def _adaptation_summary(spec, session_dir: Path) -> Dict:
         "failed": len(adapt.get("failed") or []),
     }
 
-    # Cancelled before crashed — see _healing_status.
-    if (session_dir / ".cancelled").exists():
-        status = "cancelled"
-    elif (session_dir / ".crashed").exists():
-        status = "failed"
-    elif (session_dir / ".interrupted").exists():
-        status = "interrupted"
+    # A run that has ended is judged by the rule Analytics uses, so the History
+    # row, the live badge and the Analytics count are one answer. Ended means a
+    # marker, a skip reason or the ship result: a gate alone is also written
+    # between adapt attempts, while the run is still going.
+    ended = bool(skip or ship) or any(
+        (session_dir / marker).exists()
+        for marker in (".cancelled", ".crashed", ".interrupted"))
+    judged = ""
+    if ended:
+        from qa_agents_server.analytics import run_status
+        judged = run_status(spec.name, session_dir)
+    if judged:
+        # Analytics keeps an explore-only run out of its rates; as a row it is
+        # simply a run that finished.
+        status = "completed" if judged == "explore-only" else judged
     elif skip == "infra":
-        # The model call never happened (a usage cap, an API error). Falling
-        # through to the ship check below reported that as "completed".
+        # Stopped before the gate was written (a usage cap, a missing browser).
         status = "blocked"
-    elif skip in ("escalate", "unsafe", "no-session", "unreachable"):
-        # The agent stopped rather than guessing. That is the design working, so
-        # it must not be painted red — reporting a correct refusal as a failure
-        # trains people to ignore exactly the runs worth reading.
-        status = "diagnosed"
-    elif skip == "explore-only":
-        status = "completed"
-    elif ship:
-        status = "failed" if ship.get("ship_status") in ("push_failed", "pr_failed") \
-            else "completed"
     elif (session_dir / "00-session-init.md").exists():
         status = "interrupted" if _looks_abandoned(session_dir) else "running"
     else:

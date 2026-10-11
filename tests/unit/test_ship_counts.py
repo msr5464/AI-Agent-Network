@@ -76,3 +76,42 @@ class TestTestsIn:
 
     def test_an_entry_with_no_list_still_yields_its_test(self):
         assert ship.tests_in({"test_name": "pkg.T.only"}) == ["pkg.T.only"]
+
+
+# One test, three edits: two kept by earlier attempts, the third greened it.
+CHAIN_FIX = {
+    "target_file": "/ws/BankPage.java", "fix_description": "the bank code field",
+    "test_name": "automation.shop.ShopWebTest.pays",
+    "earlier_edits": [
+        {"attempt": 1, "target_file": "/ws/CheckoutPage.java",
+         "fix_description": "the order total", "fix_diff": "-a\n+b"},
+        {"attempt": 3, "target_file": "/ws/CardFormPage.java",
+         "fix_description": "the card code field", "fix_diff": "-c\n+d"},
+    ],
+}
+
+
+class TestEditsKeptByEarlierAttempts:
+    """A chain of broken locators takes several edits to green one test.
+
+    The record of the fixed test holds the last of them. The report listed that
+    one, so a PR whose diff changed three page objects described a single edit.
+    """
+
+    def test_every_edit_behind_a_fix_is_counted(self):
+        assert ship.edit_count([CHAIN_FIX]) == 3
+        assert ship.edit_count(FIXES) == 2
+
+    def test_each_kept_edit_gets_a_line_naming_its_file_and_attempt(self):
+        lines = ship.earlier_edit_lines(CHAIN_FIX)
+        assert len(lines) == 2
+        assert "kept from attempt 1: the order total (`CheckoutPage.java`)" in lines[0]
+        assert "kept from attempt 3: the card code field (`CardFormPage.java`)" in lines[1]
+
+    def test_a_fix_with_none_adds_nothing(self):
+        assert ship.earlier_edit_lines(FIXES[0]) == []
+
+    def test_the_slack_message_says_how_many_more(self):
+        _channel, text = ship._build_slack_message(
+            "local-ShopWebTest", [CHAIN_FIX], [], [], None, "true", 4)
+        assert "+2 edit(s) kept from earlier attempts" in text

@@ -204,16 +204,32 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
     verified = adapt.get("verified") or []
     not_run = scope.get("not_verified") or []
 
+    # Say what this run did. One sentence for every outcome told a reader that
+    # tests were updated on a run that had changed nothing.
+    statuses = {i.get("status") for i in items}
+    if statuses & {"applied", "partial"}:
+        headline = "The product changed. Tests were updated to match the new behavior."
+    elif "proposed" in statuses:
+        headline = "Changes are proposed below. Nothing was written."
+    else:
+        why = next((e.get("what") for e in adapt.get("escalations") or []
+                    if e.get("what")), "")
+        headline = "Nothing was changed" + (f" — {why}." if why else ".")
+
     parts = [
         f"## 🤖 Test Adaptation Agent — {MODULE}",
         "",
-        "> Status: **NEEDS-REVIEW** — The product changed. Tests were updated to match the new behavior.",
+        f"> Status: **NEEDS-REVIEW** — {headline}",
         "",
         "> ⚠️ **This PR is always NEEDS-REVIEW.** An agent may change test *steps* "
         "here, not just selectors. Every mechanical check below passed, but only a "
         "human can confirm the test still means what it should.",
         "",
     ]
+    if explore.get("sandbox_note"):
+        parts += ["> 🧪 **Explored as a sandbox.** The flow was walked through to its "
+                  "final action because the operator asserts this environment is "
+                  f"disposable: {explore['sandbox_note']}", ""]
     if check_rows is None:
         parts += [f"### ⚠️ {check_title or 'Checks this PR changes'}", "",
                   "_Could not be measured — read every assertion in the diff._", ""]

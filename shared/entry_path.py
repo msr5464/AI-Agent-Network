@@ -61,12 +61,16 @@ _STRING_CONST = re.compile(
 _LOGIN_HINTS = ("login", "signin", "authenticate", "session")
 
 
+def source_candidates(test_id: str) -> List[str]:
+    """Where `automation.shop.CartTest#pay` would be declared, repo-relative."""
+    relative = Path(*test_id.split("#", 1)[0].split(".")).with_suffix(".java")
+    return [str(Path(root) / relative) for root in ("src/test/java", "src/main/java")]
+
+
 def test_source(workspace, test_id: str) -> Optional[Path]:
     """`automation.naukari.FooTest#bar` → the .java file that declares it."""
-    fqcn = test_id.split("#", 1)[0]
-    relative = Path(*fqcn.split(".")).with_suffix(".java")
-    for root in ("src/test/java", "src/main/java"):
-        candidate = Path(workspace) / root / relative
+    for relative in source_candidates(test_id):
+        candidate = Path(workspace) / relative
         if candidate.exists():
             return candidate
     return None
@@ -302,6 +306,86 @@ def extract(workspace, test_id: str) -> Dict:
     result["reason"] = near_miss or (
         "the test never signs in — no stored session and no credential-taking "
         "login call in its body")
+    return result
+
+
+# A bare call in a method body — `buildOrder()`, not `helper.buildOrder()`.
+_OWN_CALL = re.compile(r"(?<![.\w])([a-z]\w*)\s*\(")
+# Followed by `(` and then a `{` too, without being a method of the class.
+_KEYWORDS = frozenset(("if", "for", "while", "switch", "catch", "try",
+                       "synchronized", "return", "super", "this"))
+
+
+def _csv_row(workspace, read: Dict, narration: str) -> Optional[Dict]:
+    """The one row a literal CSV lookup reads, login secrets left out.
+
+    None unless it is certain: the file must be the only one of that name (the
+    read's module decides between two), and exactly one row may hold the key.
+    Typing the wrong row into a live product is worse than typing none.
+    """
+    import csv
+    from shared.credential_extraction import secret_columns
+
+    if not read.get("value"):
+        return None
+    name = f"{read['file']}.csv"
+    found = [path for root in ("src/test/resources", "src/main/resources")
+             if (Path(workspace) / root).is_dir()
+             for path in (Path(workspace) / root).rglob(name)]
+    module = read.get("module", "").lower()
+    found = [p for p in found if module in (part.lower() for part in p.parts)] or found
+    if len(found) != 1:
+        return None
+    try:
+        text = found[0].read_text(encoding="utf-8", errors="ignore")
+        rows = list(csv.DictReader(text.splitlines()))
+    except (OSError, csv.Error):
+        return None
+    hits = [row for row in rows
+            if (row.get(read["column"]) or "").strip() == read["value"]]
+    if len(hits) != 1:
+        return None
+    secret = set(secret_columns((text.splitlines() or [""])[0], narration))
+    values = {column: (value or "").strip() for column, value in hits[0].items()
+              if column and column.strip() not in secret and (value or "").strip()}
+    return {"file": str(found[0].relative_to(workspace)), "row": values} if values else None
+
+
+def test_walk(workspace, test_id: str) -> Dict:
+    """What the test does today, in its own words, and the data row it types.
+
+    `{"test", "steps": [...], "data": [{"file", "row": {column: value}}]}`.
+    `steps` is the test's own step log, in call order. `data` is each row the
+    test method, or a method of its class that it calls, looks up by a literal
+    key. Either is empty when the source does not say; nothing is inferred.
+
+    An explorer handed neither invents both: it chose its own order for a flow
+    the test already spells out, and typed values that left the form invalid.
+    """
+    from shared.logstep_narration import log_steps
+
+    result = {"test": test_id, "steps": [], "data": []}
+    path = test_source(workspace, test_id)
+    method = test_id.split("#", 1)[1] if "#" in test_id else ""
+    if not path or not method:
+        return result
+    source = path.read_text(encoding="utf-8", errors="ignore")
+    body = method_body(source, method)
+    result["steps"] = log_steps(body)
+
+    bodies = [body] + [method_body(source, name)
+                       for name in dict.fromkeys(_OWN_CALL.findall(body))
+                       if name != method and name not in _KEYWORDS]
+    narration = " ".join(result["steps"])
+    seen = set()
+    for read in (r for text in bodies if text for r in csv_reads(text)):
+        key = (read["module"], read["file"], read["column"], read["value"])
+        if key in seen:
+            continue
+        seen.add(key)
+        row = _csv_row(workspace, read, narration)
+        if row:
+            result["data"].append(row)
     return result
 
 

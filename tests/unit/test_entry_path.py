@@ -171,3 +171,90 @@ def test_method_body_stops_at_the_matching_brace():
     """
     body = entry_path.method_body(source, "first")
     assert "b();" in body and "c();" not in body
+
+
+# ── What the test does today, and the data it types ───────────────────────────
+
+WALK_TEST = """
+package automation.shop;
+public class ShopWebTest extends TestBase {
+    @Test
+    public void payByCard(Config config) {
+        ShopHelper shop = new ShopHelper(config);
+        ShopData order = buildOrder();
+        config.logStep("Open the shop and add the item to the cart");
+        shop.cartPage = shop.addToCart(order);
+        if (order.hasCoupon()) {
+            config.logStep("Apply the coupon");
+        }
+        config.logStep("%s");
+    }
+
+    public void refundOrder(Config config) {
+        Map<String, String> row = TestDataReader.loadCsvRowByColumnValue(
+            "shop", "orders", "scenario", "refund");
+    }
+
+    private ShopData buildOrder() {
+        Map<String, String> data = TestDataReader.loadCsvRowByColumnValue(
+            "shop", "orders", "scenario", "card");
+        return new ShopData(data);
+    }
+}
+"""
+ORDERS = ("scenario,amount,card_number,password,bank_otp,phone,note\n"
+          "card,500,4111 1111,hunter2,112233,{randomNumber:10},\n"
+          "refund,90,4000 0000,x,1,2,later\n")
+WALK_ID = "automation.shop.ShopWebTest#payByCard"
+
+
+def _shop(tmp_path, last_step="Pay by card and enter the bank code", orders=ORDERS):
+    _write(tmp_path, "src/test/java/automation/shop/ShopWebTest.java",
+           WALK_TEST % last_step)
+    if orders is not None:
+        _write(tmp_path, "src/test/resources/shop/data/orders.csv", orders)
+    return entry_path.test_walk(tmp_path, WALK_ID)
+
+
+class TestWalk:
+    """An explorer handed neither the test's steps nor its data invented both."""
+
+    def test_the_steps_are_the_tests_own_log_in_order(self, tmp_path):
+        assert _shop(tmp_path)["steps"] == [
+            "Open the shop and add the item to the cart", "Apply the coupon",
+            "Pay by card and enter the bank code"]
+
+    def test_the_row_is_the_one_this_test_loads(self, tmp_path):
+        # buildOrder() is called by the test; refundOrder() is another test's read.
+        data = _shop(tmp_path)["data"]
+        assert [d["file"] for d in data] == ["src/test/resources/shop/data/orders.csv"]
+        assert data[0]["row"] == {"scenario": "card", "amount": "500",
+                                  "card_number": "4111 1111", "bank_otp": "112233",
+                                  "phone": "{randomNumber:10}"}
+
+    def test_a_login_secret_never_reaches_the_prompt(self, tmp_path):
+        assert "password" not in _shop(tmp_path)["data"][0]["row"]
+        # An OTP is test data on a bank page and a credential in a flow that logs in.
+        signs_in = _shop(tmp_path, "Log in and pay by card")["data"][0]["row"]
+        assert "bank_otp" not in signs_in and "amount" in signs_in
+
+    @pytest.mark.parametrize("orders", [
+        None,                                                   # no such file
+        "scenario,amount\ncard,1\ncard,2\n",                   # two rows hold the key
+        "scenario,amount\nrefund,1\n",                         # no row holds it
+    ])
+    def test_no_row_is_sent_unless_it_is_certain(self, tmp_path, orders):
+        assert _shop(tmp_path, orders=orders)["data"] == []
+
+    def test_two_files_of_one_name_are_not_guessed_between(self, tmp_path):
+        _write(tmp_path, "src/test/resources/shop/archive/orders.csv", ORDERS)
+        assert _shop(tmp_path)["data"] == []
+
+    def test_a_test_that_is_not_there_has_nothing_to_say(self, tmp_path):
+        walk = entry_path.test_walk(tmp_path, "automation.shop.GoneTest#flow")
+        assert (walk["steps"], walk["data"]) == ([], [])
+
+    def test_where_a_test_would_be_declared(self):
+        assert entry_path.source_candidates(WALK_ID) == [
+            "src/test/java/automation/shop/ShopWebTest.java",
+            "src/main/java/automation/shop/ShopWebTest.java"]

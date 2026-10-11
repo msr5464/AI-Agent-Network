@@ -127,21 +127,36 @@ class PlaywrightTelemetryParser(TelemetryParser):
             })
         return entries
 
+    #: Calls that only measure the page. A framework that records why a wait
+    #: failed makes these after giving up, into the same trace.
+    _PROBES = frozenset({"Frame.queryCount", "Frame.isVisible", "Frame.isHidden",
+                         "Frame.isEnabled"})
+
     def _polled_to_death(self, actions: List[Dict], min_repeats: int = 3) -> Optional[Dict]:
+        """The selector a wait re-checked until it gave up, when nothing threw.
+
+        The last run of identical-selector calls, provided nothing but measuring
+        followed it. Reading only the very tail missed every wait whose framework
+        then counted its anchors and the page object's other locators as evidence:
+        those calls land after the polling and end the streak at one.
+        """
         tail = [a for a in actions if a.get("selector")]
-        if not tail:
-            return None
-        last_selector = tail[-1]["selector"]
-        repeats = 0
-        for action in reversed(tail):
-            if action["selector"] != last_selector:
-                break
-            repeats += 1
-        if repeats < min_repeats:
-            return None
-        return {**tail[-1],
-                "error": f"polled {repeats}x without ever becoming visible",
-                "inferred": True}
+        runs: List[List[Dict]] = []
+        for action in tail:
+            if runs and runs[-1][0]["selector"] == action["selector"]:
+                runs[-1].append(action)
+            else:
+                runs.append([action])
+        after: List[Dict] = []
+        for run in reversed(runs):
+            if len(run) >= min_repeats:
+                if any(a.get("action") not in self._PROBES for a in after):
+                    return None     # the flow acted again; that streak was not the end
+                return {**run[-1],
+                        "error": f"polled {len(run)}x without ever becoming visible",
+                        "inferred": True}
+            after.extend(run)
+        return None
 
 
 class PlaywrightTestRunner(TestRunner):
@@ -214,6 +229,7 @@ class PlaywrightCodeEngine(CodeEngine):
     ELEMENT_TYPES = ("Locator",)
     LOCATOR_CALLS = ("locator", "waitForSelector")
     TYPING_CALLS = ("fillText", "typeText", "enterData", "fill", "type", "pressSequentially")
+    PAGE_LOAD_ASSERTIONS = ("assertPageLoaded",)
     # Only the wrapper classes may make these calls. `Element.click(...)` is a
     # wrapper itself, hence the lookbehind.
     RAW_DRIVER_CALLS = (
@@ -238,7 +254,7 @@ class PlaywrightCodeEngine(CodeEngine):
 
     # page.frameLocator("a")[.frameLocator("b")].locator("c"), and the same through
     # page.locator("a").contentFrame() — Java and Python spellings. A chain ending
-    # in getBy*() is not read: step 02 and the heal both write .locator(css).
+    # in getBy*() is read by `_GETBY_PATTERNS` below, which take the same hops.
     _STR = r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'"""
     _HOP = (rf"""(?:frameLocator|frame_locator)\s*\(\s*(?:{_STR})\s*\)"""
             rf"""|locator\s*\(\s*(?:{_STR})\s*\)\s*\.\s*(?:contentFrame\s*\(\s*\)|content_frame\b)""")
@@ -257,13 +273,32 @@ class PlaywrightCodeEngine(CodeEngine):
             found.append((match.start(), match.end(), frames.join(pieces[:-1], pieces[-1])))
         return found
     
+    # `page.getByX(...)`, and the same at the end of an iframe chain. A heal writes
+    # whichever builder proved unique, inside a frame as readily as outside one;
+    # a declaration this could not read was a field that had silently stopped
+    # being one of the page object's locators.
+    _GETBY_HEAD = (rf"""(?:(?P<name>\w+)\s*=\s*)?(?<![\w.])(?:this\s*\.\s*)?page"""
+                   rf"""(?P<hops>(?:\s*\.\s*(?:{_HOP}))*)\s*\.\s*""")
+    _GETBY_VALUE = r"""\s*\(\s*(?P<q>["'])(?P<val>(?:\\.|(?!(?P=q)).)*)(?P=q)"""
     _GETBY_PATTERNS = (
-        (re.compile(r"""(?:(?P<name>\w+)\s*=\s*)?(?:page|this\.page)\s*\.\s*getByRole\s*\(\s*(?:[\w.]*AriaRole\s*\.\s*)?(?P<role>\w+)"""), "role"),
-        (re.compile(r"""(?:(?P<name>\w+)\s*=\s*)?(?:page|this\.page)\s*\.\s*getByTestId\s*\(\s*(?P<q>["'])(?P<val>(?:\\.|(?!(?P=q)).)*)(?P=q)"""), "testid"),
-        (re.compile(r"""(?:(?P<name>\w+)\s*=\s*)?(?:page|this\.page)\s*\.\s*getByPlaceholder\s*\(\s*(?P<q>["'])(?P<val>(?:\\.|(?!(?P=q)).)*)(?P=q)"""), "placeholder"),
-        (re.compile(r"""(?:(?P<name>\w+)\s*=\s*)?(?:page|this\.page)\s*\.\s*getByText\s*\(\s*(?P<q>["'])(?P<val>(?:\\.|(?!(?P=q)).)*)(?P=q)"""), "text"),
-        (re.compile(r"""(?:(?P<name>\w+)\s*=\s*)?(?:page|this\.page)\s*\.\s*getByLabel\s*\(\s*(?P<q>["'])(?P<val>(?:\\.|(?!(?P=q)).)*)(?P=q)"""), "label"),
+        (re.compile(_GETBY_HEAD + r"""getByRole\s*\(\s*(?:[\w.]*AriaRole\s*\.\s*)?(?P<role>\w+)"""), "role"),
+        (re.compile(_GETBY_HEAD + "getByTestId" + _GETBY_VALUE), "testid"),
+        (re.compile(_GETBY_HEAD + "getByPlaceholder" + _GETBY_VALUE), "placeholder"),
+        (re.compile(_GETBY_HEAD + "getByText" + _GETBY_VALUE), "text"),
+        (re.compile(_GETBY_HEAD + "getByLabel" + _GETBY_VALUE), "label"),
+        (re.compile(_GETBY_HEAD + "getByAltText" + _GETBY_VALUE), "alt"),
+        (re.compile(_GETBY_HEAD + "getByTitle" + _GETBY_VALUE), "title"),
     )
+    # The attribute builders, as a selector and as the call that declares them.
+    _GETBY_ATTRIBUTES = {"testid": ("data-testid", "getByTestId"),
+                         "placeholder": ("placeholder", "getByPlaceholder"),
+                         "alt": ("alt", "getByAltText"),
+                         "title": ("title", "getByTitle")}
+    # What those builders are at runtime: `internal:attr=[placeholder="123"s]`,
+    # `internal:testid=[data-testid="pay"s]`. The trailing flag says how the value
+    # is matched (s: exactly, i: ignoring case); it is not part of the attribute.
+    _INTERNAL_ATTR = re.compile(
+        r"""^internal:(?:attr|testid)=\[\s*([\w-]+)\s*=\s*"((?:\\.|[^"\\])*)"\s*[si]?\s*\]$""")
     _SET_NAME = re.compile(r"""setName\s*\(\s*(["'])(?P<val>(?:\\.|(?!\1).)*)\1""")
     _ARIA_REF = re.compile(r"(?:^|[\[\s])(?:aria-)?ref\s*=", re.I)
     _BARE_REF = re.compile(r"^(?=.*\d)[a-f][0-9a-f]{2,}$", re.I)
@@ -326,6 +361,13 @@ class PlaywrightCodeEngine(CodeEngine):
             selector = stripped.strip()
         if not selector:
             return None
+        internal = self._INTERNAL_ATTR.match(selector)
+        if internal:
+            # A failure quotes the builder the way the runtime holds it; the
+            # declaration reads as the attribute it stands for. One form for both,
+            # or a failing locator never matches the field that declares it.
+            value = internal.group(2).replace('\\"', '"').replace("\\\\", "\\")
+            return f"[{internal.group(1)}={self.quote_css_value(value)}]"
         lowered = selector.lower()
         if lowered.startswith(self._UNEVALUABLE_PREFIX):
             return None
@@ -402,6 +444,7 @@ class PlaywrightCodeEngine(CodeEngine):
                     field = self._FINDBY_FIELD.search(source[max(0, match.start() - 200):match.start()])
                     if field:
                         name = field.group(1)
+                value = _unescape(value)
                 entry = {"name": name, "kind": kind, "value": value,
                          "approx": kind in ("role", "text", "label"),
                          "selector": "", "accessible_name": ""}
@@ -413,16 +456,24 @@ class PlaywrightCodeEngine(CodeEngine):
                     entry["raw"] = (f"getByRole({value}"
                                     + (f', name="{entry["accessible_name"]}"' if entry["accessible_name"] else "")
                                     + ")")
-                elif kind == "testid":
-                    entry["selector"] = f"[data-testid='{value}']"
-                    entry["raw"] = f'getByTestId("{value}")'
-                elif kind == "placeholder":
-                    entry["selector"] = f"[placeholder='{value}']"
-                    entry["raw"] = f'getByPlaceholder("{value}")'
+                elif kind in self._GETBY_ATTRIBUTES:
+                    attribute, builder = self._GETBY_ATTRIBUTES[kind]
+                    entry["selector"] = f"[{attribute}={self.quote_css_value(value)}]"
+                    entry["raw"] = f'{builder}("{value}")'
                 else:
                     entry["accessible_name"] = value
                     entry["raw"] = f'getBy{kind.capitalize()}("{value}")'
-                
+
+                # Inside an iframe the entry is the whole chain, as a plain
+                # `.locator()` chain is: every reader follows the hops from there.
+                path = [_unescape(m.group(0)[1:-1])
+                        for m in re.finditer(self._STR, groups.get("hops") or "")]
+                if path:
+                    entry["frame_path"] = path
+                    entry["raw"] = frames.join(path, entry["raw"])
+                    if entry["selector"]:
+                        entry["selector"] = frames.join(path, entry["selector"])
+
                 if entry["raw"] in seen:
                     continue
                 seen.add(entry["raw"])
@@ -440,6 +491,20 @@ class PlaywrightCodeEngine(CodeEngine):
 
     def map_role(self, role: str) -> Optional[str]:
         return self._ROLE_TO_JAVA.get((role or "").lower())
+
+    # The types a Java snippet can name, and where they live. A builder's options
+    # hang off the type it was called on (`Page.GetByRoleOptions`,
+    # `FrameLocator.GetByPlaceholderOptions`); a page object declaring plain
+    # `.locator()` fields imports none of them.
+    _JAVA_TYPES = {"Page": "com.microsoft.playwright.Page",
+                   "FrameLocator": "com.microsoft.playwright.FrameLocator",
+                   "Locator": "com.microsoft.playwright.Locator",
+                   "AriaRole": "com.microsoft.playwright.options.AriaRole"}
+    _JAVA_TYPE_USE = re.compile(r"\b(Page|FrameLocator|Locator|AriaRole)\s*\.\s*[A-Z]")
+
+    def imports_for(self, snippet: str) -> List[str]:
+        return sorted({self._JAVA_TYPES[m.group(1)]
+                       for m in self._JAVA_TYPE_USE.finditer(snippet or "")})
 
     def emit_locator(self, **kwargs) -> Dict[str, str]:
         def _q(s: str) -> str:
@@ -480,26 +545,24 @@ class PlaywrightCodeEngine(CodeEngine):
                 "python": f"page.get_by_role({_q(jrole.lower())}, name={_q(name)})",
                 "java": f"page.getByRole(AriaRole.{jrole}, new Page.GetByRoleOptions().setName({_q(name)}))"
             }
-        if "placeholder" in kwargs:
-            return {
-                "python": f"page.get_by_placeholder({_q(kwargs['placeholder'])})",
-                "java": f"page.getByPlaceholder({_q(kwargs['placeholder'])})"
-            }
-        if "label" in kwargs:
-            return {
-                "python": f"page.get_by_label({_q(kwargs['label'])})",
-                "java": f"page.getByLabel({_q(kwargs['label'])})"
-            }
-        if "alt" in kwargs:
-            return {
-                "python": f"page.get_by_alt_text({_q(kwargs['alt'])})",
-                "java": f"page.getByAltText({_q(kwargs['alt'])})"
-            }
-        if "title" in kwargs:
-            return {
-                "python": f"page.get_by_title({_q(kwargs['title'])})",
-                "java": f"page.getByTitle({_q(kwargs['title'])})"
-            }
+        # The attribute builders match by substring unless told otherwise, so a
+        # caller that proved an exact value has to get an exact builder back.
+        for key, python_name, java_name in (
+                ("placeholder", "get_by_placeholder", "getByPlaceholder"),
+                ("label", "get_by_label", "getByLabel"),
+                ("alt", "get_by_alt_text", "getByAltText"),
+                ("title", "get_by_title", "getByTitle")):
+            if key not in kwargs:
+                continue
+            value = _q(kwargs[key])
+            if kwargs.get("exact", False):
+                return {
+                    "python": f"page.{python_name}({value}, exact=True)",
+                    "java": (f"page.{java_name}({value}, new Page."
+                             f"{java_name[0].upper()}{java_name[1:]}Options().setExact(true))"),
+                }
+            return {"python": f"page.{python_name}({value})",
+                    "java": f"page.{java_name}({value})"}
         if "text" in kwargs:
             text = kwargs["text"]
             exact = kwargs.get("exact", False)

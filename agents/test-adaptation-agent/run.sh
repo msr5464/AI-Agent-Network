@@ -64,10 +64,29 @@ CACHE_STEPS="${CACHE_STEPS:-true}"
 # bump would restore a plan whose kinds mean something else now, and an
 # exploration that was never asked about the tests' checks.
 CACHE_VERSION=2
-_cache_hit()     { [[ "$CACHE_STEPS" == "true" ]] && [[ "$START_FROM_STEP" -le 1 ]] \
-                     && [[ -f "$CACHE_DIR/$1" ]] \
-                     && [[ "$(cat "$CACHE_DIR/$1.version" 2>/dev/null)" == "$CACHE_VERSION" ]] \
-                     && [[ -f "$CACHE_DIR/$1.input" ]] && cmp -s "$CACHE_DIR/$1.input" "$INPUT_FILE"; }
+# What the exploration was allowed to do. One made without the sandbox assertion
+# stops at the first control the checker flags by name; restored after the
+# assertion is turned on, it reports the same refusal and the switch seems to do
+# nothing. So an exploration is only a hit for a run in the same state. A cache
+# from before this was recorded was made with the checker unaware of it: off.
+SANDBOX_STATE="off"
+_sandbox_note="${ADAPTATION_SANDBOX_NOTE:-}"
+if [[ "$(printf '%s' "${ADAPTATION_SANDBOX:-false}" | tr '[:upper:]' '[:lower:]')" == "true" \
+      && -n "${_sandbox_note//[[:space:]]/}" ]]; then
+  SANDBOX_STATE="on"
+fi
+unset _sandbox_note
+_cache_sandbox_ok() {
+  [[ "$1" == 03-explore* ]] || return 0
+  [[ "$(cat "$CACHE_DIR/$1.sandbox" 2>/dev/null || echo off)" == "${SANDBOX_STATE:-off}" ]]
+}
+_cache_hit() {
+  [[ "$CACHE_STEPS" == "true" ]] && [[ "$START_FROM_STEP" -le 1 ]] \
+    && [[ -f "$CACHE_DIR/$1" ]] \
+    && [[ "$(cat "$CACHE_DIR/$1.version" 2>/dev/null)" == "$CACHE_VERSION" ]] \
+    && [[ -f "$CACHE_DIR/$1.input" ]] && cmp -s "$CACHE_DIR/$1.input" "$INPUT_FILE" \
+    && _cache_sandbox_ok "$1"
+}
 _cache_restore() {
   # Belongs to the step being restored, not to the one still holding its ✓ back.
   flush_step_done
@@ -95,6 +114,7 @@ sys.exit(1 if (str(d.get("status", "")).lower() in ("skipped", "failed", "unsafe
   cp "$AUDIT_DIR/$1" "$CACHE_DIR/$1"
   if [[ -f "$INPUT_FILE" ]]; then cp "$INPUT_FILE" "$CACHE_DIR/$1.input"; else rm -f "$CACHE_DIR/$1.input"; fi
   echo "$CACHE_VERSION" > "$CACHE_DIR/$1.version"
+  if [[ "$1" == 03-explore* ]]; then echo "${SANDBOX_STATE:-off}" > "$CACHE_DIR/$1.sandbox"; fi
   local md="${1%.json}.md"
   [[ -f "$AUDIT_DIR/$md" ]] && cp "$AUDIT_DIR/$md" "$CACHE_DIR/$md"
   return 0

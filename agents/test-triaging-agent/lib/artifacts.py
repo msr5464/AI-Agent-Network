@@ -21,6 +21,7 @@ from shared.dom_snapshot import find_snapshot, parse_header
 from shared.telemetry import read_actions, failing_action
 from shared import baseline as _baseline
 from shared import failure_context as _failure_context
+from shared import run_artifacts
 
 
 def attach_dom_snapshot(issue: dict, report_dir: Path, method_name: str,
@@ -211,3 +212,9 @@ def attach_all(issue: dict, report_dir: Path, method_name: str, audit_dir: Path,
     attach_trace(issue, report_dir, method_name, audit_dir, log)
     attach_failure_context(issue, report_dir, method_name, audit_dir, log)
     attach_screenshot(issue, report_dir, method_name, audit_dir, log)
+    # After the context is attached: it is one of the two places the framework
+    # names the locator a wait gave up on, which no trace records.
+    try:
+        run_artifacts.name_failing_selector(issue, log=log)
+    except Exception as e:
+        log(f"  Could not name the failing selector for {method_name}: {e}")

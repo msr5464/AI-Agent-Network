@@ -201,9 +201,9 @@ from shared.dom_snapshot import (distill as distill_dom,
                                 format_for_prompt as format_dom,
                                 load_fingerprints, parse_header,
                                 candidates_from_fingerprints)
-from shared import (adaptation_handoff, baseline, diagnosis, failure_identity,
-                    locator_patch, narration, run_artifacts, verdict_feedback,
-                    workspace as workspace_helper)
+from shared import (adaptation_handoff, baseline, diagnosis, failure_context,
+                    failure_identity, locator_patch, narration, run_artifacts,
+                    verdict_feedback, workspace as workspace_helper)
 from shared.telemetry import read_actions, format_for_prompt as format_trace
 
 # Edit application and the fix-integrity guards now live in shared/edit_guards.py
@@ -212,9 +212,18 @@ from shared.telemetry import read_actions, format_for_prompt as format_trace
 # attributes of it, and the fix step's own call sites are unchanged.
 from shared.edit_guards import (            # noqa: F401
     _condense, _is_broader, _IDENTITY_CALL, _line_of, _QUOTED, _selectors_in,
-    apply_edits, compute_diff, log_edits, logstep_present, matches_negative,
+    apply_edits, assertions_unchanged, compute_diff, log_edits, logstep_present,
+    matches_negative,
     no_new_swallowing, validate_diagnosis_fit, validate_fix, wrapper_compliance,
 )
+
+
+# What the fix call may use: enough to find and read source, and nothing that
+# runs. With a shell it could read the repository's history — where the answer to
+# a locator someone broke on purpose is written down, and where a locator that
+# drifted with the application has no answer at all — and what it was allowed to
+# run depended on the permission settings of whichever machine the agent was on.
+FIX_TOOLS = ("Read", "Grep", "Glob")
 
 
 def _progress(_label: str, line: str) -> None:
@@ -1088,7 +1097,8 @@ def load_dom_snapshot(issue: dict, element_names: list) -> dict:
 # ── Context builder ───────────────────────────────────────────────────────────
 
 def build_candidate_context(issue: dict, workspace: Path, prev_test_output: str,
-                             repo_conventions: str = "") -> dict:
+                             repo_conventions: str = "",
+                             prev_outcome: dict | None = None) -> dict:
     test_name  = issue["test_name"]
     parts      = test_name.split(".")
     class_name = parts[-2] if len(parts) >= 2 else test_name
@@ -1157,7 +1167,24 @@ def build_candidate_context(issue: dict, workspace: Path, prev_test_output: str,
     # `button[type='submit']` is declared by a login page, an OTP page and a
     # checkout page alike, and the model was handed all three with nothing saying
     # which one the test was actually on. The failure names it — put it first.
-    owner = failure_identity.identify(f"{error_message}\n{stack_trace}").get("page_object")
+    recorded = failure_context.load(issue.get("failure_context") or None)
+    identity = failure_identity.of_issue(issue, recorded)
+    owner = recorded.get("page_object") or identity.get("page_object")
+    # ...and when ranking found nothing that names it, fetch it. A selector is not
+    # always a literal in the source (one inside an iframe is declared as several
+    # calls), so no declaration matched, the model was told it had none to work
+    # from, and an answer Locate had already proved could not be applied: that
+    # edit goes into a page object listed here and nowhere else.
+    if (owner and _HAS_CODE_ANALYZER
+            and not any(Path(po.get("path", "")).stem == owner for po in page_objects)):
+        try:
+            named = _CodeAnalyzer().page_object_by_name(
+                str(workspace), owner, focus=element_names,
+                max_chars=MAX_PAGE_OBJ_CHARS)
+            if named:
+                page_objects.append(named)
+        except Exception as e:
+            log(f"  page_object_by_name failed: {e}")
     if owner and page_objects:
         page_objects.sort(key=lambda po: Path(po.get("path", "")).stem != owner)
 
@@ -1219,6 +1246,12 @@ def build_candidate_context(issue: dict, workspace: Path, prev_test_output: str,
         "repo_conventions": repo_conventions,
         "dom_findings":  {},
         "prev_test_output": prev_test_output[:1500] if prev_test_output else "",
+        # What became of the previous attempt, so the retry is told what
+        # actually happened rather than one sentence that fits no case exactly.
+        "prev_outcome":  prev_outcome or {},
+        # Which element this failure is about, decided while the whole output
+        # was in hand. Read back by `split_by_progress`.
+        "failure_identity": identity,
         "fix_attempt":   FIX_ATTEMPT,
     }
 
@@ -1311,8 +1344,9 @@ def load_locate_resolutions() -> list:
 # fingerprint, a page its replay cannot reach, an element it found but could not
 # express uniquely — which is precisely where Fix earns its place.
 _LOCATE_DEFER = {
-    "ASSERTION_LOCATOR": "the locator is read by an assertion — healing it would "
-                         "turn a caught regression into a green build",
+    "ASSERTION_LOCATOR": "the locator is read by an assertion and could not be "
+                         "proven to be the same element — picking one would turn "
+                         "a caught regression into a green build",
     "UNSTABLE_LOCATOR": "this locator has been healed repeatedly — it needs a "
                         "stable test id, not another selector",
     "MISBOUND": "the selector resolves to the wrong element; rebinding it is a "
@@ -1354,7 +1388,9 @@ def locate_route(outcome: dict) -> tuple:
                            f"verification {outcome.get('verification')})")
     for name, why in _LOCATE_DEFER.items():
         if name in (verdict, classification):
-            return "defer", why
+            # Locate's own account names the assertion and what it could not prove.
+            return "defer", (outcome.get("reason") or why
+                             if name == "ASSERTION_LOCATOR" else why)
     return "own", (outcome.get("reason")
                    or f"Locate returned {verdict or classification or 'nothing'}")
 
@@ -1373,7 +1409,7 @@ def locate_resolution(ctx: dict):
     # verification run uncovered — and Locate has just resolved it from the
     # capture that run wrote. The narrow case this used to guard, re-applying an
     # answer that was already applied and still failed, is refused by Locate
-    # itself now (ALREADY_TRIED), which is where the evidence for it lives.
+    # itself now (REVERTED), which is where the evidence for it lives.
     failed = ctx.get("failed_selector") or ""
     if not failed:
         return None
@@ -1411,15 +1447,17 @@ def build_located_fix(resolution: dict, ctx: dict, workspace: Path):
     except OSError as exc:
         return None, f"cannot read {target}: {exc}"
 
-    edit, error = locator_patch.declaration_edit(source, field,
-                                                 resolution["new_expression"])
-    if edit is None:
+    # The declaration, and any import its expression needs: an answer that names
+    # a type the file never imported fails its own verification run on a build
+    # error, and a right locator is reverted as one that did not help.
+    edits, error = locator_patch.edits_for(source, field, resolution["new_expression"])
+    if not edits:
         return None, error
 
     return {
         "fixable": True,
         "target_file": str(target),
-        "edits": [edit],
+        "edits": edits,
         "fix_description": (
             f"Located deterministically: {resolution['failed_selector']} no longer "
             f"matches. Scored {resolution.get('score')} against the fingerprint "
@@ -1453,6 +1491,132 @@ def _refresh_baseline_after_heal(ctx: dict, workspace: Path) -> None:
     except Exception as exc:                       # noqa: BLE001 - advisory only
         log(f"  Could not update the baseline ({type(exc).__name__}) — "
             f"the next green run will re-record it")
+
+
+# Outcomes where an edit was proposed and thrown out before any test ran.
+_REJECTED_UNRUN = ("rejected_unsafe", "edit_failed")
+
+
+def retry_section(ctx: dict, verdict: dict) -> str:
+    """What the previous attempt did, told as what actually became of it.
+
+    One sentence used to serve every case — "Previous fix did not resolve the
+    test … do NOT repeat the previous approach" — and it was true of only one of
+    them. After an edit that WORKED and moved the test on, it told the model to
+    avoid the approach that had just succeeded, on an element nothing had been
+    tried on yet. After an edit that was reverted, it showed the output of a run
+    made with code that no longer existed, beside a failure description that did
+    not match it, and never said the source had been put back.
+    """
+    outcome = ctx.get("prev_outcome") or {}
+    status = outcome.get("status") or ""
+    output = ctx.get("prev_test_output") or ""
+    if not status and not output:
+        return ""
+
+    head = f"\n## ⚠️ RETRY — Attempt {ctx['fix_attempt']}\n"
+    diff = (outcome.get("fix_diff") or "").strip()
+    diff_block = f"```diff\n{diff[:1500]}\n```\n" if diff else ""
+
+    if status == "advanced":
+        return head + (
+            "An earlier edit in this session repaired a different element and was "
+            "kept; the test got past it and now stops at the failure described "
+            "above. This is the first attempt at THIS element — nothing has been "
+            "tried on it yet, and the earlier edit must not be undone.\n")
+
+    if status in _REJECTED_UNRUN:
+        reason = outcome.get("unfixable_reason") or "it did not pass the edit guards"
+        return head + (
+            f"The previous attempt proposed an edit that was rejected before any "
+            f"test ran: {reason}\n{diff_block}"
+            "The source is unchanged. Do not propose that edit again; address the "
+            "reason it was rejected.\n")
+
+    if status == "test_failed" and diff:
+        text = head + (
+            "The previous attempt applied this edit. The test still failed on the "
+            "same element, so the edit was reverted — the source shown below is "
+            f"back to what it was before:\n{diff_block}")
+        if output:
+            text += f"Output of the run made WITH that edit:\n```\n{output}\n```\n"
+    elif output:
+        text = head + ("Previous fix did not resolve the test. Different test output:\n"
+                       f"```\n{output}\n```\n")
+    else:
+        return ""
+
+    # Telling the model to "try something different" unconditionally is what
+    # walks it down the ladder from a precise selector to a broad one. A second
+    # failure on the same element is evidence about the diagnosis, not an
+    # invitation to guess wider.
+    if verdict.get("verdict") == "LOCATOR_STALE":
+        text += ("Try a different locator strategy — do NOT repeat the previous "
+                 "approach, and do NOT widen the selector to make it match.\n")
+    else:
+        text += ("Two attempts have now failed on the same element. That is "
+                 "evidence the original diagnosis was wrong rather than a reason "
+                 "to guess again. If you cannot identify a specific, verified "
+                 "replacement, return `fixable: false` and say what you would "
+                 "need to decide.\n")
+    return text
+
+
+def page_object_sources(ctx: dict, workspace: Path) -> str:
+    """The current text of every page object this failure's context lists.
+
+    Read from disk, not from the context: the context holds excerpts taken before
+    the attempt, and what matters to the guard is whether the failing selector is
+    still declared NOW.
+    """
+    texts = []
+    for candidate in ctx.get("page_objects") or []:
+        path = Path(candidate.get("path") or "")
+        path = path if path.is_absolute() else workspace / path
+        try:
+            texts.append(path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+    return "\n".join(texts)
+
+
+def carried_issue_note(test_name: str, status: str, issue: dict) -> str:
+    """One line on what a retry is starting from, or "" when there is nothing to say.
+
+    A carried issue is not proof that an edit landed. A reverted attempt carries
+    one too, so the retry does not fall back to the original handoff — and
+    announcing "the previous fix landed" for it contradicted the revert logged a
+    few lines earlier.
+    """
+    short = test_name.rsplit(".", 1)[-1]
+    target = (issue or {}).get("failed_selector")
+    if status == "advanced":
+        return (f"{short}: the previous fix landed — now working on "
+                f"{target or 'the next failure'}")
+    if status == "test_failed":
+        return (f"{short}: the previous edit was reverted — trying "
+                f"{target or 'the same failure'} again")
+    return ""
+
+
+def reusable_inspection(ctx: dict) -> dict:
+    """The previous attempt's live inspection, when it still describes this failure.
+
+    A retry on the same failing selector, with the source put back, parks a
+    browser on the same page and reads the same elements: a whole test run and a
+    model call to learn what the last attempt already wrote down. Not reused once
+    the test has moved on — that inspection was of a page it has since left.
+    """
+    outcome = ctx.get("prev_outcome") or {}
+    findings = outcome.get("dom_findings") or {}
+    if outcome.get("status") == "advanced":
+        return {}
+    if not str(findings.get("status", "")).startswith("ok (live") \
+            or not findings.get("selectors"):
+        return {}
+    if (outcome.get("failed_selector") or "") != (ctx.get("failed_selector") or ""):
+        return {}
+    return findings
 
 
 def build_fix_prompt(ctx: dict, fix_rules: str) -> str:
@@ -1670,29 +1834,7 @@ not what the source appears to say.
         except Exception:
             code_section = "### Test File\n(could not read)"
 
-    retry_text = ""
-    if ctx["prev_test_output"]:
-        retry_text = f"""
-## ⚠️ RETRY — Attempt {ctx['fix_attempt']}
-Previous fix did not resolve the test. Different test output:
-```
-{ctx['prev_test_output']}
-```
-"""
-        # Telling the model to "try something different" unconditionally is what
-        # walks it down the ladder from a precise selector to a broad one. A
-        # second failure on the same element is evidence about the diagnosis, not
-        # an invitation to guess wider.
-        if verdict.get("verdict") == "LOCATOR_STALE":
-            retry_text += ("Try a different locator strategy — do NOT repeat the "
-                           "previous approach, and do NOT widen the selector to "
-                           "make it match.\n")
-        else:
-            retry_text += ("Two attempts have now failed on the same element. That "
-                           "is evidence the original diagnosis was wrong rather "
-                           "than a reason to guess again. If you cannot identify a "
-                           "specific, verified replacement, return `fixable: false` "
-                           "and say what you would need to decide.\n")
+    retry_text = retry_section(ctx, verdict)
 
     return f"""You are fixing a broken locator in a test automation file.
 Work independently on this test case only.
@@ -1795,6 +1937,58 @@ def _attempt_history(result: dict) -> list:
     return sorted(history, key=lambda h: h.get("attempt", 0))
 
 
+def kept_edits(history: list, tests: list, before_attempt: int) -> list:
+    """The edits earlier attempts kept for these tests, oldest first.
+
+    A chain of broken locators is repaired one link per attempt: each edit is
+    kept because the test got past it, and only the last one sees the test go
+    green. The record of a fixed test held that last edit alone, so a run that
+    repaired three locators reported one — in the summary, in the PR body and in
+    the count — while the diff it shipped carried all three.
+    """
+    wanted = {name for name in tests if name}
+    seen, out = set(), []
+    for attempt in sorted(history or [], key=lambda h: h.get("attempt", 0)):
+        number = attempt.get("attempt", 0)
+        if number >= before_attempt:
+            continue
+        for entry in attempt.get("entries") or []:
+            if entry.get("status") != "advanced":
+                continue
+            names = set(entry.get("test_names") or []) | {entry.get("test_name")}
+            key = (entry.get("target_file"), entry.get("fix_diff"))
+            # One edit can cover several tests, and is recorded once per test.
+            if not names & wanted or key in seen:
+                continue
+            seen.add(key)
+            out.append({"attempt": number,
+                        "target_file": entry.get("target_file"),
+                        "fix_description": entry.get("fix_description") or "",
+                        "fix_diff": entry.get("fix_diff") or ""})
+    return out
+
+
+def _kept_for(entry: dict, history: list) -> list:
+    tests = entry.get("test_names") or [entry.get("test_name")]
+    return kept_edits(history, tests, entry.get("fix_attempt") or FIX_ATTEMPT)
+
+
+def attach_kept_edits(result: dict) -> int:
+    """Put the edits earlier attempts kept beside the test they were kept for.
+
+    On every record, not only the verified ones: a test that is still failing
+    after two kept edits has those two edits in the branch all the same, and a
+    report that lists neither leaves the reviewer to find them in the diff.
+    Returns how many belong to verified fixes, which is what the run's count of
+    distinct locator fixes was missing.
+    """
+    history = result.get("attempts") or []
+    for bucket in ("fixes", "unverified_fixes", "failed_fixes"):
+        for entry in result.get(bucket) or []:
+            entry["earlier_edits"] = _kept_for(entry, history)
+    return sum(len(f.get("earlier_edits") or []) for f in result.get("fixes") or [])
+
+
 def should_gate(verdict: dict, mode: str, force: bool) -> tuple:
     """Whether this verdict may stop the pipeline path. Returns (gate, note).
 
@@ -1879,8 +2073,7 @@ def split_by_progress(still_failing: list) -> tuple:
     """
     advanced, unchanged = [], []
     for member_name, member_output, member, member_started in still_failing:
-        before = failure_identity.identify(
-            f"{member.get('error_message') or ''}\n{member.get('stack_trace') or ''}")
+        before = failure_identity.of_issue(member)
         after = failure_identity.identify(member_output)
         if failure_identity.same_locator(before, after):
             unchanged.append((member_name, member_output, member))
@@ -1961,6 +2154,10 @@ def _refresh_issue(issue: dict, output: str, workspace: Path,
         "dom_snapshot": "", "failure_url": "", "trace_path": "",
         "failed_selector": "", "screenshot": "", "failure_context": "",
         "diagnosis": {},
+        # Worked out here from the whole output. The record keeps only a slice
+        # of that text, and re-deriving the identity from the slice is how a
+        # failure identified now becomes unidentifiable one attempt later.
+        "failure_identity": failure if failure.get("available") else {},
     })
     if failure.get("selector"):
         refreshed["failed_selector"] = failure["selector"]
@@ -2162,6 +2359,8 @@ def main():
     # Retry bookkeeping: only re-attempt what actually failed, and carry forward
     # the fixes already committed by earlier attempts so they stay in the report.
     prev_test_outputs: dict = {}
+    prev_outcomes: dict = {}
+    prev_history: list = []
     carried_fixes: list = []
     carried_unverified: list = []
     previous_stuck = 0
@@ -2177,12 +2376,17 @@ def main():
             refreshed = {}
             for fix in prev_data.get("failed_fixes", []):
                 prev_test_outputs[fix["test_name"]] = fix.get("test_output", "")
+                prev_outcomes[fix["test_name"]] = {
+                    key: fix.get(key) for key in
+                    ("status", "unfixable_reason", "fix_diff", "failed_selector",
+                     "dom_findings")}
                 failed_names.add(fix["test_name"])
                 if fix.get("next_issue"):
                     refreshed[fix["test_name"]] = fix["next_issue"]
             carried_fixes = prev_data.get("fixes", [])
             carried_unverified = prev_data.get("unverified_fixes", [])
             previous_stuck = prev_data.get("stuck_attempts", 0)
+            prev_history = prev_data.get("attempts") or []
             if failed_names:
                 before = len(eligible)
                 eligible = [refreshed.get(i["test_name"], i) for i in eligible
@@ -2190,8 +2394,10 @@ def main():
                 log(f"Retry attempt {FIX_ATTEMPT}: re-attempting {len(eligible)} of "
                     f"{before} issue(s) — {len(carried_fixes)} already fixed and committed")
                 for name, issue in refreshed.items():
-                    log(f"  {name.rsplit('.', 1)[-1]}: the previous fix landed — now "
-                        f"working on {issue.get('failed_selector') or 'the next failure'}")
+                    note = carried_issue_note(
+                        name, (prev_outcomes.get(name) or {}).get("status"), issue)
+                    if note:
+                        log(f"  {note}")
 
     log(f"{len(eligible)} eligible failing test(s) to analyse")
 
@@ -2285,7 +2491,8 @@ def main():
     for issue in eligible:
         test_name = issue["test_name"]
         prev_output = prev_test_outputs.get(test_name, "")
-        ctx = build_candidate_context(issue, workspace, prev_output, repo_conventions)
+        ctx = build_candidate_context(issue, workspace, prev_output, repo_conventions,
+                                      prev_outcomes.get(test_name))
 
         if ctx["trace_path"]:
             ctx["trace_timeline"] = format_trace(read_actions(Path(ctx["trace_path"])))
@@ -2458,6 +2665,10 @@ def main():
                     "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
                 log(f"  Located deterministically: {located.get('strategy')} "
                     f"score {located.get('score')} — no model call, no DOM inspection")
+                if located.get("assertion_site"):
+                    ctx["assertion_site"] = located["assertion_site"]
+                    log(f"  Read by an assertion: {located['assertion_site']} — the "
+                        f"report asks the reviewer to confirm it is the same element")
             else:
                 log(f"  Located, but not applicable here ({why}) — asking the model")
 
@@ -2473,9 +2684,13 @@ def main():
             # always wins. Otherwise the agent parks one itself, but only from the
             # second attempt on — see park_browser_for_repair for why.
             failure_url = issue.get("failure_url", "") or ctx.get("page_url", "")
+            reused = reusable_inspection(ctx) if INSPECT_DOM else {}
+            if reused:
+                log("  Reusing the live inspection from the previous attempt — same "
+                    "failing selector, and the source is back as it was")
             repair_session = (find_repair_session(workspace, test_name, failure_url)
-                              if INSPECT_DOM else {})
-            if not repair_session and INSPECT_DOM:
+                              if INSPECT_DOM and not reused else {})
+            if not repair_session and INSPECT_DOM and not reused:
                 explicit = os.environ.get("REPAIR", "").lower() == "true"
                 if explicit or FIX_ATTEMPT > 1:
                     repair_session = park_browser_for_repair(workspace, test_name,
@@ -2514,7 +2729,9 @@ def main():
 
             ctx["dom_snapshot"] = load_dom_snapshot(issue, ctx["element_names"])
 
-            if repair_session:
+            if reused:
+                ctx["dom_findings"] = reused
+            elif repair_session:
                 ctx["dom_findings"] = inspect_live_dom(ctx, ctx["page_url"], workspace,
                                                        framework_props, repair_session)
             elif ctx["dom_snapshot"]:
@@ -2535,7 +2752,9 @@ def main():
             log("  Calling Claude for fix...")
             response = call_claude(prompt, workspace,
                                    artifact_dir=(str(Path(ctx["screenshot"]).parent)
-                                                 if ctx.get("screenshot") else ""))
+                                                 if ctx.get("screenshot") else ""),
+                                   allowed_tools=list(FIX_TOOLS),
+                                   tools=",".join(FIX_TOOLS))
             if not response:
                 log("  Empty Claude response — skipping")
                 fail_cluster("no_response")
@@ -2598,7 +2817,12 @@ def main():
                 target_original, fixed_content,
                 (ctx.get("diagnosis") or {}).get("verdict", ""), snapshot_soup,
                 snapshot_prints, require_unique=acted_on,
-                failing_selector=ctx.get("failed_selector") or "")
+                failing_selector=ctx.get("failed_selector") or "",
+                declaring_source=page_object_sources(ctx, workspace))
+        if valid:
+            # Not waived by FORCE. Overriding a diagnosis is a decision about
+            # which locator to edit; it is never licence to change what is checked.
+            valid, invalid_reason = assertions_unchanged(target_original, fixed_content)
         # Guards built for test-adaptation-agent, evaluated here but never acting.
         # They are about to become load-bearing for edits far larger than a
         # locator, and the cheapest place to find out that one of them is wrong is
@@ -2695,8 +2919,18 @@ def main():
             # The edit helped nobody — put the file back exactly as it was.
             log(f"  ❌ Fix failed every test in the cluster ({cluster.size})")
             for member_name, member_output, member in unchanged:
-                log(f"     {member_name.rsplit('.', 1)[-1]} still fails on the same "
-                    f"element: {failure_identity.describe(failure_identity.identify(member_output))}")
+                short = member_name.rsplit('.', 1)[-1]
+                now = failure_identity.identify(member_output)
+                if not failure_identity.of_issue(member).get("available"):
+                    log(f"     {short} now stops at {failure_identity.describe(now)}, "
+                        f"but the failure it started from could not be identified — "
+                        f"with nothing to compare, the edit is treated as not helping")
+                elif not now.get("available"):
+                    log(f"     {short} still fails, and this run's failure could "
+                        f"not be identified — the edit is treated as not helping")
+                else:
+                    log(f"     {short} still fails on the same element: "
+                        f"{failure_identity.describe(now)}")
             try:
                 target_file.write_text(target_original, encoding="utf-8")
                 invalidate_file(target_file)
@@ -2851,7 +3085,10 @@ def main():
             f"next locator — this attempt is not charged to the retry budget "
             f"({stuck}/{RETRY_COUNT} with no progress)")
     _tests_fixed = sum(len(f.get("test_names") or [f.get("test_name")]) for f in fixes)
-    log(f"Gate: .fix-passed = {gate} ({len(fixes)} edit(s) → {_tests_fixed} test(s) verified, "
+    # Every edit behind the verified tests, including the ones earlier attempts
+    # kept on the way there.
+    edits_made = len(fixes) + sum(len(_kept_for(f, prev_history)) for f in fixes)
+    log(f"Gate: .fix-passed = {gate} ({edits_made} edit(s) → {_tests_fixed} test(s) verified, "
         f"{len(unverified_fixes)} unverified, {len(failed_fixes)} failed)")
 
     # Write JSON
@@ -2885,7 +3122,9 @@ def main():
         # way `fixes` is. run.sh reads the verdict this produces, not the count.
         "stuck_attempts": stuck,
         # How much rework clustering avoided: one edit can green several tests.
-        "distinct_fixes":     len(fixes),
+        # And the other way round: a chain of broken locators takes several edits
+        # to green one test, all but the last of them kept by earlier attempts.
+        "distinct_fixes":     edits_made,
         "distinct_unverified": len(unverified_fixes),
         "pr_branch":      pr_branch,
         "baselines_committed": committed_baselines,
@@ -2899,6 +3138,7 @@ def main():
     # was incidental — buried inside the next prompt's prev_test_output. Keep a
     # compact, append-only history so "what did fix 1 change?" stays answerable.
     result["attempts"] = _attempt_history(result)
+    attach_kept_edits(result)
 
     json_path = AUDIT_DIR / "01-fix.json"
     json_path.write_text(json.dumps(result, indent=2, default=str))
@@ -2910,7 +3150,7 @@ def main():
         "",
         f"**Build Tag:** {build_tag}  ",
         f"**Attempt:** {FIX_ATTEMPT}  ",
-        f"**Eligible tests:** {len(eligible)} | **Distinct locator fixes:** {len(fixes)} | "
+        f"**Eligible tests:** {len(eligible)} | **Distinct locator fixes:** {edits_made} | "
         f"**Tests verified:** {tests_fixed} | "
         f"**Applied but unverified:** {tests_unverified} | **Failed:** {len(failed_fixes)}  ",
         f"**Gate:** `{gate}`  ",
@@ -2957,6 +3197,15 @@ def main():
             f"- **File:** `{f.get('target_file') or f.get('test_file') or '(unknown)'}`",
             f"- **Root Cause:** {f.get('root_cause') or '(not recorded)'}",
             f"- **Fix:** {f.get('fix_description', '')}{dom}",
+            *([f"- **Review:** read by an assertion (`{f['assertion_site']}`) — "
+               f"confirm the repaired locator is the same element"]
+              if f.get("assertion_site") else []),
+            *([f"- **Kept from earlier attempts** — {len(f['earlier_edits'])} edit(s) "
+               f"this test also needed:"]
+              + [f"  - attempt {e.get('attempt')}: {e.get('fix_description') or '(no description)'} "
+                 f"(`{Path(e['target_file']).name if e.get('target_file') else 'unknown file'}`)"
+                 for e in f["earlier_edits"]]
+              if f.get("earlier_edits") else []),
             "",
             "```diff",
             (f.get("fix_diff") or "")[:2000] or "(no diff)",
@@ -2989,7 +3238,7 @@ def main():
             md_lines.append("")
 
     (AUDIT_DIR / "01-fix.md").write_text("\n".join(md_lines) + "\n")
-    log(f"Done — {len(fixes)} edit(s) fixed {tests_fixed} test(s), "
+    log(f"Done — {edits_made} edit(s) fixed {tests_fixed} test(s), "
         f"{tests_unverified} unverified, {len(failed_fixes)} failed")
 
 

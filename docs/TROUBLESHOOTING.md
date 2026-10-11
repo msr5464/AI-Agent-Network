@@ -194,7 +194,8 @@ often uncovers the next. The loop stops after `HEALING_RETRY_COUNT` attempts in 
 row with *no* progress, or `HEALING_MAX_ATTEMPTS` in total; each retry gets the
 previous failure. To debug:
 1. `01-locate.md` — what the deterministic engine proposed, or why it refused
-   (no baseline, not a locator, ambiguous, already tried, …).
+   (no baseline, no fingerprint for that locator, not a locator, ambiguous,
+   reverted, …).
 2. `01-fix.md` and the `claude-*.log` for the attempt — what was applied and why.
 
 ### PR not created after a successful fix

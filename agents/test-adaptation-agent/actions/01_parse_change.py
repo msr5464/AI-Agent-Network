@@ -277,7 +277,8 @@ def main():
     destructive = looks_destructive(outcome)
     if destructive:
         log(f"Expected outcome is destructive ('{destructive}') — exploration will "
-            f"stop before the final action and the edit will be marked escalate")
+            f"stop before the final action unless the environment is asserted to "
+            f"be a sandbox (ADAPTATION_SANDBOX with ADAPTATION_SANDBOX_NOTE)")
 
     plan = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

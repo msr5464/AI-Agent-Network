@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import tempfile
 import threading
 from pathlib import Path
@@ -135,10 +136,16 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
      "description": "Branch name is <prefix>/<module>-<timestamp>.",
      "type": "text", "category": "adaptation", "default": "adaptation", "sensitive": False},
     {"key": "adaptation_sandbox", "env_var": "ADAPTATION_SANDBOX", "label": "Sandbox Environment",
-     "description": "Assert the target environment is disposable, allowing "
-                    "exploration to walk a destructive final step. Requires "
-                    "ADAPTATION_SANDBOX_NOTE, which is reproduced in the PR body.",
+     "description": "Assert the target environment is disposable. Exploration then "
+                    "completes the flow it is given — its final action included, and "
+                    "controls whose names read as destructive (buy, pay, delete). "
+                    "Ignored while Sandbox Reason is empty.",
      "type": "boolean", "category": "adaptation", "default": False, "sensitive": False},
+    {"key": "adaptation_sandbox_note", "env_var": "ADAPTATION_SANDBOX_NOTE",
+     "label": "Sandbox Reason",
+     "description": "Why the environment is disposable, in one line. Required for "
+                    "Sandbox Environment to take effect, and reproduced in the PR body.",
+     "type": "text", "category": "adaptation", "default": "", "sensitive": False},
 
     # ── Common ───────────────────────────────────────────────────────────────
     {
@@ -886,7 +893,7 @@ def _update_env_file(updates: Dict[str, str]) -> None:
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
         if m and m.group(1) in remaining:
             env_var = m.group(1)
-            lines[i] = f"{env_var}={remaining.pop(env_var)}\n"
+            lines[i] = _env_line(env_var, remaining.pop(env_var))
 
     # Pass 2: append keys the file does not declare yet
     if remaining:
@@ -894,9 +901,25 @@ def _update_env_file(updates: Dict[str, str]) -> None:
             lines[-1] += "\n"
         lines.append("\n# --- Settings updated via Admin UI ---\n")
         for env_var, val in remaining.items():
-            lines.append(f"{env_var}={val}\n")
+            lines.append(_env_line(env_var, val))
 
     _atomic_write("".join(lines))
+
+
+def _env_line(env_var: str, value: str) -> str:
+    """One `KEY=value` line the shell reads back as exactly `value`.
+
+    shared/load_env.sh sources this file, so a value with a space in it —
+    a sentence, a command line — written bare is an assignment followed by a
+    command, and every run.sh stops on the "command not found". A plain token
+    is left as it is, so existing lines do not change.
+    """
+    return f"{env_var}={value if _BARE_VALUE.fullmatch(value) else shlex.quote(value)}\n"
+
+
+# What the shell reads unchanged with no quotes. `#` is in it: after the `=` it
+# is mid-word, not a comment, and channel names are written that way today.
+_BARE_VALUE = re.compile(r"[A-Za-z0-9_@%+=:,./#-]*")
 
 
 def _atomic_write(text: str) -> None:

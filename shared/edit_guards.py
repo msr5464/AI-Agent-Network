@@ -20,8 +20,9 @@ import difflib
 import re
 from typing import Iterable
 
-from shared.code_analyzer import split_class_members
+from shared.code_analyzer import split_class_members, without_comments
 from shared.dom_snapshot import selector_visibility
+from shared.page_identity import extract_locators as _extract_locators
 from shared.page_identity import normalize_selector as _normalize_selector
 
 # How large a diff may be before it stops looking like a targeted edit. The
@@ -342,10 +343,64 @@ def _acted_on_as_one(line: str, original: str) -> bool:
     return not (field and field.group(1) in {m.group(1) for m in _LIST_USE.finditer(original)})
 
 
+def _still_declared(selector: str, source: str) -> bool:
+    """Whether the file still declares this selector, however it spells it.
+
+    A runtime selector is not always a literal in the source. A locator inside an
+    iframe is reported as one chain of hops and declared as several calls, so a
+    substring test called every such selector "no longer in the file" — and the
+    rule below then set the failure capture aside for exactly the locators it was
+    captured for.
+    """
+    if selector in source:
+        return True
+    wanted = _normalize_selector(selector) or selector
+    for declared in _extract_locators(source):
+        raw = declared.get("raw") or ""
+        if raw == selector or (declared.get("selector") or raw) == wanted:
+            return True
+    return False
+
+
+def assertions_unchanged(original: str, updated: str) -> tuple:
+    """A locator fix changes how an element is found, never what is asserted.
+
+    Returns (ok, reason). Every assertion call in the file is compared before and
+    after, as written: an edit that alters an expected value, swaps what is
+    compared, or adds or drops a check has changed what the test verifies, and
+    the test passing afterwards proves nothing about the application.
+
+    Page-load assertions are left to the rules that already govern them — their
+    anchor is how a page is recognised, and a stale one is a locator to repair.
+    """
+    from shared.assertion_graph import asserts_in
+    from shared.frameworks import get_active_plugin
+    page_loads = set(get_active_plugin().code.PAGE_LOAD_ASSERTIONS)
+
+    def calls(text: str) -> list:
+        return [(a["callee"], " ".join((a.get("args") or "").split()))
+                for a in asserts_in(without_comments(text), "")
+                if a["callee"].split(".")[-1] not in page_loads]
+
+    before, after = calls(original), calls(updated)
+    if before == after:
+        return True, ""
+    if len(before) != len(after):
+        return False, (f"the edit {'adds' if len(after) > len(before) else 'removes'} "
+                       f"an assertion ({len(before)} before, {len(after)} after) — a "
+                       f"locator fix may change how an element is found, never what "
+                       f"the test verifies")
+    was, now = next((b, a) for b, a in zip(before, after) if b != a)
+    return False, (f"the edit changes an assertion: {was[0]}({_condense(was[1], 70)}) "
+                   f"became {now[0]}({_condense(now[1], 70)}) — a locator fix may "
+                   f"change how an element is found, never what the test verifies")
+
+
 def validate_diagnosis_fit(original: str, updated: str, verdict: str,
                            snapshot_soup=None, fingerprints=None,
                            require_unique: bool = False,
-                           failing_selector: str = "") -> tuple:
+                           failing_selector: str = "",
+                           declaring_source: str = "") -> tuple:
     """Reject an edit that does not match what the diagnosis actually found.
 
     Returns (ok, reason). Runs before the test does, so a fix that could only
@@ -362,6 +417,11 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
     `failing_selector` is the selector the capture was taken for. Supplying it is
     what lets the snapshot rules tell "this replacement is a guess" from "this
     capture is no longer about the failure in front of us".
+
+    `declaring_source` is the source of the page objects the failure is about,
+    when the edit may be to a different file. A selector absent from the file
+    being edited has not necessarily been repaired: the edit may simply be aimed
+    at another page, and then the capture is still exactly the failure in hand.
     """
     # A capture is evidence only for the failure it was captured for. When the
     # selector that failed is no longer in the file, an earlier edit already
@@ -370,7 +430,9 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
     # rule 3 rejects correct fixes as guesses. Unevaluable is not absent: drop
     # the capture rather than rule against it, and let the test run decide.
     if (failing_selector and snapshot_soup is not None
-            and failing_selector not in original):
+            and not _still_declared(failing_selector, original)
+            and not (declaring_source
+                     and _still_declared(failing_selector, declaring_source))):
         snapshot_soup, fingerprints = None, None
 
     changed = [line for line in difflib.unified_diff(

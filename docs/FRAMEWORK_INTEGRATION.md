@@ -98,6 +98,20 @@ The hardest part: parse and generate this repo's locator code.
   guards read selectors out of added lines through these.
 - `RAW_DRIVER_CALLS` — `(pattern, label)` pairs for calls that bypass the repo's
   wrappers; an edit that adds one is rejected.
+- `imports_for(snippet)` — the fully-qualified types a snippet from `emit_locator`
+  needs imported. A repair is written into a file that compiles and has to leave
+  it compiling; an option object or an enum the file never imported turns a
+  correct locator into a build failure.
+- `extract_locators` must read back every shape `emit_locator` can write,
+  including a builder at the end of an iframe chain, and `normalize_selector`
+  must bring the runtime's form of a builder to the form the declaration reads
+  as. A locator the plugin can write and not read stops being one of its page
+  object's locators the moment it is repaired.
+- `PAGE_LOAD_ASSERTIONS` — the calls that assert a PAGE has loaded by waiting for
+  an anchor element. A locator read by any other assertion is repaired only on
+  proof that the replacement is the same element; an anchor is how a page is
+  recognised, so a stale one is repaired like any other locator. Leave it empty
+  and every anchor is treated as a value the test checks.
 
 `tests/unit/test_frameworks.py` enforces most of the above for every registered
 plugin. Add yours to the parametrisation and it is checked automatically.
@@ -202,7 +216,7 @@ repo, whatever the framework. Missing ones degrade a feature rather than break a
 | Assertions through a helper, with the message as the last argument (e.g. `AssertHelper.*`) | tests and helpers | `shared/assertion_graph.py` — what a test proves, and whether an edit weakened it |
 | Per-environment properties `parameters/{environment}-{country}.properties` | `src/main/resources/` | Authoring writes URL and credential keys there instead of hard-coding them |
 | Element fingerprint script `locator-capture.js` | `src/main/resources/` | The healing Locate engine (`shared/locator_capture.py`) |
-| Page baselines, written on each successful page load (`baselineDir` in `config.properties`) | `src/main/resources/baselines/` by default | Diagnosis and Locate (`shared/baseline.py`); committed by the ship steps and `scripts/commit_baselines.py` |
+| Page baselines, written on each successful page load (`baselineDir` in `config.properties`). Per page object: `coverage` (locator counts as the page loaded), `fingerprints` (taken at load, and at a locator's first successful use when the load missed it), `selectors` (the locator each field held), `lastSeen`. A promotion must keep a fingerprint the new record lacks while the field's locator is unchanged, and the `healHistory` the healing agent writes | `src/main/resources/baselines/` by default | Diagnosis and Locate (`shared/baseline.py`); committed by the ship steps and `scripts/commit_baselines.py` |
 | Authored intent contracts (optional) | `src/test/resources/intents/` | Adaptation (`shared/intent.py`); derived from source when absent |
 
 `Playwright-Automation-Framework` has all of these and is the reference target.

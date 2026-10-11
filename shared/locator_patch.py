@@ -53,6 +53,51 @@ def declaration_edit(source: str, field: str, new_expression: str) -> tuple[Opti
             "new_string": match.group("lead") + new_expression}, ""
 
 
+_IMPORT_LINE = re.compile(r"^import\s+(?:static\s+)?([\w.]+(?:\.\*)?)\s*;[ \t]*$", re.M)
+_PACKAGE_LINE = re.compile(r"^package\s+[\w.]+\s*;[ \t]*$", re.M)
+
+
+def import_edit(source: str, expression: str) -> Optional[dict]:
+    """An edit adding the imports `expression` needs and the file lacks, or None.
+
+    A located answer is written into a file that compiles. A builder with an
+    option object, or a role, names a type that a page object made of plain
+    locator fields never imported — and the answer then failed its verification
+    run on a build error, which reads downstream as "the test still fails" and
+    reverts a locator that was right.
+    """
+    from shared.frameworks import get_active_plugin
+    needed = get_active_plugin().code.imports_for(expression)
+    if not needed:
+        return None
+    lines = list(_IMPORT_LINE.finditer(source or ""))
+    present = {m.group(1) for m in lines}
+    missing = [name for name in needed
+               if name not in present and name.rsplit(".", 1)[0] + ".*" not in present]
+    if not missing:
+        return None
+    added = "\n".join(f"import {name};" for name in missing)
+    if lines:
+        # Beside the imports it belongs with, where the file has some.
+        family = ".".join(missing[0].split(".")[:3])
+        anchor = next((m for m in reversed(lines) if m.group(1).startswith(family)),
+                      lines[-1]).group(0)
+        return {"old_string": anchor, "new_string": f"{anchor}\n{added}"}
+    package = _PACKAGE_LINE.search(source or "")
+    if not package:
+        return None
+    return {"old_string": package.group(0), "new_string": f"{package.group(0)}\n\n{added}"}
+
+
+def edits_for(source: str, field: str, new_expression: str) -> tuple[list, str]:
+    """Every edit one located answer needs: the declaration, and its imports."""
+    edit, error = declaration_edit(source, field, new_expression)
+    if edit is None:
+        return [], error
+    imports = import_edit(source, new_expression)
+    return [edit] + ([imports] if imports else []), ""
+
+
 def apply_to_source(source: str, field: str, new_expression: str) -> tuple[Optional[str], str]:
     """Rewrite one field, through the same guards as any other autofix.
 
@@ -60,10 +105,10 @@ def apply_to_source(source: str, field: str, new_expression: str) -> tuple[Optio
     scope when it cannot find anything better, and a broader selector is how a
     wrong-page failure gets papered over into a pass.
     """
-    edit, error = declaration_edit(source, field, new_expression)
-    if edit is None:
+    edits, error = edits_for(source, field, new_expression)
+    if not edits:
         return None, error
-    updated, error = edit_guards.apply_edits(source, [edit])
+    updated, error = edit_guards.apply_edits(source, edits)
     if updated is None:
         return None, error
     ok, reason = edit_guards.no_selector_broadening(source, updated)

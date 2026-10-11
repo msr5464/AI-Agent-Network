@@ -101,6 +101,27 @@ def tests_in(entry: dict) -> list:
     return entry.get("test_names") or [entry.get("test_name", "unknown")]
 
 
+def edit_count(fixes: list) -> int:
+    """Every edit behind these fixes: the one that greened each test, plus the
+    ones earlier attempts kept on the way there."""
+    return len(fixes) + sum(len(f.get("earlier_edits") or []) for f in fixes)
+
+
+def earlier_edit_lines(entry: dict, indent: str = "  ") -> list:
+    """One line per edit an earlier attempt kept for this test.
+
+    A chain of broken locators is repaired one per attempt, and the record of a
+    fixed test holds only the edit that finally greened it. Without these lines a
+    PR whose diff changes three page objects describes one of them.
+    """
+    lines = []
+    for edit in entry.get("earlier_edits") or []:
+        target = Path(edit["target_file"]).name if edit.get("target_file") else "unknown file"
+        lines.append(f"{indent}- ↳ kept from attempt {edit.get('attempt')}: "
+                     f"{edit.get('fix_description') or '(no description)'} (`{target}`)")
+    return lines
+
+
 def short_name(test_name: str) -> str:
     """Return the simple class.method portion of a fully-qualified test name."""
     parts = test_name.split(".")
@@ -192,6 +213,14 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
                 f"{evidence_links(f)}")
         for name in names[1:]:
             line += f"\n  - ✅ `{short_name(name)}`"
+        # Repaired on proof from the recorded fingerprint, and still the one kind
+        # of fix a reviewer should look at: the test passing says the check is
+        # satisfied, not that it is satisfied by the element it was written for.
+        if f.get("assertion_site"):
+            line += (f"\n  - 👀 read by an assertion (`{f['assertion_site']}`) — "
+                     f"confirm the repaired locator is the same element")
+        for extra in earlier_edit_lines(f):
+            line += f"\n{extra}"
         return line
 
     fixed_lines = "\n".join(fixed_line(f) for f in fixes) or "_(none)_"
@@ -215,7 +244,8 @@ executed**. Review and run them manually before merging.
 
     # Failed tests section
     if failed_fixes:
-        failed_lines = "\n".join(_failed_pr_line(f) for f in failed_fixes)
+        failed_lines = "\n".join(
+            "\n".join([_failed_pr_line(f)] + earlier_edit_lines(f)) for f in failed_fixes)
         needs_manual = f"""
 ### ❌ Needs Manual Fix ({len(failed_fixes)})
 
@@ -237,11 +267,15 @@ executed**. Review and run them manually before merging.
 
     status_tag = "NEEDS-REVIEW" if (failed_fixes or unverified_fixes) else "PASSED"
     status_summary = (f"{n_fixed}/{total} failing tests verified and passing locally "
-                      f"({len(fixes)} locator edit(s))."
+                      f"({edit_count(fixes)} locator edit(s))."
                       if not (failed_fixes or unverified_fixes)
                       else f"{n_fixed}/{total} failing tests fixed; manual review needed.")
 
     all_files = {target_name(f) for f in (fixes + unverified_fixes + failed_fixes) if target_name(f) != "unknown file"}
+    # ...and the files earlier attempts changed and kept, which are in the diff too.
+    all_files |= {Path(edit["target_file"]).name
+                  for f in (fixes + unverified_fixes + failed_fixes)
+                  for edit in (f.get("earlier_edits") or []) if edit.get("target_file")}
     files_changed_count = len(all_files) or len(fixes)
 
     # A heal is exactly what makes the committed fingerprint stale, so the PR
@@ -372,8 +406,10 @@ def _build_slack_message(build_tag: str, fixes: list, unverified_fixes: list,
         lines.append(f":white_check_mark: *Fixed ({n_fixed}):*")
         for f in fixes[:8]:
             dom = " _(live-DOM confirmed)_" if f.get("dom_verified") else ""
+            kept = len(f.get("earlier_edits") or [])
+            more = f" _(+{kept} edit(s) kept from earlier attempts)_" if kept else ""
             lines.append(f"  • `{short_name(f.get('test_name', 'unknown'))}` — "
-                         f"{f.get('fix_description', '')}{dom}")
+                         f"{f.get('fix_description', '')}{dom}{more}")
         if n_fixed > 8:
             lines.append(f"  _...and {n_fixed - 8} more_")
         lines.append("")
@@ -496,10 +532,11 @@ def main():
         f"| Slack | {'Sent to ' + channel if slack_notified else 'Skipped'} |",
     ]
     if fixes:
-        md_lines += ["", f"## Fixed Tests (verified) — {len(fixes)} edit(s)", ""]
+        md_lines += ["", f"## Fixed Tests (verified) — {edit_count(fixes)} edit(s)", ""]
         for f in fixes:
             names = tests_in(f)
             md_lines.append(f"- ✅ `{short_name(names[0])}` — {f.get('fix_description', '')}")
+            md_lines += earlier_edit_lines(f)
             md_lines += [f"- ✅ `{short_name(n)}` — same edit" for n in names[1:]]
     if unverified_fixes:
         md_lines += ["", "## Applied but Not Verified", ""]
@@ -509,6 +546,7 @@ def main():
         md_lines += ["", "## Could Not Fix", ""]
         for f in failed_fixes:
             md_lines.append(f"- ❌ {_failed_pr_line(f)}")
+            md_lines += earlier_edit_lines(f)
 
     (AUDIT_DIR / "02-ship.md").write_text("\n".join(md_lines) + "\n")
 

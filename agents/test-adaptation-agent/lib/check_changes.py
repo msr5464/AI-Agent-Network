@@ -445,6 +445,14 @@ def validate(declared, graph: dict, files: dict, kind: str, listed: Dict[str, di
         check, new, relation = listed[cid], (), ""
         if action == "change":
             raw = entry.get("new_expected")
+            if not check["values"]:
+                # Nothing to change the value of: it compares expressions. The two
+                # refusals below sent a model back and forth between a value list
+                # that was too long and one that was "what it expects today".
+                return refuse(f"check {cid} lists no expected value, so there is "
+                              f"nothing to `change`. If your edit replaces the "
+                              f"assertion with a different one, declare `remove`: "
+                              f"the new assertion counts as an added check")
             if not isinstance(raw, list) or len(raw) != len(check["values"]):
                 return refuse(f"check {cid}: new_expected must list "
                               f"{len(check['values'])} value(s), in the order the "

@@ -125,6 +125,33 @@ def destructive_token(text: str) -> str:
     return match.group(0) if match else ""
 
 
+# What the explorer is told the checker flags. The checker reads a control's
+# name, not what the control does, so an explorer left to judge "would this
+# change data?" walks a navigation button called Checkout and has the whole run
+# thrown away afterwards. Told the words, it refuses up front and says which
+# control stopped it. `destructive_token` matches every entry here, and every
+# entry of DESTRUCTIVE is listed: a unit test holds both.
+DESTRUCTIVE_WORDS: Tuple[str, ...] = (
+    "delete", "remove", "deactivate", "terminate", "purchase", "buy", "pay",
+    "payment", "transfer", "withdraw", "publish", "archive", "revoke", "refund",
+    "unsubscribe", "wipe", "destroy", "reset", "disable", "checkout", "check out",
+    "place order", "submit payment", "confirm & pay", "confirm and pay",
+    "send invite", "close account", "cancel subscription",
+)
+
+
+# What to do about a walk the rule above stopped, for the messages that report one.
+SANDBOX_HINT = ("If this environment is disposable, turn on Sandbox Environment "
+                "(ADAPTATION_SANDBOX=true with ADAPTATION_SANDBOX_NOTE) and run again.")
+
+
+def violations_text(flow: Dict) -> str:
+    """`BUY NOW ('buy'), CHECKOUT ('checkout')` — the walked controls the checker
+    flagged, for a message a reader can act on."""
+    return ", ".join(f"{v.get('target') or 'step ' + str(v.get('index'))} "
+                     f"('{v.get('token')}')" for v in flow.get("violations") or [])
+
+
 def _digest(url: str, title: str, heading: str) -> str:
     raw = f"{url_shape(url)}|{(title or '').strip()}|{(heading or '').strip()}"
     return "sha1:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
@@ -251,6 +278,12 @@ def count_in_inventory(selector: str, elements: List[Dict]) -> Optional[int]:
     return None if matched is None else len(matched)
 
 
+def target_label(step: Dict) -> Optional[str]:
+    """The name a reader would know a step's control by."""
+    target = (step.get("action") or {}).get("target") or {}
+    return target.get("accessible_name") or target.get("name")
+
+
 def is_destructive(step: Dict) -> Optional[str]:
     """The destructive token a step's target matches, if any."""
     target = (step.get("action") or {}).get("target") or {}
@@ -270,6 +303,30 @@ def _json_tail_complete(kind: str, payload: str) -> bool:
         return False
 
 
+_VERB = re.compile(r"[a-z_]+")
+
+
+def _unmarked_step(line: str) -> Optional[Dict]:
+    """A FLOW_STEP's object on a line of its own with no marker, or None.
+
+    Only the shape a step has: an integer index and an action with one verb. The
+    rules' own example, echoed back, lists its verbs as alternatives and is not one.
+    """
+    text = line.strip("`* \t,")
+    if not text.startswith("{"):
+        return None
+    try:
+        step = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(step, dict) or not isinstance(step.get("index"), int) \
+            or isinstance(step.get("index"), bool):
+        return None
+    action = step.get("action")
+    verb = action.get("verb") if isinstance(action, dict) else None
+    return step if isinstance(verb, str) and _VERB.fullmatch(verb) else None
+
+
 def parse_markers(stdout: str) -> Dict:
     """Every marker in an exploration's stdout, in the order it was emitted.
 
@@ -284,6 +341,7 @@ def parse_markers(stdout: str) -> Dict:
     }
     inventories: Dict[str, List[Dict]] = {}
     page_enters: Dict[str, Dict] = {}
+    unmarked: List[Dict] = []
 
     lines = (stdout or "").splitlines()
     position = 0
@@ -294,6 +352,12 @@ def parse_markers(stdout: str) -> Dict:
         # **FLOW_STEP:** `{...}`, and a walk with verified selectors parsed as empty.
         match = _MARKER.match(line.strip("`* \t"))
         if not match:
+            # So is a step written as the bare object. A walk put every one of its
+            # steps in one fenced block at the end, each complete on its own line
+            # and none with `FLOW_STEP:` before it, and the whole walk read as empty.
+            step = _unmarked_step(line)
+            if step is not None:
+                unmarked.append(step)
             continue
         kind, payload = match.group(1), match.group(2).strip("`* \t")
         # So is pretty-printed JSON. Every page of an observed run had its PAGE_STATE
@@ -348,6 +412,11 @@ def parse_markers(stdout: str) -> Dict:
         key = step.get("index") if isinstance(step.get("index"), int) else id(step)
         by_index.pop(key, None)
         by_index[key] = step
+    # An unmarked object fills an index no marked step has, and never replaces one:
+    # a recap after a walk that did mark its steps is the recap, not the record.
+    recap: Dict = {step["index"]: step for step in unmarked}
+    by_index.update({index: step for index, step in recap.items()
+                     if index not in by_index})
     flow["steps"] = list(by_index.values())
 
     for page_id, enter in page_enters.items():
@@ -432,6 +501,101 @@ def clicks_named(rows: List[Dict], name: str) -> List[Dict]:
     return sorted(best.values(), key=lambda c: -c["shared"])
 
 
+# How many unreported actions a report lists before it counts the rest.
+UNREPORTED_SHOWN = 12
+
+
+def recorded_actions(rows: List[Dict]) -> List[Dict]:
+    """Every click and keystroke the helpers recorded, in order, one per control.
+
+    [{"kind": "click" | "fill", "sel", "text", "uid", "total", "visible", "page"}].
+    The model has no part in this record: the helpers write a row the moment the
+    browser dispatches the event, so it holds what a step list can leave out.
+    Rows that follow one another on the same control are one action — a field
+    writes a row per change. So is a field's change row arriving late with the
+    value it already had: a field reports its change when focus leaves it, which
+    can be several steps after the typing. A password's value is never recorded,
+    so a later row on one is taken as that same typing. `page` is the state
+    measured next, when a step named it: the page the action led to, where its
+    FLOW_STEP is filed.
+    """
+    actions: List[Dict] = []
+    waiting: List[Dict] = []
+    previous: Optional[Dict] = None
+    holds: Dict = {}                  # control -> the value it was last given
+    for row in rows or []:
+        kind = ("click" if isinstance(row.get("clicked"), dict)
+                else "fill" if isinstance(row.get("typed"), dict) else "")
+        if not kind:
+            # An action belongs to the next state measured and to no later one.
+            for action in waiting:
+                action["page"] = row.get("page") or ""
+            waiting, previous = [], None
+            continue
+        raw = row.get("clicked") or row.get("typed")
+        control = raw.get("uid") or raw.get("sel")
+        if previous is not None and control \
+                and control == (previous.get("uid") or previous.get("sel")):
+            if kind == "click":
+                previous["kind"] = "click"
+            else:
+                holds[control] = raw.get("value")
+            continue
+        if kind == "fill" and control:
+            if control in holds and holds[control] == raw.get("value"):
+                continue
+            holds[control] = raw.get("value")
+        previous = {"kind": kind, "sel": raw.get("sel"), "text": raw.get("text") or "",
+                    "uid": raw.get("uid"), "total": raw.get("total"),
+                    "visible": raw.get("visible"), "page": ""}
+        actions.append(previous)
+        waiting.append(previous)
+    return actions
+
+
+def _counted_at(rows: List[Dict]) -> Dict[str, set]:
+    """{selector: the identities of the elements the helpers counted it at}."""
+    found: Dict[str, set] = {}
+    for row in rows or []:
+        for selector, counted in (row.get("checks") or {}).items():
+            if isinstance(counted, dict) and counted.get("uid"):
+                found.setdefault(selector, set()).add(counted["uid"])
+        for entry in row.get("known") or []:
+            if entry.get("selector") and entry.get("uid"):
+                found.setdefault(entry["selector"], set()).add(entry["uid"])
+    return found
+
+
+def _step_for(action: Dict, steps: List[Dict], counted_at: Dict[str, set]) -> Optional[Dict]:
+    """The reported step that used a recorded control: one with the same selector,
+    or one whose selector was counted at the same element under another spelling."""
+    for step in steps or []:
+        selector = ((step.get("action") or {}).get("target") or {}).get("selector") or ""
+        if selector and (selector == action.get("sel")
+                         or (action.get("uid") and action["uid"] in counted_at.get(selector, ()))):
+            return step
+    return None
+
+
+def unreported_actions(flow: Dict, rows: List[Dict]) -> List[Dict]:
+    """What the browser recorded being done that no reported step accounts for.
+
+    [{"kind", "name", "selector", "page"}], in the order it happened. Only an
+    action on exactly one visible element is listed: the hidden input behind a
+    label fires its own click when the label is clicked, and is not a second
+    action. These are shown to a reader and are not steps — an explorer also
+    clicks to look around, and a step is what an edit may be justified by.
+    """
+    counted_at = _counted_at(rows)
+    steps = flow.get("steps") or []
+    return [{"kind": action["kind"],
+             "name": action["text"] or frames.split(action["sel"])[1],
+             "selector": action["sel"], "page": action["page"]}
+            for action in recorded_actions(rows)
+            if action.get("sel") and action.get("total") == 1 and action.get("visible") == 1
+            and _step_for(action, steps, counted_at) is None]
+
+
 def apply_evidence(flow: Dict, rows: List[Dict]) -> Dict:
     """Fold what the browser helpers measured into a parsed flow map.
 
@@ -457,12 +621,32 @@ def apply_evidence(flow: Dict, rows: List[Dict]) -> Dict:
     pages = flow.setdefault("pages", {})
     live = flow.setdefault("_live", {})
     known = flow.setdefault("_known", {})
+    # The order the walk first reached each page, from rows a step named. A row
+    # placed by URL is left out: where several pages share one URL it cannot say
+    # which of them it saw.
+    order = flow.setdefault("_page_order", [])
     by_url = {page.get("url"): pid for pid, page in pages.items() if page.get("url")}
     grown = set()
+    # Clicks and keystrokes since the last measured state, each on exactly one
+    # visible element. The helpers count a control at the moment it is used, which
+    # is the only time some can be counted: a tab, a close icon or the button that
+    # opens the next screen is gone by the time the step's own count is taken, and
+    # read 0 there although the selector had been unique.
+    acted: List[Dict] = []
     for row in rows:
+        action = row.get("clicked") or row.get("typed")
+        if isinstance(action, dict):
+            if action.get("sel") and action.get("total") == 1 \
+                    and action.get("visible") == 1:
+                acted.append(action)
+            continue
+        # An action belongs to the next state measured and to no later one.
+        used, acted = acted, []
         page_id = row.get("page") or by_url.get(row.get("url"))
         if not page_id:
             continue
+        if row.get("page") and page_id not in order:
+            order.append(page_id)
         if page_id not in pages:
             pages[page_id] = facts_from_markers(
                 {"id": page_id, "url": row.get("url", ""), "title": ""}, [])
@@ -481,6 +665,10 @@ def apply_evidence(flow: Dict, rows: List[Dict]) -> Dict:
             known[page_id] = _merge_known(known.get(page_id), row["known"])
             measured +=[(e["selector"], {"total": e["total"], "visible": e.get("visible")})
                          for e in row["known"] if e.get("selector") and "total" in e]
+        # Filed under the page the step named — the one it lands on, which is where
+        # its FLOW_STEP is filed too. A row placed by URL names no step's page.
+        if row.get("page"):
+            measured += [(a["sel"], {"total": 1, "visible": 1}) for a in used]
         for selector, counted in measured:
             # One page, several states: a selector unique in one of them is
             # unique, so a later state where it is gone never overwrites that.
@@ -546,12 +734,24 @@ def verify_selectors(flow: Dict) -> Dict:
     return flow
 
 
-def detect_refusals(flow: Dict) -> Dict:
+def detect_refusals(flow: Dict, sandbox: bool = False,
+                    rows: Optional[List[Dict]] = None) -> Dict:
     """Mark destructive steps, and catch the ones that were not refused.
 
     A refusal is a normal outcome. A destructive action that *succeeded* is a
     protocol violation: the model did the thing it was told not to do, and the
     run's own evidence can no longer be trusted to be side-effect free.
+
+    `sandbox` — the operator asserted a disposable environment, so the explorer
+    was told to complete the flow. Walking a flagged control is then what it was
+    asked to do: the token stays on the step, and nothing is a violation.
+
+    `rows` — what the browser helpers recorded. The step list is the model's own
+    account, and a click it leaves out was never checked: a walk clicked through
+    to a completed payment, reported no step, and read as empty rather than
+    unsafe. So every recorded click is judged too, by the text of the control it
+    landed on, whatever a step says about it — unreported, reported as refused,
+    or reported as only looked at.
     """
     violations = []
     for step in flow.get("steps") or []:
@@ -563,22 +763,41 @@ def detect_refusals(flow: Dict) -> Dict:
         # control stays visible in the flow map — it just is not a violation.
         if ((step.get("action") or {}).get("verb") or "").strip().lower() in READ_ONLY_VERBS:
             continue
-        if (step["result"].get("outcome") or "") == "ok":
+        if (step["result"].get("outcome") or "") == "ok" and not sandbox:
             violations.append({"index": step.get("index"), "token": token,
-                               "target": ((step.get("action") or {})
-                                          .get("target") or {}).get("accessible_name")})
+                               "target": target_label(step)})
+    if rows and not sandbox:
+        counted_at = _counted_at(rows)
+        caught = {v["index"] for v in violations}
+        seen = set()
+        for action in recorded_actions(rows):
+            token = destructive_token(action["text"]) if action["kind"] == "click" else ""
+            step = _step_for(action, flow.get("steps") or [], counted_at) if token else None
+            index = step.get("index") if step else None
+            # Clicked twice is one finding; a step already caught is that finding.
+            key = index if step else action["text"].lower()
+            if not token or key in seen or (step and index in caught):
+                continue
+            seen.add(key)
+            violations.append({"index": index, "token": token,
+                               "target": action["text"], "recorded": True})
     flow["violations"] = violations
+    if sandbox:
+        flow["sandbox"] = True
     return flow
 
 
-def build(stdout: str, evidence: Optional[List[Dict]] = None) -> Dict:
+def build(stdout: str, evidence: Optional[List[Dict]] = None,
+          sandbox: bool = False) -> Dict:
     """The whole pipeline: markers in, verified ordered flow map out.
 
     `evidence` — the rows the browser helpers measured (read_evidence) — is
     folded in before identity and selector verification, so both use it.
     """
-    flow = apply_evidence(parse_markers(stdout), evidence or [])
-    flow = detect_refusals(verify_selectors(attach_identity(flow)))
+    rows = evidence or []
+    flow = verify_selectors(attach_identity(apply_evidence(parse_markers(stdout), rows)))
+    flow["unreported_actions"] = unreported_actions(flow, rows)
+    flow = detect_refusals(flow, sandbox, rows)
     flow["status"] = ("unsafe" if flow.get("violations")
                       else "partial" if flow.get("unreachable")
                       else "ok" if flow.get("steps") else "empty")
@@ -712,6 +931,30 @@ def describe(flow: Dict) -> str:
     if flow.get("violations"):
         lines += ["", "⚠️ **Destructive actions were performed, not refused** — "
                   "this run's evidence cannot be treated as side-effect free."]
+        for v in flow["violations"]:
+            named = f"{v.get('target') or '?'} (its name contains '{v.get('token')}')"
+            if not v.get("recorded"):
+                lines.append(f"- step {v.get('index')}: {named}")
+            elif v.get("index") is None:
+                lines.append(f"- {named} — clicked in the browser, not reported as a step")
+            else:
+                lines.append(f"- step {v['index']}: {named} — the browser recorded a "
+                             f"click on it, whatever the step says")
+    if flow.get("sandbox"):
+        walked = [s for s in flow.get("steps") or []
+                  if (s.get("result") or {}).get("destructive_token")
+                  and (s.get("result") or {}).get("outcome") == "ok"]
+        if walked:
+            lines += ["", "**Walked under the sandbox assertion:**"]
+            lines += [f"- step {s.get('index')}: {target_label(s) or '?'}"
+                      for s in walked]
+    unreported = flow.get("unreported_actions") or []
+    if unreported:
+        lines += ["", "**Done in the browser but not reported as a step:**"]
+        lines += [f"- {a['kind']}: {a['name']}" + (f" (on {a['page']})" if a.get("page") else "")
+                  for a in unreported[:UNREPORTED_SHOWN]]
+        if len(unreported) > UNREPORTED_SHOWN:
+            lines.append(f"- … {len(unreported) - UNREPORTED_SHOWN} more")
     return "\n".join(lines)
 
 
@@ -781,12 +1024,13 @@ def measure_page_objects(flow: Dict, page_objects: List[Dict]) -> Dict:
 
     inventories = flow.get("_inventories") or {}
     known = flow.get("_known") or {}
+    came_from = _came_from(flow.get("_page_order") or [], known)
     for page_id, page in (flow.get("pages") or {}).items():
         # The repo's own locators, counted on this page live: exact, where the
         # inventory reconstruction below is a sample ("zero means not observed").
         if known.get(page_id):
             page["page_objects"], page["best_page_object"] = _live_page_objects(
-                known[page_id])
+                known[page_id], known.get(came_from.get(page_id)))
             page["measured_sampled"] = False
             continue
         elements = inventories.get(page_id) or []
@@ -821,25 +1065,61 @@ def measure_page_objects(flow: Dict, page_objects: List[Dict]) -> Dict:
     return flow
 
 
-def _live_page_objects(entries: List[Dict]) -> Tuple[List[Dict], Optional[Dict]]:
+def _came_from(order: List[str], known: Dict[str, List[Dict]]) -> Dict[str, str]:
+    """For each page, the page the walk was on before it first reached it.
+
+    Only pages whose locators were counted can be compared against, so one the
+    helpers never measured is stepped over.
+    """
+    came_from, previous = {}, ""
+    for page_id in order:
+        if previous:
+            came_from[page_id] = previous
+        if known.get(page_id):
+            previous = page_id
+    return came_from
+
+
+def _locator_key(entry: Dict) -> tuple:
+    return (entry.get("owner"), entry.get("name"), entry.get("selector"))
+
+
+def _shown(entry: Dict) -> bool:
+    return bool(entry.get("visible", entry.get("total")))
+
+
+def _live_page_objects(entries: List[Dict],
+                       previous: Optional[List[Dict]] = None
+                       ) -> Tuple[List[Dict], Optional[Dict]]:
     """Rank page objects by how many of their locators resolve on a page, live.
 
     Broken locators (no match) are named, because which of an existing page
     object's locators stopped resolving is the question an adaptation run exists
     to answer. Those matching several are listed too, but as `several`, not as a
     fault: a page object's list locator (`.row`, counted) is meant to.
+
+    `previous` is the same count on the page the walk came from. A locator that
+    was already showing there says nothing about this page: a form left on screen
+    behind an overlay keeps every one of its locators, and by share alone it
+    outranks the page object of the overlay in front of it. So the first key is
+    how many locators *appeared* here, then the share that is showing.
     """
+    shown_before = {_locator_key(e) for e in previous or [] if _shown(e)}
     owners: Dict[str, Dict] = {}
     for entry in entries or []:
         owner = entry.get("owner") or "?"
         report = owners.setdefault(owner, {
             "name": owner, "path": entry.get("path", ""), "matched": 0,
-            "evaluable": 0, "broken": [], "several": []})
+            "evaluable": 0, "broken": [], "several": [], "appeared": 0, "shown": 0})
         if "total" not in entry:
             continue
         report["evaluable"] += 1
         if entry["total"] >= 1:
             report["matched"] += 1
+        if _shown(entry):
+            report["shown"] += 1
+            if _locator_key(entry) not in shown_before:
+                report["appeared"] += 1
         name = entry.get("name") or entry.get("selector") or "?"
         if entry["total"] == 0:
             report["broken"].append(name)
@@ -850,10 +1130,12 @@ def _live_page_objects(entries: List[Dict]) -> Tuple[List[Dict], Optional[Dict]]
         ratio = round(report["matched"] / report["evaluable"], 3) if report["evaluable"] else 0.0
         reports.append({**report, "total": report["evaluable"], "ratio": ratio,
                         "sampled": False, "live": True})
-    reports.sort(key=lambda r: (-r["ratio"], -r["matched"], r["name"]))
+    reports.sort(key=lambda r: (-r["appeared"],
+                                -(r["shown"] / r["evaluable"] if r["evaluable"] else 0.0),
+                                -r["ratio"], -r["matched"], r["name"]))
     best = next((r for r in reports if r["evaluable"] and r["matched"]), None)
     return reports, ({key: best[key] for key in ("name", "path", "matched", "evaluable",
-                                                 "ratio", "broken", "several",
+                                                 "ratio", "broken", "several", "appeared",
                                                  "sampled", "live")} if best else None)
 
 
@@ -866,7 +1148,9 @@ def describe_page_objects(flow: Dict) -> str:
             broken = ", ".join(best.get("broken") or [])
             rows.append(f"| `{page_id}` | `{best['name']}` | "
                         f"{best['matched']}/{best['evaluable']} locators resolve live"
-                        + (f"; broken: {broken}" if broken else "") + " |")
+                        + (f"; broken: {broken}" if broken else "")
+                        + (f"; {best['appeared']} first shown on this page"
+                           if best.get("appeared") else "") + " |")
         elif best:
             rows.append(f"| `{page_id}` | `{best['name']}` | "
                         f"{best['matched']}/{best['evaluable']} locators matched |")

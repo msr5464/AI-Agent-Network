@@ -185,7 +185,7 @@ def world(tmp_path):
 def _one(world, **overrides):
     mod = world["mod"]
     sources = overrides.pop("_sources", {"LoginPage": LOGIN_PAGE})
-    assertions = overrides.pop("_assertions", set())
+    assertions = overrides.pop("_assertions", {})
     issue = {"test_name": "automation.shop.ShopWebTest.loginAndVerifyProductsPage",
              "failed_selector": "#login-mukesh",
              "failure_url": "https://shop.example.com/",
@@ -194,8 +194,11 @@ def _one(world, **overrides):
              "stack_trace": "at automation.modules.shop.web.LoginPage.doLogin"
                             "(LoginPage.java:9)",
              "dom_snapshot": str(world["snapshot"])}
+    mode = overrides.pop("_mode", None)
     issue.update(overrides)
     cfg = mod.yaml.safe_load(mod.CONFIG_FILE.read_text())
+    if mode:
+        cfg["classify"]["heal_assertions"] = mode
     return mod.locate_one(issue, sources, assertions, cfg,
                           mod.Volatility(cfg), world["repo"])
 
@@ -237,10 +240,12 @@ class TestResolvingFromTheCapture:
         assert record["verdict"] != "HEALED"
         assert "new_expression" not in record
 
-    def test_a_locator_read_by_an_assertion_is_never_healed(self, world):
-        record = _one(world, _assertions={"loginButton"})
-        assert record["classification"] == "ASSERTION_LOCATOR"
-        assert "new_expression" not in record
+    def test_no_failing_selector_says_what_is_missing_not_what_it_means(self, world):
+        # An absent selector is a gap in the evidence. It used to be reported as
+        # "not a locator failure", two lines under a diagnosis of a stale locator.
+        record = _one(world, failed_selector="")
+        assert record["verdict"] == "SKIPPED"
+        assert record["reason"] == "no failing selector recorded — nothing to locate"
 
     def test_no_capture_is_a_refusal_not_a_crash(self, world):
         record = _one(world, dom_snapshot="")
@@ -254,6 +259,105 @@ class TestResolvingFromTheCapture:
             for n in range(3)]}
         path.write_text(json.dumps(record))
         assert _one(world)["classification"] == "UNSTABLE_LOCATOR"
+
+
+SEEN_BY = {"loginButton": 'assertElementVisible(config, loginButton, "Login")'}
+
+
+class TestALocatorAnAssertionReads:
+    """Repaired on proof, reported otherwise — never handed on to be guessed at.
+
+    Pointed at a different element, a presence check passes on anything visible,
+    and a caught regression becomes a green build. The fingerprint match does not
+    make that mistake, so its answer is accepted; when it has none, Fix must not
+    ask the model to pick one.
+    """
+
+    def test_it_is_repaired_when_the_fingerprint_proves_the_element(self, world):
+        record = _one(world, _assertions=SEEN_BY)
+        assert record["verdict"] == "HEALED"
+        assert record["new_locator"] == "[data-test='login-button']"
+        # Carried to the report, so a reviewer is pointed at the one kind of fix
+        # a passing test does not vouch for.
+        assert record["assertion_site"] == SEEN_BY["loginButton"]
+
+    def test_it_is_reported_when_nothing_proves_it(self, world, tmp_path):
+        record = _one(world, _assertions=SEEN_BY, dom_snapshot=str(
+            _capture(tmp_path, "gone", [USERNAME], "")))
+        assert record["verdict"] == "NO_HEAL"
+        assert record["classification"] == "ASSERTION_LOCATOR"
+        assert "could not be proven to be the same element" in record["reason"]
+        assert SEEN_BY["loginButton"] in record["reason"]
+        assert "new_expression" not in record
+        # What Locate actually concluded is kept, not overwritten.
+        assert record["unproven_as"] and record["unproven_as"] != "ASSERTION_LOCATOR"
+
+    def test_missing_evidence_is_not_proof_either(self, world):
+        record = _one(world, _assertions=SEEN_BY, dom_snapshot="")
+        assert record["classification"] == "ASSERTION_LOCATOR"
+        assert record["unproven_as"] == "NO_CAPTURE"
+
+    def test_configured_never_it_is_refused_before_anything_is_spent(self, world):
+        record = _one(world, _assertions=SEEN_BY, _mode="never")
+        assert record["classification"] == "ASSERTION_LOCATOR"
+        assert "never auto-healed" in record["reason"]
+        assert "new_expression" not in record
+
+    def test_configured_always_it_is_a_locator_like_any_other(self, world, tmp_path):
+        record = _one(world, _assertions=SEEN_BY, _mode="always", dom_snapshot=str(
+            _capture(tmp_path, "gone", [USERNAME], "")))
+        assert record["classification"] != "ASSERTION_LOCATOR"
+
+    def test_a_locator_nothing_asserts_on_is_untouched_by_the_rule(self, world, tmp_path):
+        record = _one(world, dom_snapshot=str(_capture(tmp_path, "gone", [USERNAME], "")))
+        assert record["classification"] != "ASSERTION_LOCATOR"
+        assert "assertion_site" not in record
+
+
+class TestWhyThereIsNothingToCompareAgainst:
+    """Three different gaps used to share one sentence, false for the commonest.
+
+    "It did not resolve on the last good run" was said of a locator the page-load
+    count showed matching, whose fingerprint had simply not been captured — a hole
+    in the baseline, reported as evidence about the element.
+    """
+
+    def _reason(self, world, coverage):
+        return world["mod"]._no_fingerprint_reason(
+            "CheckoutPage", "orderTotal", {"coverage": coverage})
+
+    def test_matched_but_never_fingerprinted_is_an_incomplete_baseline(self, world):
+        reason = self._reason(world, {"orderTotal": 1})
+        assert "matched 1 element(s) on the last good run" in reason
+        assert "the baseline is incomplete" in reason
+        assert "did not resolve" not in reason
+
+    def test_absent_at_load_and_never_used(self, world):
+        assert "matched nothing when the page loaded" in self._reason(
+            world, {"orderTotal": 0})
+
+    def test_not_evaluable_at_load(self, world):
+        assert "could not be evaluated when the page loaded" in self._reason(world, {})
+
+    def test_a_hole_in_a_baseline_is_not_counted_as_a_missing_baseline(
+            self, world, tmp_path):
+        # Both are missing evidence and both go to Fix, so the verdict is shared.
+        # The count is not: "no baseline" says no good run was recorded, and here
+        # one was.
+        path = tmp_path / "baselines" / "shop" / "LoginPage.json"
+        stored = json.loads(path.read_text())
+        del stored["fingerprints"]["loginButton"]
+        path.write_text(json.dumps(stored))
+        record = _one(world)
+        assert record["verdict"] == "NO_BASELINE"
+        assert record["classification"] == "NO_FINGERPRINT"
+        assert world["mod"]._counts([record]) == {"NO_FINGERPRINT": 1}
+
+    def test_no_recorded_run_at_all_keeps_the_plain_name(self, world, tmp_path):
+        (tmp_path / "baselines" / "shop" / "LoginPage.json").unlink()
+        record = _one(world)
+        assert record["verdict"] == "NO_BASELINE"
+        assert not record.get("classification")
 
 
 class TestOneLocatorIsResolvedOnce:
@@ -416,8 +520,48 @@ class TestWalkingTheChain:
         payload = json.loads((chain["audit"] / "01-locate.json").read_text())
         again = [r for r in payload["resolutions"]
                  if r["failed_selector"] == "#login-mukesh"]
-        assert again[0]["classification"] == "ALREADY_TRIED"
+        assert again[0]["classification"] == "REVERTED"
         assert again[0]["verdict"] != "HEALED"
+        assert payload["verdicts"] == {"REVERTED": 1}
+
+    def _reverted(self, chain, earlier):
+        (chain["audit"] / "01-locate.json").write_text(json.dumps({"resolutions": [dict(
+            {"test_name": f"automation.shop.ShopWebTest.{TESTS[0]}",
+             "failed_selector": "#login-mukesh"}, **earlier)]}))
+        fix_json = json.loads((chain["audit"] / "01-fix.json").read_text())
+        fix_json["failed_fixes"][0] = {
+            "test_name": f"automation.shop.ShopWebTest.{TESTS[0]}",
+            "status": "test_failed", "failed_selector": "#login-mukesh"}
+        (chain["audit"] / "01-fix.json").write_text(json.dumps(fix_json))
+        chain["mod"].main()
+        payload = json.loads((chain["audit"] / "01-locate.json").read_text())
+        return next(r for r in payload["resolutions"]
+                    if r["failed_selector"] == "#login-mukesh")
+
+    def test_the_refusal_names_the_locator_and_what_was_written_for_it(self, chain):
+        # It replaces the answer in the file. Naming neither, the only trace of a
+        # located-and-reverted repair was a truncated selector and "already tried".
+        record = self._reverted(chain, {
+            "verdict": "HEALED", "locator_id": "LoginPage#loginButton",
+            "page_object": "LoginPage", "field": "loginButton",
+            "new_expression": 'page.getByPlaceholder("Sign in")'})
+        assert record["locator_id"] == "LoginPage#loginButton"
+        assert record["field"] == "loginButton"
+        assert record["tried"] == 'page.getByPlaceholder("Sign in")'
+        assert 'page.getByPlaceholder("Sign in") was applied' in record["reason"]
+        assert "reverted" in record["reason"]
+
+    def test_an_answer_disproved_once_stays_disproved(self, chain):
+        # Two attempts on: the file holds the refusal, not the answer, so there
+        # is no HEALED record left to recognise the selector by. It was resolved
+        # afresh and the same failed answer offered a second time.
+        record = self._reverted(chain, {
+            "verdict": "NO_HEAL", "classification": "REVERTED",
+            "locator_id": "LoginPage#loginButton",
+            "tried": 'page.locator("#login-button")'})
+        assert record["classification"] == "REVERTED"
+        assert record["tried"] == 'page.locator("#login-button")'
+        assert "new_expression" not in record
 
     def test_a_baseline_written_during_the_repair_is_refused(self, chain, tmp_path):
         # A sibling test passing mid-run re-records the page object, so the
@@ -524,3 +668,127 @@ class TestNotEveryAnchorIsWorthHaving:
 
         issues = chain["mod"]._issues(handoff, {"failed_fixes": [reverted]})
         assert [i["failed_selector"] for i in issues] == ["#cart-link"]
+
+
+# ── An attribute the page rewrites is not something to anchor a repair on ─────
+
+CARD_PAGE = '''
+public class CardPage extends BasePage {
+    private final Locator expiryField;
+    private final Locator codeField;
+    public CardPage(Config config) {
+        expiryField = page.locator("#expiry");
+        codeField = page.locator("#code-mukesh");
+    }
+    public void pay(String expiry, String code) {
+        fillText(expiryField, expiry, "Expiry field");
+        fillText(codeField, code, "Security code field");
+    }
+}
+'''
+
+CARD_HTML = """<!-- qa-agent-network:dom-snapshot test="payByCard" \
+url="https://shop.example.com/pay" capturedAt="2026-09-23T16:09:03" fingerprints="{sidecar}" -->
+<!DOCTYPE html><html lang="en"><head><title>Pay</title></head>
+<body class=""><form>
+  <input id="number" type="tel" placeholder="1234 1234 1234 1234">
+  <input id="expiry" type="tel" placeholder="{expiry_hint}">
+  <input id="code" type="password" placeholder="123">
+</form></body></html>
+"""
+
+CARD_NUMBER = _el(1, "input", id="number", type="tel",
+                  placeholder="1234 1234 1234 1234", id_xpath="//*[@id='number']",
+                  attrs={"id": "number", "type": "tel",
+                         "placeholder": "1234 1234 1234 1234"})
+EXPIRY = _el(2, "input", id="expiry", type="tel", placeholder="MM/YY",
+             id_xpath="//*[@id='expiry']",
+             attrs={"id": "expiry", "type": "tel", "placeholder": "MM/YY"})
+CODE = _el(3, "input", id="code", type="password", placeholder="123",
+           id_xpath="//*[@id='code']",
+           attrs={"id": "code", "type": "password", "placeholder": "123"})
+
+
+@pytest.fixture
+def card(world, tmp_path):
+    """A card form whose security-code locator broke, and one to compare it with.
+
+    The page blanks the hint of whichever field has focus. At the failure the
+    test had just typed the expiry, so that is the field showing it.
+    """
+    (tmp_path / "baselines" / "shop" / "CardPage.json").write_text(json.dumps({
+        "pageObject": "CardPage", "module": "shop",
+        "recordedAt": "2026-09-01T10:00:00",
+        "urlShape": "https://shop.example.com/pay", "title": "Pay", "bodyClass": "",
+        "coverage": {"expiryField": 1, "codeField": 1}, "landmarks": [],
+        "fingerprints": {"expiryField": EXPIRY, "codeField": CODE},
+    }))
+
+    def run(expiry_hint):
+        focused = dict(EXPIRY, placeholder=expiry_hint,
+                       attrs=dict(EXPIRY["attrs"], placeholder=expiry_hint))
+        sidecar = tmp_path / "pay.fingerprints.json"
+        sidecar.write_text(json.dumps({"url": "https://shop.example.com/pay",
+                                       "elements": [CARD_NUMBER, focused, CODE]}))
+        snapshot = tmp_path / "pay.html"
+        snapshot.write_text(CARD_HTML.format(sidecar=sidecar, expiry_hint=expiry_hint))
+        return _one(
+            world, _sources={"CardPage": CARD_PAGE},
+            test_name="automation.shop.ShopWebTest.payByCard",
+            failed_selector="#code-mukesh",
+            failure_url="https://shop.example.com/pay",
+            error_message="Failed to enter data in element 'Security code field' "
+                          "with locator: Locator@#code-mukesh",
+            stack_trace="at automation.modules.shop.web.CardPage.pay(CardPage.java:11)",
+            dom_snapshot=str(snapshot))
+    return run
+
+
+class TestAnAttributeThePageRewrites:
+    """Proved unique is proved for one moment of the page.
+
+    `[placeholder='123']` matched exactly one field in the capture, was written
+    into the page object, and timed out on its first run: clearing the field
+    focuses it, the page blanks a focused field's hint, and the locator no
+    longer found what it had just found.
+    """
+
+    def test_a_hint_the_page_changed_on_a_neighbour_is_not_used(self, card):
+        record = card(expiry_hint="")
+        assert record["verdict"] == "HEALED"
+        assert record["strategy"] == "id"
+        assert record["new_locator"] == "#code"
+
+    def test_the_answer_says_what_it_passed_over_and_on_whose_evidence(self, card):
+        witness = card(expiry_hint="")["anchors_passed_over"]["placeholder"]
+        assert "expiryField still matches" in witness
+        assert "'MM/YY' on the last good run" in witness
+        assert "'' in the failure capture" in witness
+
+    def test_a_page_that_left_its_hints_alone_still_gets_the_readable_locator(self, card):
+        record = card(expiry_hint="MM/YY")
+        assert record["strategy"] == "placeholder"
+        assert record["new_locator"] == "[placeholder='123']"
+        assert "anchors_passed_over" not in record
+
+    def test_the_failing_field_is_never_its_own_witness(self, world):
+        # Its locator is the one that broke; what it holds now proves nothing
+        # about what the page does to a hint.
+        mod = world["mod"]
+        soup = mod.page_identity.parse(
+            CARD_HTML.format(sidecar="none", expiry_hint="MM/YY").replace(
+                'placeholder="123"', 'placeholder=""'))
+        declared = [{"name": "codeField", "selector": "#code"}]
+        assert mod._unsettled_anchors({"fingerprints": {"codeField": CODE}},
+                                      declared, "codeField", soup) == {}
+        assert "placeholder" in mod._unsettled_anchors(
+            {"fingerprints": {"codeField": CODE}}, declared, "otherField", soup)
+
+    def test_a_neighbour_that_no_longer_resolves_to_one_element_is_no_witness(self, world):
+        mod = world["mod"]
+        soup = mod.page_identity.parse(CARD_HTML.format(sidecar="none", expiry_hint=""))
+        stored = {"fingerprints": {"expiryField": EXPIRY}}
+        for selector in ("#gone", "input[type='tel']"):        # none, then two
+            assert mod._unsettled_anchors(
+                stored, [{"name": "expiryField", "selector": selector}],
+                "codeField", soup) == {}

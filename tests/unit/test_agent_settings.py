@@ -7,6 +7,7 @@ Covers the two behaviours the admin Agent Settings page depends on:
 """
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -94,6 +95,12 @@ class TestSchema:
         assert by_env["HEALING_BRANCH_PREFIX"]["default"] == "healing"
         assert by_env["ADAPTATION_BRANCH_PREFIX"]["default"] == "adaptation"
 
+    def test_the_sandbox_switch_has_its_reason_beside_it(self):
+        # The switch is ignored without a reason, and the reason had no field: the
+        # assertion could not be made from Settings at all.
+        envs = [f["env_var"] for f in agent_settings.SETTINGS_SCHEMA]
+        assert envs.index("ADAPTATION_SANDBOX_NOTE") == envs.index("ADAPTATION_SANDBOX") + 1
+
     def test_per_invocation_vars_are_not_exposed(self):
         """Writing these to config/.env would pin every run to one test."""
         forbidden = {"TEST_NAME", "FORCE", "REPAIR", "BUILD_TAG", "MODULE",
@@ -119,6 +126,31 @@ class TestEnvFileWrites:
     def test_new_key_is_appended(self, env_file):
         agent_settings.set_many({"slack_notify_channel": "#qa-new"})
         assert "SLACK_NOTIFY_CHANNEL=#qa-new" in env_file.read_text()
+
+    def test_a_sentence_is_written_so_the_shell_reads_it_back(self, env_file):
+        # shared/load_env.sh sources this file. Written bare, a value with a space
+        # is an assignment followed by a command, and every run.sh stops on it.
+        reason = "Demo store: test payments only, it's not real money"
+        agent_settings.set_many({"adaptation_sandbox_note": reason})
+        read_back = subprocess.run(
+            ["/bin/bash", "-c", f'set -Eeuo pipefail; set -a; source "{env_file}"; '
+                                'printf "%s" "$ADAPTATION_SANDBOX_NOTE"'],
+            capture_output=True, text=True)
+        assert (read_back.returncode, read_back.stdout) == (0, reason), read_back.stderr
+        assert os.environ["ADAPTATION_SANDBOX_NOTE"] == reason
+
+    def test_a_declared_key_is_updated_where_it_sits(self, env_file):
+        env_file.write_text(_SAMPLE_ENV.replace(
+            "# ── GitHub ──", "ADAPTATION_SANDBOX_NOTE=\n# ── GitHub ──"))
+        agent_settings.set_many({"adaptation_sandbox_note": "demo"})
+        text = env_file.read_text()
+        assert "ADAPTATION_SANDBOX_NOTE=demo\n# ── GitHub ──" in text
+        assert "Settings updated via Admin UI" not in text
+
+    def test_an_emptied_value_is_written_empty(self, env_file):
+        agent_settings.set_many({"adaptation_sandbox_note": "demo"})
+        agent_settings.set_many({"adaptation_sandbox_note": ""})
+        assert "ADAPTATION_SANDBOX_NOTE=\n" in env_file.read_text()
 
     def test_unknown_keys_are_ignored(self, env_file):
         before = env_file.read_text()

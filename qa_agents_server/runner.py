@@ -1338,6 +1338,29 @@ def _audit_watcher(run: RunState) -> None:
         time.sleep(AUDIT_POLL_INTERVAL)
 
 
+def _final_status(agent: str, audit_dir: Path, exit_code: int) -> str:
+    """How a run that was not cancelled ended, for the run record.
+
+    Always one of TERMINAL_STATUSES: the event stream only closes on those, so a
+    finer answer here would leave the live view open on a finished run.
+    """
+    if exit_code != 0:
+        return "failed"
+    if get_agent(agent).summary_kind == "adaptation":
+        # This agent's verdict is NEEDS-REVIEW by design, so the check below
+        # recorded every one of its runs as failed. Its own files say how the run
+        # went, by the rule History and Analytics use; a stop that is not a
+        # failure is recorded as completed.
+        from qa_agents_server import analytics
+        return ("failed" if analytics.run_status(agent, audit_dir) == "failed"
+                else "completed")
+    # Check .verdict if present to distinguish APPROVED vs NEEDS-REVIEW
+    verdict_path = audit_dir / ".verdict"
+    if verdict_path.exists():
+        return "completed" if verdict_path.read_text().strip() == "APPROVED" else "failed"
+    return "completed"
+
+
 def _wait_and_reap(run: RunState) -> None:
     """Wait for the subprocess to exit, determine final status, emit done."""
     proc = run.proc
@@ -1372,16 +1395,8 @@ def _wait_and_reap(run: RunState) -> None:
             (run.audit_dir / ".cancelled").write_text("true\n")
         except OSError:
             pass
-    elif exit_code == 0:
-        # Check .verdict if present to distinguish APPROVED vs NEEDS-REVIEW
-        verdict_path = run.audit_dir / ".verdict"
-        if verdict_path.exists():
-            verdict = verdict_path.read_text().strip()
-            final_status = "completed" if verdict == "APPROVED" else "failed"
-        else:
-            final_status = "completed"
     else:
-        final_status = "failed"
+        final_status = _final_status(run.agent, run.audit_dir, exit_code)
     run.status = final_status
 
     # Preserve anything the run left in the worktree before tearing it down.

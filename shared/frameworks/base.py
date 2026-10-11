@@ -152,6 +152,20 @@ class CodeEngine(abc.ABC):
     #: `field.fill(…)`. The element a call like this names must be a field.
     TYPING_CALLS: Tuple[str, ...] = ()
 
+    #: Assertions that a PAGE has loaded, by waiting for an anchor element. The
+    #: anchor is how the page is recognised, not a value the test checks, so a
+    #: stale one is repaired like any other locator.
+    PAGE_LOAD_ASSERTIONS: Tuple[str, ...] = ()
+
+    def imports_for(self, snippet: str) -> List[str]:
+        """Fully-qualified types a snippet from `emit_locator` needs imported.
+
+        A snippet is written into a file that already compiles, and it has to go
+        on compiling: an option object or an enum the file never imported turns a
+        correct locator into a build failure. None by default.
+        """
+        return []
+
     @abc.abstractmethod
     def remove_framework_suffixes(self, selector: str) -> str:
         """Strip framework-specific pseudo-classes (e.g. :has-text) from a CSS selector."""

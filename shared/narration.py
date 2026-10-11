@@ -23,7 +23,13 @@ from typing import List
 # The href is the only part a reader cannot recover from anywhere else, so it is
 # kept alongside the text rather than dropped with the tag.
 _ANCHOR = re.compile(r"<a\s[^>]*href='([^']*)'[^>]*>(.*?)</a>", re.I | re.S)
-_TAG = re.compile(r"</?[a-zA-Z][^>]*>")
+# Markup only, by name. "Anything in angle brackets" also ate a constructor's
+# stack frame (`Page.<init>(Page.java:26)`), a generic type and the `<true>` an
+# assertion prints its values in — and the frame is the one that says which page
+# object a page-load failure belongs to.
+_TAG = re.compile(
+    r"</?(?:a|b|i|u|em|strong|span|div|p|br|hr|font|small|code|pre|img|"
+    r"h[1-6]|ul|ol|li|table|thead|tbody|tr|td|th)\b[^>]*>", re.I)
 
 # The framework's timestamped narration, which `step_provenance` reads.
 _NARRATION = re.compile(

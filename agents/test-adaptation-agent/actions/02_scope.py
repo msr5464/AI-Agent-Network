@@ -50,6 +50,10 @@ VERIFY_POLICY = os.environ.get("ADAPTATION_VERIFY_POLICY", "named_only")
 # ways. False means the run works in the developer's checkout and leaves its
 # edits there uncommitted — which changes what the gates below are protecting.
 AUTO_PUSH = os.environ.get("AUTO_PUSH", "true").lower() != "false"
+# How many of the tests to verify have their steps and data handed to the
+# explorer. One browser walk follows one flow; a module-wide scope would
+# otherwise fill the prompt with every test's narration.
+WALK_TESTS = 3
 
 
 def get_workspace():
@@ -105,6 +109,28 @@ def write_skip(reason: str, infra: bool = False):
     log(f"Skipped: {reason}")
 
 
+def miss_reason(plan: dict, searched: str, workspace: Path) -> str:
+    """Why nothing was in scope, in terms the person who wrote the note can act on.
+
+    A note that names a test which exists on another branch is not a wrong note,
+    so say where the search was made and where the test does live.
+    """
+    asked = (plan.get("named_tests") or []) + (plan.get("affects") or [])
+    if not asked:
+        return f"no tests found for Module: {plan.get('module', '')} on {searched}"
+    reason = (f"none of the tests the note names were found on {searched} "
+              f"({', '.join(asked[:4])})")
+    branches = []
+    for test in (plan.get("named_tests") or [])[:3]:
+        for relative in entry_path.source_candidates(test):
+            branches += [b for b in workspace_helper.refs_with_path(workspace, relative)
+                         if b not in branches]
+    if branches:
+        return (f"{reason} — the test class is on: {', '.join(branches[:5])}. Start "
+                f"the run on one of those, or correct Tests:/Affects:")
+    return f"{reason} — check Tests:/Affects:, and the branch the run was started on"
+
+
 def main():
     plan_path = AUDIT_DIR / "01-parse-change.json"
     if not plan_path.exists():
@@ -156,11 +182,13 @@ def main():
         if not moved["ok"]:
             write_skip(f"could not check out the base branch — {moved['reason']}", infra=True)
             return
+        searched = f"{prepared['branch']} @ {prepared['sha'][:8]}"
     else:
         _, current, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace)
         log(f"AUTO_PUSH=false — adapting your checkout on "
             f"{current.strip() or 'HEAD'} as it stands, uncommitted changes included")
         log(f"  review with: git -C {workspace} status")
+        searched = f"your checkout on {current.strip() or 'HEAD'}"
 
     nouns = sorted({n for item in plan["items"] for n in (item.get("nouns") or [])})
     result = blast_radius.resolve(
@@ -177,7 +205,9 @@ def main():
             f"{hub['would_have_added']} file(s))")
 
     if not named and not shared:
-        write_skip("the change note matched no tests — check Affects: or Module:")
+        # Nothing was looked at, so this is not a decision about the change: the
+        # note stays queued for a run against the right branch or a fixed header.
+        write_skip(miss_reason(plan, searched, workspace), infra=True)
         return
 
     # Freeze what each test proves, BEFORE anything is edited.
@@ -235,6 +265,16 @@ def main():
             break
     log(f"Entry path: {entry_path.describe(entry)}")
 
+    # What each test to be verified does today and the data it types, read from
+    # its own source for the same reason as the entry path: an explorer handed
+    # neither invents the order of a flow the test already spells out.
+    walks = [walk for walk in (entry_path.test_walk(workspace, row["test"])
+                               for row in verify_rows[:WALK_TESTS])
+             if walk["steps"] or walk["data"]]
+    for walk in walks:
+        log(f"Test walk: {walk['test'].rsplit('.', 1)[-1]} — {len(walk['steps'])} "
+            f"logged step(s), {len(walk['data'])} data row(s)")
+
     scope = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "workspace": str(workspace),
@@ -262,6 +302,7 @@ def main():
             call for contract in frozen.values()
             for call in (contract.get("_unresolved") or [])}),
         "entry_path": entry,
+        "test_walks": walks,
         "budget": budget,
     }
     (AUDIT_DIR / "02-scope.json").write_text(json.dumps(scope, indent=2))

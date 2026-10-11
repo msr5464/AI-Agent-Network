@@ -156,6 +156,10 @@ Rules for `check_changes`:
 - `new_expected` only for `change`: the full list of the check's expected values
   after your edit, in the order the check has them, without quotes. A check that
   expects `"1"` and becomes `"2"` is `["2"]`. Omit it for `remove`.
+- A check listed as **expects no expected value** compares expressions, not a
+  literal, so it cannot be `change`d. Replacing it with a different assertion — a
+  "total decreases" comparison that becomes an equality — is a `remove`; the
+  assertion you write in its place is an added check and needs no declaration.
 - `relax` only for a check listed with a **relation** — the page was measured to
   render its expected value differently (`words`: inside a longer text, `numeric`:
   the same number formatted differently, `phone`: the same number with another

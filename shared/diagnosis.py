@@ -29,8 +29,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from shared import (baseline, dom_snapshot, failure_context, history,
-                    page_identity, preconditions, step_provenance,
+from shared import (baseline, dom_snapshot, failure_context, failure_identity,
+                    history, page_identity, preconditions, step_provenance,
                     trace_network)
 
 # Verdicts the agent can act on, and what it is allowed to do about them.
@@ -159,8 +159,7 @@ def _anchors_cover(context: Dict, failed_selector: str) -> bool:
         # Nothing to compare against: the anchors are the only account there is.
         return True
     for anchor in anchors:
-        recorded = str(anchor.get("selector") or "")
-        recorded = recorded.split("Locator@", 1)[-1].strip()
+        recorded = failure_identity.bare_selector(str(anchor.get("selector") or ""))
         if page_identity.normalize_selector(recorded) == selector:
             return True
     return False

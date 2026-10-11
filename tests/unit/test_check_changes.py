@@ -118,6 +118,33 @@ class TestDeclarations:
                                       "action": "change", "new_expected": ["2", "3"]}])
         assert not ok and "must list 1 value" in why
 
+    DECREASES = ('        AssertHelper.assertTrue(config, after < before, '
+                 '"Total should decrease after the coupon");\n')
+    UNCHANGED = ('        AssertHelper.assertEquals(config, after, before, '
+                 '"Total should stay the same without a coupon");\n')
+
+    @pytest.mark.parametrize("new_expected", [["before"], []])
+    def test_a_check_with_no_expected_value_says_to_declare_its_removal(self, new_expected):
+        # A value list was "too long", an empty one was "what it expects today":
+        # the two refusals sent a model back and forth, and neither named the
+        # declaration that is accepted.
+        before = _java(COUNT, self.DECREASES)
+        cid = _id("Total should decrease after the coupon", before)
+        ok, why, _ = _judge(_java(COUNT, self.UNCHANGED),
+                            [{"check": cid, "action": "change",
+                              "new_expected": new_expected}], before=before)
+        assert not ok
+        assert "lists no expected value" in why and "declare `remove`" in why
+
+    def test_replacing_a_comparison_with_another_assertion_is_a_declared_removal(self):
+        before = _java(COUNT, self.DECREASES)
+        cid = _id("Total should decrease after the coupon", before)
+        ok, why, rows = _judge(_java(COUNT, self.UNCHANGED),
+                               [{"check": cid, "action": "remove",
+                                 "why": "no coupon is applied now"}], before=before)
+        assert ok, why
+        assert [(r["id"], r["action"]) for r in rows] == [(cid, "remove")]
+
     def test_the_same_id_twice_is_refused(self):
         cid = _id("Removed product should no longer be in cart")
         ok, why, _ = _judge(_java(COUNT, BADGE), [{"check": cid, "action": "remove"},

@@ -310,3 +310,194 @@ def test_discover_is_quiet_when_there_is_nothing(framework, tmp_path, monkeypatc
     monkeypatch.setenv("FRAMEWORK_DIR", "")
     assert get_plugin(framework).telemetry.discover(tmp_path, "nothingHere") == []
     assert get_plugin(framework).telemetry.discover(tmp_path / "missing", "x") == []
+
+
+# ── A wait that polls until it gives up ───────────────────────────────────────
+def _poll(selector, action="Frame.isVisible"):
+    return {"action": action, "selector": selector, "error": ""}
+
+
+def test_a_polled_wait_is_named_through_the_evidence_recorded_after_it():
+    """Nothing throws when a wait polls until its budget runs out, so the failing
+    selector is inferred from the streak. A framework that then records why the
+    wait failed — counting its anchor, and every other locator on the page
+    object — makes those calls into the same trace, after the polling. Reading
+    only the very tail saw a streak of one and named nothing.
+    """
+    telemetry = get_plugin("playwright").telemetry
+    actions = ([{"action": "Frame.click", "selector": "#checkout", "error": ""}]
+               + [_poll("div.order-total") for _ in range(12)]
+               + [_poll("div.order-total", "Frame.queryCount"),
+                  _poll("div.order-total >> nth=0"),
+                  _poll("div.details", "Frame.queryCount"),
+                  _poll("div.phone", "Frame.queryCount"),
+                  _poll("div.order-total", "Frame.queryCount")])
+    failed = telemetry.failing_action(actions)
+    assert failed and failed["selector"] == "div.order-total"
+    assert failed["inferred"] is True
+
+
+def test_a_streak_the_flow_moved_on_from_is_not_the_failure():
+    """Polling that was followed by another interaction succeeded: the flow went
+    on, so that selector is not what the test died waiting for."""
+    telemetry = get_plugin("playwright").telemetry
+    actions = ([_poll("div.spinner") for _ in range(6)]
+               + [{"action": "Frame.click", "selector": "#next", "error": ""}])
+    assert telemetry.failing_action(actions) is None
+
+
+def test_an_action_that_threw_still_wins_over_any_streak():
+    telemetry = get_plugin("playwright").telemetry
+    actions = ([_poll("div.order-total") for _ in range(5)]
+               + [{"action": "Frame.fill", "selector": "#card-code",
+                   "error": "Timeout 30000ms exceeded."}])
+    assert telemetry.failing_action(actions)["selector"] == "#card-code"
+
+
+# ── The code emitted for a selector has to BE that selector ───────────────────
+def test_an_exact_attribute_is_emitted_as_an_exact_builder():
+    """What is proved unique is the selector; what is written into the page object
+    is the snippet. The attribute builders match by substring unless told
+    otherwise, so `[placeholder='123']` — one field — was emitted as a builder
+    that also matched the field whose placeholder was "1234 1234 1234 1234", and
+    an answer reported as proved failed its first run on an ambiguous locator.
+    """
+    code = get_plugin("playwright").code
+    for key, builder in (("placeholder", "getByPlaceholder"), ("alt", "getByAltText"),
+                         ("title", "getByTitle"), ("label", "getByLabel")):
+        emitted = code.emit_locator(**{key: "123"}, exact=True)
+        assert emitted["java"].startswith(f'page.{builder}("123", new Page.')
+        assert emitted["java"].endswith("Options().setExact(true))")
+        assert "exact=True" in emitted["python"]
+
+
+def test_an_exact_builder_inside_an_iframe_uses_the_frame_options_type():
+    emitted = get_plugin("playwright").code.emit_locator(
+        placeholder="123", exact=True, frame_path=["#pay-frame"])
+    assert emitted["java"] == (
+        'page.frameLocator("#pay-frame").getByPlaceholder("123", '
+        'new FrameLocator.GetByPlaceholderOptions().setExact(true))')
+
+
+def test_a_caller_that_did_not_ask_for_exact_gets_the_plain_builder():
+    emitted = get_plugin("playwright").code.emit_locator(label="Email")
+    assert emitted["java"] == 'page.getByLabel("Email")'
+
+
+def test_the_ladder_asks_for_exact_wherever_its_selector_is_exact():
+    """Every rung pairs a selector with a snippet; the pair must match the same
+    elements, or proving one says nothing about the other."""
+    import yaml
+    from shared import locator_emit
+    from shared.locator_score import Volatility
+
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[2]
+                          / "config" / "locator.yaml").read_text())
+    element = {"tag": "input", "role": None, "accessible_name": None,
+               "placeholder": "123", "alt": "card back", "title": "Security code",
+               "id": None, "name": None, "text": "", "is_interactive": True,
+               "class_list": []}
+    by_strategy = {c["strategy"]: c for c in
+                   locator_emit.candidates_for(element, Volatility(cfg))}
+    for strategy in ("placeholder", "alt", "title"):
+        assert "setExact(true)" in by_strategy[strategy]["java"], strategy
+    assert by_strategy["placeholder"]["sel"] == "[placeholder='123']"
+
+
+def test_an_unsettled_hint_takes_its_rung_and_the_name_built_from_it_off_the_ladder():
+    """A text field's accessible name IS its placeholder when it has no label, so
+    getByRole(TEXTBOX, "MM/YY") reads the same value through another door."""
+    import yaml
+    from shared import locator_emit
+    from shared.locator_score import Volatility
+
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[2]
+                          / "config" / "locator.yaml").read_text())
+    element = {"tag": "input", "role": "textbox", "accessible_name": "MM/YY",
+               "placeholder": "MM/YY", "title": "Expiry date", "id": "expiry",
+               "name": None, "text": "", "is_interactive": True, "class_list": []}
+
+    def rungs(**kwargs):
+        return [c["strategy"] for c in
+                locator_emit.candidates_for(element, Volatility(cfg), **kwargs)]
+
+    assert rungs()[:2] == ["role+name", "placeholder"]
+    assert rungs(unsettled=("placeholder",)) == ["title", "id"]
+    # Named by something else, the role rung has nothing to do with the hint.
+    element["accessible_name"] = "Expiry"
+    assert rungs(unsettled=("placeholder",)) == ["role+name", "title", "id"]
+
+
+# ── A getBy builder is a declared locator wherever it is written ──────────────
+CARD_FORM = '''public class CardFormPage extends BasePage {
+    private final Locator code;
+    private final Locator number;
+    private final Locator pay;
+    private final Locator logo;
+    private final Locator help;
+    private final Locator submit;
+    public CardFormPage(Config config) {
+        code = page.frameLocator("#pay-frame").getByPlaceholder("123",
+                new FrameLocator.GetByPlaceholderOptions().setExact(true));
+        number = page.getByPlaceholder("1234 1234");
+        pay = page.frameLocator("#pay-frame").getByRole(AriaRole.BUTTON,
+                new FrameLocator.GetByRoleOptions().setName("Pay now").setExact(true));
+        logo = this.page.getByAltText("Bank logo");
+        help = page.frameLocator("#pay-frame").frameLocator("iframe[title='3ds']").getByTitle("Help");
+        submit = page.frameLocator("#pay-frame").getByTestId("submit");
+    }
+}'''
+HOP = " >> internal:control=enter-frame >> "
+
+
+def _declared(source=CARD_FORM):
+    return {d["name"]: d for d in get_plugin("playwright").code.extract_locators(source)}
+
+
+def test_a_builder_inside_an_iframe_is_read_as_a_locator():
+    """A repair writes whichever builder proved unique, inside a frame as readily
+    as outside one. Only `.locator()` chains were read back, so a field repaired
+    with a builder in a frame stopped being one of its page object's locators:
+    it dropped out of the coverage count, and the next time it broke nothing
+    could say which field declared it."""
+    declared = _declared()
+    assert set(declared) == {"code", "number", "pay", "logo", "help", "submit"}
+    assert declared["code"]["selector"] == f"#pay-frame{HOP}[placeholder='123']"
+    assert declared["code"]["frame_path"] == ["#pay-frame"]
+    assert declared["submit"]["selector"] == f"#pay-frame{HOP}[data-testid='submit']"
+
+
+def test_every_hop_of_a_nested_iframe_is_kept():
+    declared = _declared()
+    assert declared["help"]["frame_path"] == ["#pay-frame", "iframe[title='3ds']"]
+    assert declared["help"]["selector"] == (
+        f"#pay-frame{HOP}iframe[title='3ds']{HOP}[title='Help']")
+
+
+def test_a_role_builder_in_an_iframe_keeps_its_name_and_its_frame():
+    declared = _declared()
+    assert declared["pay"]["kind"] == "role"
+    assert declared["pay"]["accessible_name"] == "Pay now"
+    assert declared["pay"]["frame_path"] == ["#pay-frame"]
+
+
+def test_a_builder_outside_any_iframe_reads_as_before():
+    declared = _declared()
+    assert declared["number"]["selector"] == "[placeholder='1234 1234']"
+    assert "frame_path" not in declared["number"]
+    # The two builders a repair can emit and nothing used to read.
+    assert declared["logo"]["selector"] == "[alt='Bank logo']"
+
+
+def test_the_runtime_form_of_a_builder_is_the_declared_form():
+    """A failure quotes a builder the way the runtime holds it; the declaration
+    reads as the attribute it stands for. Unless both come out the same, a failing
+    locator never matches the field that declares it."""
+    code = get_plugin("playwright").code
+    declared = _declared()
+    runtime = f'#pay-frame{HOP}internal:attr=[placeholder="123"s]'
+    assert code.normalize_selector(runtime) == declared["code"]["selector"]
+    assert code.normalize_selector('Locator@internal:attr=[placeholder="1234 1234"i]') == \
+        declared["number"]["selector"]
+    assert code.normalize_selector('internal:testid=[data-testid="submit"s]') == \
+        "[data-testid='submit']"

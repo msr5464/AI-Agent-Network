@@ -44,7 +44,10 @@ classify:
   misbound_max:           0.70   # locator resolves, but to a different element
   misbound_margin:        0.08   # another element beats the resolved one by this much
   heal_misbound:          false  # report silent rebinds; do not fix them unasked
-  heal_assertions:        false  # never rewrite what a test verifies
+  # A locator an assertion reads directly. never: report it. proven: repair it
+  # when the recorded fingerprint proves the replacement is the same element,
+  # report it otherwise. always: treat it like any other locator.
+  heal_assertions:        proven
 
 budgets:
   candidates_to_verify: 3      # R3

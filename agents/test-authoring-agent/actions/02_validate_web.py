@@ -546,7 +546,9 @@ def delayed_updates(rows: list, found: dict) -> list:
         if isinstance(act, dict):
             pending.append(act)
             continue
-        if not row.get("inventory"):
+        # A brief screen's record (`brief`) is not the state an action settled
+        # into: taken as one, it would stand as the "before" of the next step.
+        if not row.get("inventory") or row.get("brief"):
             continue
         settled = row.get("settled") or {}
         if prev is not None and pending and prev.get("url") == row.get("url") \

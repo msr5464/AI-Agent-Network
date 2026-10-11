@@ -88,10 +88,68 @@ proposal) Fix applies that answer instead of calling the model — through the s
 guards, diff cap and test run as a model-written fix, which is what actually
 verifies it. It resolves one locator once however many tests it broke, and every
 refusal hands the work back to Fix with its reason — missing evidence
-(`NO_BASELINE`, `NO_CAPTURE`, `NO_DECLARATION`), not a locator problem
-(`NOT_LOCATOR`, `WRONG_STATE`, `APP_BUG`, `FEATURE_REMOVED`, `ASSERTION_LOCATOR`,
-`MISBOUND`), no safe answer (`LOW_CONFIDENCE`, `AMBIGUOUS`, `UNSTABLE_LOCATOR`,
-`NO_STABLE_LOCATOR`), or nothing new to try (`ALREADY_CURRENT`, `ALREADY_TRIED`).
+(`NO_BASELINE`, `NO_FINGERPRINT`, `NO_CAPTURE`, `NO_DECLARATION`), not a locator
+problem (`NOT_LOCATOR`, `WRONG_STATE`, `APP_BUG`, `FEATURE_REMOVED`, `MISBOUND`), no
+safe answer (`LOW_CONFIDENCE`, `AMBIGUOUS`, `UNSTABLE_LOCATOR`, `NO_STABLE_LOCATOR`),
+or nothing new to try (`ALREADY_CURRENT`, `REVERTED`).
+
+Two of those names exist so the run's summary says what happened.
+`NO_FINGERPRINT` is a page that was recorded with nothing held for this one
+locator; `NO_BASELINE` is a page never recorded at all, and counting the first as
+the second reads as "no good run exists" when one does. `REVERTED` is an answer
+Locate gave that Fix applied, saw fail on the same element and took back out: the
+record keeps the locator it was for and the code that was tried, and it holds for
+the rest of the session, so no later attempt is offered the same answer again.
+
+**A locator an assertion reads is repaired on proof, and only on proof.** Keeping
+the expected value fixed does not stop a repair pointing the locator at a
+*different element*; a check that compares a value catches that in the
+verification run, a presence check passes on anything visible, and a caught
+regression becomes a green build. The fingerprint match does not make that
+mistake, so when Locate proves the replacement is the same element the fix is
+applied (and the report names the assertion for the reviewer). When it cannot,
+whatever the reason, the verdict is `ASSERTION_LOCATOR` and Fix stops without
+asking the model, which is the one path that can pick an element nothing proved.
+`classify.heal_assertions` in `config/locator.yaml` chooses `never`, `proven`
+(shipped) or `always`.
+
+An assertion that a **page has loaded** is not one of these. Its anchor is how the
+page is recognised, and whether the test is on that page is decided from the rest
+of the page — the diagnosis, the other locators, the baseline — not from the
+anchor. A stale anchor is repaired like any other locator, by Locate or by the
+model. The framework plugin names those calls (`CodeEngine.PAGE_LOAD_ASSERTIONS`).
+
+**The code written for an answer is the selector that was proved.** Locate proves
+a selector unique and writes a snippet for it, and the two must match the same
+elements: a builder that matches by substring is a different locator from an
+exact attribute selector, however alike they read. Where the proved selector is
+exact, the emitted builder is asked for an exact match too.
+
+**Proved unique is proved for one moment.** A hint the user is shown —
+placeholder, alt text, title — reads well and ranks above an id, and it is also
+what a page rewrites while it is being used: a placeholder blanked while its
+field has focus matches until the test touches the field, then matches nothing.
+The capture cannot show that about the element being repaired, but its
+neighbours can. When another locator of the same page object still finds exactly
+one element and that element holds a different hint than the last good run
+recorded, the page has shown that it changes that attribute, and Locate leaves
+it off the ladder — along with a role-and-name locator whose name is only that
+hint — and takes the next rung. The console line names the attribute and the
+field that gave it away. The failing field is never its own witness.
+
+An answer also has to leave the file compiling. A builder with an option object,
+or a role, names a type that a page object of plain locator fields never
+imported, so the edit carries the import with it (`locator_patch.edits_for`, from
+the plugin's `imports_for`). Without it the answer fails its own verification run
+in the compiler — and a build failure names no element, so a right locator is
+reverted as one that did not help.
+
+**The failing selector comes from three places, best first:** the action that
+threw in the trace; the locator the failure message quotes; the anchor the
+framework recorded in its failure context. Only the first exists for an action
+that threw. A wait that polls until its budget runs out throws nothing, so a
+page-load failure is filed under what the message and the context say — without
+that, `failed_selector` is empty and Locate has nothing to look up.
 
 It deliberately does **not** drive the application to recreate the failure —
 signing in, minting sessions, replaying a journey. It used to, and that is where
@@ -132,7 +190,11 @@ the session file — including when the inspection fails.
 
 It is skipped automatically when: the run came from a triaging handoff rather
 than a named test, `CI` is set, there is no display, the port is already busy, or
-`REPAIR=false`. `REPAIR=true` forces it from the first attempt.
+`REPAIR=false`. `REPAIR=true` forces it from the first attempt. It is also skipped
+when the previous attempt already inspected the same failing selector live and the
+source has since been put back: that page and those elements have not changed, so
+the earlier findings are reused instead of paying for another test run and model
+call to read them again.
 
 Tier 2 is the normal unattended path and needs no browser, no credentials and no replay: the
 automation framework writes the page's HTML next to the failure screenshot
@@ -155,7 +217,20 @@ themselves read via `config.getRunTimeProperty()`.
 Claude returns minimal search/replace `edits`, never a whole file: it is only ever
 shown an excerpt of a large page object, so a regenerated file would silently drop
 what it never saw. A safety guard rejects any fix that empties a file, removes a
-method, or changes more lines than a locator change plausibly needs.
+method, or changes more lines than a locator change plausibly needs — and any fix
+that alters an assertion call or its expected value, for a located edit and a
+model-written one alike, with or without `FORCE`.
+
+The fix call is given `Read`, `Grep` and `Glob` and nothing that runs. With a shell
+it could read the repository's history — which holds the answer to a locator
+someone broke on purpose and no answer at all to one that drifted with the
+application — and what it was allowed to run depended on the permission settings
+of whichever machine the agent was on.
+
+The page object a failure names is always in the prompt, whether or not ranking by
+element name found it. A selector is not always a literal in the source (one
+inside an iframe is declared as several calls), and a Locate answer can only be
+applied to a page object listed in the fix context.
 
 ---
 
@@ -249,6 +324,11 @@ is usually a handful of defects, so the agent works in phases:
    The edit is kept, and the next attempt is handed the NEW failure — refreshed
    from the artifacts the verification run just wrote. Only a test that still
    fails on the *same* element condemns the edit, and only then is it reverted.
+   Which element a failure is about is worked out once, from the run's whole
+   output, and carried on the record (`shared/failure_identity.py`); a record's
+   own text and the selector it was filed under are the fallbacks. Two page-load
+   failures on the same page object are the same failure whatever anchor the
+   message quotes — a replacement anchor that is also absent is not progress.
 
 Rule 6 is what lets one run walk a chain of broken locators. Without it the gate
 was whole-test pass/fail: a fix that repaired the login button, got the flow onto
@@ -259,6 +339,14 @@ was already fixed, and the run could never get past the first one.
 Without this, the first test's fix lands and the other four arrive to find the
 file already corrected — their edit fails to apply, and they get reported as
 "needs manual fix" while their fix is sitting in the same PR.
+
+**Every edit kept on the way is reported with the test it was kept for.** Only the
+last edit of a chain sees the test go green, and the record of a fixed test used
+to hold that one alone: a run that repaired three locators reported one, in the
+summary, the PR body and the count, while the diff it shipped carried all three.
+Each record now carries the edits earlier attempts kept for its tests
+(`earlier_edits`, from `kept_edits` in `01_fix.py`), a still-failing test
+included, and `distinct_fixes` counts them.
 
 Repository scans are cached for the run, so 30 failures cost one walk of the
 source tree rather than 30.
@@ -304,10 +392,15 @@ spin forever. See `retry_verdict` in `01_fix.py`.
 
 A retry re-attempts **only the tests that actually failed** — fixes already applied and
 committed by an earlier attempt are carried forward into the report rather than redone.
-On retry, `01_fix.py` injects the previous test failure output into the Claude prompt so it
-tries a different locator strategy. Where the previous attempt's edit *worked* and merely
-uncovered the next broken locator, the retry gets that new failure instead: new selector,
-new DOM snapshot, new diagnosis (`next_issue` in `01-fix.json`).
+On retry, the prompt says what actually became of the previous attempt
+(`retry_section` in `01_fix.py`). An edit that was **reverted** is shown, with the
+statement that the source is back as it was and the output of the run made with
+it. An edit **rejected before any test ran** is shown with the guard's reason and
+no test output, since none belongs to it. Where the previous edit *worked* and
+merely uncovered the next broken locator, the retry gets that new failure — new
+selector, new DOM snapshot, new diagnosis (`next_issue` in `01-fix.json`) — and is
+told this is the first attempt at that element, not asked to avoid the approach
+that just succeeded.
 
 If `01_fix.py` crashes, run.sh's ERR trap posts to `SLACK_ALERT_CHANNEL` and leaves the
 handoff queued — a crash is never silent.
@@ -354,6 +447,11 @@ Only `AUTOMATION_ISSUE` + `HIGH` issues whose category is `LOCATOR_STALE`,
 that test (an API test, screenshots disabled, or a framework without the capture
 hook). The healing agent then falls back to tier 3 (re-opening the page) or 4.
 
+`failed_selector` is the trace's failing action when one threw, otherwise the
+locator the failure message or the failure context names
+(`run_artifacts.name_failing_selector`). It is empty only when none of the three
+names one.
+
 ---
 
 ## Elements inside iframes
@@ -371,6 +469,11 @@ reads it as one selector (`shared/frames.py`):
 - Locate ranks the failing frame's own capture and emits the replacement with the
   same hops (`candidates_for(..., frame_path=)`), so the page object gets
   `page.frameLocator(...).locator(...)` back, never a top-document locator;
+- whichever builder proved unique is what gets written, inside a frame as readily
+  as outside one, so a chain ending in a `getBy…` builder is read back as a
+  declared locator like any other. The runtime's own form of such a builder
+  (`internal:attr=[…]`) normalises to the form the declaration reads as, so a
+  failing one still matches the field that declares it;
 - the guards read a frame fix as one chain, so a correct one is no longer rejected
   as "matches nothing".
 
@@ -412,6 +515,27 @@ An empty result is logged either way, and the two cases are distinguished: finge
 disk that genuinely match HEAD is the ordinary no-op, none on disk at all names the
 directory that was searched. They used to share one silent `return []`, which is why this
 went unnoticed across ten PRs in a single day.
+
+**What a baseline holds, and when it is thin.** A fingerprint is taken when the page
+object loads, for every locator that resolves then, and again the first time the
+test finds a locator visible, for any the first pass missed. The second pass is
+what covers an overlay that was still closed, an iframe inside an iframe that had
+not loaded, and a header that re-rendered under the handle just taken — without
+it those locators had no fingerprint at all, and Locate answered `NO_FINGERPRINT`
+for every one of them. `coverage` is untouched by the second pass: it stays a
+count of the page as it loaded, which is what a failing page-load is compared
+with.
+
+A passing run replaces the whole file, so the framework keeps what the old record
+knew and the new one does not: a fingerprint, as long as the field still holds the
+same locator (`selectors`), and the repair history, which only this agent writes.
+One capture that missed used to erase the fingerprints of every earlier run, and
+every promotion erased the history the `UNSTABLE_LOCATOR` rule counts.
+
+When Locate still finds no fingerprint it says which gap it is: matched on the
+last good run and never fingerprinted (an incomplete baseline, which says nothing
+about the element), matched nothing at load and was not used afterwards, or could
+not be evaluated at load.
 
 **The session copies them before it starts.** The framework re-records a page's
 baseline whenever a test that walks through it passes — so a class where four tests
@@ -558,3 +682,7 @@ make audit AGENT=test-healing-agent SESSION=20260328-143022-fix-ProdSanity-All-T
    via `shared/git.py`'s `push_url`; it is never written into `.git/config`
 8. **Never report an unverified fix as verified** — the three states are
    verified / unverified / failed, and they stay distinct all the way to the PR
+9. **A fix changes how an element is found, never what is asserted** — an edit
+   that alters an assertion call or its expected value is rejected before any
+   test runs, and a locator an assertion reads is repaired only on proof that
+   the replacement is the same element

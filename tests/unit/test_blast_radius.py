@@ -155,6 +155,17 @@ class TestResolve:
         assert "no Affects given" in result["selection"], (
             "a derived scope is a weaker claim than a stated one and has to say so")
 
+    @pytest.mark.parametrize("asked", [
+        {"named_tests": ["automation.checkout.CheckoutWebTest#plcaeOrder"]},
+        {"affects": ["automation.chekout.*"]},
+    ])
+    def test_a_note_that_names_tests_never_widens_to_the_module(self, repo, asked):
+        # A misspelt test name became every test in the module: the fallback was
+        # for a note with no Affects at all, and it fired for one that matched none.
+        result = br.resolve(repo, module="checkout", **asked)
+        assert result["tiers"]["named"] == [] and result["tiers"]["shared_surface"] == []
+        assert result["selection"] == "Tests/Affects matched nothing"
+
     def test_hop_bound_is_honoured(self, repo):
         near = br.resolve(repo, affects=["automation.checkout.*"], max_hops=1)
         far = br.resolve(repo, affects=["automation.checkout.*"], max_hops=3)

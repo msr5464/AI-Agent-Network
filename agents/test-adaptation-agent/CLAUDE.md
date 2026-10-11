@@ -174,18 +174,63 @@ emits `PAGE_ENTER` and `FLOW_STEP`, and `PAGE_STATE` is optional.
 | the page's inventory, every frame (identity elements too: headings, header, nav, title-like classes) | that page's inventory, a union with any `PAGE_STATE` the model typed |
 | counts of the selectors a step harvested or asked to `check` | live verification of step selectors (a 1/1 reading is kept) |
 | live counts of every locator in `03-known-locators.json` | per page object, which of its locators resolve on this page and which are broken (0). Those matching several are listed as `several`, not as a fault, because a list locator is meant to |
+| every click and keystroke, with a count of the control at the moment it was used | live verification of the step that used it, filed under the page the step lands on. Only a use on exactly one visible element counts. A tab, a close icon or the button that opens the next screen is gone by the time the step's own count is taken, and read "not unique" there |
 
 `03-known-locators.json` is extracted from every in-scope page object before
 exploring, with the framework plugin's `extract_locators()`. Only exact locators
 go in: a literal the code finishes at runtime (`"#item-" + n`, a format template)
 is marked `approx` and left out, because counted as written it matches nothing and
 would read as broken. When known counts exist, `measure_page_objects` ranks page
-objects by the share of their locators that resolve live, and step 04's prompt
-lists the broken ones by name. Without them it falls back to the inventory
+objects first by how many of their locators **first show on that page** — visible
+there and not on the page the walk came from — then by the share showing, and step
+04's prompt lists the broken ones by name. A form left on screen behind an overlay
+keeps every one of its locators, so by share alone it outranked the page object of
+the overlay in front of it. Without known counts it falls back to the inventory
 coverage below.
 
+**A screen that closes by itself is a page like any other.** A result, a
+confirmation or a redirect notice is gone before a second call can look at it, so
+the only call that can measure it is the one that records it,
+`page.qa.record(action, ms, { page: '<pageId>' })`. Named, each state it shows is
+measured the way a step's page is — inventory and known-locator counts, marked
+`brief` — at the moment it appears, which is the only moment it can be. What is
+filed is decided when the recording ends, because only then is it known what the
+screen was:
+
+- the states that **came and went** and lasted at least a second;
+- not the flicker before them, and not the page left showing at the end: that is
+  the next page, and the explorer measures it with the step after the recording;
+- when nothing came and went, what is still showing — the screen never closed.
+
+Nothing past a change of address is measured. Recorded without a name the screen
+has no inventory; the call's result says so, and nothing is filed, because a row
+placed by address lands on whichever page shares it.
+
 A page the walk entered but no helper call named has no inventory. That is a
-warning, and it earns a second attempt only when a step acted on that page. A
+warning, and it earns a second attempt only when a step acted on that page.
+
+**Two accounts of one walk.** The step list is typed by the model. The helpers'
+record of every click and keystroke is not: a row is written the moment the
+browser dispatches the event. After each walk the two are compared
+(`flow_map.unreported_actions`), and what the browser recorded that no step
+reports is kept in the flow map and listed in the audit report and the PR.
+
+- A step accounts for an action when it names the same selector, or one the
+  helpers counted at the same element.
+- Only an action on exactly one visible element is listed; the hidden input behind
+  a label fires its own click and is not a second action. A field's change event
+  arriving late with the value it already had is not a second typing.
+- They are **shown, not steps**. An explorer also clicks to look around, and a
+  step is what an edit may be justified by, so step 04 neither sees them nor may
+  cite them.
+- The record has limits of its own: it has nothing for a step that only looks or
+  waits, and a field with no unique selector of its own is recorded without one.
+
+**The step list is still typed by the model**, and a walk can drive the whole flow
+and report none of it. Two things cover that. A step written as its bare object,
+with no `FLOW_STEP:` before it, is read as a step (a marked step is never replaced
+by an unmarked recap of it). And a walk that measured pages but reported no step
+at all earns a second attempt, told to write a line after every action. A
 page the run only passed through (the start page, opened with a saved session)
 has no selector to verify, and a whole attempt was once spent on exactly that.
 
@@ -235,6 +280,56 @@ than a heuristic. Two consequences worth knowing:
   `mint_session._bounced()` compares the landed URL's path against the module's
   configured entry URL and refuses. Minting writes to a staging file and promotes
   it only on success, so a failed attempt can never delete a session that worked.
+
+### 5. The explorer walks the test's own flow
+
+The same reading gives the explorer what else the test already states.
+`entry_path.test_walk()` records, in `02-scope.json` as `test_walks`:
+
+- the test's **logged steps**, in call order;
+- the **data row** it loads by a literal key, in the test method or a method of its
+  class that it calls. Login-secret columns are left out
+  (`credential_extraction.secret_columns`), and no row is sent unless exactly one
+  file of that name and exactly one row match.
+
+Step 03 puts both in the prompt, with the start URL: the note's `URL:`, else the
+URL the framework is configured with for the module (`mint_session.entry_url`,
+tried with the note's module and the test's package). An explorer given none of
+these found the site by guessing, chose its own order for a flow the test spells
+out, and typed values that left a form invalid — which then read as a broken
+locator.
+
+## Destructive actions and the sandbox assertion
+
+Two things guard a walk through a real product. The explorer is told to refuse
+anything irreversible. Afterwards `flow_map.detect_refusals` checks every step it
+acted on by the control's **name**: one containing a word in
+`flow_map.DESTRUCTIVE_WORDS` that was not refused is a violation, the exploration
+is `unsafe`, and nothing is adapted.
+
+The name check cannot tell a button that pays from one that opens the next screen.
+So the explorer is given the same word list and refuses up front, and the run stops
+at that control and names it. When nothing at all was walked, `04_adapt.py` stops
+before any model call.
+
+The check does not rest on the step list alone. Every click the helpers recorded
+is judged too, by the text of the control it landed on, whatever a step says about
+it: not reported, reported as refused, or reported as only looked at. A walk that
+reported nothing used to read as empty however far it had clicked. Such a walk is
+not walked a second time, since it would click the same controls again.
+
+`ADAPTATION_SANDBOX=true` with `ADAPTATION_SANDBOX_NOTE` is the operator asserting
+the environment is disposable. It covers the whole walk, on every module:
+
+- the explorer is told to complete the flow it was given, final action included,
+  and still to take no irreversible action that neither the test's steps nor the
+  note call for;
+- flagged words are recorded on the steps and raise no violation;
+- the note is reproduced in the PR body.
+
+Without the note the switch is ignored, and the log says so. The step-03 cache is
+kept per sandbox state, so an exploration that stopped on a refusal is not restored
+once the assertion is made.
 
 ## Changing a check
 
@@ -384,7 +479,9 @@ checkout is, and leaves HEAD alone.
   file that is missing, or a login that runs but lands back on the login form.
   When the login the test itself uses does not authenticate, that is a finding
   about the module, not a reason to sign in some other way;
-- the flow's terminal action is destructive and `ADAPTATION_SANDBOX` is unset;
+- the flow's terminal action is destructive, or a control on the way to the change
+  is named as one, and the sandbox assertion has not been made (see "Destructive
+  actions and the sandbox assertion");
 - an **existing** page object would need regenerating wholesale;
 - a check would have to change without the note saying so, or be weakened, to
   make the test green;
@@ -457,6 +554,15 @@ drift.
 
 **`.skip-reason`** — `infra` (leave the note queued) / `no-work` / `escalate` /
 `unsafe` / `no-session` / `unreachable` / `explore-only` / `stuck`.
+
+`infra` includes a note whose `Tests:`/`Affects:` match nothing on the branch that
+was searched: nothing was looked at, so it is not a decision about the change. The
+message names the branch and the branches where the test class does exist.
+`Module:` is the fallback only for a note that gives neither header — a note that
+names tests is never widened to the whole module.
+
+How a finished run counts — in History, on the live badge and in Analytics — is one
+rule, `qa_agents_server.analytics.run_status`, read from these files.
 
 ## Audit Trail
 

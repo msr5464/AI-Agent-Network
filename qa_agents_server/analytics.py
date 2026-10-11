@@ -201,6 +201,16 @@ _ADAPTATION_SKIPS = {"no-work": "diagnosed", "escalate": "diagnosed",
                      "no-session": "blocked", "unreachable": "blocked"}
 
 
+def run_status(agent: str, session_dir, caller: str = "") -> str:
+    """How a finished run counts — the one rule, for every reader of it.
+
+    History and the server's run record ask here rather than deriving their own
+    answer, which is how one run came to be failed, completed and diagnosed at
+    once. `caller` is returned only when the session's files decide nothing.
+    """
+    return _status(agent, Path(session_dir), caller)
+
+
 def _status(agent: str, d: Path, caller: str) -> str:
     """How this run counts, read from the session's own files.
 
@@ -240,7 +250,9 @@ def _status(agent: str, d: Path, caller: str) -> str:
         return "failed" if gate == "false" else caller
 
     if agent == "test-adaptation-agent":
-        if gate == "skipped":
+        # A reason with no gate beside it is still the run saying why it stopped:
+        # judged by the ship result alone, a run a usage cap ended read completed.
+        if gate == "skipped" or (not gate and why in _ADAPTATION_SKIPS):
             return _ADAPTATION_SKIPS.get(why, "failed")
         items = [i.get("status") for i in (_load_json(d / "04-adapt.json").get("items") or [])
                  if isinstance(i, dict)]

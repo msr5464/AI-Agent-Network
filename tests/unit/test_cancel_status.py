@@ -9,7 +9,7 @@ import dataclasses
 
 import pytest
 
-from qa_agents_server import audit_reader
+from qa_agents_server import analytics, audit_reader, runner
 from qa_agents_server import agents as agents_mod
 
 
@@ -71,3 +71,71 @@ def test_an_adaptation_stopped_by_infra_is_blocked_not_completed(tmp_path, monke
     (session / ".skip-reason").write_text("infra\n")
     (session / "05-ship.json").write_text('{"verdict": "NEEDS-REVIEW", "ship_status": "dry_run"}')
     assert audit_reader.get_session(session.name, agent=name)["status"] == "blocked"
+
+
+ADAPTATION = "test-adaptation-agent"
+
+
+def _ended(session, gate="skipped", reason=""):
+    (session / ".fix-passed").write_text(gate + "\n")
+    if reason:
+        (session / ".skip-reason").write_text(reason + "\n")
+    (session / ".verdict").write_text("NEEDS-REVIEW\n")
+    (session / "05-ship.json").write_text('{"verdict": "NEEDS-REVIEW", "ship_status": "dry_run"}')
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("no-work", "diagnosed"), ("escalate", "diagnosed"), ("stuck", "failed"),
+    ("unsafe", "failed"), ("infra", "blocked"), ("no-session", "blocked"),
+    ("unreachable", "blocked"), ("explore-only", "completed"),
+])
+def test_an_adaptation_row_reads_as_analytics_counts_it(tmp_path, monkeypatch, reason, expected):
+    # One run was failed in the run record, completed in History and diagnosed
+    # in Analytics, each by a rule of its own.
+    session = _session(tmp_path, monkeypatch, ADAPTATION)
+    _ended(session, reason=reason)
+    row = audit_reader.get_session(session.name, agent=ADAPTATION)["status"]
+    counted = analytics.run_status(ADAPTATION, session)
+    assert row == expected
+    # Analytics leaves an explore-only run out of its rates; as a row it finished.
+    assert row == ("completed" if counted == "explore-only" else counted)
+
+
+def test_a_gate_written_between_adapt_attempts_does_not_end_the_row(tmp_path, monkeypatch):
+    session = _session(tmp_path, monkeypatch, ADAPTATION)
+    (session / ".fix-passed").write_text("false\n")
+    assert audit_reader.get_session(session.name, agent=ADAPTATION)["status"] == "running"
+
+
+@pytest.mark.parametrize("gate,reason,expected", [
+    ("true", "", "completed"), ("skipped", "no-work", "completed"),
+    ("skipped", "infra", "completed"), ("skipped", "unreachable", "completed"),
+    ("skipped", "unsafe", "failed"), ("skipped", "stuck", "failed"),
+])
+def test_an_adaptation_run_record_is_not_failed_for_needing_review(
+        tmp_path, monkeypatch, gate, reason, expected):
+    # Its verdict is NEEDS-REVIEW by design, so "not APPROVED" recorded every run
+    # as failed.
+    session = _session(tmp_path, monkeypatch, ADAPTATION)
+    _ended(session, gate, reason)
+    assert runner._final_status(ADAPTATION, session, 0) == expected
+
+
+@pytest.mark.parametrize("name", [ADAPTATION, "test-healing-agent"])
+def test_a_run_record_only_ever_holds_a_state_the_stream_ends_on(tmp_path, monkeypatch, name):
+    # Anything else leaves the live view open on a run that has finished.
+    session = _session(tmp_path, monkeypatch, name)
+    for gate, reason in (("skipped", "infra"), ("skipped", "escalate"), ("true", ""),
+                         ("false", "")):
+        _ended(session, gate, reason)
+        for exit_code in (0, 1):
+            assert runner._final_status(name, session, exit_code) in runner.TERMINAL_STATUSES
+    assert runner._final_status(name, session, 1) == "failed"
+
+
+def test_other_agents_run_records_still_follow_the_verdict(tmp_path, monkeypatch):
+    session = _session(tmp_path, monkeypatch, "test-healing-agent")
+    (session / ".verdict").write_text("NEEDS-REVIEW\n")
+    assert runner._final_status("test-healing-agent", session, 0) == "failed"
+    (session / ".verdict").write_text("APPROVED\n")
+    assert runner._final_status("test-healing-agent", session, 0) == "completed"

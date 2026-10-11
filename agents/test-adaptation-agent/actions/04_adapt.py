@@ -711,7 +711,12 @@ def main():
 
     if scope.get("skipped"):
         result["escalations"].append({"what": "scope", "why": scope.get("reason", "")})
-        finish(result, "skipped", "no-work")
+        # Scope wrote why it stopped. A stop that never got to look (`infra`) has
+        # to stay one: rewritten as `no-work` it consumes the note and counts as
+        # a decision the agent never made.
+        written = AUDIT_DIR / ".skip-reason"
+        finish(result, "skipped",
+               (written.read_text().strip() if written.exists() else "") or "no-work")
         return
 
     workspace = workspace_helper.resume_workspace(scope["workspace"], log=log)
@@ -731,10 +736,13 @@ def main():
         return
 
     if explore.get("status") == "unsafe":
+        walked = flow_map.violations_text(flow)
         result["escalations"].append({
             "what": "destructive action performed",
-            "why": "exploration performed an action it should have refused, so its "
-                   "evidence cannot be treated as side-effect free"})
+            "why": "exploration acted on a control whose name reads as destructive"
+                   + (f" — {walked}" if walked else "")
+                   + ", so its evidence cannot be treated as side-effect free. "
+                   + flow_map.SANDBOX_HINT})
         finish(result, "skipped", "unsafe")
         return
 
@@ -743,6 +751,23 @@ def main():
             "what": "no flow map",
             "why": "exploration recorded no steps, so no edit could be justified by "
                    "an observation"})
+        finish(result, "skipped", "unreachable")
+        return
+
+    # The walk refused a control before it had observed anything. Every item
+    # would be declined for want of evidence, so say why here rather than spend
+    # a model call arriving at the same answer with less to go on.
+    outcomes = [(s.get("result") or {}).get("outcome") for s in flow["steps"]]
+    if "refused" in outcomes and "ok" not in outcomes:
+        first = flow["steps"][outcomes.index("refused")]
+        token = (first.get("result") or {}).get("destructive_token")
+        result["escalations"].append({
+            "what": "refused before anything was observed",
+            "why": f"exploration stopped at {flow_map.target_label(first) or 'its first control'}"
+                   + (f", whose name contains '{token}'" if token else "")
+                   + ", so nothing of the flow was seen and no edit could be "
+                     "justified. " + flow_map.SANDBOX_HINT})
+        log(f"STOP: {result['escalations'][-1]['why']}")
         finish(result, "skipped", "unreachable")
         return
 

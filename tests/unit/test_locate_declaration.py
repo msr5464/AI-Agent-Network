@@ -93,6 +93,40 @@ COLLIDING = {
 }
 
 
+FRAMED_BUILDER_PAGE = '''
+public class CardFormPage extends BasePage {
+    private final Locator code;
+    public CardFormPage(Config config) {
+        code = page.frameLocator("#pay-frame").getByPlaceholder("123",
+                new FrameLocator.GetByPlaceholderOptions().setExact(true));
+    }
+    public void fill(String v) { enterData(code, v, "Card code field"); }
+}
+'''
+
+
+class TestALocatorDeclaredWithABuilderInAnIframe:
+    """A field repaired with a builder inside a frame has to stay findable.
+
+    The declaration was not read at all, so the selector a later failure quoted
+    matched no field, and neither did the element name it quoted — the field it
+    led to was not among the page object's locators.
+    """
+
+    RUNTIME = ('#pay-frame >> internal:control=enter-frame >> '
+               'internal:attr=[placeholder="123"s]')
+
+    def test_the_failing_selector_finds_its_field(self):
+        found = loc._declaring_field({"CardFormPage": FRAMED_BUILDER_PAGE}, self.RUNTIME)
+        assert found[:2] == ("CardFormPage", "code")
+
+    def test_so_does_the_element_name(self):
+        found = loc._field_by_element_name(
+            {"CardFormPage": FRAMED_BUILDER_PAGE},
+            "Failed to enter data in element 'Card code field' with locator: x")
+        assert found[:2] == ("CardFormPage", "code")
+
+
 class TestFieldByElementName:
     def test_the_named_page_is_searched_first(self):
         name, field, _ = loc._field_by_element_name(

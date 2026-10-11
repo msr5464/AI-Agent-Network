@@ -343,6 +343,11 @@ def _match_tests(catalog: dict, affects: List[str], named: List[str],
 
     if selected:
         how = "affects glob / named test"
+    elif globs or named_set:
+        # The note said which tests. Widening to the whole module because none of
+        # them was found would adapt tests nobody named — a misspelt test name
+        # became every test in the module.
+        how = "Tests/Affects matched nothing"
     elif module:
         # A human will omit `Affects:`. Falling back to the module keeps the run
         # possible, but it is a weaker claim and the caller must say so.

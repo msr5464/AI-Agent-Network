@@ -123,3 +123,46 @@ class TestAdaptationRestoredStep:
         stage = json.loads((tmp_path / "audit" / "metrics" / "stages.jsonl").read_text())
         assert (stage["key"], stage["label"], stage["skipped"]) == (
             "explore", "[03/05] Explore", True)
+
+
+class TestAdaptationSandboxState:
+    """An exploration made with the sandbox assertion off stops at the first control
+    the checker flags. Restored after the assertion is turned on, it reported the
+    same refusal and the switch seemed to do nothing."""
+
+    FUNCTIONS = ["_cache_sandbox_ok", "_cache_hit", "_cache_save"]
+    HIT = 'if _cache_hit "{name}"; then echo HIT; else echo MISS; fi'
+
+    def _save(self, tmp_path, state):
+        (tmp_path / "audit").mkdir(exist_ok=True)
+        for name in ("03-explore.json", "01-parse-change.json"):
+            (tmp_path / "audit" / name).write_text(json.dumps(
+                {"status": "partial", "flow": {"pages": {}}}))
+        _bash(tmp_path, ADAPTATION, self.FUNCTIONS,
+              f'CACHE_VERSION=2; SANDBOX_STATE={state}\n'
+              '_cache_save "03-explore.json"; _cache_save "01-parse-change.json"')
+
+    def _hit(self, tmp_path, state, name="03-explore.json"):
+        out = _bash(tmp_path, ADAPTATION, self.FUNCTIONS,
+                    f'CACHE_VERSION=2; SANDBOX_STATE={state}\n' + self.HIT.format(name=name))
+        return out.strip().splitlines()[-1]
+
+    def test_the_same_state_is_a_hit(self, tmp_path):
+        self._save(tmp_path, "off")
+        assert self._hit(tmp_path, "off") == "HIT"
+
+    def test_a_different_state_is_a_miss_either_way(self, tmp_path):
+        self._save(tmp_path, "off")
+        assert self._hit(tmp_path, "on") == "MISS"
+        self._save(tmp_path, "on")
+        assert self._hit(tmp_path, "off") == "MISS"
+
+    def test_a_cache_from_before_the_state_was_recorded_counts_as_off(self, tmp_path):
+        self._save(tmp_path, "off")
+        (tmp_path / "cache" / "03-explore.json.sandbox").unlink()
+        assert self._hit(tmp_path, "off") == "HIT"
+        assert self._hit(tmp_path, "on") == "MISS"
+
+    def test_steps_the_assertion_does_not_touch_stay_cached(self, tmp_path):
+        self._save(tmp_path, "off")
+        assert self._hit(tmp_path, "on", "01-parse-change.json") == "HIT"

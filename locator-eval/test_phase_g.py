@@ -150,7 +150,10 @@ def test_assertion_locators_are_refused_from_real_source():
                                                  ["addButton", "cartBadge"])
     assert fields == {"cartBadge"}, fields
 
+    # Configured never to touch one: refused before the page is even opened.
+    # (The shipped default repairs on proof and reports otherwise.)
     cfg = yaml.safe_load(CONFIG.read_text())
+    cfg["classify"]["heal_assertions"] = "never"
     baseline = {"locator_id": "CartPage#cartBadge", "raw_locator": ".badge",
                 "action": "click", "element": {}, "context": {"landmarks": []},
                 "history": []}

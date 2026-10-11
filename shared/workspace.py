@@ -29,7 +29,10 @@ import contextlib
 import errno
 import os
 import re
+import shutil
 import subprocess
+import tarfile
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -407,6 +410,37 @@ def remote_branch_exists(org: str, repo: str, token: str,
     return False if result.returncode == 2 else None
 
 
+def refs_with_path(path, relpath: str, limit: int = 5, scan: int = 200) -> List[str]:
+    """Branches of the checkout at `path` that contain `relpath`, newest first.
+
+    For telling someone where a file they named does exist, when it is not on
+    the branch that was searched. Reads refs already fetched and nothing else;
+    a remote branch is named without its `origin/`. [] on any failure, and
+    bounded: `scan` refs looked at, `limit` names returned.
+    """
+    try:
+        listed = _git(["for-each-ref", "--sort=-committerdate", f"--count={scan}",
+                       "--format=%(refname:short)", "refs/heads", "refs/remotes"],
+                      cwd=path, timeout=30)
+        if listed.returncode != 0:
+            return []
+        names: List[str] = []
+        for ref in listed.stdout.split():
+            if ref == "origin" or ref.endswith("/HEAD"):
+                continue
+            if _git(["cat-file", "-e", f"{ref}:{relpath}"], cwd=path,
+                    timeout=15).returncode != 0:
+                continue
+            name = ref[len("origin/"):] if ref.startswith("origin/") else ref
+            if name not in names:
+                names.append(name)
+            if len(names) >= limit:
+                break
+        return names
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
 def list_remote_branches(org: str, repo: str, token: str) -> List[str]:
     """Every branch on the remote, for the UI's picker. [] on any failure."""
     if not (org and repo and token):
@@ -690,6 +724,73 @@ def cleanup_worktree(main_path, worktree_path, log=lambda m: None) -> Dict:
         _git(["worktree", "prune"], cwd=main_path, timeout=120)
     log(f"Cleaned up worktree at {worktree_path}")
     return {"ok": True, "reason": ""}
+
+
+# ── Reading a branch without checking it out ──────────────────────────────────
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def export_tree(path, sha: str, dest) -> Dict:
+    """Write the files of commit `sha` into `dest`. Changes nothing in the repo.
+
+    For a reader that needs another branch's files on disk — the server's test
+    picker, which must list what a run based on that branch will see. A checkout
+    would move the HEAD a developer or a local run is standing on, and a
+    worktree registers itself in .git/worktrees, where the runner's prune and
+    every `worktree add` contend. `git archive` only reads the object store.
+
+    Returns {ok, reason}. `dest` appears whole or not at all: the tree is
+    unpacked beside it and renamed into place, so a reader arriving mid-export
+    never lists half a repository and takes it for the full one.
+    """
+    if not _SHA_RE.match(sha or ""):
+        return {"ok": False, "reason": f"not a commit id: {sha!r}"}
+    dest = Path(dest)
+    if dest.is_dir():
+        return {"ok": True, "reason": ""}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{dest.name}-", dir=str(dest.parent)))
+    try:
+        # stderr goes to a file, not a pipe: stdout is being drained as a
+        # stream, and a second pipe nobody reads until the end is a deadlock
+        # waiting for git to say more than a pipe buffer holds.
+        with tempfile.TemporaryFile() as errors:
+            proc = subprocess.Popen(
+                ["git", "archive", "--format=tar", sha], cwd=str(path),
+                stdout=subprocess.PIPE, stderr=errors,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+            unpacked = True
+            try:
+                with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+                    # The "data" filter refuses absolute paths and links that
+                    # leave the destination. Absent on older interpreters, where
+                    # the archive is still this repository's own tree.
+                    if hasattr(tarfile, "data_filter"):
+                        tar.extractall(staging, filter="data")
+                    else:
+                        tar.extractall(staging)
+            except (tarfile.TarError, OSError):
+                unpacked = False
+            finally:
+                proc.stdout.close()
+                proc.wait()
+            if proc.returncode != 0 or not unpacked:
+                errors.seek(0)
+                said = errors.read().decode("utf-8", "ignore").strip()
+                return {"ok": False,
+                        "reason": f"could not read {sha[:8]}: {said[:200] or 'git archive failed'}"}
+        try:
+            os.replace(staging, dest)
+        except OSError:
+            # Another request exported the same commit first. Same content.
+            if not dest.is_dir():
+                raise
+        return {"ok": True, "reason": ""}
+    except OSError as e:
+        return {"ok": False, "reason": f"could not write {dest}: {e}"}
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

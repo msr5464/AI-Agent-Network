@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from shared import failure_context as _failure_context
+from shared import failure_identity
 from shared.dom_snapshot import find_snapshot, parse_header
 from shared.telemetry import failing_action, read_actions
 
@@ -33,7 +34,8 @@ def attach(issue: dict, results_dir: Path, method_name: str,
     """Fill in dom_snapshot / screenshot / failure_context / trace_path.
 
     Returns the failing selector read from the trace, or "" when the trace does
-    not name one. `log` is optional: the fix step calls this to refresh an issue
+    not name one — `failed_selector` is then filled from the failure's own
+    account, which is evidence of a different kind and is not returned as this. `log` is optional: the fix step calls this to refresh an issue
     quietly, where the reproduce step narrates it.
     """
     say = log or (lambda _msg: None)
@@ -90,4 +92,31 @@ def attach(issue: dict, results_dir: Path, method_name: str,
         else:
             say(f"  Trace: {trace.name}")
 
+    name_failing_selector(issue, context, say)
     return trace_selector
+
+
+def name_failing_selector(issue: dict, context: Optional[dict] = None,
+                          log: Optional[Callable[[str], None]] = None) -> str:
+    """Fill `failed_selector` from the failure itself when the trace named none.
+
+    A trace names the selector only when an action on it threw. A wait that polls
+    until its budget runs out throws nothing, so for that whole class of failure
+    the field stayed empty — and every step that looks a failure up by its
+    selector (the offline locate, the clustering, the edit guards) had nothing to
+    look up. The framework says which locator it was waiting for twice over: in
+    the message it fails with, and in the context it writes beside the snapshot.
+    """
+    if issue.get("failed_selector"):
+        return issue["failed_selector"]
+    if context is None:
+        path = issue.get("failure_context") or ""
+        context = _failure_context.load(path) if isinstance(path, str) else path
+    text = issue.get("error_message") or issue.get("root_cause") or ""
+    selector = failure_identity.failing_selector(text, context)
+    if selector:
+        issue["failed_selector"] = selector
+        source = ("the failure message" if failure_identity.identify(text).get("selector")
+                  else "the failure context")
+        (log or (lambda _msg: None))(f"  Failing selector: {selector} (from {source})")
+    return selector
