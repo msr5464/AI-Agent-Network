@@ -146,3 +146,15 @@ class TestCredentialsFromPlan:
     def test_an_explicit_input_file_overrides_the_plans(self, tmp_path):
         plan = {"_input_file": str(tmp_path / "gone.txt")}
         assert credentials_from_plan(plan, self._input(tmp_path))["username"] == "qa.user@example.com"
+
+
+@pytest.mark.parametrize("test_case,asked", [
+    ("1. Log in with Username: qa and Password: Secret1", False),
+    ("1. Log in. Keep the username and password in the properties file", True),
+    ("1. Log in with the password from staging-sg.properties", True),
+    ("1. Open the product and check its properties table", False),
+    ("", False),
+])
+def test_the_properties_file_is_used_only_when_the_test_case_names_it(test_case, asked):
+    from shared.credential_extraction import wants_properties
+    assert wants_properties(test_case) is asked

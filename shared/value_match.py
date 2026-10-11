@@ -201,6 +201,17 @@ def order(expected, actual) -> Optional[str]:
     return "less" if b[0] < a[0] else "greater"
 
 
+def spelled_out(text) -> str:
+    """`text` with every character a reader cannot see written as its \\uXXXX escape.
+
+    A page rendered a name with a non-breaking space after it. Shown as it was, a
+    fix asked to copy the text exactly typed an ordinary space, and the check
+    failed again on two strings that print alike.
+    """
+    return "".join(ch if ch == " " or (ch.isprintable() and not ch.isspace())
+                   else f"\\u{ord(ch):04X}" for ch in str(text))
+
+
 def triage(failure_text: str, messages, parse) -> Optional[Dict[str, str]]:
     """The failed assertion, when all it saw was its expected value rendered differently.
 

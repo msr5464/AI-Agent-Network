@@ -198,9 +198,9 @@ class TestTheBrowsersOwnRecord:
                             "visible": visible}}
 
     @staticmethod
-    def _typed(sel, value, uid=None, password=False):
-        return {"typed": {"sel": sel, "value": None if password else value, "uid": uid,
-                          "password": password, "total": 1, "visible": 1}}
+    def _typed(sel, value, uid=None):
+        return {"typed": {"sel": sel, "value": value, "uid": uid,
+                          "total": 1, "visible": 1}}
 
     @staticmethod
     def _state(page="cart", checks=None):
@@ -223,8 +223,8 @@ class TestTheBrowsersOwnRecord:
         # A field reports its change when focus leaves it, steps after the typing.
         rows = [self._typed("#card", "4111"), self._state(),
                 self._typed("#card", "4111"),                       # the same value
-                self._typed("#pin", "", password=True), self._state(),
-                self._typed("#pin", "", password=True),             # never recorded
+                self._typed("#pin", "1234"), self._state(),
+                self._typed("#pin", "1234"),                        # a password field too
                 self._typed("#card", "4000")]                       # typed again
         assert [a["sel"] for a in fm.recorded_actions(rows)] == ["#card", "#pin", "#card"]
 

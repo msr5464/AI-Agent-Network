@@ -66,8 +66,8 @@ had only read. Step 03 generated `fillText()` on a `<td>`.
 
 The claim itself is checked too. `qa-helpers.js` reports every value typed into
 any field as it happens, cross-origin iframes included, and `qa-page.js` writes
-each one to the evidence file as a `typed` row. A password's value is never
-recorded, only its selector. When a run recorded any typing, an `INPUT_USED` whose
+each one to the evidence file as a `typed` row, a password field's like any
+other. When a run recorded any typing, an `INPUT_USED` whose
 value matches none of the recorded values is dropped. The field's selector stays,
 because only the claim is wrong. A field that formats its input
 (`4111111111111111` shown as `4111 1111 1111 1111`) still counts.
@@ -164,7 +164,10 @@ at 30 on a slow one. The cost was never the flow. It came from four places:
 The quality bar is unchanged. Every selector is still measured live at count 1 and
 visible 1 (the helpers do the same counting rule 2c always required), every iframe
 hop is still proven unique, and brief screens are still recorded in the call that
-shows them (`page.qa.record`). Driven by script with these helpers, the whole
+shows them (`page.qa.record`). A recording marks what is on the page before its
+action and then asks only for what came or changed since, 80 elements a look: counted
+over the whole page, a toast (appended after everything else) fell past the 80th
+element and the recording reported that nothing had appeared. Driven by script with these helpers, the whole
 checkout (buy, card, promo, 3-D Secure OTP, the result screen and the redirect)
 takes about 35s of browser time.
 
@@ -256,13 +259,23 @@ trusting the model's claim about itself):
 
 | Check | Outcome |
 |-------|---------|
-| the input asked for it | **kept at full strength.** The test fails on purpose, the PR says why, and the verdict is NEEDS-REVIEW. The product does not do what was asked — that is a finding. Step 04 is told these checks and stops with the `defect` gate when one is the failure, instead of pointing its locator at some other element |
+| the input asked for it | **kept at full strength.** Step 02 not seeing it is not yet the product not doing it, so the test decides. If it fails there, the PR says why and the verdict is NEEDS-REVIEW: the product does not do what was asked, and that is a finding. Step 04 is told these checks and stops with the `defect` gate when one is the failure, instead of pointing its locator at some other element. If the test passes, the check is confirmed by the test (below) |
 | the pipeline invented it | **dropped entirely** — locator, accessor and assertion. A failing check nobody asked for is exactly what gets "fixed" by deleting it |
 
 Dropping is the irreversible direction, so it needs the harder test: a check is only
 dropped when *nothing* in it traces back to the input. A partly-traceable check is
 kept and the test goes red, because a wrongly-kept check is visible and a wrongly-
 dropped one is silent.
+
+**A check step 02 missed can still be confirmed by the test.** A message shown for
+a few seconds was gone before step 02 looked. The generated test asserted it and
+passed, and the PR still said "this test fails on purpose" under a NEEDS-REVIEW
+verdict, because step 05 read only step 03's list.
+
+| Where | What happens |
+|-------|--------------|
+| **04 Run & Fix**, on a passing run | `confirmed_checks` fingerprints the test as it passed and keeps each kept check that one assertion is about: more than half of the check's distinctive words in that assertion's accessor, expected value and message (`check_provenance.asserted_by`). An assertion inside a condition does not count, since it may not have run. Written to `04-run-and-fix.json` → `confirmed_checks`. |
+| **05 Ship** | `open_checks` is step 03's list minus those. Only what is left reaches the PR and the verdict. Left over on a passing test, a check is reported as "not seen and not found in the test". On a test that failed, only the `defect` gate means it failed on one of these checks; with any other gate the PR says step 02 did not see them and the run failed for another reason, never that the test fails on purpose. |
 
 **An action names an outcome, and the mechanism is ours to find.** "Save the profile"
 does not mean "there is a Save button" — Naukri's profile summary autosaves about a
@@ -310,6 +323,15 @@ formatting fix was rejected along with the bug-hiding one. Identical assertions 
 method are fingerprinted separately (`<hash>_1`, `<hash>_2`), so deleting one of a
 pair is caught too.
 
+A relaxation one attempt was sanctioned to make (see "Values and check contracts")
+still stands in the attempts after it. The frozen copy keeps the assertion as first
+written, so each later check is handed the sanctions already used
+(`honoured_relaxations`, read from every applied attempt's `relaxed_checks`) and judges
+the relaxed assertion against the frozen one the same way. Without that, every fix
+after a relaxation was rejected for removing the assertion the relaxation had replaced:
+a run relaxed a name check in attempt 2, had two correct fixes to a page object rejected
+in attempts 3 and 4, and stopped as stuck.
+
 This exists because none of the six per-file guards could see it: deleting an
 assertion is a one-line diff that loses no method, adds no `Thread.sleep`, and is
 invisible to `no_selector_broadening`, which only inspects `page.locator(...)` calls.
@@ -352,7 +374,7 @@ loosening an equality in step 04.
 | **02 Validate Web** | The prompt's TEST DATA block lists every `Label: value` line of the raw test case (`shared/test_case.py`), so a value reaches the browser even when step 01 reworded it away. An `Email:` or `OTP:` goes there too unless the flow logs in; only then is it a CREDENTIAL. Rule 2g: `INPUT_USED: <field>\|<typed>` for every field filled, and `VALUE_CHECK: <step>\|<element>\|<shown>\|<input:field \| element:name \| literal>\|<other side>` for every comparison. Written to `02-validate-web.json` as `inputs_used` / `value_checks`, with the relation computed in Python. The values win in both directions. A comparison whose two sides match under no relation is downgraded to unverified. One the model reported unverified is promoted to passed when its two sides do match, the element's selector was confirmed, and the expected side traces to its source: the typed value, a measured element, or a literal in the step. A run had called `08123456789` against `+628123456789` a mismatch. A `literal` whose text is not in the test case was read off the page, and is dropped (`drop_untraced_sources`). "Record the amount shown" had come back as `literal\|20,000` and been generated as `assertEquals(amount, "20,000")`. An order claim its values contradict ("decreased" with an amount that went up) is downgraded the same way. |
 | **03 Generate**, in the prompt | VALIDATED INPUTS: a typed value the test case itself states is marked GIVEN BY THE TEST CASE and becomes that field's default exactly as written. Every other field's test data keeps the typed value's shape (word count, character classes, prefix), randomised inside it. CHECK CONTRACTS: each check is asserted with exactly its measured relation, with the expected side taken from its source, never a new literal. A contract overrides the plan's `assertEquals` wording. A `numeric` contract compares both amounts as plain number text through the string equality assertion. When it said "the two parsed numbers", the model wrote `assertEquals(config, long, long, …)`, which has no overload, and the compile gate stopped the run. An order contract (`less`/`greater`) says to read the other side from exactly the element named, where it is on screen. Order checks were once left out of the contracts. The plan then read "the total before the promo" after the card number had already lowered it, and the test compared an amount with itself. |
 | **03 Generate**, after codegen | An expected value (an assertion's whole string argument, or a CSV cell under an `expected*` header) that appears neither in the test case nor in anything step 02 typed, read or reported is untraced. One repair pass under `VALUE_REPAIR_MAX_DIFF_LINES` runs, and it is kept only if it removes some. Whatever remains goes in `03-generate.json` → `untraced_expected_values`. |
-| **04 Run & Fix** | A failure that is an `Expected/Actual` pair with a benign relation, pinned by its message to exactly one frozen assertion, is `VALUE_MISMATCH`. When its expected side is a string literal and the page only spaces or cases it differently, the fix is that literal, rewritten to exactly what the page shows (`literal_fix`). No sanction is given, so a comparator change is rejected: offered one, a fix wrapped both sides of a message check in `.replaceAll("\\s+", "").toLowerCase()`. Otherwise the prompt offers two fixes in order: (a) restore the data's validated shape, or (b) change **only** that assertion's comparator. `conserved(sanction=…)` accepts exactly (b): same place, same message, every compared expression and expected value still passed, no deeper condition. It is recorded as `relaxed_checks`. A frozen file without argument text (an older session) gets no sanction. |
+| **04 Run & Fix** | A failure that is an `Expected/Actual` pair with a benign relation, pinned by its message to exactly one frozen assertion, is `VALUE_MISMATCH`. When its expected side is a string literal and the page only spaces or cases it differently, the fix is that literal, rewritten to exactly what the page shows (`literal_fix`). A character that cannot be seen is written in the prompt as its `\uXXXX` escape (`value_match.spelled_out`), and conservation reads the escape as the spacing it is. A page showed a name with a non-breaking space after it, the fix typed an ordinary space, and the check failed again on two strings that print alike. No sanction is given, so a comparator change is rejected: offered one, a fix wrapped both sides of a message check in `.replaceAll("\\s+", "").toLowerCase()`. Otherwise the prompt offers two fixes in order: (a) restore the data's validated shape, or (b) change **only** that assertion's comparator. `conserved(sanction=…)` accepts exactly (b): same place, same message, every compared expression and expected value still passed, no deeper condition. It is recorded as `relaxed_checks`. A frozen file without argument text (an older session) gets no sanction. |
 
 The message is the pin because the fingerprint leaves it out. Name and phone checks with
 one call shape share a fingerprint, so without it the name check's relaxation was paired
@@ -413,8 +435,8 @@ Nothing the fixer was shown said so. Now:
 
 | Evidence | Why |
 |---|---|
-| The execution trace lists every value the test typed, per field, however early (`telemetry.format_for_prompt`). A secret-looking field shows only its length | The timeline showed selectors only, and `type()` values were not even parsed: Playwright sends them as `text`, not `value` |
-| The system prompt lists the values the test case states (`test_case_data_section`). Login secrets are named, not shown | A fix that rewrote the test data made up a name, an email, a card number and an expired expiry for a test case that stated all four |
+| The execution trace lists every value the test typed, per field, however early (`telemetry.format_for_prompt`), a password or one-time code included | The timeline showed selectors only, and `type()` values were not even parsed: Playwright sends them as `text`, not `value` |
+| The system prompt lists the values the test case states (`test_case_data_section`), a login included. One the test case asks to keep in the properties file is marked as kept there | A fix that rewrote the test data made up a name, an email, a card number and an expired expiry for a test case that stated all four |
 | A CSV a fix writes, new files included, must have one field per column in every row (`_csv_rows_fit`) | An unquoted `Bangalore, India` shifted every later column. The per-file guards only ran on files that already existed |
 
 The fix call loads only `Read`, `Grep` and `Glob`, with this run's worktree added and named
@@ -492,8 +514,8 @@ Web Steps:
 - `defect`  — the test ran and failed exactly as the input's documented `Actual Result` says the product misbehaves today, or on a check step 02 never saw the product do; the loop stops instead of working around a real bug → ship with NEEDS-REVIEW. Never on a compile failure
 
 **.verdict**
-- `APPROVED`      — test passed, nothing the input asked for went unverified, no fix was rejected for weakening an assertion
-- `NEEDS-REVIEW`  — test failing, OR a requested check could not be observed, OR a fix was rejected for weakening a test, OR no test ran at all
+- `APPROVED`      — test passed, everything the input asked for was observed (by step 02, or by an assertion in the passing test), no fix was rejected for weakening an assertion
+- `NEEDS-REVIEW`  — test failing, OR a requested check was observed by neither step 02 nor the passing test, OR a fix was rejected for weakening a test, OR no test ran at all
 
 ---
 
@@ -513,7 +535,7 @@ Web Steps:
 | `03-system-prompt.txt`, `04-system-prompt.txt` | Generate, Run & Fix | The static half of each prompt — conventions, references, rules — sent once as `--system-prompt-file` instead of inside every batch or attempt |
 | `03-generate.json` + `.md` | Generate | List of files written, `dropped_unverified_checks`, `kept_unverified_checks`, `unconfirmed_locators`, `guessed_locators` (what codegen wrote for each, and whether step 02's counts confirmed it, a repair replaced it, or it is still a guess), `untraced_expected_values`, `csv_lookup_problems` (CSV reads their sheet cannot answer); the reuse ledger (`reuse`, `reuse_unknown`, `new_operations`), `created_files` / `pre_run_files`, and the review records `test_shape`, `modified_existing`, `changed_existing_api`, `near_duplicates`, `rebuilt_pages`, `option_enum_gaps`, `reuse_unused`; `restored_existing_tests` (existing `@Test` methods step 03 changed and put back) |
 | `pre-run/` | Generate, Run & Fix | Every existing file this run changed, as it was before the run touched it — step 03's copies, plus any a step 04 fix added. What `modified_existing` and the regression re-run diff against |
-| `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes, `value_mismatch` / `relaxed_checks` when a failure was triaged as one |
+| `04-run-and-fix.json` + `.md` | Run & Fix | Test output, applied fixes, `value_mismatch` / `relaxed_checks` when a failure was triaged as one, `confirmed_checks` on a passing run (the checks step 02 could not observe that the test asserts) |
 | `04-proven-locators.json` | Run & Fix | Only on a passing run: the locators that matched one visible element while it passed. Seeds later runs of step 02; also copied to `cache/<user>/<module>/` |
 | `04-regression.json` + `.md` | Run & Fix | Only after the new test passes: the existing methods this run changed, the existing tests that reach them, and each re-run's result with its first error line. A failure, or more tests than the cap, makes the verdict NEEDS-REVIEW |
 | `regression-baselines/` | Run & Fix | Page fingerprints the regression re-runs recorded, kept out of the checkout so they never ride into the PR |
@@ -521,7 +543,7 @@ Web Steps:
 | `.assertions-frozen.json` | Run & Fix | What the generated test proved before any fix — the conservation baseline |
 | `.fix-history.json` | Run & Fix | Every fix attempt, appended: diagnosis, edits proposed, guards that rejected them. Feeds the next prompt and the stop rule |
 | `.fix-passed` | Run & Fix | Gate: true / false / skipped / stuck / defect |
-| `05-ship.json` + `.md` | Ship | PR URL, Slack status |
+| `05-ship.json` + `.md` | Ship | PR URL, Slack status, `confirmed_checks` |
 | `.verdict` | Ship | APPROVED / NEEDS-REVIEW |
 
 ---
@@ -672,7 +694,7 @@ The rule is enforced at four points, all reading `shared/url_properties.py`:
 | **03 Generate**, after codegen | A key the generated code reads that the properties file does not define is **recovered from `urls_visited` or the run aborts** — see "A URL property is not a warning" below. |
 | **03 Generate**, after codegen | A literal URL the generated code *added* gets one targeted repair pass, guarded by `validate_fix`. One already in an existing file is left alone, as step 04's guard does. What survives is logged and recorded in `03-generate.json` → `hardcoded_urls`. |
 | **04 Run & Fix** | `ensure_url_properties()` rewrites the keys before the first run (run.sh's forced base checkout, `shared.workspace prepare-base --checkout`, discards them). `no_hardcoded_url` is a fix guard: a fix that adds a literal URL is rejected before it reaches disk. |
-| **05 Ship** | The URL keys are committed — added to HEAD's copy of the properties file, never the working copy, so the run's real credentials in that same file are not committed with them. |
+| **05 Ship** | Every property the committed code reads and the repository lacks is committed: the URL keys, and a login kept in the properties file (`run_properties`). They are added to HEAD's copy of the file with the values this run wrote, read before the branch is cut, because that checkout puts HEAD's copy back. A key no committed file reads stays out. |
 
 ### `urls_visited` — why the step text was not enough
 
@@ -727,11 +749,20 @@ Key naming: the host alone is `{feature}.url` (matching the existing `saucedemo.
 API base is `{feature}.api.url`, and anything with a path is named for its last meaningful
 segment — `/nlogin/login` → `{feature}.login.url`. Id-like segments are skipped.
 
-Credentials use the same properties file through `shared/credential_properties.py` but are
-the opposite case: never committed. Both share `shared/properties_file.py` so the file
-location and the "never overwrite a human's value" rule exist in one place.
+### Where a login lives
 
-A test-data CSV is committed with the PR, so a login secret never stays in one.
+A login is test data. The username and password a flow signs in with are a row of the
+module's users sheet, read through a Helper method, and the sheet is committed with the
+PR like every other sheet. A generated test once read its login from two properties
+that step 05 left out of the PR, so it ran only in the checkout that wrote them.
+
+| Case | Where the login goes |
+|------|----------------------|
+| default | `csvFiles/users.csv` in the module. Step 03 offers the module's credential sheet to codegen with its other sheets, and offers a new module that logs in a users sheet to create (`_plan_csv_files`). An existing row a regenerated sheet drops or changes blocks the write (`_lost_csv_rows`) |
+| the test case names the properties file ("keep the login in the properties file", `staging-sg.properties`) | `{feature}.username` / `{feature}.password` in the properties file, read with `config.getRunTimeProperty()`. `credential_extraction.wants_properties` decides, from the test case's own words |
+| an existing module | whatever its existing tests already do (rule 7a in the codegen prompt) |
+
+In the properties case only, a login secret may not sit in a generated sheet.
 `credential_extraction.secret_columns` decides what counts. A password, token, API key
 or secret column always counts. An OTP counts only when the flow logs in, because a bank
 page's 3-D Secure OTP is test data. Step 03 (`_move_csv_secrets`) takes each new secret
@@ -739,12 +770,14 @@ column out of the sheet, writes its value to `{feature}.<column>` in the propert
 file, and runs one repair pass that points the code reading the column at the
 property. It writes the rest of the sheet. A column it cannot move, or a read the
 repair left, stops the run with `"error": "csv_secrets_unmoved"`. A test reading a
-column that is gone would only fail in step 04. An existing credential sheet is left
-as it is on disk. In step 04, `_no_csv_secret` refuses a fix that adds a secret column
-to a CSV, new files included. It writes the value to its property first, so the reason
-names a property the next attempt can read. This replaced a check that refused any
-sheet with an `otp` column and still wrote the test that reads it. A payment run lost
-every value of its test case that way, and step 04 then made up its own.
+column that is gone would only fail in step 04. In step 04, `_no_csv_secret` refuses a
+fix that adds a secret column to a CSV, new files included. It writes the value to its
+property first, so the reason names a property the next attempt can read.
+
+Either way the login reaches the PR: a sheet is committed as a file, and step 05
+commits every property the generated code reads (see the URL table above). Both homes
+share `shared/properties_file.py`, so the file location and the "never overwrite a
+human's value" rule exist in one place.
 
 The test and its sheet come out of one batch, and nothing compiled checks that they
 agree. Right after the secrets move, `_check_csv_lookups` holds every generated CSV

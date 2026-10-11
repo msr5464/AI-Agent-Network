@@ -12,9 +12,10 @@ server, the line-oriented marker protocol, emit-as-you-go, per-attempt scoring â
 and changes four things that matter for running against a real product rather than
 a scratch environment:
 
-  * **`storage_state`, never a password.** `shared/claude.py` writes the whole
-    command line into its debug log, so a credential in the prompt is a credential
-    on disk. An expired session is a hard stop, not a fallback to signing in.
+  * **`storage_state` for the entry login.** The browser starts signed in the way
+    the test's own login leaves it. An expired session is a hard stop, not a
+    fallback to signing in. A sign-in that is one of the test's own steps is
+    walked like any other step, with the values in the test's data row.
   * **`.mcp.json` in the audit dir, not the repo root.** The root is shared mutable
     state; the server can run one agent while a developer runs another.
   * **Destructive actions are refused**, and a destructive action that *succeeded*

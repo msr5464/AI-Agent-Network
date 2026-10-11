@@ -17,10 +17,7 @@ window.__qa = (() => {
     const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
   };
-  // A password field's value never leaves the page: every harvest goes to the
-  // model and, as evidence, to disk.
-  const text = el => (el.type === 'password' ? ''
-    : (el.innerText || el.value || el.getAttribute('aria-label') || ''))
+  const text = el => (el.innerText || el.value || el.getAttribute('aria-label') || '')
     .trim().replace(/\s+/g, ' ').slice(0, 60);
   // Which element something resolved to, stable while it stays in this document,
   // so Python can tell that two spellings name one element. A run kept a close
@@ -97,15 +94,14 @@ window.__qa = (() => {
   // Every value typed into a field, reported as it happens to page.qa's binding
   // (window.__qaTyped), so INPUT_USED is held to what was typed: a run reported
   // `amountField|20,000` for a cart total it had only read. A password field
-  // reports that it was typed into, never its value.
+  // reports what it was given like any other.
   const typed = e => {
     const el = e.target;
     if (!window.__qaTyped || !el || !el.matches
         || !el.matches('input,textarea,select,[contenteditable]')) return;
-    const password = el.type === 'password';
     const b = best(el);
-    window.__qaTyped({ sel: b.sel, total: b.total, visible: b.visible, uid: uid(el), password,
-      value: password ? null : String(el.isContentEditable ? el.innerText : el.value).slice(0, 200) });
+    window.__qaTyped({ sel: b.sel, total: b.total, visible: b.visible, uid: uid(el),
+      value: String(el.isContentEditable ? el.innerText : el.value).slice(0, 200) });
   };
   document.addEventListener('input', typed, true);
   document.addEventListener('change', typed, true);
@@ -122,20 +118,36 @@ window.__qa = (() => {
   };
   document.addEventListener('click', clicked, true);
 
+  // What `mark` found on the page, and what each element said then.
+  let marked = new WeakMap();
+
   return {
     vis, count, text, best, uid,
+
+    // Before a recording's action: every element a harvest would list, with its
+    // text, so `harvest({ fresh: true })` returns only what came or changed after.
+    mark() {
+      marked = new WeakMap();
+      for (const el of document.querySelectorAll('*')) {
+        if ((control(el) || ownText(el)) && vis(el)) marked.set(el, text(el));
+      }
+    },
 
     // Rule 2a + 2b + 2c in one call: every visible interactive element — and, with
     // `texts`, every visible element holding its own text, for reading values —
     // each with its best stable selector already counted.
     harvest(scope, opts = {}) {
-      const { texts = false, limit = 60 } = opts || {};
+      const { texts = false, limit = 60, fresh = false } = opts || {};
       // An element when page.qa resolved the scope itself (any Playwright syntax).
       const root = !scope ? document
         : typeof scope === 'string' ? document.querySelector(scope) : scope;
       if (!root) return { error: 'nothing matches scope ' + scope };
       return [...root.querySelectorAll('*')]
         .filter(el => (control(el) || (texts && ownText(el))) && vis(el))
+        // Before the cap, so the cap counts only what is new. A toast is appended
+        // after everything else on the page: on a page that already listed 80
+        // elements a recording never reached it, and reported that none appeared.
+        .filter(el => !fresh || marked.get(el) !== text(el))
         .slice(0, limit)
         .map(el => {
           const o = { tag: el.tagName.toLowerCase(), text: text(el), ...best(el), uid: uid(el) };

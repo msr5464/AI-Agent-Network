@@ -19,9 +19,8 @@ invokes that same helper method through Maven. Whatever the module's login does 
 its own navigation, post-submit steps, dismissed modals — happens because the
 module's own code is what ran.
 
-The credential still never enters a prompt, a model context, or a log, and now it
-never crosses a command line either: `SessionMinter` receives property *keys* and
-resolves them to values inside the JVM.
+Minting hands over no value at all: `SessionMinter` receives property *keys*, or
+the helper's own data call, and resolves them inside the JVM.
 """
 
 from __future__ import annotations

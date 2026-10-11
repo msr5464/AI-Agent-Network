@@ -749,8 +749,7 @@ Rules:
         recovered = [f for f in from_text if f not in plan_creds]
         plan["demo_credentials"] = creds
         if recovered:
-            # Which fields, never their values — the run header masks the same
-            # lines, and a log that prints them undoes that.
+            # Which fields the plan lacked; their values are in the input file.
             log(f"Extracted demo credentials from the input text: {', '.join(recovered)}")
     elif creds and mentions_login(raw_text):
         # Half a credential is worse than none downstream — it makes a login look

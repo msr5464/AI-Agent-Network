@@ -288,7 +288,8 @@ def write_file(rel_path: str, content: str) -> None:
 # encodes) exists in exactly one place.
 from shared.credential_properties import write_credential_property
 from shared.credential_extraction import (credentials_from_plan, secret_columns,  # noqa: E402
-                                          secret_property_key, take_secret_columns)
+                                          secret_property_key, take_secret_columns,
+                                          wants_properties)
 from shared.page_identity import is_dom_selector  # noqa: E402
 from shared.test_catalog import test_methods_in  # noqa: E402
 # URLs are the same story as credentials — one place decides the property file and
@@ -404,8 +405,9 @@ def prune_unverified_checks(plan: dict, web_data: dict, raw_input: str) -> dict:
                 f"locator is a guess: if the test fails here, suspect the locator "
                 f"before the product.")
         else:
-            log(f"UNVERIFIED but asked for — keeping the assertion for {step!r}. The "
-                f"generated test WILL fail here: the product did not do this.")
+            log(f"UNVERIFIED but asked for — keeping the assertion for {step!r}. Step "
+                f"02 did not see the product do this: the generated test fails here "
+                f"unless it does.")
 
     if not dropped:
         return {"dropped": [], "kept_unverified": kept, "kept_unmeasured": unmeasured}
@@ -1820,12 +1822,38 @@ def main() -> None:
         except Exception:
             pass
 
-    # For a NEW web module with no CSV file, the codegen prompt below (rule 7b)
-    # instructs Claude to call config.getRunTimeProperty("{feature}.username"/
-    # ".password") — the SAME condition used here. Write the actual property so
-    # that call resolves to a real value instead of silently returning null.
+    # A login is test data: it goes in the module's users sheet with the rest,
+    # unless the test case asks for the properties file. Then, for a NEW web module
+    # with no CSV file, the codegen prompt below (rule 7b) instructs Claude to call
+    # config.getRunTimeProperty("{feature}.username"/".password") — the SAME
+    # condition used here. Write the actual property so that call resolves to a
+    # real value instead of silently returning null.
+    login_in_properties = wants_properties(raw_input)
+    if login_in_properties:
+        login_data_rule = (
+            "Never put a login secret in a CSV — a password, token or API key, or an OTP\n"
+            "       the login asks for; the test case asks for those in the properties file (see WEB\n"
+            "       LOGIN CREDENTIALS). Other values the flow types, a card number or a bank page's\n"
+            "       OTP among them, are test data and go in the CSV.")
+        new_module_login_rule = (
+            f'use config.getRunTimeProperty("{feature.lower()}.username")\n'
+            f'      and config.getRunTimeProperty("{feature.lower()}.password") unless a CSV file '
+            f"is listed above.")
+    else:
+        login_data_rule = (
+            "A login is test data too: the username and password the flow signs in with are a\n"
+            "       row of the module's users sheet (see WEB LOGIN CREDENTIALS), never a Java\n"
+            "       literal and never a property. So is every other value the flow types.")
+        new_module_login_rule = (
+            "the login is a row of the module's users sheet, listed\n"
+            '      under "Files to generate": a key column the test looks the user up by, then\n'
+            "      username and password holding generation_plan[\"demo_credentials\"] exactly as given.\n"
+            "      The Helper reads that row in a get* method, the way the reference Helper looks a\n"
+            "      user up, and logs in with it. The test names the user by its key and never holds\n"
+            "      the values. Never config.getRunTimeProperty() for a login.")
     credential_property_status = "not applicable"
-    if not existing and test_type in ("web", "both") and not csv_roles_hint:
+    if (login_in_properties and not existing and test_type in ("web", "both")
+            and not csv_roles_hint):
         credential_property_status = write_credential_property(
             AUTOMATION_FRAMEWORK_DIR, feature.lower(), credentials_from_plan(plan), log=log
         )
@@ -2000,10 +2028,8 @@ Rules (MANDATORY — violations will cause compilation failures):
        module's csvFiles/ folder (users.csv, products.csv), NOT by API vs web — API and web tests
        that use the same entity share one sheet. A CSV listed under "Files to generate" is
        OPTIONAL: return it only if a generated test reads from it. When extending an existing CSV,
-       return the whole file with every existing row unchanged and new rows appended. Never put
-       a login secret in a CSV — a password, token or API key, or an OTP the login asks for;
-       those come from properties (see WEB LOGIN CREDENTIALS). Other values the flow types, a
-       card number or a bank page's OTP among them, are test data and go in the CSV.
+       return the whole file with every existing row unchanged and new rows appended.
+       {login_data_rule}
      - State isolation: one user per test; never share an account between test methods.
    LOGGING — decided by the KIND of class, never by what you want to say:
      - test class  -> config.logStep("...")            NEVER Log.step / Log.comment
@@ -2048,8 +2074,7 @@ Rules (MANDATORY — violations will cause compilation failures):
         • github.loginWithStoredSession()                          (a saved storage state)
       NEVER introduce a new credential mechanism (e.g. getCredentials(), CSV lookup, allocateUser())
       if the existing test methods don't already use it.
-   b) For NEW modules where no prior test exists: use config.getRunTimeProperty("{feature.lower()}.username")
-      and config.getRunTimeProperty("{feature.lower()}.password") unless a CSV file is listed above.
+   b) For NEW modules where no prior test exists: {new_module_login_rule}
    c) allocateUser() is ONLY for internal applications with a DB-backed user pool. NEVER use it for
       external/3rd-party services (GitHub, SauceDemo, public APIs, etc.).
 8. Locators: prefer [data-cy='...'] > [id='...'] > [name='...'] > CSS > XPath.
@@ -2283,12 +2308,14 @@ Return ONLY a JSON object, no prose:
         files_map, guesses = _repair_guessed_locators(
             files_map, guessed_locators(files_map, locator_gaps, evidence_rows), evidence_rows)
 
-    # A CSV is committed with the PR. A login secret in one leaves the sheet for the
-    # properties file, and the code that read it is pointed at the property. What
-    # cannot be moved stops the run here: a test reading a column that is no longer
-    # in its sheet would only fail in step 04.
-    files_map, csv_secrets, unmoved_secrets = _move_csv_secrets(
-        files_map, feature, props_file_name, raw_input)
+    # A login stays in its sheet unless the test case asks for the properties file.
+    # Then a login secret in a generated sheet leaves it for the properties file,
+    # and the code that read it is pointed at the property. What cannot be moved
+    # stops the run here: a test reading a column that is no longer in its sheet
+    # would only fail in step 04.
+    files_map, csv_secrets, unmoved_secrets = (
+        _move_csv_secrets(files_map, feature, props_file_name, raw_input)
+        if login_in_properties else (files_map, {}, {}))
     if unmoved_secrets:
         log("ERROR: login secrets in the generated test data could not be moved out of "
             "the CSV into the properties file:")
@@ -2390,11 +2417,11 @@ Return ONLY a JSON object, no prose:
         except ValueError:
             log(f"  BLOCKED: path escapes Thanos-pw root: {rel_path}")
             continue
-        if rel_path.endswith(".csv") and _is_credential_csv(
+        if login_in_properties and rel_path.endswith(".csv") and _is_credential_csv(
                 read_existing_file(rel_path).split("\n", 1)[0], raw_input):
-            # An existing credential sheet, which tests read as it is on disk. A model
-            # rewriting it can mangle real passwords. New secret columns never get
-            # here: _move_csv_secrets took them out of every sheet it was given.
+            # The login is in the properties file this time, so an existing
+            # credential sheet gains nothing and is left as it is on disk. New secret
+            # columns never get here: _move_csv_secrets took them out of every sheet.
             log(f"  KEPT: {rel_path} is an existing credential sheet — left as it is on disk")
             continue
         if rel_path.endswith(".csv"):
@@ -2987,23 +3014,32 @@ def _check_csv_lookups(files_map: dict) -> tuple:
     return files_map, problems
 
 
-def _plan_csv_files(feature_lower: str, test_case: str = "") -> list:
-    """The module's test-data CSVs codegen may extend, or the one it may create.
+def _plan_csv_files(feature_lower: str, test_case: str = "", logs_in: bool = False) -> list:
+    """The module's test-data CSVs codegen may extend, or the ones it may create.
 
-    Credential sheets are left out: a model regenerating one can mangle real
-    passwords, and 05_ship commits whatever step 03 wrote.
+    A login is test data, so the module's credential sheet is offered with the
+    rest, and a module that logs in and has none is offered a users sheet to
+    create. An existing row a regenerated sheet drops or changes blocks the write
+    (_lost_csv_rows). Only a test case that asks for its login in the properties
+    file leaves credential sheets out.
     """
+    in_properties = wants_properties(test_case)
     csv_dir = AUTOMATION_FRAMEWORK_DIR / "src" / "test" / "resources" / feature_lower / "csvFiles"
-    data = []
+    data, has_login = [], False
     for path in sorted(csv_dir.glob("*.csv")):
         try:
             with path.open(encoding="utf-8", errors="ignore") as handle:
                 header = handle.readline()
         except OSError:
             continue
-        if not _is_credential_csv(header, test_case):
+        credential = _is_credential_csv(header, test_case)
+        has_login = has_login or credential
+        if not (in_properties and credential):
             data.append(str(path.relative_to(AUTOMATION_FRAMEWORK_DIR)))
-    return data or [_csv_path(feature_lower, f"{feature_lower}-data")]
+    data = data or [_csv_path(feature_lower, f"{feature_lower}-data")]
+    if logs_in and not in_properties and not has_login:
+        data.append(_csv_path(feature_lower, "users"))
+    return data
 
 
 def _find_existing_helper(feature_lower: str, feature_class: str) -> str:
@@ -3049,6 +3085,10 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
     """Build the list of files that need to be generated or updated."""
     files = []
     feature_lower = feature.lower()
+    # A web flow that signs in with a username and a password the test case gives.
+    login = credentials_from_plan(plan)
+    logs_in = (test_type in ("web", "both")
+               and bool(login.get("username") and login.get("password")))
 
     if not existing:
         # New module — generate the full set from scratch
@@ -3097,7 +3137,7 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
             files.append(existing_flow)
         else:
             files.append(f"src/test/java/automation/{feature_lower}/{feature_class}FlowTest.java")
-        return files + _plan_csv_files(feature_lower, test_case)
+        return files + _plan_csv_files(feature_lower, test_case, logs_in)
 
     if test_type in ("api", "both"):
         existing_api = _find_existing_test_class(feature_lower, "api") if existing else ""
@@ -3115,7 +3155,7 @@ def _plan_files(plan, test_type, existing, pkg_main, pkg_test, feature_class, fe
         else:
             files.append(f"src/test/java/automation/{feature_lower}/{feature_class}WebTest.java")
 
-    return files + _plan_csv_files(feature_lower, test_case)
+    return files + _plan_csv_files(feature_lower, test_case, logs_in)
 
 
 def _infer_test_class(written: list, test_type: str) -> str:

@@ -117,13 +117,19 @@ def _normalise_args(text: str) -> Tuple[str, str]:
     return skeleton, "|".join(expected)
 
 
+# A character written as its escape in source: a space no editor shows apart
+# from an ordinary one is still only spacing.
+_ESCAPED_CHAR = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
 def _canonical(literals: List[str]) -> List[str]:
     """Expected values with whitespace and case ignored — formatting, not meaning.
 
     `"$175.00"` and `"$ 175.00"` are one expectation rendered two ways; a fix that
     turns one into the other has not changed what the test proves.
     """
-    return [re.sub(r"\s+", "", s).lower() for s in literals]
+    return [re.sub(r"\s+", "", _ESCAPED_CHAR.sub(lambda m: chr(int(m.group(1), 16)), s)).lower()
+            for s in literals]
 
 
 def _is_declaration(text: str, start: int) -> bool:
@@ -620,7 +626,8 @@ def relaxes(before_args: str, after_args: str) -> bool:
                if not _STRING.fullmatch(operand))
 
 
-def conserved(before: Dict, after: Dict, sanction: Optional[Dict] = None) -> Dict:
+def conserved(before: Dict, after: Dict, sanction: Optional[Dict] = None,
+              honoured: tuple = ()) -> Dict:
     """Compare two fingerprint sets. Returns a verdict with named reasons.
 
     Neither argument is modified: `before` is usually a frozen contract that the
@@ -632,6 +639,12 @@ def conserved(before: Dict, after: Dict, sanction: Optional[Dict] = None) -> Dic
     the page was measured to render differently (`shared/value_match.py`), and it
     is reported as `relaxed`, never folded into "preserved". Everything else is
     judged exactly as without it.
+
+    `honoured` — the sanctions earlier attempts of the same run were given and
+    used. Each still lets its assertion stand relaxed, judged against the frozen
+    one the same way, and is not reported again. Without them, every fix after a
+    relaxation was rejected for removing the assertion the relaxation replaced,
+    and a run stopped on a correct fix to another file.
     """
     lost, weakened, conditionalised, moved, changed, relaxed = [], [], [], [], [], []
     after_asserts = after["asserts"]
@@ -652,10 +665,17 @@ def conserved(before: Dict, after: Dict, sanction: Optional[Dict] = None) -> Dic
     # phone, both `assertEquals(config, x.get(), data.get(), …)`) share one, and
     # pairing by fingerprint handed the name check's relaxation to the phone
     # check — reported as a weakening of a check nobody touched.
-    wanted = (sanction or {}).get("message")
-    target = next((fp for fp, info in before["asserts"].items()
-                   if wanted and message_of(info.get("args") or "") == wanted), None)
-    if target:
+    permits = [(permit, False) for permit in honoured or ()
+               if permit.get("message") != (sanction or {}).get("message")]
+    if sanction:
+        permits.append((sanction, True))
+    for permit, fresh in permits:
+        wanted = permit.get("message")
+        target = next((fp for fp, info in before["asserts"].items()
+                       if wanted and fp not in pairs
+                       and message_of(info.get("args") or "") == wanted), None)
+        if not target:
+            continue
         info = before["asserts"][target]
         same_place = [a for a in unmatched
                       if after_asserts[a]["site"] == info["site"]
@@ -668,8 +688,8 @@ def conserved(before: Dict, after: Dict, sanction: Optional[Dict] = None) -> Dic
             (a for a in same_place
              if len(after_asserts[a]["cond_path"]) <= len(info["cond_path"])
              and relaxes(info.get("args"), after_asserts[a].get("args"))), None)
-        if claim(target, replacement):
-            relation = (sanction or {}).get("relation")
+        if claim(target, replacement) and fresh:
+            relation = permit.get("relation")
             relaxed.append(f"{info['callee']} at {info['site']} -> "
                            f"{after_asserts[replacement]['callee']}"
                            + (f" ({relation})" if relation else ""))

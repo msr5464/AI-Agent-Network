@@ -514,8 +514,7 @@ def recorded_actions(rows: List[Dict]) -> List[Dict]:
     Rows that follow one another on the same control are one action — a field
     writes a row per change. So is a field's change row arriving late with the
     value it already had: a field reports its change when focus leaves it, which
-    can be several steps after the typing. A password's value is never recorded,
-    so a later row on one is taken as that same typing. `page` is the state
+    can be several steps after the typing. `page` is the state
     measured next, when a step named it: the page the action led to, where its
     FLOW_STEP is filed.
     """

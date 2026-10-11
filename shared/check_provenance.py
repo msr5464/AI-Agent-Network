@@ -243,6 +243,23 @@ def subject_words(text: str) -> Set[str]:
     return _distinctive(text)
 
 
+def asserted_by(step_text: str, assertions: Iterable[str]) -> bool:
+    """Whether one of a test's assertions is about what this check asks for.
+
+    Asked once the test has passed, about a check step 02 could not observe: an
+    assertion about it that ran green is the observation step 02 lacked. More
+    than half of the check's distinctive words must be in ONE assertion's text
+    (its accessor, expected value and message). Spread over several assertions
+    they name none of them, and exactly half would let a "success toast" check
+    ride on an assertion about some other success message.
+    """
+    distinctive = _distinctive(step_text)
+    if not distinctive:
+        return False
+    return any(2 * len(_traced(distinctive, _words(text))) > len(distinctive)
+               for text in assertions)
+
+
 def describe_all(steps: Iterable[str], raw_input_text: str) -> dict:
     """Provenance for a list of steps, for logging and the audit trail."""
     out = {}

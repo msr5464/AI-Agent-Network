@@ -56,7 +56,7 @@ exports.default = async ({ page }) => {
     await page.exposeBinding('__qaTyped', async ({ frame }, t) => {
       const p = await prefix(frame).catch(() => null);
       note({ typed: { sel: t && t.sel && p !== null ? p + t.sel : null,
-                      value: t ? t.value : null, password: !!(t && t.password),
+                      value: t ? t.value : null,
                       total: t ? t.total : null, visible: t ? t.visible : null,
                       uid: t ? t.uid : null } });
     }).catch(() => {});
@@ -336,10 +336,16 @@ exports.default = async ({ page }) => {
   // and not the page left showing at the end, which is the next page and is
   // measured by the step after this one.
   const record = async (action, ms = 20000, opts = {}) => {
-    const grab = async () => located(await everyFrame(
-      o => (window.__qa ? window.__qa.harvest(null, o) : []), { texts: true, limit: 80 }));
+    const listed = async opts => located(await everyFrame(
+      o => (window.__qa ? window.__qa.harvest(null, o) : []), { texts: true, ...opts }));
+    // Each look asks a frame only for what came or changed since this mark, so the
+    // 80 are new elements and not the first 80 of the page.
+    await everyFrame(() => { if (window.__qa) window.__qa.mark(); });
+    const grab = () => listed({ limit: 80, fresh: true });
     const id = (fr, e) => fr.frame + ' ' + e.sel + ' ' + e.text;
-    const before = new Set((await grab()).flatMap(fr =>
+    // The whole page once, for a frame that reloads while this records: its new
+    // document has no mark, and what it shows again is still not new.
+    const before = new Set((await listed({ limit: 1000 })).flatMap(fr =>
       Array.isArray(fr.result) ? fr.result.map(e => id(fr, e)) : []));
     const t0 = Date.now(), url0 = page.url();
     const acted = Promise.resolve().then(action).then(() => 'ok', short);

@@ -229,14 +229,15 @@ class TestWalk:
         data = _shop(tmp_path)["data"]
         assert [d["file"] for d in data] == ["src/test/resources/shop/data/orders.csv"]
         assert data[0]["row"] == {"scenario": "card", "amount": "500",
-                                  "card_number": "4111 1111", "bank_otp": "112233",
-                                  "phone": "{randomNumber:10}"}
+                                  "card_number": "4111 1111", "password": "hunter2",
+                                  "bank_otp": "112233", "phone": "{randomNumber:10}"}
 
-    def test_a_login_secret_never_reaches_the_prompt(self, tmp_path):
-        assert "password" not in _shop(tmp_path)["data"][0]["row"]
-        # An OTP is test data on a bank page and a credential in a flow that logs in.
+    def test_a_login_is_in_the_row_like_the_rest_of_it(self, tmp_path):
+        """An explorer told to sign in as one of the test's steps was shown the row
+        without its password."""
         signs_in = _shop(tmp_path, "Log in and pay by card")["data"][0]["row"]
-        assert "bank_otp" not in signs_in and "amount" in signs_in
+        assert signs_in["password"] and signs_in["bank_otp"] == "112233"
+        assert signs_in["amount"] == "500"
 
     @pytest.mark.parametrize("orders", [
         None,                                                   # no such file

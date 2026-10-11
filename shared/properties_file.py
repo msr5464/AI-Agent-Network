@@ -11,6 +11,7 @@ that exists with an EMPTY value in place rather than appending a second copy.
 Those rules live here once rather than in each caller.
 """
 import os
+import re
 from pathlib import Path
 
 
@@ -40,12 +41,17 @@ def read_values(text: str) -> dict:
     return values
 
 
+def keys_read(source: str) -> list:
+    """Every property key a source file reads, in the order it reads them."""
+    return list(dict.fromkeys(re.findall(r'getRunTimeProperty\s*\(\s*"([^"]+)"', source or "")))
+
+
 def apply(text: str, wanted: dict, comment: str) -> tuple:
     """Return (new_text, filled, appended) for adding `wanted` to `text`.
 
-    Pure text in, text out — no filesystem. 05_ship.py uses this to compute what
-    the *committed* properties file should contain without touching the working
-    copy, which at that point holds run credentials that must never be committed.
+    Pure text in, text out — no filesystem. 05_ship.py uses this to add the keys
+    the run's code reads to the committed copy of the file, and nothing else the
+    working copy happens to hold.
     """
     missing = {k: v for k, v in wanted.items() if k not in read_values(text)}
     if not missing:

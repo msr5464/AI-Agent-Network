@@ -754,14 +754,10 @@ _TAKES_TYPING = ("input", "textarea", "select")
 def _was_typed(value: str, selector, typed: list) -> bool:
     """Whether `value` is among what the browser recorded typed. A field may
     format what it is given (`4111111111111111` shown as `4111 1111 1111 1111`),
-    so any relation or the same letters and digits count. A password's value is
-    never recorded: it counts when it went into this field's own selector."""
+    so any relation or the same letters and digits count. A password field's
+    value is recorded and matched like any other."""
     letters = lambda s: re.sub(r"\W", "", str(s)).casefold()
     for t in typed:
-        if t.get("password"):
-            if selector and t.get("sel") == selector:
-                return True
-            continue
         shown = t.get("value")
         if shown is not None and (value_match.relation(value, shown)
                                   or letters(value) == letters(shown) != ""):
@@ -1393,9 +1389,8 @@ def main() -> None:
 
     # Credential check — a login step needs credentials, and they can reach us two
     # ways: structured in the plan (step 01), or written inline in the input file.
-    # Both are read with the SAME extractor the masking layer's vocabulary matches,
-    # so a shape that gets masked in the run header (`username=foo`) can never be
-    # reported here as "no credentials found".
+    # Both are read with the SAME extractor, so a shape step 01 understood
+    # (`username=foo`) can never be reported here as "no credentials found".
     plan_creds = {k: v for k, v in (plan.get("demo_credentials") or {}).items() if v}
     demo_creds = credentials_from_plan(plan)
     steps_need_login = mentions_login("\n".join(web_steps))

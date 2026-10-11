@@ -11,7 +11,7 @@ branched on, so it cannot drift.
 
 The body is the real product of this agent. A reviewer has to be able to tell what
 the agent *observed* from what it *assumed*, so it carries: the change note as
-written (credential-masked), the flow map with every step marked observed /
+written, the flow map with every step marked observed /
 refused / unreachable, each edit against the flow step that justified it, every
 guard result including the ones that passed, what was verified versus merely
 listed, and everything that escalated.

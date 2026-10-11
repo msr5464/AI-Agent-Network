@@ -733,6 +733,36 @@ class TestSanctionedRelax:
         assert ag.conserved(before, kept, sanction=sanction)["ok"]
         assert not ag.conserved(before, dropped, sanction=sanction)["ok"]
 
+    RELAXED = ("AssertHelper.assertContains(config, overlay.getCustomerName(), "
+               "data.getName(), {m});")
+
+    def test_a_relaxation_an_earlier_attempt_was_given_still_stands(self):
+        """Every fix after a sanctioned relaxation was rejected for removing the
+        assertion the relaxation had replaced, and the run stopped as stuck."""
+        body = self.RELAXED.format(m=self.NAME) + self.PHONE
+        assert not self._conserved(body, sanction=None)["ok"], "untold, it is a weakening"
+        before = self._fps("AssertHelper.assertEquals(config, overlay.getCustomerName(), "
+                           f"data.getName(),\n    {self.NAME});\n{self.PHONE}")
+        report = ag.conserved(before, self._fps(body), honoured=[self.SANCTION])
+        assert report["ok"], report["reason"]
+        assert report["relaxed"] == [], "reported by the attempt that made it, not again"
+
+    def test_an_earlier_relaxation_excuses_nothing_else(self):
+        before = self._fps("AssertHelper.assertEquals(config, overlay.getCustomerName(), "
+                           f"data.getName(),\n    {self.NAME});\n{self.PHONE}")
+        gone = self._fps(self.PHONE)
+        other = self._fps(self.RELAXED.format(m=self.NAME)
+                          + "AssertHelper.assertContains(config, overlay.getCustomerPhone(), "
+                            'data.getPhone(), "phone should match");')
+        assert not ag.conserved(before, gone, honoured=[self.SANCTION])["ok"]
+        assert not ag.conserved(before, other, honoured=[self.SANCTION])["ok"]
+
+    @pytest.mark.parametrize("literal", ['"Blue Mug\\u00A0"', '"Blue Mug\u00a0"'])
+    def test_a_space_that_cannot_be_seen_is_still_only_spacing(self, literal):
+        before = self._fps('AssertHelper.assertEquals(config, page.getName(), "Blue Mug", "name");')
+        after = self._fps(f'AssertHelper.assertEquals(config, page.getName(), {literal}, "name");')
+        assert ag.conserved(before, after)["ok"]
+
     def test_a_freeze_without_argument_text_cannot_be_relaxed(self):
         before = self._fps("AssertHelper.assertEquals(config, overlay.getCustomerName(), "
                            f"data.getName(), {self.NAME});")

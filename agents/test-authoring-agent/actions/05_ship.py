@@ -96,6 +96,33 @@ def load_json(filename: str, required: bool = True) -> dict:
     return json.loads(path.read_text())
 
 
+def open_checks(gen_data: dict, fix_data: dict) -> list:
+    """The requested checks nothing has observed: not step 02, and not the test.
+
+    Step 03 lists every check step 02 could not observe. Once the test has passed
+    with an assertion about one (step 04's `confirmed_checks`), the test observed
+    it. It is then no finding for the PR and no reason for NEEDS-REVIEW.
+    """
+    confirmed = set(fix_data.get("confirmed_checks") or []) if fix_data.get("passed") else set()
+    return [c for c in gen_data.get("kept_unverified_checks") or [] if c not in confirmed]
+
+
+def run_properties(sources: dict, committed: str, working: str) -> dict:
+    """The properties this run's code reads that the repository does not have yet.
+
+    {key: value}, each value from the run's own properties file, where steps 03
+    and 04 wrote it. A login the test case asked to keep in the properties file is
+    one of them, committed like any other change the run made: code that reads a
+    key the repository lacks is broken for every other checkout. A key no
+    committed file reads stays out, whatever else the working copy holds.
+    """
+    have = properties_file.read_values(committed)
+    local = properties_file.read_values(working)
+    read = {key for path, source in sources.items() if path.endswith(".java")
+            for key in properties_file.keys_read(source)}
+    return {key: local[key] for key in sorted(read) if key in local and key not in have}
+
+
 def read_gate() -> str:
     gate = AUDIT_DIR / ".fix-passed"
     return gate.read_text().strip() if gate.exists() else "skipped"
@@ -162,6 +189,15 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
             baseline_contents[rel] = path.read_text()
         except OSError as exc:
             log(f"Could not read baseline {path.name} ({exc}) — skipping it")
+
+    # The same goes for the properties file, a tracked file the run changed: the
+    # checkout puts HEAD's copy back, and the values steps 03 and 04 wrote for the
+    # keys the generated code reads are gone with it.
+    props_path = properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR)
+    try:
+        run_props = props_path.read_text()
+    except OSError:
+        run_props = ""
 
     if not step3_contents and not attempts_with_fixes:
         log("No files to commit")
@@ -242,24 +278,28 @@ def create_branch_and_commit(gen_data: dict, fix_attempts_data: list) -> tuple:
                    else "tests not run" if fix_gate == "skipped"
                    else "tests need review")
 
-    # The URL properties belong in the PR: code that reads {feature}.login.url is
-    # broken for every other checkout if the key never reaches the repo. Credentials
-    # in that same file are the opposite and must NEVER be committed — so the
-    # committed content is built from HEAD's copy plus the URL keys, never from the
-    # working copy, which is where step 03/04 wrote this run's real credentials.
-    url_props = gen_data.get("url_properties") or {}
-    if url_props:
-        props_path = properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR)
-        props_rel  = str(props_path.relative_to(AUTOMATION_FRAMEWORK_DIR))
-        rc, committed, _ = git(["show", f"HEAD:{props_rel}"], AUTOMATION_FRAMEWORK_DIR)
-        updated, filled, appended = properties_file.apply(
-            committed if rc == 0 else "", url_props,
-            f"{gen_data.get('feature', MODULE).capitalize()} URLs "
-            f"(auto-added by test-authoring-agent)")
-        if filled or appended:
-            step3_contents[props_rel] = updated
-            log(f"Committing {len(filled) + len(appended)} URL propert(ies) in "
-                f"{props_rel}: {', '.join(sorted({**filled, **appended}))}")
+    # Every property the committed code reads belongs in the PR: code that reads
+    # {feature}.login.url or {feature}.password is broken for every other checkout
+    # if the key never reaches the repo. The committed content is HEAD's copy plus
+    # those keys, each with the value steps 03 and 04 wrote for this run.
+    props_rel  = str(props_path.relative_to(AUTOMATION_FRAMEWORK_DIR))
+    rc, committed, _ = git(["show", f"HEAD:{props_rel}"], AUTOMATION_FRAMEWORK_DIR)
+    committed = committed if rc == 0 else ""
+    feature_label = gen_data.get("feature", MODULE).capitalize()
+    updated, filled, appended = properties_file.apply(
+        committed, gen_data.get("url_properties") or {},
+        f"{feature_label} URLs (auto-added by test-authoring-agent)")
+    sources = dict(step3_contents)
+    for attempt in attempts_with_fixes:
+        sources.update(attempt.get("fix_file_contents") or {})
+    updated, also_filled, also_appended = properties_file.apply(
+        updated, run_properties(sources, updated, run_props),
+        f"{feature_label} (auto-added by test-authoring-agent)")
+    added = {**filled, **appended, **also_filled, **also_appended}
+    if added:
+        step3_contents[props_rel] = updated
+        log(f"Committing {len(added)} propert(ies) in {props_rel}: "
+            f"{', '.join(sorted(added))}")
 
     if step3_contents:
         msg = (
@@ -545,12 +585,32 @@ def push_and_create_pr(branch_name: str, gen_data: dict, fix_data: dict) -> tupl
     # What the browser could not confirm. Split by who asked for it, because the
     # two need opposite things from a reviewer: one is a finding about the product,
     # the other is a note that the pipeline stopped short of inventing a test.
-    kept_unverified = gen_data.get("kept_unverified_checks") or []
-    unmeasured      = gen_data.get("kept_unmeasured_checks") or []
+    kept_unverified = open_checks(gen_data, fix_data)
+    unmeasured      = [c for c in gen_data.get("kept_unmeasured_checks") or []
+                       if c in kept_unverified]
     never_seen      = [c for c in kept_unverified if c not in unmeasured]
     dropped_checks  = gen_data.get("dropped_unverified_checks") or []
     checks_section = ""
-    if never_seen:
+    if never_seen and test_passed:
+        # A passing test cannot be failing on purpose. What is left here passed
+        # without an assertion step 04 could tie to the check.
+        checks_section += (
+            "### ⚠️ Asked for, but not seen and not found in the test\n\n"
+            "The test input asks for these. Step 02 could not observe them in the "
+            "live UI, and the test passed without an assertion that could be matched "
+            "to them. Check that the test asserts each one: if it does not, it "
+            "proves less than the input asks.\n\n"
+            + "".join(f"- {c}\n" for c in never_seen) + "\n")
+    elif never_seen and read_gate() != "defect":
+        # The run failed somewhere else, so it says nothing about these checks.
+        checks_section += (
+            "### ⚠️ Asked for, but not seen by step 02\n\n"
+            "The test input asks for these, and step 02 could not observe them in the "
+            "live UI. Their assertions are generated at full strength. This run's test "
+            "did not pass for another reason, reported below, so it has not settled "
+            "them either way.\n\n"
+            + "".join(f"- {c}\n" for c in never_seen) + "\n")
+    elif never_seen:
         checks_section += (
             "### ⚠️ Asked for, but never seen on the page\n\n"
             "The test input asks for these, and step 02 could not observe any of "
@@ -773,13 +833,15 @@ def main() -> None:
     # exists but nobody can see or review it — that's never APPROVED,
     # regardless of whether the test itself passed.
     ship_failed = ship_status in ("push_failed", "pr_failed")
-    # A run that could not observe something the input asked for is never
-    # APPROVED, even if the suite is green — green here means the pipeline
-    # declined to assert on it, which is precisely the thing a human has to look
-    # at. Same for a fix that was rejected for weakening a test.
+    # Something the input asked for that nothing observed is never APPROVED, even
+    # if the suite is green: step 02 did not see it, and the test has no assertion
+    # step 04 could match to it. A check the passing test asserts was observed
+    # there. Same for a fix that was rejected for weakening a test.
     weakening_rejected = [r for r in (fix_data.get("fix_rejections") or [])
                           if "assertion_conservation" in str(r.get("reason", ""))]
-    kept_unverified = gen_data.get("kept_unverified_checks") or []
+    kept_unverified = open_checks(gen_data, fix_data)
+    confirmed_checks = [c for c in gen_data.get("kept_unverified_checks") or []
+                        if c not in kept_unverified]
     # An existing test this run's change broke, or could not be re-run to prove it
     # did not, is a change nobody has verified — the same reason as above.
     regression = load_json("04-regression.json", required=False)
@@ -794,7 +856,13 @@ def main() -> None:
     verdict = ("APPROVED" if (ran_and_passed and honest and not ship_failed)
                else "NEEDS-REVIEW")
     (AUDIT_DIR / ".verdict").write_text(verdict)
-    if kept_unverified:
+    if confirmed_checks:
+        log(f"{len(confirmed_checks)} requested check(s) step 02 could not observe "
+            f"are asserted by the passing test — confirmed there.")
+    if kept_unverified and test_passed:
+        log(f"NEEDS-REVIEW: {len(kept_unverified)} requested check(s) were not "
+            f"observed by step 02, and no assertion in the passing test matches them.")
+    elif kept_unverified:
         log(f"NEEDS-REVIEW: {len(kept_unverified)} requested check(s) could not be "
             f"confirmed in the UI — the test asserts them at full strength.")
     if weakening_rejected:
@@ -834,6 +902,7 @@ def main() -> None:
         "files_count":      len(files_written),
         "regression_failed": regression_failed,
         "regression_not_run": regression_not_run,
+        "confirmed_checks": confirmed_checks,
     }
     (AUDIT_DIR / "05-ship.json").write_text(json.dumps(result, indent=2))
 

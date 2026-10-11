@@ -162,7 +162,8 @@ def call_claude(prompt: str) -> str:
 
 from shared.credential_properties import write_credential_property
 from shared.credential_extraction import (credentials_from_plan, input_text, secret_columns,
-                                          secret_property_key, take_secret_columns)
+                                          secret_property_key, take_secret_columns,
+                                          wants_properties)
 from shared.test_case import given_values
 from shared.test_catalog import test_methods_in
 from shared import properties_file, url_properties
@@ -193,7 +194,7 @@ from shared.edit_guards import (apply_edits, compute_diff, log_edits,
 # that is a one-line diff that loses no method and adds no sleep. An authored test
 # shipped green with `assertTrue(isSuccessToastVisible())` replaced by an `if` and
 # a `logWarning` — every guard above passed it. This is the one that would not.
-from shared import assertion_graph, intent
+from shared import assertion_graph, check_provenance, intent
 from shared import blast_radius, module_index
 # How a page rendered the value an assertion expected — the one kind of failed
 # assertion whose comparator may move, and only to what the page was measured to do.
@@ -426,6 +427,26 @@ def freeze_assertions(test_class: str, test_method: str) -> None:
         log(f"  could not persist frozen assertions: {exc}")
 
 
+def honoured_relaxations() -> list:
+    """The relaxations earlier attempts of this run were sanctioned to make.
+
+    [{"message", "relation"}], read from each applied attempt's `relaxed_checks`.
+    The frozen copy still holds the assertion as first written, so a later
+    attempt has to be told the relaxed one stands. Untold, it rejected two
+    correct fixes to a page object as removing that assertion, and the run
+    stopped as stuck.
+    """
+    found = []
+    for path in sorted(AUDIT_DIR.glob("04-run-and-fix-attempt-*.json")):
+        try:
+            checks = json.loads(path.read_text()).get("relaxed_checks") or []
+        except (OSError, ValueError):
+            continue
+        found += [{"message": c["message"], "relation": c.get("relation")}
+                  for c in checks if c.get("message")]
+    return found
+
+
 def check_conservation(test_class: str, test_method: str,
                        sanction: dict = None) -> tuple:
     """Compare what the test proves now against the frozen copy. (ok, reason).
@@ -451,7 +472,8 @@ def check_conservation(test_class: str, test_method: str,
     if after is None:
         return True, ""
 
-    report = assertion_graph.conserved(frozen, after, sanction=sanction)
+    report = assertion_graph.conserved(frozen, after, sanction=sanction,
+                                       honoured=honoured_relaxations())
     if report["ok"]:
         log(f"  {assertion_graph.describe(report)}")
         if sanction is not None and report.get("relaxed"):
@@ -515,15 +537,17 @@ def test_case_data_section(test_case: str) -> str:
     A fix that writes test data had nothing else to take it from. Step 03's CSV
     was refused, and the fix that rewrote it made up a name, an email, a different
     card number and an expiry already past, for a test case that gave all four.
-    A login secret is named, not shown: it is read from the properties file.
+    A login is test data like the rest. When the test case asks for it in the
+    properties file, the line says so, so a fix reads it from there.
     """
     given = given_values(test_case)
     if not given:
         return ""
+    in_properties = wants_properties(test_case)
     lines = "".join(
-        f"  {label}: "
-        + ("(a login secret: read it from the properties file)"
-           if secret_columns(label, test_case) else value) + "\n"
+        f"  {label}: {value}"
+        + (" (kept in the properties file: read it from there, never from a CSV)"
+           if in_properties and secret_columns(label, test_case) else "") + "\n"
         for label, value in given)
     return ("\nTEST DATA THE TEST CASE STATES. Test data a fix writes, a CSV row or a "
             "Builder default, uses each of these exactly as written, never a sample value "
@@ -549,16 +573,19 @@ def _csv_rows_fit(rel_path: str, updated: str) -> tuple:
 
 
 def _no_csv_secret(rel_path: str, original: str, updated: str) -> tuple:
-    """Refuse a fix that adds a login-secret column to a CSV. Returns (ok, reason).
+    """Refuse a fix that adds a login-secret column to a CSV, for a test case that
+    asks for its login in the properties file. Returns (ok, reason).
 
     Step 03 moves such a column into the properties file before anything is
-    written (_move_csv_secrets); a fix is the other way one gets in, and the CSV is
-    committed with the PR. The value is written to its property first, so the
-    reason names a property the next attempt can read.
+    written (_move_csv_secrets); a fix is the other way one gets in. The value is
+    written to its property first, so the reason names a property the next attempt
+    can read. Any other test case keeps its login in the sheet.
     """
     if not rel_path.endswith(".csv"):
         return True, ""
     test_case = input_text({})
+    if not wants_properties(test_case):
+        return True, ""
     before = set(secret_columns(original.split("\n", 1)[0], test_case))
     added = [c for c in secret_columns(updated.split("\n", 1)[0], test_case) if c not in before]
     _, taken, _ = take_secret_columns(updated, added)
@@ -570,7 +597,8 @@ def _no_csv_secret(rel_path: str, original: str, updated: str) -> tuple:
     properties_file.upsert(properties_file.properties_path(AUTOMATION_FRAMEWORK_DIR),
                            {keys[c]: v for c, v in taken.items()},
                            f"{feature} test secrets (auto-added by test-authoring-agent)", log)
-    return False, ("a CSV is committed with the PR, so it may not hold a login secret. "
+    return False, ("the test case asks for its login in the properties file, so a CSV "
+                   "may not hold it. "
                    "Leave the column out and read each value from its property instead: "
                    + "; ".join(f'{c} -> config.getRunTimeProperty("{k}")'
                                for c, k in keys.items())
@@ -1364,9 +1392,13 @@ def value_mismatch_section(mismatch: dict, inputs_used: dict) -> str:
         return ""
     relation = mismatch["relation"]
     # Page text in a prompt: capped, as everywhere else.
-    expected, actual = (str(mismatch[k])[:120] for k in ("expected", "actual"))
+    expected, actual = (value_match.spelled_out(str(mismatch[k])[:120])
+                        for k in ("expected", "actual"))
     typed = "".join(f"  {field} = {value!r}\n" for field, value in (inputs_used or {}).items())
     if literal_fix(mismatch):
+        unseen = ("A \\uXXXX above is a character that cannot be seen, a non-breaking space "
+                  "for one: write it in the literal as that same escape, never as a space.\n"
+                  if "\\u" in expected + actual else "")
         return (
             f"\n<value_mismatch>\n"
             f"The failing assertion is \"{mismatch['message']}\". It expected the literal "
@@ -1376,6 +1408,7 @@ def value_mismatch_section(mismatch: dict, inputs_used: dict) -> str:
             "assertion and nowhere else. Change nothing else about the assertion: no "
             "trimming, lower-casing or replaceAll on either side, and no other comparator. "
             "Any of those is rejected.\n"
+            + unseen +
             "</value_mismatch>\n")
     return (
         f"\n<value_mismatch>\n"
@@ -1448,9 +1481,10 @@ def ensure_credentials(plan: dict) -> None:
     """Make sure the login properties exist BEFORE the first test run.
 
     run.sh syncs the framework repo with `git checkout -f <branch>`, which discards
-    every uncommitted change — including the credential properties step 03 wrote,
-    which ship deliberately never commits because they are secrets. They are
-    therefore per-run state that the *next* run wipes.
+    every uncommitted change — including the credential properties step 03 wrote.
+    Until ship commits them they are per-run state that the *next* run wipes. A
+    module whose login is a CSV row reads none of them, and a key no code reads is
+    not committed.
 
     try_fix_infra_credentials() below already repairs this, but only after a maven
     cycle has failed AND classify_failure() matched a credential signature. A run
@@ -2503,6 +2537,36 @@ def record_proven_locators(files_written: list, plan: dict, test: str,
     return proven
 
 
+def confirmed_checks(test_class: str, test_method: str) -> list:
+    """The checks step 02 could not observe that the passing test asserts.
+
+    Step 02 not seeing something is not the product not doing it. A message shown
+    for a few seconds was gone before step 02 looked, the generated test asserted
+    it and passed, and step 05, reading only step 03's list, wrote a PR that said
+    the test fails on purpose and gave the run NEEDS-REVIEW.
+
+    Read from the test as it passed, and only from an assertion no condition
+    wraps: one inside an `if` may never have run.
+    """
+    try:
+        kept = (json.loads((AUDIT_DIR / "03-generate.json").read_text())
+                .get("kept_unverified_checks") or [])
+    except Exception:
+        kept = []
+    if not kept:
+        return []
+    prints = _fingerprint_test(test_class, test_method) or {}
+    ran = [a.get("args") or " ".join(a.get("literals") or [])
+           for a in (prints.get("asserts") or {}).values() if not a.get("cond_path")]
+    confirmed = [c for c in kept if check_provenance.asserted_by(c, ran)]
+    if confirmed:
+        log(f"Confirmed by the passing test: {len(confirmed)} check(s) step 02 could "
+            f"not observe are asserted in it at full strength:")
+        for check in confirmed:
+            log(f"  - {check}")
+    return confirmed
+
+
 # What the NEXT attempt needs and cannot re-derive: where the test failed, what it
 # said, the page it left behind, and when the run that produced all three started.
 _CARRIED_FORWARD = ("failure_location", "failure_message", "screenshot_path",
@@ -2519,6 +2583,8 @@ def _write_result(data: dict, files_written: list, attempt: int) -> None:
     # previous session. Observed in a real run — the attempt after a rejected one read a
     # context file timestamped hours earlier. Carry them forward instead.
     out = dict(data)
+    if out.get("passed") and out.get("test_class") and out.get("test_method"):
+        out["confirmed_checks"] = confirmed_checks(out["test_class"], out["test_method"])
     if any(out.get(k) in (None, "", [], 0, 0.0) for k in _CARRIED_FORWARD):
         try:
             prev = json.loads((AUDIT_DIR / "04-run-and-fix.json").read_text())

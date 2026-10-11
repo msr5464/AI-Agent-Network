@@ -316,15 +316,18 @@ _KEYWORDS = frozenset(("if", "for", "while", "switch", "catch", "try",
                        "synchronized", "return", "super", "this"))
 
 
-def _csv_row(workspace, read: Dict, narration: str) -> Optional[Dict]:
-    """The one row a literal CSV lookup reads, login secrets left out.
+def _csv_row(workspace, read: Dict) -> Optional[Dict]:
+    """The one row a literal CSV lookup reads, every column of it.
+
+    A login is test data like the rest of the row: a test that signs in as one of
+    its own steps types it, and an explorer shown the row without its password
+    was told to sign in with nothing to sign in with.
 
     None unless it is certain: the file must be the only one of that name (the
     read's module decides between two), and exactly one row may hold the key.
     Typing the wrong row into a live product is worse than typing none.
     """
     import csv
-    from shared.credential_extraction import secret_columns
 
     if not read.get("value"):
         return None
@@ -345,9 +348,8 @@ def _csv_row(workspace, read: Dict, narration: str) -> Optional[Dict]:
             if (row.get(read["column"]) or "").strip() == read["value"]]
     if len(hits) != 1:
         return None
-    secret = set(secret_columns((text.splitlines() or [""])[0], narration))
     values = {column: (value or "").strip() for column, value in hits[0].items()
-              if column and column.strip() not in secret and (value or "").strip()}
+              if column and (value or "").strip()}
     return {"file": str(found[0].relative_to(workspace)), "row": values} if values else None
 
 
@@ -376,14 +378,13 @@ def test_walk(workspace, test_id: str) -> Dict:
     bodies = [body] + [method_body(source, name)
                        for name in dict.fromkeys(_OWN_CALL.findall(body))
                        if name != method and name not in _KEYWORDS]
-    narration = " ".join(result["steps"])
     seen = set()
     for read in (r for text in bodies if text for r in csv_reads(text)):
         key = (read["module"], read["file"], read["column"], read["value"])
         if key in seen:
             continue
         seen.add(key)
-        row = _csv_row(workspace, read, narration)
+        row = _csv_row(workspace, read)
         if row:
             result["data"].append(row)
     return result

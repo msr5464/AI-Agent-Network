@@ -153,6 +153,19 @@ def mentions_login(text: str) -> bool:
     return any(word in lowered for word in LOGIN_WORDS)
 
 
+# "keep the login in the properties file", "read the password from staging-sg.properties".
+_PROPERTIES_ASKED = re.compile(r"\bpropert(?:y|ies)\s+file\b|\.properties\b", re.IGNORECASE)
+
+
+def wants_properties(test_case: str) -> bool:
+    """Whether the test case asks for its login to be kept in the properties file.
+
+    A login is test data and goes in the module's CSV with the rest of it. The
+    properties file is the exception, taken only when the test case names it.
+    """
+    return bool(_PROPERTIES_ASKED.search(test_case or ""))
+
+
 # A column holding a login secret, matched on word boundaries so a `footprint`
 # column is not an `otp` one.
 _SECRET_COLUMN = re.compile(r"(?<![a-z])(?:" + "|".join(
@@ -163,8 +176,9 @@ _OTP_COLUMN = re.compile(r"(?<![a-z])(?:" + LABELS["otp"] + r")(?![a-z])")
 def secret_columns(header: str, test_case: str) -> list:
     """The columns of a CSV header row that hold a login secret, as written.
 
-    A CSV is committed with the pull request; the properties file's secrets never
-    are. A password, API key, token or secret column always holds one. An OTP
+    These are the columns that move to the properties file when the test case
+    asks for its login there (wants_properties), and what marks a sheet as a
+    credential sheet. A password, API key, token or secret column always holds one. An OTP
     column does only when the flow logs in: a bank page's 3-D Secure OTP is test
     data, and a payment run whose sheet held the sandbox OTP had the whole sheet
     refused. With no test case to tell, an OTP counts.

@@ -628,7 +628,12 @@ class TestCopiedMethods:
 
 
 class TestCsvTestData:
-    def test_credential_sheets_are_never_planned_for_codegen(self, tmp_path, monkeypatch):
+    IN_PROPERTIES = "Steps:\n1. Log in. Keep the login in the properties file.\n"
+
+    def test_a_login_is_test_data_and_its_sheet_is_planned_with_the_rest(self, tmp_path,
+                                                                         monkeypatch):
+        """A login went to a properties file the PR never carried, so the test ran
+        nowhere but in the run that wrote it."""
         mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
         csv_dir = mod.AUTOMATION_FRAMEWORK_DIR / "src/test/resources/saucedemo/csvFiles"
         csv_dir.mkdir(parents=True)
@@ -636,10 +641,27 @@ class TestCsvTestData:
         (csv_dir / "users.csv").write_text("user_key,environment,username,password,role\n")
         (csv_dir / "products.csv").write_text("product_key,environment,slug,title\n")
         (csv_dir / "posts.csv").write_text("post_key,environment,postId,userId,title,body,limit\n")
+        sheets = "src/test/resources/saucedemo/csvFiles/"
         assert mod._plan_csv_files("saucedemo") == [
-            "src/test/resources/saucedemo/csvFiles/posts.csv",
+            sheets + "posts.csv", sheets + "products.csv", sheets + "users.csv"]
+        # It has a credential sheet already: no second one is offered.
+        assert mod._plan_csv_files("saucedemo", "", True) == [
+            sheets + "posts.csv", sheets + "products.csv", sheets + "users.csv"]
+        new = "src/test/resources/newmodule/csvFiles/"
+        assert mod._plan_csv_files("newmodule") == [new + "newmodule-data.csv"]
+        assert mod._plan_csv_files("newmodule", "", True) == [
+            new + "newmodule-data.csv", new + "users.csv"], "a module that logs in gets one"
+
+    def test_only_a_test_case_that_asks_for_the_properties_file_leaves_them_out(
+            self, tmp_path, monkeypatch):
+        mod = _load_action("03_generate.py", tmp_path, monkeypatch, workspace=tmp_path)
+        csv_dir = mod.AUTOMATION_FRAMEWORK_DIR / "src/test/resources/saucedemo/csvFiles"
+        csv_dir.mkdir(parents=True)
+        (csv_dir / "users.csv").write_text("user_key,environment,username,password,role\n")
+        (csv_dir / "products.csv").write_text("product_key,environment,slug,title\n")
+        assert mod._plan_csv_files("saucedemo", self.IN_PROPERTIES, True) == [
             "src/test/resources/saucedemo/csvFiles/products.csv"]
-        assert mod._plan_csv_files("newmodule") == [
+        assert mod._plan_csv_files("newmodule", self.IN_PROPERTIES, True) == [
             "src/test/resources/newmodule/csvFiles/newmodule-data.csv"]
 
     @pytest.mark.parametrize("header,credential", [
@@ -976,8 +998,9 @@ class TestRuntimeEvidence:
         assert "Setting 0" not in out["dom_section"], "the store page is not where it failed"
 
     def test_a_fix_may_not_put_a_login_secret_in_a_csv(self, tmp_path, monkeypatch):
-        """Step 03 moves a login secret out of the sheet; a fix is the other way one
-        gets in, and the guards only ran on files that already existed."""
+        """For a test case that asks for its login in the properties file: step 03
+        moves a login secret out of the sheet, a fix is the other way one gets in,
+        and the guards only ran on files that already existed."""
         monkeypatch.setenv("AUTHORING_ENVIRONMENT", "staging")
         monkeypatch.setenv("AUTHORING_COUNTRY", "SG")
         case = tmp_path / "case.txt"
@@ -985,6 +1008,10 @@ class TestRuntimeEvidence:
         monkeypatch.setenv("INPUT_FILE", str(case))
         mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch, workspace=tmp_path)
         path = "src/test/resources/shop/csvFiles/users.csv"
+        # A login is test data: by default its sheet may hold it.
+        assert mod._no_csv_secret(path, "", "user_key,password\nbuyer,Secret1\n") == (True, "")
+        case.write_text("1. Login with username qa and password Secret1, "
+                        "kept in the properties file\n")
         ok, reason = mod._no_csv_secret(path, "", "user_key,password\nbuyer,Secret1\n")
         assert not ok and 'config.getRunTimeProperty("shop.password")' in reason
         props = (mod.AUTOMATION_FRAMEWORK_DIR / "parameters" / "staging-sg.properties").read_text()
@@ -994,7 +1021,7 @@ class TestRuntimeEvidence:
         sheet = "user_key,password\nbuyer,Secret1\n"
         assert mod._no_csv_secret(path, sheet, sheet + "seller,Other2\n") == (True, "")
         # A payment OTP is test data.
-        case.write_text("9. And enter Bank OTP: 112233\n")
+        case.write_text("9. And enter Bank OTP: 112233. Secrets are kept in the properties file\n")
         assert mod._no_csv_secret(path, "", "checkout_key,otp\ncheckout,112233\n") == (True, "")
 
     def test_a_csv_row_must_have_one_value_per_column(self, tmp_path, monkeypatch):
@@ -1016,7 +1043,10 @@ class TestRuntimeEvidence:
                 "   Name: Mukesh Rajput\n   Expiry: 01/35\n")
         section = mod.test_case_data_section(case)
         assert "Name: Mukesh Rajput" in section and "Expiry: 01/35" in section
-        assert "Secret1" not in section, "a login secret is named, not shown"
+        assert "Password: Secret1\n" in section, "a login is test data like the rest"
+        asked = mod.test_case_data_section(case + "Keep the login in the properties file.\n")
+        assert "Password: Secret1 (kept in the properties file" in asked
+        assert "Name: Mukesh Rajput\n" in asked, "only the login is marked"
         assert mod.test_case_data_section("Steps:\n1. Open the page\n") == ""
 
     def test_what_step_02_reported_and_clicked_for_the_locator_is_shown(self, tmp_path,
@@ -1403,6 +1433,70 @@ class TestCheckProvenance:
         assert sp.reconcile("inferred", sp.INFERRED) == sp.INFERRED
         # And the drop decision does not consult the claim at all.
         assert sp.droppable(TOAST_CHECK, NAUKRI_INPUT)
+
+
+class TestChecksThePassingTestConfirms:
+    """A check step 02 could not observe is settled by a passing test that asserts it.
+
+    Step 02 looked for a message after it had gone. The generated test asserted
+    it and passed, and the PR still said the test fails on purpose.
+    """
+
+    CHECK = "Verify the toast 'Item saved to your list.' appears"
+    TOAST = ('config, shop.detailsPage.getToastMessage(), "Item saved to your list.", '
+             '"Toast message should confirm the item was saved"')
+    COUNT = 'config, shop.detailsPage.getListCount(), "2", "List icon should show 2 items"'
+
+    def test_an_assertion_about_the_check_confirms_it(self):
+        from shared import check_provenance as sp
+        assert sp.asserted_by(self.CHECK, [self.COUNT, self.TOAST])
+
+    def test_an_assertion_about_something_else_does_not(self):
+        from shared import check_provenance as sp
+        assert not sp.asserted_by(self.CHECK, [self.COUNT])
+
+    def test_half_the_words_is_not_enough(self):
+        """A check about a success toast must not ride on another success message."""
+        from shared import check_provenance as sp
+        assert not sp.asserted_by(
+            "Verify the success toast appears",
+            ['config, page.getPaymentMessage(), "Payment was successful", "Payment succeeded"'])
+
+    def test_words_spread_over_several_assertions_name_none(self):
+        from shared import check_provenance as sp
+        assert not sp.asserted_by(
+            "Verify the invoice street matches the billing city",
+            ['config, page.getStreet(), order.getStreet(), "Street"',
+             'config, page.getCity(), order.getCity(), "City"',
+             'config, page.getInvoiceNumber(), number, "Invoice"'])
+
+    def _step04(self, tmp_path, monkeypatch, asserts):
+        mod = _load_action("04_run_and_fix.py", tmp_path, monkeypatch)
+        (tmp_path / "03-generate.json").write_text(json.dumps(
+            {"kept_unverified_checks": [self.CHECK]}))
+        monkeypatch.setattr(mod, "_fingerprint_test", lambda *_: {"asserts": asserts})
+        return mod
+
+    def test_the_passing_result_records_it(self, tmp_path, monkeypatch):
+        mod = self._step04(tmp_path, monkeypatch,
+                           {"a_1": {"args": self.TOAST, "cond_path": []}})
+        mod._write_result({"passed": True, "test_class": "ShopWebTest",
+                           "test_method": "saveItem"}, [], 0)
+        result = json.loads((tmp_path / "04-run-and-fix.json").read_text())
+        assert result["confirmed_checks"] == [self.CHECK]
+
+    def test_an_assertion_inside_a_condition_may_not_have_run(self, tmp_path, monkeypatch):
+        mod = self._step04(tmp_path, monkeypatch,
+                           {"a_1": {"args": self.TOAST, "cond_path": ["if (shown)"]}})
+        assert mod.confirmed_checks("ShopWebTest", "saveItem") == []
+
+    def test_a_failing_result_confirms_nothing(self, tmp_path, monkeypatch):
+        mod = self._step04(tmp_path, monkeypatch,
+                           {"a_1": {"args": self.TOAST, "cond_path": []}})
+        mod._write_result({"passed": False, "test_class": "ShopWebTest",
+                           "test_method": "saveItem"}, [], 1)
+        assert "confirmed_checks" not in json.loads(
+            (tmp_path / "04-run-and-fix.json").read_text())
 
 
 class TestVisibleOnlySelectors:
@@ -2069,6 +2163,30 @@ class TestValueMismatchTriage:
         assert patched == [rel] and rejections == []
         assert sanction["relaxed"] and "assertContains" in sanction["relaxed"][0]
 
+    def test_a_later_fix_is_not_rejected_for_an_earlier_sanctioned_relax(self, tmp_path,
+                                                                        monkeypatch):
+        """Attempt 2 relaxed one check as sanctioned. Attempts 3 and 4 fixed another
+        file, were rejected for removing that check, and the run stopped as stuck."""
+        mod, rel = self._frozen(tmp_path, monkeypatch)
+        mismatch = mod.triage_value_mismatch(self.FAILURE)
+        sanction = {"message": mismatch["message"], "relation": mismatch["relation"]}
+        relax = {rel: [{
+            "old_string": "AssertHelper.assertEquals(config, overlay.getCustomerName()",
+            "new_string": "AssertHelper.assertContains(config, overlay.getCustomerName()"}]}
+        assert mod.apply_fix({}, relax, "PaymentGatewayWebTest", "completeCreditCardPayment",
+                             sanction)[0] == [rel]
+        later = {rel: [{"old_string": "  @Test\n", "new_string": "  // waits added\n  @Test\n"}]}
+        _, _, rejections = mod.apply_fix({}, later, "PaymentGatewayWebTest",
+                                         "completeCreditCardPayment", None)
+        assert "assertion_conservation" in rejections[-1]["reason"], "untold, it is rejected"
+        (tmp_path / "04-run-and-fix-attempt-2.json").write_text(json.dumps(
+            {"relaxed_checks": [{**mismatch, "change": sanction["relaxed"][0]}]}))
+        assert mod.honoured_relaxations() == [
+            {"message": mismatch["message"], "relation": "words"}]
+        patched, _, rejections = mod.apply_fix({}, later, "PaymentGatewayWebTest",
+                                               "completeCreditCardPayment", None)
+        assert patched == [rel] and rejections == []
+
     def test_relaxing_the_other_check_is_still_rejected(self, tmp_path, monkeypatch):
         mod, rel = self._frozen(tmp_path, monkeypatch)
         mismatch = mod.triage_value_mismatch(self.FAILURE)
@@ -2116,6 +2234,17 @@ class TestLiteralValueMismatch:
         assert ("replace 'Thank you for your purchase. Get a nice sleep.' with exactly "
                 "'Thank you for your purchase.Get a nice sleep.'") in section
         assert "compare with" not in section, "no comparator is offered"
+        assert "cannot be seen" not in section
+
+    def test_a_character_that_cannot_be_seen_is_spelled_out(self, tmp_path, monkeypatch):
+        """The page showed a name with a non-breaking space after it. Asked to copy
+        it exactly, a fix typed an ordinary space and the check failed again."""
+        mod = self._frozen(tmp_path, monkeypatch)
+        section = mod.value_mismatch_section(
+            {"message": "name", "expected": "Blue Mug", "actual": "Blue Mug\u00a0",
+             "relation": "formatting", "literal": True}, {})
+        assert "with exactly 'Blue Mug\\u00A0'" in section
+        assert "cannot be seen" in section and "\u00a0" not in section
 
     def test_the_literal_edit_passes_conservation_without_a_sanction(self, tmp_path, monkeypatch):
         mod = self._frozen(tmp_path, monkeypatch)
@@ -2385,12 +2514,15 @@ def test_an_input_used_must_be_something_the_browser_saw_typed(tmp_path, monkeyp
     counts, visibles, rejected = {k: 1 for k in found}, {k: 1 for k in found}, {}
     inputs = {"nameField": "Test User", "cardField": "4111111111111111",
               "pwdField": "s3cret", "amountField": "20,000"}
-    rows = [{"typed": {"sel": "#name", "value": "Test User", "password": False}},
-            {"typed": {"sel": "#card", "value": "4111 1111 1111 1111", "password": False}},
-            {"typed": {"sel": "#pwd", "value": None, "password": True}}]
+    rows = [{"typed": {"sel": "#name", "value": "Test User"}},
+            {"typed": {"sel": "#card", "value": "4111 1111 1111 1111"}},
+            {"typed": {"sel": "#pwd", "value": "s3cret"}}]
     kept = mod.enforce_typed_fields(inputs, found, counts, visibles, rejected, rows)
     assert kept == {"nameField": "Test User", "cardField": "4111111111111111",
                     "pwdField": "s3cret"}, "a field that formats what it is given still counts"
+    wrong = mod.enforce_typed_fields({"pwdField": "another"}, dict(found), counts, visibles,
+                                     {}, rows)
+    assert "pwdField" not in wrong, "a password claim is held to what was typed, like any other"
     assert "amountField" in found and not rejected, "the claim is dropped, not the field"
     assert mod.enforce_typed_fields({"nameField": "x"}, {"nameField": "#name"}, {}, {}, {},
                                     []) == {"nameField": "x"}, (
@@ -3255,9 +3387,9 @@ def test_a_field_typed_into_but_never_reported_is_confirmed_from_the_keystrokes(
     mod = _load_action("02_validate_web.py", tmp_path, monkeypatch)
     bank = "#pay >> internal:control=enter-frame >> iframe[title='3ds'] >> internal:control=enter-frame >> "
     rows = [
-        {"typed": {"sel": bank + "#otp", "value": None, "password": True,
+        {"typed": {"sel": bank + "#otp", "value": "112233",
                    "total": 1, "visible": 1, "uid": "b:4"}},
-        {"typed": {"sel": bank + "#card-cvv", "value": None, "password": True,
+        {"typed": {"sel": bank + "#card-cvv", "value": "123",
                    "total": 1, "visible": 1, "uid": "b:2"}},
         {"clicked": {"sel": bank + "button[name='ok']", "total": 1, "visible": 1, "text": "OK"}},
     ]
@@ -3291,7 +3423,7 @@ _BANK_ROWS = [
     {"checks": {_BANK + "#amount": {"total": 1, "visible": 1, "tag": "p", "text": "49.00"},
                 _BANK + "label[for='code']": {"total": 1, "visible": 1, "tag": "label"},
                 _BANK + "span.hint": {"total": 2, "visible": 2, "tag": "span"}}},
-    {"typed": {"sel": _BANK + "#code", "value": None, "password": True, "total": 1, "visible": 1}},
+    {"typed": {"sel": _BANK + "#code", "value": "112233", "total": 1, "visible": 1}},
 ]
 
 

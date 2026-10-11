@@ -301,7 +301,7 @@ def test_the_values_a_test_typed_reach_the_prompt(tmp_path, monkeypatch):
     rendered = telemetry.format_for_prompt(telemetry.read_actions(trace))
     assert "#card-number  <- 'India'" in rendered
     assert "#address  <- 'Bangalore'" in rendered
-    assert "Secret1" not in rendered and "#password  <- (7 characters, not shown)" in rendered
+    assert "#password  <- 'Secret1'" in rendered, "a wrong password is a cause a fixer must see"
 
 
 @ALL

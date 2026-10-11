@@ -22,7 +22,6 @@ the framework already writes the failure-time DOM as plain HTML alongside. Human
 get the full picture by opening the zip in Playwright Trace Viewer.
 """
 
-import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -47,19 +46,16 @@ def failing_action(actions: List[Dict]) -> Optional[Dict]:
     return get_active_plugin().telemetry.failing_action(actions)
 
 
-_SECRET_FIELD = re.compile(r"pass(word|wd)?\b|pwd|otp|token|secret", re.IGNORECASE)
-
-
 def _typed_values(actions: List[Dict], limit: int = 25) -> List[tuple]:
     """[(selector, value)] for each non-empty value typed into a field, last value
-    per field. A field that looks like a secret shows its length, not its value."""
+    per field. Every field alike: a wrong password or one-time code is a cause of
+    failure a fixer has to be able to see."""
     last: Dict[str, str] = {}
     for action in actions:
         selector, value = action.get("selector") or "", action.get("value") or ""
         if selector and value:
             last.pop(selector, None)
-            last[selector] = (f"({len(value)} characters, not shown)"
-                              if _SECRET_FIELD.search(selector) else repr(value))
+            last[selector] = repr(value)
     return list(last.items())[-limit:]
 
 

@@ -5,17 +5,21 @@ The file location, key naming and idempotence rules live in
 shared/properties_file.py, which url_properties.py shares — this module only
 decides WHICH keys a module's credentials use.
 
+A login is kept in the module's CSV by default. This is the other home, used when
+the test case asks for the properties file or an existing module already reads its
+login from there.
+
 Used by test-authoring-agent's generate (03) and run-and-fix (04) steps:
-  - 03_generate.py writes it once, right after generating a new web module,
-    using the same property key ({feature}.username) the codegen prompt already
-    instructs Claude to reference via config.getRunTimeProperty().
+  - 03_generate.py writes it once for a new web module whose test case asks for
+    the properties file, using the same property key ({feature}.username) the
+    codegen prompt then instructs Claude to reference via config.getRunTimeProperty().
   - 04_run_and_fix.py re-checks/writes it defensively before diagnosing a
     CODE_ERROR failure — a safety net for cases 03's write doesn't cover (an
     existing module, a session run before this existed, or a properties file
     edited/reverted since generation).
 
-These values are real credentials, so 05_ship.py never commits them — see
-url_properties.py for why URLs are the opposite case.
+05_ship.py commits them with every other property the run's code reads: a key
+the code reads and the repository lacks leaves the test broken for everyone else.
 """
 from pathlib import Path
 

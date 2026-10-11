@@ -288,9 +288,8 @@ The same reading gives the explorer what else the test already states.
 
 - the test's **logged steps**, in call order;
 - the **data row** it loads by a literal key, in the test method or a method of its
-  class that it calls. Login-secret columns are left out
-  (`credential_extraction.secret_columns`), and no row is sent unless exactly one
-  file of that name and exactly one row match.
+  class that it calls, every column of it: a login is test data like the rest.
+  No row is sent unless exactly one file of that name and exactly one row match.
 
 Step 03 puts both in the prompt, with the start URL: the note's `URL:`, else the
 URL the framework is configured with for the module (`mint_session.entry_url`,
@@ -590,11 +589,12 @@ rule, `qa_agents_server.analytics.run_status`, read from these files.
    item, and reported in the PR against the snapshot frozen in step 02.
 2. **Freeze the contract before editing.** Never re-derive it afterwards.
 3. **Transcribe, do not invent.** Every added step maps to an observed one.
-4. **`storage_state`, never a password.** `shared/claude.py` writes the whole
-   command line to its log; a credential in a prompt is a credential on disk.
-   An expired session is a hard stop — exploring with one lands on a login page
-   and "discovers" that the entire flow changed. The session itself comes from
-   the entry path the test declares, never from a reconstructed login.
+4. **`storage_state` for the entry login.** The browser starts signed in the way
+   the test's own login leaves it. An expired session is a hard stop — exploring
+   with one lands on a login page and "discovers" that the entire flow changed.
+   The session itself comes from the entry path the test declares, never from a
+   reconstructed login. A sign-in that is one of the test's own steps is walked
+   like any other step, with the values in the test's data row.
 5. **Refusing is a correct outcome.** Escalation is the design working. But an
    item that an earlier item *of the same attempt* already did — applied, with
    verified tests — is `covered`, not escalated. The model's `covered_by` claim is
