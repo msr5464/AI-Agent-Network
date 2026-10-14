@@ -773,3 +773,374 @@ def test_elements_matching_returns_the_matched_elements_or_none():
     assert matched == [inventory[0]]
     assert flow_map.elements_matching("a:has-text('Card')", inventory) is None
     assert flow_map.count_in_inventory("a.option", inventory) == 2
+
+
+class TestAStepAndTheActionRecordedForIt:
+    """Two accounts of one walk. A step is verified only through a selector the
+    helpers counted, and an explorer types its own spelling: a click the helpers
+    recorded on exactly one visible element was reported under a selector nothing
+    had counted, so it was listed twice, as an unverified step and as an action no
+    step reported, and the change item it belonged to was declined."""
+
+    PAGES = ("PAGE_ENTER: list|https://shop.test/|Shop\n"
+             "PAGE_ENTER: confirm|https://shop.test/|Shop\n")
+
+    @staticmethod
+    def _click(sel, text="", uid=None, total=1, visible=1, via=None):
+        row = {"sel": sel, "text": text, "uid": uid, "total": total, "visible": visible}
+        return {"clicked": {**row, **({"via": via} if via else {})}}
+
+    @staticmethod
+    def _typed(sel, value, uid=None, total=1):
+        return {"typed": {"sel": sel, "value": value, "uid": uid, "total": total,
+                          "visible": total}}
+
+    @staticmethod
+    def _state(page="list", checks=None, known=None):
+        return {"page": page, "url": "https://shop.test/", "checks": checks or {},
+                "known": known or [], "inventory": [{"tag": "h1", "text": page}]}
+
+    @staticmethod
+    def _step(index, page, verb="click", name="x", selector="", label="", value=None):
+        return json.dumps({"index": index, "page": page, "action": {
+            "verb": verb, "value": value,
+            "target": {"name": name, "selector": selector, "accessible_name": label}},
+            "result": {"outcome": "ok"}})
+
+    def _flow(self, steps, rows):
+        return fm.build(self.PAGES + "".join("FLOW_STEP: " + s + "\n" for s in steps), rows)
+
+    def test_a_click_reported_under_another_spelling_takes_the_one_that_was_counted(self):
+        rows = [self._click("button.danger.wide", "Remove selected", uid="e1"),
+                self._state("confirm")]
+        flow = self._flow([self._step(1, "confirm", name="removeSelected", label="Remove Selected",
+                                      selector="button:has-text('Remove selected')")], rows)
+        step = flow["steps"][0]
+        assert step["action"]["target"]["selector"] == "button.danger.wide"
+        assert step["action"]["target"]["reported_selector"] == \
+            "button:has-text('Remove selected')"
+        check = step["selector_check"]
+        assert (check["unique"], check["counted_against"], check["adopted"]) == (
+            True, "live", "name")
+        assert flow["unreported_actions"] == [], "one action, listed once"
+
+    def test_a_field_is_found_by_the_value_it_was_given(self):
+        rows = [self._typed("#passport", "P-1", uid="e1"),
+                self._typed("#expiry", "2031-01-01", uid="e2"), self._state()]
+        flow = self._flow([
+            self._step(1, "list", verb="fill", name="passport", selector="xpath=//input[1]",
+                       value="P-1"),
+            self._step(2, "list", verb="fill", name="expiry", selector="xpath=//input[2]",
+                       value="2031-01-01")], rows)
+        assert [s["action"]["target"]["selector"] for s in flow["steps"]] == [
+            "#passport", "#expiry"]
+        assert all(s["selector_check"]["unique"] for s in flow["steps"])
+
+    def test_a_selector_the_helpers_counted_is_never_replaced(self):
+        rows = [self._click("#go", "Go", uid="e1"),
+                self._state(checks={"text=Go": {"total": 1, "visible": 1, "uid": "e1"}})]
+        flow = self._flow([self._step(1, "list", name="go", label="Go", selector="text=Go")],
+                          rows)
+        target = flow["steps"][0]["action"]["target"]
+        assert target["selector"] == "text=Go" and "reported_selector" not in target
+
+    def test_the_only_step_between_two_matched_ones_takes_the_only_action_between(self):
+        rows = [self._click("#search", "Search", uid="e1"), self._state(),
+                self._click("td.pick label", "", uid="e2"), self._state(),
+                self._click("#remove", "Remove", uid="e3"), self._state("confirm")]
+        flow = self._flow([
+            self._step(1, "list", name="search", label="Search", selector="#search"),
+            self._step(2, "list", name="rowCheckbox", selector="td.pick span.box"),
+            self._step(3, "confirm", name="remove", label="Remove", selector="#remove")], rows)
+        picked = flow["steps"][1]
+        assert picked["action"]["target"]["selector"] == "td.pick label"
+        assert picked["selector_check"]["adopted"] == "position"
+
+    def test_nothing_is_taken_when_two_actions_could_be_the_step(self):
+        # One of them is the explorer looking around, and nothing says which.
+        rows = [self._click("#search", "Search", uid="e1"), self._state(),
+                self._click("#help", "", uid="e8"), self._state(),
+                self._click("td.pick label", "", uid="e2"), self._state(),
+                self._click("#remove", "Remove", uid="e3"), self._state("confirm")]
+        flow = self._flow([
+            self._step(1, "list", name="search", label="Search", selector="#search"),
+            self._step(2, "list", name="rowCheckbox", selector="td.pick span.box"),
+            self._step(3, "confirm", name="remove", label="Remove", selector="#remove")], rows)
+        picked = flow["steps"][1]
+        assert picked["action"]["target"]["selector"] == "td.pick span.box"
+        assert picked["selector_check"]["unique"] is None
+
+    def test_an_action_no_count_singles_out_is_not_adopted(self):
+        rows = [self._click("a.tab", "Add item", uid="e1", total=3, visible=3), self._state()]
+        flow = self._flow([self._step(1, "list", name="addTab", label="Add item",
+                                      selector="li a:has-text('Add item')")], rows)
+        assert flow["steps"][0]["selector_check"]["unique"] is None
+
+    def test_it_is_known_by_a_selector_counted_on_the_same_element(self):
+        # The control's own class is shared by three tabs; the repo's locator for
+        # this one was counted on the element the click landed on.
+        known = [{"owner": "ListPage", "name": "addTab", "selector": "a:has-text('Add item')",
+                  "total": 1, "visible": 1, "uid": "e1"}]
+        rows = [self._state(known=known),
+                self._click("a.tab", "Add item", uid="e1", total=3, visible=3), self._state()]
+        flow = self._flow([self._step(1, "list", name="addTab", label="Add item",
+                                      selector="li a:has-text('Add item')")], rows)
+        step = flow["steps"][0]
+        assert step["action"]["target"]["selector"] == "a:has-text('Add item')"
+        assert step["selector_check"]["unique"] is True
+        assert step["modelled_by"] == "ListPage.addTab"
+
+    def test_a_label_and_the_control_it_hands_its_click_to_are_one_action(self):
+        # A styled checkbox: the input looks hidden and still has a size.
+        rows = [self._click("td.pick label", "", uid="e1"),
+                self._click("td.pick input", "on", uid="e2", via="e1"),
+                self._typed("td.pick input", "on", uid="e2"), self._state()]
+        actions = fm.recorded_actions(rows)
+        assert [(a["kind"], a["sel"], a["uids"]) for a in actions] == [
+            ("click", "td.pick label", ["e1", "e2"])]
+        flow = self._flow([], rows)
+        assert [a["selector"] for a in flow["unreported_actions"]] == ["td.pick label"]
+
+    def test_a_step_naming_the_control_behind_a_label_accounts_for_the_click(self):
+        rows = [self._click("td.pick label", "", uid="e1"),
+                self._click("td.pick input", "on", uid="e2", via="e1"),
+                self._state(checks={"#agree": {"total": 1, "visible": 1, "uid": "e2"}})]
+        flow = self._flow([self._step(1, "list", name="agree", selector="#agree")], rows)
+        assert flow["unreported_actions"] == []
+
+    def test_a_flagged_click_tied_to_its_step_is_one_finding(self):
+        rows = [self._click("button.danger.wide", "Delete selected", uid="e1"),
+                self._state("confirm")]
+        flow = self._flow([self._step(4, "confirm", name="deleteSelected",
+                                      label="Delete Selected",
+                                      selector="button:has-text('Delete')")], rows)
+        assert [(v["index"], v["token"]) for v in flow["violations"]] == [(4, "delete")]
+
+
+class TestWhatTheTestsAlreadyReach:
+    """Whether an observed step is one the tests already make was read off names:
+    the explorer's for the control against the source's for whatever it calls. No
+    step of a walk was ever recognised, so a note could never be seen as applied."""
+
+    MARKERS = ("PAGE_ENTER: list|https://shop.test/|Shop\n"
+               + "".join("FLOW_STEP: " + json.dumps({
+                   "index": n, "page": "list", "action": {"verb": "click", "target": {
+                       "name": name, "selector": sel, "accessible_name": name}},
+                   "result": {"outcome": "ok"}}) + "\n"
+                   for n, (name, sel) in enumerate([("search", "#search"), ("pick", "#pick")])))
+
+    def _flow(self, known):
+        rows = [{"page": "list", "url": "https://shop.test/", "known": known,
+                 "inventory": [{"tag": "h1", "text": "list"}],
+                 "checks": {"#search": {"total": 1, "visible": 1, "uid": "e1"},
+                            "#pick": {"total": 1, "visible": 1, "uid": "e2"}}}]
+        return fm.build(self.MARKERS, rows)
+
+    SEARCH = {"owner": "ListPage", "name": "searchButton", "selector": "button.go",
+              "total": 1, "visible": 1, "uid": "e1"}
+
+    def test_a_control_a_page_object_resolves_to_is_not_reported_as_added(self):
+        flow = self._flow([self.SEARCH])
+        assert flow["steps"][0]["modelled_by"] == "ListPage.searchButton"
+        assert "modelled_by" not in flow["steps"][1]
+        diff = fm.diff_against_test(flow, [])
+        assert [a["flow_index"] for a in diff["added"]] == [1]
+
+    def test_once_every_control_is_modelled_nothing_is_added(self):
+        pick = {"owner": "ListPage", "name": "rowCheckbox", "selector": "td label",
+                "total": 1, "visible": 1, "uid": "e2"}
+        assert fm.diff_against_test(self._flow([self.SEARCH, pick]), [])["added"] == []
+
+    def test_a_locator_that_matches_several_models_none_of_them(self):
+        loose = {**self.SEARCH, "total": 2, "visible": 2}
+        assert "modelled_by" not in self._flow([loose])["steps"][0]
+
+    def test_what_the_guards_read_is_unchanged(self):
+        flow = self._flow([self.SEARCH])
+        fm.diff_against_test(flow, [])
+        assert flow["steps"][0]["maps_to_test"]["kind"] == "new", (
+            "an edit that reuses a control the tests already have is still justified "
+            "by the step that used it")
+
+
+class TestThePageAWalkCameFrom:
+    def test_a_dialog_is_compared_with_the_page_it_opened_over(self):
+        # list, then a form, then the list again, and a dialog over it. Compared
+        # with the form — the page first reached before it — every locator of the
+        # list read as new on the dialog, and the list's page object took it.
+        def known(shown):
+            return [{"owner": owner, "path": f"p/{owner}.java", "name": name,
+                     "selector": f".{name}", "total": 1 if name in shown else 0,
+                     "visible": 1 if name in shown else 0}
+                    for owner, names in (("ListPage", ("search", "row", "edit", "more")),
+                                         ("FormPage", ("name", "save")),
+                                         ("ConfirmDialog", ("title", "yes")))
+                    for name in names]
+        listed = ("search", "row", "edit", "more")
+        rows = [{"page": "list", "url": "u", "known": known(listed)},
+                {"page": "form", "url": "u", "known": known(("name", "save"))},
+                {"page": "list", "url": "u", "known": known(listed)},
+                {"page": "confirm", "url": "u", "known": known(listed + ("title", "yes"))}]
+        markers = "\n".join(f"PAGE_ENTER: {p}|u|Shop" for p in ("list", "form", "confirm"))
+        flow = fm.build(markers, rows)
+        assert flow["_page_walk"] == ["list", "form", "list", "confirm"]
+        fm.measure_page_objects(flow, [{"path": "p/ListPage.java", "snippet": ""}])
+        best = flow["pages"]["confirm"]["best_page_object"]
+        assert (best["name"], best["matched"], best["broken"]) == ("ConfirmDialog", 2, [])
+
+
+class TestALocatorUsedInline:
+    def test_one_that_matched_nothing_is_not_called_broken(self):
+        # Inline is how a page object asks whether something is there right now.
+        rows = [{"page": "form", "url": "u", "known": [
+            {"owner": "FormPage", "path": "p/FormPage.java", "name": "save",
+             "selector": ".save", "total": 1, "visible": 1},
+            {"owner": "FormPage", "path": "p/FormPage.java", "name": ".calendar",
+             "selector": ".calendar", "inline": True, "total": 0, "visible": 0},
+            {"owner": "FormPage", "path": "p/FormPage.java", "name": "title",
+             "selector": ".title", "total": 0, "visible": 0}]}]
+        flow = fm.build("PAGE_ENTER: form|u|Shop", rows)
+        fm.measure_page_objects(flow, [{"path": "p/FormPage.java", "snippet": ""}])
+        best = flow["pages"]["form"]["best_page_object"]
+        assert (best["broken"], best["unseen"]) == (["title"], [".calendar"])
+        table = fm.describe_page_objects(flow)
+        assert "broken: title" in table
+        assert "used inline and not on the page during the walk: `.calendar`" in table
+
+
+class TestWhatAnEditIsTranscribedFrom:
+    def test_the_adapt_table_carries_each_steps_name_selector_and_value(self):
+        flow = fm.build(TestAStepAndTheActionRecordedForIt.PAGES + "FLOW_STEP: " + json.dumps({
+            "index": 1, "page": "list", "action": {"verb": "fill", "value": "P-1", "target": {
+                "name": "passportNumber", "selector": "div.field:has-text('Passport') input",
+                "accessible_name": "Passport"}}, "result": {"outcome": "ok"}}))
+        wide = fm.describe(flow, selectors=True)
+        assert "| Name | Selector | Value |" in wide
+        assert "passportNumber | `div.field:has-text('Passport') input` | P-1 |" in wide
+        plain = fm.describe(flow)
+        assert "Selector" not in plain and "div.field" not in plain, (
+            "the report and the PR keep the table they had")
+
+    def test_a_selector_cannot_break_the_table(self):
+        flow = fm.build("PAGE_ENTER: p|u|T\nFLOW_STEP: " + json.dumps({
+            "index": 1, "page": "p", "action": {"verb": "click", "target": {
+                "name": "a", "selector": "[lang|='en'] `x`"}}, "result": {"outcome": "ok"}}))
+        row = fm.describe(flow, selectors=True).splitlines()[-1]
+        assert "[lang\\|='en'] 'x'" in row
+
+
+class TestEvidenceForAChangeItem:
+    """An edit may be justified only by a step whose selector was counted unique,
+    so an item whose controls have none is lost before the adapt step is asked."""
+
+    def _flow(self, *steps):
+        return {"pages": {"memberProfile": {}, "itemList": {}}, "steps": [
+            {"index": n, "page": {"id": page},
+             "action": {"verb": verb, "target": {"name": name, "accessible_name": label}},
+             "selector_check": {"unique": unique}, "result": {"outcome": "ok"}}
+            for n, (page, verb, name, label, unique) in enumerate(steps, 1)]}
+
+    def test_a_control_with_a_verified_step_has_evidence(self):
+        flow = self._flow(("itemList", "click", "removeSelectedButton", "Remove Selected", True))
+        found = fm.evidence_for(flow, ["item list", "remove selected"], "Item List")
+        assert found["controls"] == ["remove selected"], "a page is not a control"
+        assert (found["verified"], found["unverified"]) == ([1], [])
+
+    def test_a_step_under_an_uncounted_selector_is_not_evidence(self):
+        flow = self._flow(("itemList", "click", "rowCheckbox", "", None))
+        found = fm.evidence_for(flow, ["row checkbox"], "Item List")
+        assert (found["verified"], found["unverified"]) == ([], [1])
+        assert found["by_control"]["row checkbox"] == {"verified": [], "unverified": [1]}
+
+    def test_a_form_reported_as_its_save_button_has_none_for_its_fields(self):
+        flow = self._flow(("memberProfile", "click", "save", "Save", True))
+        found = fm.evidence_for(flow, ["member's passport number", "passport expiry date",
+                                       "member profile"], "Member Profile")
+        assert found["controls"] == ["member's passport number", "passport expiry date"]
+        assert found["verified"] == [] and found["unverified"] == []
+
+    def test_the_explorers_own_spelling_of_a_control_still_names_it(self):
+        flow = self._flow(("memberProfile", "fill", "membersPassport", "", True))
+        assert fm.evidence_for(flow, ["member's passport number"])["verified"] == [1]
+
+    def test_looking_at_a_control_is_not_acting_on_it(self):
+        flow = self._flow(("itemList", "observe", "removeSelectedButton", "Remove Selected", True))
+        assert fm.evidence_for(flow, ["remove selected"])["verified"] == []
+
+    def test_an_item_that_names_no_control_has_no_opinion(self):
+        assert fm.evidence_for(self._flow(), ["member profile"], "Member Profile") is None
+        assert fm.evidence_for(self._flow(), []) is None
+
+
+class TestAControlUsedTwice:
+    def test_a_step_does_not_take_the_later_use_and_put_the_rest_out_of_order(self):
+        # The first Save is recorded under a selector three buttons share, so the
+        # step cannot be tied to it. Tied to the second Save instead, the two
+        # steps between them would have nothing left in order to match.
+        join = TestAStepAndTheActionRecordedForIt()
+        rows = [join._click("button.btn", "Save", uid="a1", total=3, visible=3), join._state(),
+                join._click("#name", "", uid="a2"), join._state(),
+                join._click("#city", "", uid="a3"), join._state(),
+                join._click("#save", "Save", uid="a4"),
+                join._state(checks={"#save": {"total": 1, "visible": 1, "uid": "a4"}})]
+        flow = join._flow([
+            join._step(1, "list", name="save", label="Save", selector="#save"),
+            join._step(2, "list", name="name", selector="#name"),
+            join._step(3, "list", name="city", selector="#city"),
+            join._step(4, "list", name="saveAgain", label="Save", selector="#save")], rows)
+        assert [s.get("recorded_action") for s in flow["steps"]] == [0, 1, 2, 3], (
+            "each step with its own use: the first Save by its text, once the "
+            "steps around it have theirs")
+
+
+class TestASelectorThatPicksByPosition:
+    """Asked to pass a selector that matches one element, a walk met two buttons
+    under one selector and took the second by position. It was the other
+    section's button: the page said it had saved, and nothing typed was kept."""
+
+    SECOND = "form.card button[type='submit'] >> nth=1"
+
+    @pytest.mark.parametrize("selector, by_position", [
+        ("form.card button[type='submit'] >> nth=1", True),
+        ("button >>nth=-1", True),
+        (":nth-match(button.btn, 2)", True),
+        ("form.card:has-text('Blood Group') button[type='submit']", False),
+        ("table tr:nth-child(2) td.pick label", False),
+        ("#month-9", False),
+        ("", False),
+    ])
+    def test_it_is_told_by_how_it_is_written(self, selector, by_position):
+        assert fm.positional(selector) is by_position
+
+    def test_counted_as_one_it_is_still_not_unique(self):
+        join = TestAStepAndTheActionRecordedForIt()
+        rows = [join._click("button.btn", "Save", uid="e2", total=2, visible=2),
+                join._state(checks={self.SECOND: {"total": 1, "visible": 1, "uid": "e2"}})]
+        flow = join._flow([join._step(1, "list", name="save", label="Save",
+                                      selector=self.SECOND)], rows)
+        check = flow["steps"][0]["selector_check"]
+        assert (check["unique"], check["counted_against"], check.get("positional")) == (
+            False, "none", True)
+        assert flow["steps"][0]["action"]["target"]["selector"] == self.SECOND, (
+            "nothing else was counted on the button, so nothing replaces it")
+        assert "| NO (picked by position) |" in fm.describe(flow)
+
+    def test_it_gives_way_to_a_selector_that_says_which_one(self):
+        join = TestAStepAndTheActionRecordedForIt()
+        named = "form.card:has-text('Blood Group') button[type='submit']"
+        rows = [join._click(named, "Save", uid="e2"),
+                join._state(checks={self.SECOND: {"total": 1, "visible": 1, "uid": "e2"}})]
+        flow = join._flow([join._step(1, "list", name="save", label="Save",
+                                      selector=self.SECOND)], rows)
+        target = flow["steps"][0]["action"]["target"]
+        assert (target["selector"], target["reported_selector"]) == (named, self.SECOND)
+        assert flow["steps"][0]["selector_check"]["unique"] is True
+
+    def test_it_is_never_the_selector_a_control_is_known_by(self):
+        join = TestAStepAndTheActionRecordedForIt()
+        rows = [join._click("button.btn", "Save", uid="e2", total=2, visible=2),
+                join._state(checks={self.SECOND: {"total": 1, "visible": 1, "uid": "e2"}})]
+        flow = join._flow([join._step(1, "list", name="save", label="Save",
+                                      selector="text=Save")], rows)
+        target = flow["steps"][0]["action"]["target"]
+        assert target["selector"] == "text=Save" and "reported_selector" not in target

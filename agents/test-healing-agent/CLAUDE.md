@@ -101,6 +101,29 @@ Locate gave that Fix applied, saw fail on the same element and took back out: th
 record keeps the locator it was for and the code that was tried, and it holds for
 the rest of the session, so no later attempt is offered the same answer again.
 
+Three things Locate does beyond the fingerprint search:
+
+- **Puts back the selector the last passing run used** (`T0_recorded`). A locator
+  breaks because the page changed or because the code did. The baseline holds the
+  selector each field was found with, so when the fingerprint search has no
+  answer and the source now declares something else, that selector is restored.
+  Only on proof: it matches exactly one visible element in the failure capture,
+  or the element is one the capture cannot hold (next point).
+- **Says when the capture cannot hold the element** (`absent_from_capture` on the
+  record). A message that shows after a click and clears itself is gone by the
+  time the wait for it gives up. Two facts together establish it: the last good
+  run found nothing for the locator as the page loaded and used it later, and
+  nothing in the capture resembles what that run recorded. Fix then lets the
+  test run judge the replacement, because a check against that capture rejects
+  the right selector exactly as it rejects a guess.
+- **Resolves the page's other missing locators in the same pass** (`siblings` on
+  the record). A locator of the same page object that matched as the page loaded
+  on the last good run and matches nothing now is resolved with the same
+  baseline, capture and proof, and Fix applies it in the same edit. One that
+  cannot be proved, or that an assertion reads, waits for its own failure. A
+  sibling the test never reaches is repaired on that proof alone: the run that
+  verifies the edit does not exercise it.
+
 **A locator an assertion reads is repaired on proof, and only on proof.** Keeping
 the expected value fixed does not stop a repair pointing the locator at a
 *different element*; a check that compares a value catches that in the
@@ -172,10 +195,13 @@ Independently of all four, when the handoff carries a **Playwright trace**
 the test really used and exactly which one failed. That comes from the recorded
 run, so it is not subject to the source being out of date.
 
-**Tier 1 is automatic, and only on retry.** The first attempt works from the
-failure-time DOM snapshot, which handles most broken locators and stays fast and
-headless. If that attempt produces no working fix, the agent re-runs the test
-with the browser parked and attaches to it — the one thing a snapshot cannot do
+**Tier 1 is automatic, and only for a second try at the same element.** The
+first attempt at an element works from the failure-time DOM snapshot, which
+handles most broken locators and stays fast and headless. "First attempt at an
+element" is not "attempt 1": a chain of broken locators is repaired one per
+attempt, so each later link arrives on a later attempt having never been tried
+(`tried_before` in `01_fix.py`). If an attempt at an element produces no working
+fix, the agent re-runs the test with the browser parked and attaches to it — the one thing a snapshot cannot do
 is count how many elements a candidate selector matches, or try the corrected
 locator for real before the code is edited.
 
@@ -220,6 +246,12 @@ what it never saw. A safety guard rejects any fix that empties a file, removes a
 method, or changes more lines than a locator change plausibly needs — and any fix
 that alters an assertion call or its expected value, for a located edit and a
 model-written one alike, with or without `FORCE`.
+
+Two more rules read the DOM captured at failure (`validate_diagnosis_fit`). A
+replacement that matches nothing there is a guess, unless Locate has said the
+capture cannot hold the element, in which case the test run decides. And an edit
+may not replace a selector that matches exactly one visible element there: that
+selector resolved when the test failed, so it is not the one that broke.
 
 The fix call is given `Read`, `Grep` and `Glob` and nothing that runs. With a shell
 it could read the repository's history — which holds the answer to a locator
@@ -357,7 +389,7 @@ source tree rather than 30.
 |------|------|-------------|
 | **01 Locate** | Identify the owning page-object field, rank the failure capture against the baseline, emit a unique selector — once per attempt, so each link of a chain is resolved as the run uncovers it | No model, no browser, no credentials, no file edits |
 | **01 Fix** | Read handoff, build context, inspect live DOM, call Claude, apply edits, run test, commit | No DB, no HTML parsing |
-| **02 Ship** | Push branch, create PR, Slack notify | No AI, no code changes |
+| **02 Ship** | Push branch, create PR (a draft when no test is green yet but edits were kept), Slack notify | No AI, no code changes |
 
 ---
 
@@ -401,6 +433,12 @@ merely uncovered the next broken locator, the retry gets that new failure — ne
 selector, new DOM snapshot, new diagnosis (`next_issue` in `01-fix.json`) — and is
 told this is the first attempt at that element, not asked to avoid the approach
 that just succeeded.
+
+Every test still failing carries the failure it was last seen on, whatever ended
+the attempt (`carry_current_issues`). An attempt that ran no test — a guard's
+rejection, a refusal, an unreadable model response — changed nothing, so the
+failure it was working on is still the failure. Without that the next attempt
+reads the original handoff: a locator the session has already repaired.
 
 If `01_fix.py` crashes, run.sh's ERR trap posts to `SLACK_ALERT_CHANNEL` and leaves the
 handoff queued — a crash is never silent.
@@ -556,7 +594,11 @@ writes can never stand as evidence about the run before it.
 ## Fix Gate Values (.fix-passed)
 
 - `true`    — every attempted fix was applied, and passed wherever a runner existed → PR created
-- `false`   — one or more fixes failed tests → retry loop, then Slack alert
+- `false`   — one or more fixes failed tests → retry loop, then Slack alert. If the
+              run kept edits on the way (the test got past each repaired element and
+              stopped at a later one), Ship raises them as a **draft** PR titled
+              `[PARTIAL]`, records `pr_draft: true` in `02-ship.json`, and the run
+              is still reported as needing review
 - `skipped` — no eligible issues or infra not configured → clean exit
 
 A fix applied where **no test runner could be found** is recorded as

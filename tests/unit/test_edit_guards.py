@@ -453,3 +453,110 @@ class TestOptionTemplateStaysATemplate:
             'click(page.frameLocator("#pay").locator("a[data-option=\'" + method.getKey() + "\']"), "Method");',
             'selectOption(page.locator("select#method"), method.getKey(), "Method");')
         assert g.no_selector_broadening(self.TEMPLATE, after)[0] is True
+
+
+class TestAnElementTheCaptureCannotHold:
+    """The bug this pins: a message that shows after a click and clears itself was
+    gone from the page by the time the wait for it gave up. The capture taken then
+    could not hold it, so the right selector for it matched nothing, exactly as a
+    guess would — and was rejected as one, twice, before any test ran.
+    """
+
+    LINE = '    private final Locator notice = page.locator("%s");\n'
+    ORIGINAL = LINE % ".notice-typo"
+    BODY = '<div id="cart"><button id="add">Add to cart</button></div>'
+
+    @pytest.fixture
+    def soup(self):
+        bs4 = pytest.importorskip("bs4")
+        return bs4.BeautifulSoup(self.BODY, "html.parser")
+
+    def test_the_right_selector_is_left_to_the_test_run(self, soup):
+        ok, _why = g.validate_diagnosis_fit(
+            self.ORIGINAL, self.LINE % ".notice", "LOCATOR_STALE", soup, {},
+            failing_selector=".notice-typo", element_in_capture=False)
+        assert ok
+
+    def test_an_element_the_capture_could_hold_is_still_judged_by_it(self, soup):
+        ok, why = g.validate_diagnosis_fit(
+            self.ORIGINAL, self.LINE % ".notice", "LOCATOR_STALE", soup, {},
+            failing_selector=".notice-typo")
+        assert not ok and "matches nothing" in why
+
+    def test_it_waives_nothing_else(self, soup):
+        # Broadening is how a wrong-page failure gets papered over, wherever the
+        # element is.
+        ok, why = g.validate_diagnosis_fit(
+            self.ORIGINAL, self.LINE % "div", "LOCATOR_STALE", soup, {},
+            failing_selector=".notice-typo", element_in_capture=False)
+        assert not ok
+
+
+class TestASelectorThatWorksIsNotReplaced:
+    """The bug this pins: an attempt was handed a failure an earlier edit had
+    already repaired. It rewrote the repaired selector, which was finding its
+    element, and explained the change with something the page had never done.
+    """
+
+    FILE = ('    search = page.locator("%s");\n'
+            '    submit = page.locator("%s");\n')
+    WORKING = FILE % ("[data-test='search-query']", "[data-test='search-submit']")
+
+    BODY = ('<form><input id="q" data-test="search-query">'
+            '<button id="go" data-test="search-submit">Go</button>'
+            '<a class="tag">one</a><a class="tag">two</a></form>')
+    PRINTS = {"elements": [
+        {"tag": "input", "id": "q", "testid": "search-query", "alt": None,
+         "aria_label": None, "text": "", "is_visible": True},
+        {"tag": "button", "id": "go", "testid": "search-submit", "alt": None,
+         "aria_label": None, "text": "Go", "is_visible": True},
+    ]}
+
+    @pytest.fixture
+    def soup(self):
+        bs4 = pytest.importorskip("bs4")
+        return bs4.BeautifulSoup(self.BODY, "html.parser")
+
+    def _check(self, soup, original, updated, failing, prints=None):
+        return g.validate_diagnosis_fit(
+            original, updated, "LOCATOR_STALE", soup,
+            self.PRINTS if prints is None else prints, failing_selector=failing)
+
+    def test_rewriting_a_locator_the_capture_shows_working_is_rejected(self, soup):
+        # The selector that failed is no longer in the file, so the capture is
+        # not about this edit's replacement — and still shows what it replaces
+        # finding exactly one visible element.
+        ok, why = self._check(soup, self.WORKING,
+                              self.FILE % ("#q", "[data-test='search-submit']"),
+                              "[data-test='search-typo']")
+        assert not ok
+        assert "[data-test='search-query']" in why and "not the locator that broke" in why
+
+    def test_a_working_locator_changed_alongside_the_broken_one_is_rejected(self, soup):
+        original = self.FILE % ("[data-test='search-typo']", "[data-test='search-submit']")
+        ok, why = self._check(soup, original, self.FILE % ("#q", "#go"),
+                              "[data-test='search-typo']")
+        assert not ok and "[data-test='search-submit']" in why
+
+    def test_the_locator_that_failed_is_replaced_as_before(self, soup):
+        original = self.FILE % ("[data-test='search-typo']", "[data-test='search-submit']")
+        assert self._check(soup, original, self.WORKING, "[data-test='search-typo']")[0]
+
+    def test_the_failing_selector_may_be_changed_even_where_it_matches(self, soup):
+        # Present and still the failure: hidden, covered, or the wrong element.
+        # What to do about that is the diagnosis's call, not this rule's.
+        ok, _why = self._check(soup, self.WORKING,
+                               self.FILE % ("#q", "[data-test='search-submit']"),
+                               "[data-test='search-query'] >> nth=0")
+        assert ok
+
+    def test_matching_several_is_not_working(self, soup):
+        original = self.FILE % ("a.tag", "[data-test='search-submit']")
+        assert self._check(soup, original,
+                           self.FILE % ("#q", "[data-test='search-submit']"), "")[0]
+
+    def test_unknown_visibility_claims_nothing(self, soup):
+        ok, _why = self._check(soup, self.WORKING,
+                               self.FILE % ("#q", "[data-test='search-submit']"),
+                               "[data-test='search-typo']", prints={})
+        assert ok

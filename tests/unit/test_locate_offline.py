@@ -792,3 +792,171 @@ class TestAnAttributeThePageRewrites:
             assert mod._unsettled_anchors(
                 stored, [{"name": "expiryField", "selector": selector}],
                 "codeField", soup) == {}
+
+
+# ── An element that is only on the page after something is done to it ─────────
+NOTICE_PAGE = '''
+public class LoginPage extends BasePage {
+    public LoginPage(Config config) {
+        usernameField = page.locator("#user-name");
+        loginButton = page.locator("#login-button");
+        notice = page.locator(".notice-typo");
+    }
+    public String read() { return getText(notice, "Notice"); }
+}
+'''
+
+NOTICE = _el(3, "div", class_list=["notice"], role="alert", accessible_name="Saved",
+             text="Saved", is_interactive=False,
+             attrs={"class": "notice", "role": "alert"})
+RECORDED_AT = "2026-09-01T10:00:00"
+
+
+def _rebaseline(world, **changes):
+    """Rewrite the recorded good run. Everything in it is stamped with one time,
+    the way a single passing run writes it."""
+    path = world["tmp"] / "baselines" / "shop" / "LoginPage.json"
+    record = json.loads(path.read_text())
+    for key, value in changes.items():
+        record[key] = {**(record.get(key) or {}), **value} if isinstance(value, dict) else value
+    record.setdefault("lastSeen", {name: RECORDED_AT for name in record["coverage"]})
+    path.write_text(json.dumps(record))
+
+
+def _notice(world, **baseline):
+    _rebaseline(world, coverage={"notice": baseline.pop("at_load", 0)},
+                fingerprints={"notice": NOTICE},
+                selectors={"notice": baseline.pop("selector", "Locator@.notice")},
+                **baseline)
+    return _one(world, _sources={"LoginPage": NOTICE_PAGE},
+                failed_selector=".notice-typo",
+                error_message="Failed to get text from element 'Notice' with "
+                              "locator: Locator@.notice-typo")
+
+
+class TestAnElementTheCaptureCannotHold:
+    """The bug this pins: a message that shows after a click and clears itself was
+    gone by the time the wait for it gave up. Nothing in the capture resembled it,
+    which was reported as low confidence and nothing more — so the step that
+    judges a replacement against that capture rejected the right one as a guess.
+    """
+
+    def test_it_is_said_that_the_capture_cannot_hold_it(self, world):
+        record = _notice(world, selector="Locator@.notice-typo")
+        assert record["verdict"] != "HEALED"
+        assert "exists only after an action" in record["absent_from_capture"]
+
+    def test_an_element_that_was_there_as_the_page_loaded_is_simply_missing(self, world):
+        record = _notice(world, at_load=1)
+        assert record["verdict"] != "HEALED"
+        assert "absent_from_capture" not in record
+
+    def test_a_sighting_from_an_earlier_run_is_not_this_run_using_it(self, world):
+        _rebaseline(world, lastSeen={"usernameField": RECORDED_AT, "loginButton": RECORDED_AT,
+                                     "notice": "2026-08-01T10:00:00"})
+        assert "absent_from_capture" not in _notice(world, selector="Locator@.notice-typo")
+
+
+class TestTheSelectorTheLastPassingRunUsed:
+    """A locator breaks because the page changed or because the code did. For the
+    second the answer was written down on the last run that passed."""
+
+    def test_it_is_put_back_for_an_element_the_capture_cannot_hold(self, world):
+        record = _notice(world)
+        assert record["verdict"] == "HEALED" and record["tier"] == "T0_recorded"
+        assert record["new_locator"] == ".notice"
+        assert record["new_expression"] == 'page.locator(".notice")'
+        assert "test run is the proof" in record["verification"]
+        # Ranked against a fingerprint and passed over; this was not chosen from them.
+        assert "rejected" not in record and "score" not in record
+
+    def test_it_is_put_back_when_the_capture_proves_it(self, world):
+        # The fingerprint cannot decide, the recorded selector can: it still finds
+        # exactly one visible element.
+        _rebaseline(world, fingerprints={"loginButton": NOTICE},
+                    selectors={"loginButton": "Locator@#login-button"})
+        record = _one(world)
+        assert record["verdict"] == "HEALED" and record["tier"] == "T0_recorded"
+        assert record["new_locator"] == "#login-button"
+        assert record["verification"] == "unique in the failure capture"
+
+    def test_not_when_the_source_still_declares_it(self, world):
+        # The code did not change, so the page did. That is a search, not a restore.
+        assert _notice(world, selector="Locator@.notice-typo")["verdict"] != "HEALED"
+
+    def test_not_without_proof(self, world):
+        # In neither the capture nor the class of element a capture cannot hold.
+        assert _notice(world, at_load=1)["verdict"] != "HEALED"
+
+    def test_not_a_chain_that_one_call_cannot_spell(self, world):
+        _rebaseline(world, fingerprints={"loginButton": NOTICE}, selectors={
+            "loginButton": "Locator@#pay >> internal:control=enter-frame >> #login-button"})
+        assert _one(world)["verdict"] != "HEALED"
+
+    def test_the_fingerprint_answers_first_when_it_can(self, world):
+        _rebaseline(world, selectors={"loginButton": "Locator@#login-button"})
+        assert _one(world)["tier"] != "T0_recorded"
+
+
+# ── Two locators missing from one page ────────────────────────────────────────
+TWO_BROKEN = '''
+public class LoginPage extends BasePage {
+    public LoginPage(Config config) {
+        formBox = page.locator("form");
+        usernameField = page.locator("%s");
+        loginButton = page.locator("%s");
+    }
+    public void doLogin(String u) {
+        fillText(usernameField, u, "Username field");
+        click(loginButton, "Login button");
+    }
+}
+'''
+
+
+def _two(world, username="#user-typo", login="#login-typo", **overrides):
+    _rebaseline(world, coverage={"formBox": 1})
+    return _one(world, _sources={"LoginPage": TWO_BROKEN % (username, login)},
+                failed_selector=login,
+                error_message="Failed to click on element 'Login button' with "
+                              f"locator: Locator@{login}", **overrides)
+
+
+class TestWhatElseThePageLost:
+    """One broken locator hides the next, and each costs a whole test run to
+    reach. Two of them on one page are both in the capture the first one left."""
+
+    def test_the_other_missing_locator_is_resolved_with_the_failing_one(self, world):
+        record = _two(world)
+        assert record["field"] == "loginButton" and record["verdict"] == "HEALED"
+        (sibling,) = record["siblings"]
+        assert sibling["locator_id"] == "LoginPage#usernameField"
+        assert sibling["new_locator"] == "[data-test='username']"
+        assert sibling["verification"] == "unique in the failure capture"
+
+    def test_a_locator_that_still_matches_is_left_alone(self, world):
+        assert "siblings" not in _two(world, username="#user-name")
+
+    def test_one_an_assertion_reads_waits_for_its_own_failure(self, world):
+        record = _two(world, _assertions={
+            "usernameField": 'assertElementVisible(config, usernameField, "Username")'})
+        assert "siblings" not in record
+
+    def test_one_that_cannot_be_proved_waits_for_its_own_failure(self, world, tmp_path):
+        # The username input is not in this capture at all.
+        record = _two(world, dom_snapshot=str(
+            _capture(tmp_path, "no-username", [LOGIN_BUTTON], "login-button")))
+        assert record["verdict"] == "HEALED" and "siblings" not in record
+
+    def test_a_second_field_declared_with_the_same_broken_selector(self, world):
+        # A selector is listed once however many fields declare it, so the second
+        # field is found by its name.
+        record = _two(world, username="#typo", login="#typo")
+        ids = {record["locator_id"]} | {s["locator_id"] for s in record["siblings"]}
+        assert ids == {"LoginPage#usernameField", "LoginPage#loginButton"}
+
+    def test_the_report_names_it(self, world):
+        mod = world["mod"]
+        record = _two(world)
+        text = mod._markdown({"mode": "enforce", "resolutions": [record]})
+        assert "also missing on this page: `LoginPage#usernameField`" in text

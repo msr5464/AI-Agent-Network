@@ -743,9 +743,12 @@ def _baseline_field_for(ev: Dict) -> str:
                 continue
             name = detail.get("name") or ""
             if name in recorded:
-                # Absent now, and once present: it went away. Absent now and
-                # never seen: the selector is wrong, which is a locator fix.
-                if recorded[name] == 0 and name in seen:
+                # Absent on the last good run, and seen on an earlier one: it
+                # went away. Never seen: the selector is wrong, which is a
+                # locator fix. Seen on that same run: it only appears once
+                # something is done to the page (a toast, an open menu), so it
+                # was there to be used and the zero is when it was counted.
+                if recorded[name] == 0 and baseline.last_matched_earlier(record, name):
                     return name
                 return ""
     return ""

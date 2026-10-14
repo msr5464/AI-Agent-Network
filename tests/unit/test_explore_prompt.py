@@ -144,6 +144,180 @@ class TestWhatTheTestDoes:
         assert "What the test does today" not in only_data
 
 
+class TestWhatTheHelperSignsInWith:
+    PLAN = {"module": "Portal", "note": "n", "items": []}
+    SIGN_IN = {"file": "src/main/java/portal/PortalHelper.java",
+               "row": {"username": "admin", "password": "pw-1"},
+               "typed_by": "PortalHelper.login()"}
+
+    def test_a_value_says_what_types_it(self, explore):
+        out = explore.build_prompt(self.PLAN, "", "", "", {"test_walks": [
+            {"test": TEST_ID, "steps": ["Sign in"], "data": [self.SIGN_IN]}]})
+        values = out[out.index("## The values the test types"):]
+        assert "typed by `PortalHelper.login()`" in values
+        assert "- username: admin" in values and "- password: pw-1" in values
+        assert "except where the change note gives a new value for one" in values
+
+    def test_a_signed_out_start_is_not_called_a_flow_without_a_login(self, explore):
+        out = explore.build_prompt(self.PLAN, "", "", "", {}, {"url": "", "signed_in": False})
+        assert "no saved session is loaded for this test" in out
+        assert "does not sign in" not in out
+
+
+class TestAChangeItemWithNoEvidence:
+    """A walk filled two new fields, read them back, and reported a step for
+    neither. Step 04 could only decline the item, twice, having been asked twice."""
+
+    PLAN = {"type": "web", "module": "portal", "items": [
+        {"index": 1, "kind": "test_data", "text": "Pick B", "nouns": ["status"]},
+        {"index": 2, "kind": "field_added", "text": "Fill the passport number",
+         "nouns": ["passport number", "member details"], "page_hint": "Member Details"},
+        {"index": 3, "kind": "step_insert", "text": "Tick the row, then Remove Selected",
+         "nouns": ["row checkbox", "remove selected"], "page_hint": "Member List"}]}
+
+    class _Done:
+        status, stdout = "ok", ""
+
+        def browser_unavailable(self):
+            return ""
+
+    @staticmethod
+    def _step(index, name, label, unique=True, verb="click"):
+        return {"index": index, "page": {"id": "memberDetails", "identity_digest": "d"},
+                "action": {"verb": verb, "target": {"name": name, "accessible_name": label}},
+                "selector_check": {"unique": unique}, "result": {"outcome": "ok"}}
+
+    def _flow(self, *steps, **extra):
+        return {"steps": list(steps), "pages": {"memberDetails": {"id": "memberDetails"}},
+                "_inventories": {"memberDetails": [{"tag": "h1"}]}, "status": "ok", **extra}
+
+    SAVE = ("save", "Save")
+    REMOVE = ("removeSelectedButton", "Remove Selected")
+
+    def test_an_item_that_adds_a_control_needs_a_verified_step_for_it(self, explore):
+        flow = self._flow(self._step(1, *self.SAVE), self._step(2, *self.REMOVE),
+                          self._step(3, "rowCheckbox", "", unique=None))
+        assert explore.uncovered_items(self.PLAN, flow) == [
+            {"index": 2, "controls": ["passport number"], "unverified": []},
+            {"index": 3, "controls": ["row checkbox"], "unverified": [3]}], (
+            "the test_data item adds no control and is never listed")
+
+    def test_a_walk_that_proved_every_item_leaves_nothing(self, explore):
+        flow = self._flow(self._step(1, "passportNumber", "Passport Number", verb="fill"),
+                          self._step(2, "rowCheckbox", ""), self._step(3, *self.REMOVE))
+        assert explore.uncovered_items(self.PLAN, flow) == []
+
+    def test_a_walk_that_was_stopped_is_not_asked_for_what_lay_beyond(self, explore):
+        # A second walk stops at the same control.
+        steps = [self._step(1, *self.SAVE)]
+        for stopped in ({"refusals": [{"index": "2"}]}, {"violations": [{"index": 2}]},
+                        {"unreachable": [{"reached": "list", "missing": "dialog"}]}):
+            assert explore.uncovered_items(self.PLAN, self._flow(*steps, **stopped)) == []
+
+    def test_the_second_walk_is_told_which_items_and_how_to_report_them(self, explore):
+        note = explore.evidence_note(
+            [{"index": 2, "controls": ["passport number"], "unverified": []},
+             {"index": 3, "controls": ["row checkbox"], "unverified": [3]}],
+            [{"kind": "fill", "name": "input.text", "selector": "input.text",
+              "page": "memberDetails"}])
+        assert "item 2: passport number — no step reported acting on any of them" in note
+        assert "item 3: row checkbox — step 3 acted on one under a selector nothing counted" \
+            in note
+        assert "- fill input.text (on memberDetails)" in note
+        assert "page.qa.step({ click: '<selector>' }" in note
+        assert "Each field of a form is a step of its own" in note
+
+    def _run(self, explore, tmp_path, monkeypatch, walks, attempts=1):
+        (tmp_path / "01-parse-change.json").write_text(json.dumps(self.PLAN))
+        (tmp_path / "02-scope.json").write_text(json.dumps(
+            {"workspace": str(tmp_path), "entry_path": {"mode": "none"}}))
+        notes_seen = []
+
+        def run_attempt(_plan, _rules, notes, *args, **kwargs):
+            notes_seen.append(notes)
+            return walks[len(notes_seen) - 1], self._Done()
+
+        monkeypatch.setattr(explore, "run_attempt", run_attempt)
+        monkeypatch.setattr(explore, "ATTEMPTS", attempts)
+        explore.main()
+        return notes_seen, json.loads((tmp_path / "03-explore-web.json").read_text())
+
+    def test_it_is_walked_again_and_the_walk_that_proved_more_is_kept(
+            self, explore, tmp_path, monkeypatch):
+        thin = self._flow(*[self._step(n, f"step{n}", f"Step {n}") for n in range(1, 9)])
+        full = self._flow(self._step(1, "passportNumber", "Passport Number", verb="fill"),
+                          self._step(2, "rowCheckbox", ""), self._step(3, *self.REMOVE))
+        notes, written = self._run(explore, tmp_path, monkeypatch, [thin, full])
+        assert len(notes) == 2 and "left change items without evidence" in notes[1]
+        assert len(written["flow"]["steps"]) == 3, (
+            "the walk that proved the note outranks the one with more steps")
+        assert written["uncovered_items"] == []
+
+    def test_a_walk_that_proved_every_item_is_not_walked_again(
+            self, explore, tmp_path, monkeypatch):
+        full = self._flow(self._step(1, "passportNumber", "Passport Number", verb="fill"),
+                          self._step(2, "rowCheckbox", ""), self._step(3, *self.REMOVE))
+        notes, _written = self._run(explore, tmp_path, monkeypatch, [full])
+        assert len(notes) == 1
+
+    def test_what_is_still_unproven_after_the_last_walk_is_written_down(
+            self, explore, tmp_path, monkeypatch):
+        thin = self._flow(self._step(1, *self.SAVE))
+        notes, written = self._run(explore, tmp_path, monkeypatch, [thin], attempts=0)
+        assert len(notes) == 1
+        assert [u["index"] for u in written["uncovered_items"]] == [2, 3]
+
+
+class TestTheTestsOwnLocators:
+    """The helpers counted the page objects' locators on every page, and the
+    explorer was never shown them. Left to find an existing control again, a walk
+    met two Save buttons under one selector and took the wrong one by position."""
+
+    KNOWN = [
+        {"owner": "ProfilePage", "path": "p/ProfilePage.java", "name": "saveProfileButton",
+         "selector": "form:has(label:has-text('City')) button[type='submit']"},
+        {"owner": "ProfilePage", "path": "p/ProfilePage.java", "name": "div.calendar",
+         "selector": "div.calendar", "inline": True},
+        {"owner": "ListPage", "path": "p/ListPage.java", "name": "searchButton",
+         "selector": "button.search"}]
+    PLAN = {"module": "Portal", "note": "n", "items": []}
+
+    def test_they_are_listed_by_page_object_with_their_names(self, explore):
+        out = explore.build_prompt(self.PLAN, "", "", "", {}, known=self.KNOWN)
+        listed = out[out.index("## The locators the tests use today"):]
+        listed = listed[:listed.index("## What the flow is supposed to achieve")]
+        assert listed.index("`ListPage`") < listed.index("`ProfilePage`")
+        assert ("- saveProfileButton: `form:has(label:has-text('City')) "
+                "button[type='submit']`") in listed
+        assert "div.calendar" not in listed, "no field names it, so nothing says what for"
+
+    def test_nothing_is_added_when_there_are_none(self, explore):
+        for known in (None, [], [self.KNOWN[1]]):
+            out = explore.build_prompt(self.PLAN, "", "", "", {}, known=known)
+            assert "The locators the tests use today" not in out
+
+    def test_the_rules_send_an_existing_step_through_them_and_forbid_positions(self, explore):
+        rules = explore.load_explore_rules()
+        assert "**Never pick one of several matches by position**" in rules
+        assert "acts through the test's own locator" in rules
+
+
+class TestHowAStepIsWritten:
+    def test_the_rules_have_the_explorer_name_the_selector_it_acts_on(self, explore):
+        rules = explore.load_explore_rules()
+        assert "page.qa.step({ click: '#login-button' }" in rules
+        assert "The selector you pass is the\n  selector you report" in rules
+        assert "Never act on the page outside these calls" in rules
+        assert "Every control you act on is a step of\nits own" in rules
+
+    def test_a_value_the_note_replaces_is_typed_as_the_note_gives_it(self, explore):
+        assert "where the note gives a new value for a field" in explore.load_explore_rules()
+
+    def test_a_list_cut_short_is_asked_for_again_by_section(self, explore):
+        rules = explore.load_explore_rules()
+        assert "`unlisted: <n>`" in rules and "left out, not missing" in rules
+
+
 class TestBriefScreens:
     """A screen that closes by itself is measured only by the call that records it."""
 

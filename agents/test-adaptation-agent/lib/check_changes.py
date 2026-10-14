@@ -36,6 +36,14 @@ from shared.code_analyzer import split_class_members, without_comments
 CHECK_CHANGING = frozenset({"step_merge", "content_changed", "outcome_changed",
                             "api_contract", "coverage_changed"})
 
+# Kinds that may move a check's EXPECTED VALUE and do nothing else to it. The
+# value the test types is what such an item changes, and a check that reads that
+# value back has to follow: refused outright, "select B instead of A" could never
+# be adapted where the test asserts the literal A. Held to more than the kinds
+# above (`validate`): the new value must be one the item states, the browser must
+# have been seen to show it, and a check may be neither removed nor relaxed.
+VALUE_FOLLOWING = frozenset({"test_data"})
+
 # In the refusal for an item whose kind may not change checks. 04_adapt matches
 # it to retry such an item after the note's check-changing items have landed.
 KIND_MAY_NOT_CHANGE = "may not change what a test checks"
@@ -185,6 +193,28 @@ def fenced_relation(report: Optional[dict]) -> str:
 
 # ── Evidence ──────────────────────────────────────────────────────────────────
 
+def stated(value: str, text: str) -> bool:
+    """Whether a change item's own words contain an expected value.
+
+    Compared on letters and digits alone, the value against every run of the
+    text's words, so quoting, case, spacing and punctuation do not decide it:
+    `(2)itemsleft` is stated by `shows "(2) items left"`.
+    """
+    wanted = re.sub(r"[^a-z0-9]+", "", str(value).lower())
+    words = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    if not wanted:
+        return False
+    for start in range(len(words)):
+        run = ""
+        for word in words[start:start + 12]:
+            run += word
+            if run == wanted:
+                return True
+            if not wanted.startswith(run):
+                break
+    return False
+
+
 def _seen(value: str, saw: str) -> bool:
     if re.fullmatch(r"-?\d+(?:\.\d+)?", value):
         found = bool(re.search(rf"(?<![\d.]){re.escape(value)}(?!\.?\d)",
@@ -241,8 +271,14 @@ def _relaxations(delta: dict, wanted) -> List[Tuple[dict, dict]]:
 
 
 def evidence(action: str, kind: str, check: dict, new_values: Optional[List[str]],
-             report: Optional[dict]) -> str:
-    """confirmed | contradicted | unverified | test-only — see the module docs."""
+             report: Optional[dict], shown: Optional[str] = None) -> str:
+    """confirmed | contradicted | unverified | test-only — see the module docs.
+
+    `shown` is the text the page displayed for this check, as the explorer wrote
+    it down apart from any commentary (its VALUE_CHECK). When there is one it is
+    what a changed value is judged against, not the report's prose: "shows
+    nothing; had it saved it would show B" names B and was read as B confirmed.
+    """
     if kind == "api_contract":
         # Exploration only GETs and only records top-level keys: it can neither
         # confirm nor contradict a contract change reliably.
@@ -255,7 +291,7 @@ def evidence(action: str, kind: str, check: dict, new_values: Optional[List[str]
 
     old = check["values"]
     changed = [i for i, (o, n) in enumerate(zip(old, new_values or [])) if o != n]
-    saw = (report or {}).get("saw") or ""
+    saw = shown if shown is not None else (report or {}).get("saw") or ""
     # A value nested in a call — `get("title")`, `> 0` — is not something a page
     # shows, so it can be neither seen nor contradicted.
     if not changed or not saw or not all(check["top"][i] for i in changed):
@@ -410,12 +446,15 @@ def _summary(keys) -> str:
 def validate(declared, graph: dict, files: dict, kind: str, listed: Dict[str, dict],
              found_reports: Dict[str, dict], outside: Dict[tuple, List[str]],
              covered: bool = False, found_values: Optional[Dict[str, dict]] = None,
-             recorded: Optional[List[dict]] = None) -> Tuple[bool, str, List[dict]]:
+             recorded: Optional[List[dict]] = None,
+             item_text: str = "") -> Tuple[bool, str, List[dict]]:
     """(ok, reason, rows). `rows` describe every declared change plus the moves
     and rewordings, for the report and the PR.
 
     `found_values` (`value_reports`) and `recorded` (value mismatches a previous
-    attempt's verify run measured) are what a `relax` must be confirmed by."""
+    attempt's verify run measured) are what a `relax` must be confirmed by.
+    `item_text` is the change item's own words, which a `VALUE_FOLLOWING` kind's
+    new expected values must be found in."""
     def refuse(reason: str):
         return False, reason, []
 
@@ -479,7 +518,13 @@ def validate(declared, graph: dict, files: dict, kind: str, listed: Dict[str, di
                           f"declared or not, beyond a measured relax")
 
     actual, detail = _actual(graph, files, relax_ids)
-    if actual and kind not in CHECK_CHANGING:
+    if actual and kind in VALUE_FOLLOWING:
+        more = [key for key in actual if key[1] != "change"]
+        if more:
+            return refuse(f"a `{kind}` item may move a check's expected value and do "
+                          f"nothing else to a check, but this edit does: "
+                          f"{_summary(more)}")
+    elif actual and kind not in CHECK_CHANGING:
         return refuse(f"a `{kind}` item {KIND_MAY_NOT_CHANGE}, but this "
                       f"edit does: {_summary(actual)}. If the expected value really "
                       f"changed, the note needs its own item saying so")
@@ -520,18 +565,43 @@ def validate(declared, graph: dict, files: dict, kind: str, listed: Dict[str, di
                          "why": why, "evidence": "confirmed", "saw": clean_observed(saw)})
             continue
         report = found_reports.get(check["id"])
-        verdict = evidence(action, kind, check, list(new) if new else None, report)
+        measured = (found_values or {}).get(check["id"])
+        shown = measured.get("rendered") if measured else None
+        verdict = evidence(action, kind, check, list(new) if new else None, report, shown)
         if verdict == "contradicted":
-            return refuse(f"{describe(check)}: the browser reported "
-                          f"{report['verdict'] or 'seeing'} \"{report['saw']}\", "
+            said = (f"the page showing \"{clean_observed(shown)}\"" if shown is not None
+                    else f"{report['verdict'] or 'seeing'} \"{report['saw']}\"")
+            return refuse(f"{describe(check)}: the browser reported {said}, "
                           f"which contradicts this {action}")
+        if kind in VALUE_FOLLOWING:
+            # The caution this kind is allowed its change under. Any other kind
+            # is told what a check becomes by the note's classification; this one
+            # only by the value it types, so the value has to be the note's own
+            # and the page has to have been seen showing it.
+            moved = [n for o, n in zip(check["values"], new) if o != n]
+            unstated = [n for n in moved if not stated(n, item_text)]
+            if unstated:
+                return refuse(f"{describe(check)}: a `{kind}` item may move a check "
+                              f"only to a value its own text states, and it does not "
+                              f"state {', '.join(unstated)}")
+            if shown is None:
+                return refuse(f"{describe(check)}: a `{kind}` item may move a check's "
+                              f"expected value only when the browser was seen showing "
+                              f"the new one, and the explorer wrote down no VALUE_CHECK "
+                              f"for this check: nothing says what the page displayed")
+            if verdict != "confirmed":
+                return refuse(f"{describe(check)}: a `{kind}` item may move a check's "
+                              f"expected value only when the browser was seen showing "
+                              f"the new one, and the page showed "
+                              f"\"{clean_observed(shown)}\"")
         after = detail.get((signature(check), action, new), {}).get("after")
         rows.append({"id": check["id"], "tests": check.get("tests", []),
                      "site": check["site"], "message": check["message"],
                      "action": action, "before": check.get("display", []),
                      "after": (after or {}).get("display", []),
                      "why": why, "evidence": verdict,
-                     "saw": (report or {}).get("saw", "")})
+                     "saw": (clean_observed(shown) if shown is not None
+                             else (report or {}).get("saw", ""))})
 
     seen = set()
     for label in ("moved", "reworded"):

@@ -119,12 +119,20 @@ exports.default = async ({ page }) => {
     let frames = located(await Promise.all(page.frames().map(async f => {
       const root = inner && await f.locator(inner).count().catch(() => 0)
         ? await f.locator(inner).first().elementHandle().catch(() => null) : null;
+      // With how many elements the list left out at its limit: unsaid, a control
+      // past the cut reads as a control that is not on the page.
+      const got = inner && !root ? 'nothing matches scope ' + inner
+        : await f.evaluate(([r, o]) => {
+          if (!window.__qa) return 'no window.__qa here';
+          const list = window.__qa.harvest(r, o);
+          return Array.isArray(list) ? { list, unlisted: window.__qa.unlisted() } : list;
+        }, [root, opts || {}]).catch(e => 'error: ' + short(e));
+      const listed = got && Array.isArray(got.list);
       return {
         frame: f.url().split('?')[0].slice(0, 100),
         prefix: await prefix(f).catch(() => null),
-        result: inner && !root ? 'nothing matches scope ' + inner
-          : await f.evaluate(([r, o]) => (window.__qa ? window.__qa.harvest(r, o)
-            : 'no window.__qa here'), [root, opts || {}]).catch(e => 'error: ' + short(e)),
+        result: listed ? got.list : got,
+        ...(listed && got.unlisted ? { unlisted: got.unlisted } : {}),
       };
     })));
     await anchorOnLabels(frames);
@@ -261,6 +269,38 @@ exports.default = async ({ page }) => {
     if (row) note(row);
   };
 
+  // An action written as what it does to which element — { click: '<selector>' },
+  // { fill: '<selector>', value: '…' }, or a list of them — instead of a function.
+  // The selector is counted the moment before it is used, and the count is filed
+  // with the step's evidence: the selector a step reports is then the one that was
+  // measured and the one that worked. Written as a function, an action's selector
+  // is counted only when the caller remembers to ask (`before`, `check`), and a
+  // walk left a third of its steps unverified by not asking.
+  const VERBS = ['click', 'fill', 'select', 'check', 'uncheck', 'hover', 'press'];
+  const declared = action => {
+    const list = Array.isArray(action) ? action : [action];
+    const out = list.map(a => {
+      const verb = a && typeof a === 'object' && VERBS.find(v => typeof a[v] === 'string');
+      return verb ? { verb, sel: a[verb], value: a.value } : null;
+    });
+    return list.length && out.every(Boolean) ? out : null;
+  };
+  const perform = d => {
+    const loc = page.locator(d.sel);
+    if (d.verb === 'fill') return loc.fill(String(d.value == null ? '' : d.value));
+    if (d.verb === 'select') return loc.selectOption(d.value);
+    if (d.verb === 'press') return loc.press(String(d.value || 'Enter'));
+    return loc[d.verb]();
+  };
+  // Runs declared actions in order, each counted first. `used` fills as it goes,
+  // so what was counted before a failure is still reported.
+  const performAll = async (said, used) => {
+    for (const d of said) {
+      used[d.sel] = (await check({ used: d.sel })).used;
+      await perform(d);
+    }
+  };
+
   // One step, one round trip: act, settle, then report — the named selectors
   // counted (`check`) and/or what is on the page now (`harvest`, default on).
   // `before` is counted before acting: the control the step clicks, when the click
@@ -272,8 +312,10 @@ exports.default = async ({ page }) => {
     const out = { ok: true };
     if (opts.before) out.before = await check(opts.before);
     const asked = requested;
+    const said = declared(action), used = {};
     if (action) {
-      try { await action(); } catch (e) { out.ok = false; out.error = short(e); }
+      try { await (said ? performAll(said, used) : action()); }
+      catch (e) { out.ok = false; out.error = short(e); }
     }
     out.settledMs = await settle(opts.maxMs, opts.quietMs);
     // How long the page kept working after the action, and on how many requests:
@@ -282,7 +324,13 @@ exports.default = async ({ page }) => {
     out.requests = requested - asked;
     out.url = page.url();
     if (opts.check) out.check = await check(opts.check);
-    if (opts.harvest !== false) out.frames = await harvest(opts.scope, opts);
+    // Typing into a field changes no control on the page, so declared fills
+    // return no harvest unless one is asked for: a walk read the whole page
+    // back after every field of a form, most of its cost in tokens.
+    const typing = said && said.every(d => d.verb === 'fill');
+    if (typing ? opts.harvest === true : opts.harvest !== false) {
+      out.frames = await harvest(opts.scope, opts);
+    }
     // What the harvest counted is evidence as much as what `check` counted.
     const harvested = {};
     for (const fr of out.frames || []) {
@@ -297,7 +345,11 @@ exports.default = async ({ page }) => {
       ...harvested,
       ...(out.before ? selectorsOf(opts.before, out.before) : {}),
       ...(out.check ? selectorsOf(opts.check, out.check) : {}),
+      // Last: counted before the action, where the harvest's count of the same
+      // selector is of the page the action left behind.
+      ...used,
     }, action ? { ms: out.settledMs, requests: out.requests } : null);
+    if (said) out.used = bareCounts(used);
     if (out.frames) out.frames = bare(out.frames);
     if (out.before) out.before = bareCounts(out.before);
     if (out.check) out.check = bareCounts(out.check);
@@ -348,7 +400,9 @@ exports.default = async ({ page }) => {
     const before = new Set((await listed({ limit: 1000 })).flatMap(fr =>
       Array.isArray(fr.result) ? fr.result.map(e => id(fr, e)) : []));
     const t0 = Date.now(), url0 = page.url();
-    const acted = Promise.resolve().then(action).then(() => 'ok', short);
+    const said = declared(action), used = {};
+    const acted = Promise.resolve().then(said ? () => performAll(said, used) : action)
+      .then(() => 'ok', short);
     const states = [], seen = new Set();
     // Every distinct state of the whole page in the window, in order: when it was
     // first and last seen, and what was measured of it.
@@ -398,11 +452,15 @@ exports.default = async ({ page }) => {
     for (const t of (lasting.length ? lasting : still.length ? still
                      : ended.length ? ended : taken)) note(t.row);
     // Each element was counted while it was on screen: that is evidence too.
-    note({ page: opts.page || null, url: page.url(), checks: Object.fromEntries(
+    // Written before the action is awaited, as it always was: an action that
+    // hangs must not take the recording's evidence with it. `used` holds every
+    // selector counted so far, which is each one an action was started on.
+    note({ page: opts.page || null, url: page.url(), checks: { ...Object.fromEntries(
       states.flatMap(s => s.els.filter(e => e.sel)
         .map(e => [e.sel, { total: e.total, visible: e.visible, text: e.text,
-                            ...(e.total === 1 && e.uid ? { uid: e.uid } : {}) }]))) });
-    return { action: await acted,
+                            ...(e.total === 1 && e.uid ? { uid: e.uid } : {}) }]))),
+      ...used } });
+    return { action: await acted, ...(said ? { used: bareCounts(used) } : {}),
              ...(opts.page ? { page: opts.page } : named ? { unnamed:
                "no page id was passed, so nothing this screen showed is filed under a "
                + "page: record it as page.qa.record(action, ms, { page: '<pageId>' })" } : {}),

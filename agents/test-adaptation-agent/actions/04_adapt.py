@@ -160,6 +160,23 @@ def carry_forward(result: dict) -> None:
         result["failed"] = earlier.get("failed") or []
 
 
+def earlier_declines() -> dict:
+    """{item index: its record} for the items the previous attempt declined.
+
+    Each carries `declined_in_attempt`, the attempt whose model call said no,
+    which an item skipped on that account passes on unchanged.
+    """
+    if ATTEMPT <= 1:
+        return {}
+    try:
+        earlier = json.loads((AUDIT_DIR / "04-adapt.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return {int(i["index"]): {**i, "declined_in_attempt":
+                              i.get("declined_in_attempt") or earlier.get("attempt")}
+            for i in earlier.get("items") or [] if i.get("status") == "declined"}
+
+
 def finish(result: dict, gate: str, skip_reason: str = ""):
     carry_forward(result)
     if not result.get("items"):
@@ -251,7 +268,8 @@ def build_adapt_prompt(item: dict, plan: dict, scope: dict, flow: dict,
     steps = [s for s in flow.get("steps") or []]
     flow_table = flow_map.describe({"steps": steps, "status": "ok",
                                     "refusals": flow.get("refusals") or [],
-                                    "unreachable": flow.get("unreachable") or []})
+                                    "unreachable": flow.get("unreachable") or []},
+                                   selectors=True)
 
     contracts = scope.get("intent_contracts") or {}
     # The checks as they are right now — measured just before this item, so an
@@ -271,6 +289,13 @@ def build_adapt_prompt(item: dict, plan: dict, scope: dict, flow: dict,
                       f"listed here, or `relax` one listed with a relation, but only the "
                       f"ones you declare in `check_changes`. Every other check must still "
                       f"be made exactly as it is.")
+    elif item["kind"] in check_changes.VALUE_FOLLOWING:
+        permission = (f"This item is `{item['kind']}`: where it replaces a value the test "
+                      f"types, a check that reads that value back may be `change`d to the "
+                      f"new value — declared in `check_changes`, to a value this item "
+                      f"itself states, and only where the explorer's report next to the "
+                      f"check shows the page displaying it. It may not remove or relax a "
+                      f"check, and every other check must still be made exactly as it is.")
     else:
         permission = (f"This item is `{item['kind']}`: it may not remove or change any "
                       f"check listed here. Adding checks is fine.")
@@ -304,7 +329,9 @@ elements the browser reported — not inferred from the name.
 
 ## 🔎 FLOW MAP — what a browser actually observed just now
 This is the evidence. Every interaction you add must correspond to a row here.
-A row whose Unique? column is not `yes` justifies nothing.
+A row whose Unique? column is not `yes` justifies nothing. Selector is what the
+browser counted on exactly one visible element as the step used it, and Value is
+what the step typed.
 
 {flow_table}
 
@@ -533,13 +560,15 @@ def already_applied(diff: dict, items: list) -> bool:
     """Whether exploration saw nothing the tests do not already do — and that
     means the note is done.
 
-    Only for items whose job is adding interactions. Removing a step, changing a
-    check or adding a check adds no interaction, so any of those would always
-    look done; notes with only unclassified items go on to escalate instead.
+    Only for a note whose every item adds interactions (`check_changes.ADDITIVE`).
+    A changed value, a retargeted locator, a moved route, a removed step or a
+    changed check adds no control the tests lack, so a note with any of those
+    would always look done. That was harmless only while no observed step was
+    ever recognised as one the tests already make. Notes with only unclassified
+    items go on to escalate instead.
     """
     kinds = {i.get("kind") for i in items} - {check_changes.UNCLASSIFIED}
-    return (bool(kinds) and not diff["added"]
-            and not kinds & (check_changes.CHECK_CHANGING | {"coverage_added"}))
+    return bool(kinds) and not diff["added"] and kinds <= check_changes.ADDITIVE
 
 
 def value_mismatches(failed: list, checks: list) -> list:
@@ -596,7 +625,8 @@ def judge_checks(item: dict, payload: dict, txn, scope: dict, workspace: Path,
     ok, why, rows = check_changes.validate(
         payload.get("check_changes"), graph, files, item["kind"], listed,
         check_changes.reports(flow), outside,
-        found_values=check_changes.value_reports(flow), recorded=recorded)
+        found_values=check_changes.value_reports(flow), recorded=recorded,
+        item_text=item.get("text") or "")
 
     holes = sorted(set(after["unresolved"]) - set(before["unresolved"]))
     record["check_changes"] = rows
@@ -837,10 +867,25 @@ def main():
         return
 
     done = []  # items this attempt applied and verified, shown to the items after them
+    declined_before = earlier_declines()
     queue, deferred = list(actionable), set()
     while queue:
         item = queue.pop(0)
         log(f"Item {item['index']} [{item['kind']}] — {item['text']}")
+        prior = declined_before.get(int(item["index"]))
+        if prior and not done:
+            # Asked again it would be shown the same flow map and the same files,
+            # and a decline is the model saying those are not enough. Only an
+            # item applied since can change the answer, and none has been.
+            reason = prior.get("reason") or "declined"
+            result["items"].append({**item, "status": "declined", "guards": [],
+                                    "reason": reason,
+                                    "declined_in_attempt": prior["declined_in_attempt"]})
+            result["escalations"].append({"what": f"item {item['index']}: {item['text']}",
+                                          "why": reason})
+            log(f"  not asked again — declined in attempt {prior['declined_in_attempt']} "
+                f"on this same flow map, and nothing has been applied since")
+            continue
         try:
             before = check_changes.measure(scope, workspace)
         except Exception as exc:  # noqa: BLE001 — fail closed: nothing to judge against
@@ -1106,6 +1151,11 @@ def main():
         finish(result, gate, "" if "proposed" in statuses else "no-work")
     elif "applied" in statuses or "partial" in statuses:
         finish(result, "true" if not result["failed"] else "false")
+    elif statuses <= {"declined", "escalated"} and not any(h.get("applied") for h in history):
+        # Every item was handed to a human and nothing is on disk: there is
+        # nothing to retry and nothing failing. Gated `false`, this was retried
+        # with the same evidence and then reported as still failing.
+        finish(result, "skipped", "escalate")
     else:
         finish(result, "false")
 

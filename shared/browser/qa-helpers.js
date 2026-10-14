@@ -12,6 +12,12 @@ window.__qa = (() => {
   // CSS-in-JS class names are regenerated per build.
   const hashed = c => volatile(c) || /^(css|sc|jsx|emotion|makeStyles)-/.test(c)
     || /__[a-z0-9]{5,}$/i.test(c);
+  // A class that says what state the element is in right now (`field--focus`,
+  // `is-active`, `ng-touched`) selects it only until that state passes. A field's
+  // keystrokes were recorded under its focus class, unique for exactly as long as
+  // it was being typed into.
+  const stateful = c => /(^|[-_])(focus(ed)?|hover(ed)?|active|inactive|visited|selected|checked|unchecked|pressed|expanded|collapsed|disabled|enabled|loading|valid|invalid|dirty|touched|untouched|pristine|error)$/i.test(c);
+  const classes = el => [...el.classList].filter(c => !hashed(c) && !stateful(c));
   const q = v => "'" + String(v).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
   const vis = el => {
     const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
@@ -52,7 +58,7 @@ window.__qa = (() => {
       const v = el.getAttribute(a);
       if (v && v.length < 80 && !volatile(v)) out.push(`${tag}[${a}=${q(v)}]`);
     }
-    const cls = [...el.classList].filter(c => !hashed(c));
+    const cls = classes(el);
     if (cls.length) out.push(tag + '.' + cls.map(c => CSS.escape(c)).join('.'));
     return out;
   };
@@ -68,7 +74,9 @@ window.__qa = (() => {
     for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
       const scope = candidates(p).find(s => count(s).total === 1);
       if (!scope) continue;
-      for (const s of own) {
+      // An element with nothing of its own to select by (a bare `<label>` around
+      // a styled checkbox) is still the only one of its tag under that ancestor.
+      for (const s of own.length ? own : [el.tagName.toLowerCase()]) {
         const n = count(scope + ' ' + s);
         if (n.total === 1) return { sel: scope + ' ' + s, ...n };
       }
@@ -110,16 +118,28 @@ window.__qa = (() => {
   // landed on: a run clicked a page's main button, never counted or reported it,
   // and step 03 guessed its locator. Python confirms a plan's locator from a
   // recorded click whose text names it.
+  // A label hands its click on to the control it labels, as a second click event.
+  // That one is the same action, so it is reported as arriving `via` the label:
+  // a styled checkbox whose input only looks hidden was otherwise recorded as two
+  // clicks, and the second names an element nothing can click directly.
+  let labelled = null;
   const clicked = e => {
     let el = e.target;
     while (el && el.nodeType === 1 && el !== document.body && !control(el)) el = el.parentElement;
     if (!window.__qaClicked || !el || el.nodeType !== 1 || el === document.body) return;
-    window.__qaClicked({ ...best(el), text: text(el), uid: uid(el) });
+    const report = { ...best(el), text: text(el), uid: uid(el) };
+    if (labelled && labelled.el.control === e.target && Date.now() - labelled.at < 500) {
+      report.via = labelled.uid;
+    }
+    if (el.tagName === 'LABEL') labelled = { el, uid: uid(el), at: Date.now() };
+    window.__qaClicked(report);
   };
   document.addEventListener('click', clicked, true);
 
   // What `mark` found on the page, and what each element said then.
   let marked = new WeakMap();
+  // How many elements the last harvest left out at its limit.
+  let cut = 0;
 
   return {
     vis, count, text, best, uid,
@@ -142,12 +162,14 @@ window.__qa = (() => {
       const root = !scope ? document
         : typeof scope === 'string' ? document.querySelector(scope) : scope;
       if (!root) return { error: 'nothing matches scope ' + scope };
-      return [...root.querySelectorAll('*')]
+      const found = [...root.querySelectorAll('*')]
         .filter(el => (control(el) || (texts && ownText(el))) && vis(el))
         // Before the cap, so the cap counts only what is new. A toast is appended
         // after everything else on the page: on a page that already listed 80
         // elements a recording never reached it, and reported that none appeared.
-        .filter(el => !fresh || marked.get(el) !== text(el))
+        .filter(el => !fresh || marked.get(el) !== text(el));
+      cut = Math.max(0, found.length - limit);
+      return found
         .slice(0, limit)
         .map(el => {
           const o = { tag: el.tagName.toLowerCase(), text: text(el), ...best(el), uid: uid(el) };
@@ -161,8 +183,31 @@ window.__qa = (() => {
               || el.closest('tr, li, label, fieldset, [class*=field], [class*=form-group]');
             const near = box ? text(box).replace(o.text, '').trim() : '';
             if (near) o.near = near.slice(0, 40);
-            // The tag to anchor on: page.qa counts `tr:has-text('Name') input`.
-            if (near && box) o.box = box.tagName.toLowerCase();
+            // What to anchor on: page.qa counts `tr:has-text('Name') input`. A row,
+            // a list item or a label is anchored on by its tag. A wrapper found by
+            // its class needs the class too: `div:has-text('Name')` is every
+            // ancestor of the label, and no field under it is the only one.
+            const anchor = b => {
+              const tag = b.tagName.toLowerCase();
+              return /^(tr|li|label|fieldset)$/.test(tag) ? tag
+                : tag + classes(b).map(c => '.' + CSS.escape(c)).join('');
+            };
+            if (near && box) o.box = anchor(box);
+            // Nothing beside it to tell it by — the Save button of one section
+            // among several: the form or section it sits in, known by the first
+            // thing that section says (`form:has-text('Billing') button`). Left
+            // with two buttons under one selector, a walk picked by position,
+            // picked the other section's, and saved nothing it had typed.
+            if (!o.box) {
+              const part = el.closest(
+                'form, fieldset, section, [role=dialog], [role=region], [role=group]');
+              const said = part && part.querySelector('legend, h1, h2, h3, h4, h5, h6, label');
+              const words = said ? text(said) : '';
+              if (words && words !== o.text) {
+                o.near = words.slice(0, 40);
+                o.box = anchor(part);
+              }
+            }
             for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
               const scope = candidates(p).find(s => count(s).total === 1);
               if (scope) { o.within = scope; break; }
@@ -171,6 +216,11 @@ window.__qa = (() => {
           return o;
         });
     },
+
+    // A harvest is cut at its limit without a word, and what it left out looks
+    // like what is not there: a page listed its menu, its tabs and its fields,
+    // and the buttons under them were past the cut. The walk made a selector up.
+    unlisted() { return cut; },
 
     // The page as an inventory, in the shape the flow map's PAGE_STATE carries:
     // every visible control plus the page's identity — headings and the

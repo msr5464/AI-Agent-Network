@@ -354,6 +354,41 @@ def test_an_action_that_threw_still_wins_over_any_streak():
     assert telemetry.failing_action(actions)["selector"] == "#card-code"
 
 
+# ── An error the flow carried on past ─────────────────────────────────────────
+_CAUGHT = [{"action": "Frame.isVisible", "selector": "a.card",
+            "error": "Error: strict mode violation: locator(\"a.card\") resolved to 9 elements"},
+           {"action": "Frame.click", "selector": "a.card >> nth=0", "error": ""}]
+
+
+def test_an_error_the_flow_carried_on_past_is_not_the_failure():
+    """A visibility check on a locator that matches a whole list threw, was
+    caught, and the test went on to fail on another element entirely. The first
+    error in the trace was read as the failure, so every failure after that
+    point was reported against the list's selector."""
+    telemetry = get_plugin("playwright").telemetry
+    actions = _CAUGHT + [
+        {"action": "Frame.waitForSelector", "selector": "#price",
+         "error": "Timeout 30000ms exceeded."},
+        {"action": "Frame.textContent", "selector": "#price", "error": "Timeout 1ms exceeded."},
+        _poll("#price", "Frame.queryCount"), _poll("h1", "Frame.queryCount")]
+    assert telemetry.failing_action(actions)["selector"] == "#price"
+
+
+def test_a_caught_error_does_not_hide_a_wait_that_polled_out():
+    telemetry = get_plugin("playwright").telemetry
+    actions = _CAUGHT + [_poll("div.order-total") for _ in range(5)]
+    failed = telemetry.failing_action(actions)
+    assert failed["selector"] == "div.order-total" and failed["inferred"] is True
+
+
+def test_a_caught_error_is_not_a_failure_the_trace_never_recorded():
+    """A test that ends on a failed value check has no failing action, and an
+    old caught error must not stand in for one."""
+    telemetry = get_plugin("playwright").telemetry
+    actions = _CAUGHT + [{"action": "Frame.textContent", "selector": "#total", "error": ""}]
+    assert telemetry.failing_action(actions) is None
+
+
 # ── The code emitted for a selector has to BE that selector ───────────────────
 def test_an_exact_attribute_is_emitted_as_an_exact_builder():
     """What is proved unique is the selector; what is written into the page object
@@ -501,3 +536,32 @@ def test_the_runtime_form_of_a_builder_is_the_declared_form():
         declared["number"]["selector"]
     assert code.normalize_selector('internal:testid=[data-testid="submit"s]') == \
         "[data-testid='submit']"
+
+
+# ── A locator as a live browser can count it ──────────────────────────────────
+
+LIVE_SOURCE = (
+    'public class MemberPage extends BasePage {\n'
+    '  private final Locator title = page.locator(".title");\n'
+    '  private final Locator status = page.locator("div.group:has(label:has-text(\'Status\')) .select");\n'
+    '  Locator option(String v) { return page.locator("span:text-is(\'" + v + "\')"); }\n'
+    '}\n')
+
+
+def test_a_locator_in_the_engines_own_syntax_is_countable_as_written():
+    """Plain CSS is what a captured document can be queried with. A live browser
+    driven by the same engine evaluates more, and a page object written with text
+    selectors had most of its locators left uncounted."""
+    code = get_plugin("playwright").code
+    live = {loc["name"]: code.live_selector(loc) for loc in code.extract_locators(LIVE_SOURCE)}
+    assert live["title"] == ".title"
+    assert live["status"] == "div.group:has(label:has-text('Status')) .select"
+    assert live["option"] == "", "assembled when the test runs: nothing fixed to count"
+
+
+@ALL
+def test_by_default_only_what_reduces_to_plain_css_is_countable(framework):
+    code = get_plugin(framework).code
+    assert code.live_selector({"selector": "#save", "raw": "#save"}) == "#save"
+    assert code.live_selector({"selector": "#save", "raw": "#save", "approx": True}) == ""
+    assert code.live_selector({"selector": "", "raw": ""}) == ""

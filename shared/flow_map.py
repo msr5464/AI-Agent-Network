@@ -429,6 +429,21 @@ def _unique(counted: Optional[Dict]) -> bool:
     return bool(counted) and counted.get("total") == 1 and counted.get("visible") == 1
 
 
+# A selector that takes one of several matches by where it comes among them.
+_POSITIONAL = re.compile(r">>\s*nth\s*=|:nth-match\(")
+
+
+def positional(selector: str) -> bool:
+    """Whether a selector singles its element out by position (`>> nth=1`).
+
+    Counted, such a selector always reads as one element, and it proves nothing:
+    it matches several, and which of them it picks moves with the page. A walk
+    met two buttons under one selector, took the second, and it was the other
+    section's.
+    """
+    return bool(_POSITIONAL.search(selector or ""))
+
+
 def _merge_known(before: Optional[List[Dict]], now: List[Dict]) -> List[Dict]:
     """One page's known-locator counts across its states, best reading kept.
 
@@ -508,13 +523,16 @@ UNREPORTED_SHOWN = 12
 def recorded_actions(rows: List[Dict]) -> List[Dict]:
     """Every click and keystroke the helpers recorded, in order, one per control.
 
-    [{"kind": "click" | "fill", "sel", "text", "uid", "total", "visible", "page"}].
+    [{"kind": "click" | "fill", "sel", "text", "value", "uid", "uids", "total",
+    "visible", "page"}].
     The model has no part in this record: the helpers write a row the moment the
     browser dispatches the event, so it holds what a step list can leave out.
     Rows that follow one another on the same control are one action — a field
     writes a row per change. So is a field's change row arriving late with the
     value it already had: a field reports its change when focus leaves it, which
-    can be several steps after the typing. `page` is the state
+    can be several steps after the typing. And so is the click a label hands on
+    to the control it labels (`via`): one action, whose `uids` then hold both
+    elements. `value` is the last value the control was given. `page` is the state
     measured next, when a step named it: the page the action led to, where its
     FLOW_STEP is filed.
     """
@@ -533,20 +551,27 @@ def recorded_actions(rows: List[Dict]) -> List[Dict]:
             continue
         raw = row.get("clicked") or row.get("typed")
         control = raw.get("uid") or raw.get("sel")
+        if previous is not None and kind == "click" and raw.get("via") \
+                and raw["via"] in previous["uids"]:
+            if raw.get("uid") and raw["uid"] not in previous["uids"]:
+                previous["uids"].append(raw["uid"])
+            continue
         if previous is not None and control \
-                and control == (previous.get("uid") or previous.get("sel")):
+                and control in (previous["uids"] or [previous.get("sel")]):
             if kind == "click":
                 previous["kind"] = "click"
             else:
                 holds[control] = raw.get("value")
+                previous["value"] = raw.get("value")
             continue
         if kind == "fill" and control:
             if control in holds and holds[control] == raw.get("value"):
                 continue
             holds[control] = raw.get("value")
         previous = {"kind": kind, "sel": raw.get("sel"), "text": raw.get("text") or "",
-                    "uid": raw.get("uid"), "total": raw.get("total"),
-                    "visible": raw.get("visible"), "page": ""}
+                    "value": raw.get("value") if kind == "fill" else None,
+                    "uid": raw.get("uid"), "uids": [raw["uid"]] if raw.get("uid") else [],
+                    "total": raw.get("total"), "visible": raw.get("visible"), "page": ""}
         actions.append(previous)
         waiting.append(previous)
     return actions
@@ -565,15 +590,263 @@ def _counted_at(rows: List[Dict]) -> Dict[str, set]:
     return found
 
 
+def _same_control(selector: str, action: Dict, counted_at: Dict[str, set]) -> bool:
+    """Whether `selector` names the control a recorded action landed on: the same
+    spelling, or one the helpers counted at the same element."""
+    return bool(selector) and (
+        selector == action.get("sel")
+        or any(uid in counted_at.get(selector, ()) for uid in _uids(action)))
+
+
+def _uids(action: Dict) -> List[str]:
+    return action.get("uids") or ([action["uid"]] if action.get("uid") else [])
+
+
 def _step_for(action: Dict, steps: List[Dict], counted_at: Dict[str, set]) -> Optional[Dict]:
     """The reported step that used a recorded control: one with the same selector,
     or one whose selector was counted at the same element under another spelling."""
     for step in steps or []:
-        selector = ((step.get("action") or {}).get("target") or {}).get("selector") or ""
-        if selector and (selector == action.get("sel")
-                         or (action.get("uid") and action["uid"] in counted_at.get(selector, ()))):
+        target = (step.get("action") or {}).get("target") or {}
+        if any(_same_control(target.get(key) or "", action, counted_at)
+               for key in ("selector", "reported_selector")):
             return step
     return None
+
+
+def _unique_at(rows: List[Dict]) -> Dict[str, List[str]]:
+    """{element: the selectors the helpers counted on it alone, visible}.
+
+    The repo's own locators first: a control a page object already has a working
+    locator for is known by that one.
+    """
+    found: Dict[str, List[str]] = {}
+
+    def keep(selector, counted):
+        if selector and isinstance(counted, dict) and counted.get("uid") and _unique(counted) \
+                and not positional(selector) \
+                and selector not in found.setdefault(counted["uid"], []):
+            found[counted["uid"]].append(selector)
+
+    for row in rows or []:
+        for entry in row.get("known") or []:
+            keep(entry.get("selector"), entry)
+    for row in rows or []:
+        for selector, counted in (row.get("checks") or {}).items():
+            keep(selector, counted)
+    return found
+
+
+# What a step's verb can have been recorded as. A field that was clicked and then
+# typed into is recorded as a click that holds a value.
+_CLICK_VERBS = ("click", "dismiss", "check", "uncheck")
+_FILL_VERBS = ("fill", "type")
+
+
+def _text_key(text) -> str:
+    return " ".join(str(text or "").split()).lower()
+
+
+def _page_of(step: Dict) -> str:
+    ref = step.get("page")
+    return (ref.get("id") if isinstance(ref, dict) else ref) or ""
+
+
+def _named_by(step: Dict, action: Dict) -> bool:
+    """Whether a recorded action is, by what the page itself said, the one a step
+    reports: a click on a control whose text is the step's accessible name, or a
+    field given the value the step says it typed."""
+    verb = ((step.get("action") or {}).get("verb") or "").lower()
+    target = (step.get("action") or {}).get("target") or {}
+    if verb in _CLICK_VERBS:
+        name = _text_key(target.get("accessible_name"))
+        return bool(name) and name == _text_key(action.get("text"))
+    if verb in _FILL_VERBS:
+        value = (step.get("action") or {}).get("value")
+        return value not in (None, "") and str(value) == str(action.get("value"))
+    return False
+
+
+def _kind_fits(step: Dict, action: Dict) -> bool:
+    verb = ((step.get("action") or {}).get("verb") or "").lower()
+    if verb in _CLICK_VERBS:
+        return action.get("kind") == "click"
+    if verb in _FILL_VERBS:
+        return action.get("kind") == "fill" or action.get("value") not in (None, "")
+    return verb == "select"
+
+
+def _known_by(action: Dict, unique_at: Dict[str, List[str]]) -> str:
+    """The selector to know a recorded control by: the one it was recorded under
+    when that matched it alone, visible, else one the helpers counted on the same
+    element alone. "" when nothing counted singles it out."""
+    if action.get("sel") and _unique(action):
+        return action["sel"]
+    for uid in _uids(action):
+        if unique_at.get(uid):
+            return unique_at[uid][0]
+    return ""
+
+
+def _in_order(steps: int, actions: int, fits) -> List[tuple]:
+    """The most (step, action) pairs `fits` allows with both in walk order.
+
+    The most, not the first each step finds: a control used twice is recorded
+    twice, and a step taking the later use for want of the earlier one would put
+    every step between the two out of order.
+    """
+    best = [[0] * (actions + 1) for _ in range(steps + 1)]
+    for i in range(steps - 1, -1, -1):
+        for j in range(actions - 1, -1, -1):
+            best[i][j] = max(best[i + 1][j], best[i][j + 1],
+                             1 + best[i + 1][j + 1] if fits(i, j) else 0)
+    pairs, i, j = [], 0, 0
+    while i < steps and j < actions:
+        if fits(i, j) and best[i][j] == 1 + best[i + 1][j + 1]:
+            pairs.append((i, j))
+            i, j = i + 1, j + 1
+        elif best[i + 1][j] >= best[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return pairs
+
+
+def join_record(flow: Dict, rows: List[Dict]) -> Dict:
+    """Tie each reported step to the action the browser recorded for it.
+
+    A walk has two accounts: the steps the model typed and the clicks and
+    keystrokes the helpers recorded. A step is verified only through a selector
+    the helpers counted, and the model types its own spelling: a walk clicked a
+    button the helpers recorded on exactly one visible element, reported the
+    click under a selector nothing had counted, and the same click was listed
+    twice, once as an unverified step and once as an action no step reported.
+    The change item it belonged to was declined for want of evidence.
+
+    Matched in the order the walk happened, each action to one step:
+
+      1. by element — the step names the selector the action was recorded under,
+         or one the helpers counted at the same element;
+      2. by what the page said — between the actions its neighbours matched, the
+         one control whose text is the step's accessible name, or the one field
+         given the value the step typed;
+      3. by position — the only unmatched step between two matched ones, and the
+         only action of its kind recorded between theirs.
+
+    A matched step whose own selector was not counted unique takes the selector
+    the control is known by (`_known_by`); what the model typed is kept as
+    `reported_selector`. Nothing is adopted from an action no count singles out,
+    so a step can still end unverified. Never a step from an action alone: the
+    record also holds what an explorer clicked to look around.
+    """
+    actions = recorded_actions(rows)
+    steps = [s for s in flow.get("steps") or []
+             if ((s.get("action") or {}).get("verb") or "").lower()
+             in _CLICK_VERBS + _FILL_VERBS + ("select",)
+             and (s.get("result") or {}).get("outcome", "ok") == "ok"]
+    flow["_joined"] = []
+    counted_at, unique_at = _counted_at(rows), _unique_at(rows)
+    if not actions or not steps:
+        _mark_modelled(steps, {}, rows, counted_at)
+        return flow
+    matched: Dict[int, tuple] = {}            # position in `steps` -> (action position, how)
+    claimed: set = set()
+
+    def take(index: int, position: int, how: str) -> None:
+        matched[index] = (position, how)
+        claimed.add(position)
+
+    def fits_page(step: Dict, action: Dict) -> bool:
+        return not action.get("page") or not _page_of(step) or action["page"] == _page_of(step)
+
+    def same_element(selector: str, action: Dict) -> bool:
+        # A spelling several elements share says nothing about which one was used.
+        return bool(selector) and (
+            (selector == action.get("sel") and _unique(action))
+            or any(uid in counted_at.get(selector, ()) for uid in _uids(action)))
+
+    selectors = [((s.get("action") or {}).get("target") or {}).get("selector") or ""
+                 for s in steps]
+    for index, position in _in_order(
+            len(steps), len(actions),
+            lambda i, j: same_element(selectors[i], actions[j])):
+        take(index, position, "element")
+
+    def between(index: int) -> List[int]:
+        """Unclaimed actions recorded between what the step's neighbours matched."""
+        lower = max((matched[i][0] for i in matched if i < index), default=-1)
+        upper = min((matched[i][0] for i in matched if i > index), default=len(actions))
+        return [p for p in range(lower + 1, upper) if p not in claimed]
+
+    def one_control(positions: List[int]) -> Optional[int]:
+        controls = {actions[p].get("uid") or actions[p].get("sel") for p in positions}
+        return positions[0] if positions and len(controls) == 1 else None
+
+    for index, step in enumerate(steps):
+        if index in matched:
+            continue
+        position = one_control([p for p in between(index)
+                                if _named_by(step, actions[p]) and fits_page(step, actions[p])])
+        if position is not None:
+            take(index, position, "name")
+
+    for index, step in enumerate(steps):
+        if index in matched:
+            continue
+        lower = max((i for i in matched if i < index), default=-1)
+        upper = min((i for i in matched if i > index), default=len(steps))
+        if any(i not in matched for i in range(lower + 1, upper) if i != index):
+            continue                    # two unmatched steps share the gap: no telling
+        fitting = [p for p in between(index)
+                   if _kind_fits(step, actions[p]) and fits_page(step, actions[p])]
+        position = one_control(fitting)
+        if position is not None and _known_by(actions[position], unique_at):
+            take(index, position, "position")
+
+    live = flow.setdefault("_live", {})
+    for index, (position, how) in sorted(matched.items()):
+        step, action = steps[index], actions[position]
+        step["recorded_action"] = position
+        target = step["action"].setdefault("target", {})
+        reported = target.get("selector") or ""
+        if reported and not positional(reported) \
+                and _unique(live.get(_page_of(step), {}).get(reported)):
+            continue                    # its own selector was counted, and stands
+        known = _known_by(action, unique_at)
+        if not known or known == reported:
+            continue
+        target["reported_selector"] = reported
+        target["selector"] = known
+        live.setdefault(_page_of(step), {})[known] = {"total": 1, "visible": 1}
+        step.setdefault("selector_check", {})["adopted"] = how
+    flow["_joined"] = sorted(claimed)
+    _mark_modelled(steps, {id(steps[index]): actions[position]
+                           for index, (position, _how) in matched.items()}, rows, counted_at)
+    return flow
+
+
+def _mark_modelled(steps: List[Dict], action_of: Dict[int, Dict], rows: List[Dict],
+                   counted_at: Dict[str, set]) -> None:
+    """Mark each step whose control a page object already has a locator for.
+
+    `modelled_by` is `Owner.field`: the repo's own locator, counted on the live
+    page on the very element the step used. Measured rather than matched on
+    names, which an explorer makes up and a page object spells its own way: read
+    by name, no step of a walk was ever one the tests already made.
+    """
+    known_at: Dict[str, str] = {}
+    for row in rows or []:
+        for entry in row.get("known") or []:
+            if entry.get("uid") and _unique(entry):
+                known_at.setdefault(entry["uid"],
+                                    f"{entry.get('owner') or '?'}.{entry.get('name') or '?'}")
+    for step in steps:
+        target = (step.get("action") or {}).get("target") or {}
+        uids = list(_uids(action_of.get(id(step)) or {}))
+        for key in ("selector", "reported_selector"):
+            uids += sorted(counted_at.get(target.get(key) or "", ()))
+        owner = next((known_at[uid] for uid in uids if uid in known_at), "")
+        if owner:
+            step["modelled_by"] = owner
 
 
 def unreported_actions(flow: Dict, rows: List[Dict]) -> List[Dict]:
@@ -587,11 +860,13 @@ def unreported_actions(flow: Dict, rows: List[Dict]) -> List[Dict]:
     """
     counted_at = _counted_at(rows)
     steps = flow.get("steps") or []
+    joined = set(flow.get("_joined") or [])
     return [{"kind": action["kind"],
              "name": action["text"] or frames.split(action["sel"])[1],
              "selector": action["sel"], "page": action["page"]}
-            for action in recorded_actions(rows)
+            for position, action in enumerate(recorded_actions(rows))
             if action.get("sel") and action.get("total") == 1 and action.get("visible") == 1
+            and position not in joined
             and _step_for(action, steps, counted_at) is None]
 
 
@@ -624,6 +899,9 @@ def apply_evidence(flow: Dict, rows: List[Dict]) -> Dict:
     # placed by URL is left out: where several pages share one URL it cannot say
     # which of them it saw.
     order = flow.setdefault("_page_order", [])
+    # And the walk as it went, a page named again each time it is come back to:
+    # what a page is compared with is the page the walk was on just before it.
+    walk = flow.setdefault("_page_walk", [])
     by_url = {page.get("url"): pid for pid, page in pages.items() if page.get("url")}
     grown = set()
     # Clicks and keystrokes since the last measured state, each on exactly one
@@ -646,6 +924,8 @@ def apply_evidence(flow: Dict, rows: List[Dict]) -> Dict:
             continue
         if row.get("page") and page_id not in order:
             order.append(page_id)
+        if row.get("page") and walk[-1:] != [page_id]:
+            walk.append(page_id)
         if page_id not in pages:
             pages[page_id] = facts_from_markers(
                 {"id": page_id, "url": row.get("url", ""), "title": ""}, [])
@@ -710,6 +990,11 @@ def verify_selectors(flow: Dict) -> Dict:
             check.update({"match_count": None, "counted_against": "none",
                           "unique": None})
             continue
+        if positional(candidate):
+            # Whatever it counted, the position is what picked the element.
+            check.update({"match_count": None, "counted_against": "none",
+                          "unique": False, "positional": True})
+            continue
         # Counted on the live page by the helpers: proof, where a recount against
         # the inventory is only "consistent with unique".
         counted = (flow.get("_live") or {}).get(page_id, {}).get(candidate)
@@ -769,9 +1054,12 @@ def detect_refusals(flow: Dict, sandbox: bool = False,
         counted_at = _counted_at(rows)
         caught = {v["index"] for v in violations}
         seen = set()
-        for action in recorded_actions(rows):
+        joined = {s["recorded_action"]: s for s in flow.get("steps") or []
+                  if "recorded_action" in s}
+        for position, action in enumerate(recorded_actions(rows)):
             token = destructive_token(action["text"]) if action["kind"] == "click" else ""
-            step = _step_for(action, flow.get("steps") or [], counted_at) if token else None
+            step = (joined.get(position)
+                    or _step_for(action, flow.get("steps") or [], counted_at)) if token else None
             index = step.get("index") if step else None
             # Clicked twice is one finding; a step already caught is that finding.
             key = index if step else action["text"].lower()
@@ -794,7 +1082,8 @@ def build(stdout: str, evidence: Optional[List[Dict]] = None,
     folded in before identity and selector verification, so both use it.
     """
     rows = evidence or []
-    flow = verify_selectors(attach_identity(apply_evidence(parse_markers(stdout), rows)))
+    flow = attach_identity(apply_evidence(parse_markers(stdout), rows))
+    flow = verify_selectors(join_record(flow, rows))
     flow["unreported_actions"] = unreported_actions(flow, rows)
     flow = detect_refusals(flow, sandbox, rows)
     flow["status"] = ("unsafe" if flow.get("violations")
@@ -808,9 +1097,12 @@ def diff_against_test(flow: Dict, test_steps: List[Dict]) -> Dict:
 
     `test_steps` are `{index, target}` derived from source. Each observed step is
     marked with its counterpart (`maps_to_test`), which the guards read; one with
-    no counterpart is reported as added. Nothing is guessed. What the tests do
-    that the product no longer does is not derivable from `{index, target}`, so
-    it is not reported here — the adapt step measures removed checks directly.
+    no counterpart is reported as added — unless the walk measured its control to
+    be one a page object already has a locator for (`modelled_by`), which the
+    tests can already reach whatever either side calls it. Nothing is guessed.
+    What the tests do that the product no longer does is not derivable from
+    `{index, target}`, so it is not reported here — the adapt step measures
+    removed checks directly.
     """
     added = []
     test_targets = {re.sub(r"[^a-z0-9]+", "", (s.get("target") or "").lower()): s
@@ -827,9 +1119,10 @@ def diff_against_test(flow: Dict, test_steps: List[Dict]) -> Dict:
             mapping.setdefault("kind", "unmapped")
         else:
             mapping.update({"kind": "new"})
-            added.append({"flow_index": step.get("index"),
-                          "why": f"no test step reaches "
-                                 f"{target.get('accessible_name') or target.get('name')}"})
+            if not step.get("modelled_by"):
+                added.append({"flow_index": step.get("index"),
+                              "why": f"no test step reaches "
+                                     f"{target.get('accessible_name') or target.get('name')}"})
 
     return {"added": added}
 
@@ -855,6 +1148,62 @@ def pages_acted_on(flow: Dict) -> set:
         ref = step.get("page")
         ids.add(ref.get("id") if isinstance(ref, dict) else ref)
     return ids - {None, ""}
+
+
+def _names_control(noun: str, words: set) -> bool:
+    """Whether a control's naming words carry a noun from the change note.
+
+    Half the noun's words, rounded up, each found whole or as the stem of one: a
+    control the note calls "member's passport number" is reported as
+    `membersPassport`. Loose on purpose. Reading a named control as missing costs a
+    second walk of the whole flow; reading a missing one as present costs nothing
+    that was not already lost.
+    """
+    wanted = naming_words(noun)
+    found = sum(1 for want in wanted
+                if any(have.startswith(want) or want.startswith(have) for have in words))
+    return bool(wanted) and found * 2 >= len(wanted)
+
+
+def evidence_for(flow: Dict, nouns: List[str], page_hint: str = "") -> Optional[Dict]:
+    """What a walk recorded for the controls one change item names.
+
+    `{"controls", "verified", "unverified", "by_control"}`: the nouns that name a
+    control, and the indices of the steps that acted on one, split by whether the
+    step's selector was counted unique — over all of them, and per control. None
+    when the item names no control: a noun that is a page (`page_hint`, or the id
+    of a page the walk entered) is where the change happens, not something a step
+    acts on.
+
+    A step is all an edit may be justified by, so an item whose controls no
+    verified step acted on cannot be adapted whatever else the browser did.
+    """
+    pages = [naming_words(page_hint)] + [naming_words(pid) for pid in flow.get("pages") or {}]
+    controls = [noun for noun in nouns or []
+                if naming_words(noun) and not any(
+                    page and naming_words(noun) <= page for page in pages)]
+    if not controls:
+        return None
+    by_control = {noun: {"verified": [], "unverified": []} for noun in controls}
+    for step in flow.get("steps") or []:
+        action = step.get("action") or {}
+        if (action.get("verb") or "").lower() in READ_ONLY_VERBS + ("navigate",) \
+                or (step.get("result") or {}).get("outcome", "ok") != "ok":
+            continue
+        target = action.get("target") or {}
+        words = naming_words(target.get("name") or "") \
+            | naming_words(target.get("accessible_name") or "")
+        unique = (step.get("selector_check") or {}).get("unique") is True
+        for noun in controls:
+            if _names_control(noun, words):
+                by_control[noun]["verified" if unique else "unverified"].append(
+                    step.get("index"))
+
+    def every(key: str) -> List:
+        return sorted({index for steps in by_control.values() for index in steps[key]},
+                      key=lambda index: (index is None, index))
+    return {"controls": controls, "verified": every("verified"),
+            "unverified": every("unverified"), "by_control": by_control}
 
 
 def score(flow: Dict, status: str) -> tuple:
@@ -901,24 +1250,44 @@ def validate(flow: Dict) -> tuple:
     return (not problems), problems
 
 
-def describe(flow: Dict) -> str:
-    """The flow map as a markdown table, for the audit report and the PR body."""
+def _cell(text) -> str:
+    """Text for one cell of a markdown table: one line, no column break."""
+    return " ".join(str(text if text is not None else "").split()).replace("|", "\\|")
+
+
+def describe(flow: Dict, selectors: bool = False) -> str:
+    """The flow map as a markdown table, for the audit report and the PR body.
+
+    `selectors` adds each step's name, selector and typed value: what the adapt
+    step transcribes from. Shown the control's label alone, it had nothing to
+    write a new control's locator from but its own guess.
+    """
     # The combined explore flow carries no status of its own; "?" read as broken.
     status = f"**Status:** {flow['status']} — " if flow.get("status") else ""
     lines = [f"{status}{len(flow.get('steps') or [])} step(s)", "",
-             "| # | Page | Action | Target | Unique? | Result |",
-             "|---|---|---|---|---|---|"]
+             "| # | Page | Action | Target | Unique? | Result |"
+             + (" Name | Selector | Value |" if selectors else ""),
+             "|---|---|---|---|---|---|" + ("---|---|---|" if selectors else "")]
     for step in flow.get("steps") or []:
         action = step.get("action") or {}
         target = action.get("target") or {}
         check = step.get("selector_check") or {}
         result = step.get("result") or {}
         unique = {True: "yes", False: "NO", None: "unverified"}[check.get("unique")]
+        if check.get("positional"):
+            unique = "NO (picked by position)"
+        extra = ""
+        if selectors:
+            selector = _cell(target.get("selector")).replace("`", "'")
+            extra = (f" {_cell(target.get('name'))} | "
+                     + (f"`{selector}`" if selector else "") + " | "
+                     + (_cell(action.get("value")) if action.get("value") not in (None, "")
+                        else "") + " |")
         lines.append(
             f"| {step.get('index')} | {(step.get('page') or {}).get('id','?')} "
             f"| {action.get('verb','?')} "
             f"| {target.get('accessible_name') or target.get('name') or ''} "
-            f"| {unique} | {result.get('outcome','?')} |")
+            f"| {unique} | {result.get('outcome','?')} |" + extra)
     if flow.get("refusals"):
         lines += ["", "**Refused (destructive):**"]
         lines += [f"- step {r['index']}: {r['target']} ({r['rule']})"
@@ -1023,7 +1392,7 @@ def measure_page_objects(flow: Dict, page_objects: List[Dict]) -> Dict:
 
     inventories = flow.get("_inventories") or {}
     known = flow.get("_known") or {}
-    came_from = _came_from(flow.get("_page_order") or [], known)
+    came_from = _came_from(flow.get("_page_walk") or [], known)
     for page_id, page in (flow.get("pages") or {}).items():
         # The repo's own locators, counted on this page live: exact, where the
         # inventory reconstruction below is a sample ("zero means not observed").
@@ -1064,16 +1433,23 @@ def measure_page_objects(flow: Dict, page_objects: List[Dict]) -> Dict:
     return flow
 
 
-def _came_from(order: List[str], known: Dict[str, List[Dict]]) -> Dict[str, str]:
+def _came_from(walk: List[str], known: Dict[str, List[Dict]]) -> Dict[str, str]:
     """For each page, the page the walk was on before it first reached it.
+
+    `walk` names a page again each time the walk comes back to it. Read from the
+    order pages were first reached, a dialog opened from a list on the walk's
+    third visit there was compared with the form visited in between: the list's
+    locators all read as new on the dialog, and the list's page object took it.
 
     Only pages whose locators were counted can be compared against, so one the
     helpers never measured is stepped over.
     """
-    came_from, previous = {}, ""
-    for page_id in order:
-        if previous:
-            came_from[page_id] = previous
+    came_from, previous, reached = {}, "", set()
+    for page_id in walk:
+        if page_id not in reached:
+            reached.add(page_id)
+            if previous:
+                came_from[page_id] = previous
         if known.get(page_id):
             previous = page_id
     return came_from
@@ -1095,7 +1471,11 @@ def _live_page_objects(entries: List[Dict],
     Broken locators (no match) are named, because which of an existing page
     object's locators stopped resolving is the question an adaptation run exists
     to answer. Those matching several are listed too, but as `several`, not as a
-    fault: a page object's list locator (`.row`, counted) is meant to.
+    fault: a page object's list locator (`.row`, counted) is meant to. A locator
+    the page object only uses inline (`inline`, no field declares it) that matched
+    nothing is `unseen`, not broken: inline is how a page object asks whether
+    something is there right now, and a calendar that opens under a date field
+    was reported as that page's one broken locator.
 
     `previous` is the same count on the page the walk came from. A locator that
     was already showing there says nothing about this page: a form left on screen
@@ -1109,7 +1489,8 @@ def _live_page_objects(entries: List[Dict],
         owner = entry.get("owner") or "?"
         report = owners.setdefault(owner, {
             "name": owner, "path": entry.get("path", ""), "matched": 0,
-            "evaluable": 0, "broken": [], "several": [], "appeared": 0, "shown": 0})
+            "evaluable": 0, "broken": [], "several": [], "unseen": [],
+            "appeared": 0, "shown": 0})
         if "total" not in entry:
             continue
         report["evaluable"] += 1
@@ -1121,7 +1502,7 @@ def _live_page_objects(entries: List[Dict],
                 report["appeared"] += 1
         name = entry.get("name") or entry.get("selector") or "?"
         if entry["total"] == 0:
-            report["broken"].append(name)
+            report["unseen" if entry.get("inline") else "broken"].append(name)
         elif entry["total"] > 1:
             report["several"].append(name)
     reports = []
@@ -1134,8 +1515,9 @@ def _live_page_objects(entries: List[Dict],
                                 -r["ratio"], -r["matched"], r["name"]))
     best = next((r for r in reports if r["evaluable"] and r["matched"]), None)
     return reports, ({key: best[key] for key in ("name", "path", "matched", "evaluable",
-                                                 "ratio", "broken", "several", "appeared",
-                                                 "sampled", "live")} if best else None)
+                                                 "ratio", "broken", "several", "unseen",
+                                                 "appeared", "sampled", "live")}
+                     if best else None)
 
 
 def describe_page_objects(flow: Dict) -> str:
@@ -1145,9 +1527,12 @@ def describe_page_objects(flow: Dict) -> str:
         best = page.get("best_page_object")
         if best and best.get("live"):
             broken = ", ".join(best.get("broken") or [])
+            unseen = ", ".join(f"`{name}`" for name in best.get("unseen") or [])
             rows.append(f"| `{page_id}` | `{best['name']}` | "
                         f"{best['matched']}/{best['evaluable']} locators resolve live"
                         + (f"; broken: {broken}" if broken else "")
+                        + (f"; used inline and not on the page during the walk: {unseen}"
+                           if unseen else "")
                         + (f"; {best['appeared']} first shown on this page"
                            if best.get("appeared") else "") + " |")
         elif best:
@@ -1160,8 +1545,9 @@ def describe_page_objects(flow: Dict) -> str:
         return ""
     pages = (flow.get("pages") or {}).values()
     live = [p for p in pages if (p.get("best_page_object") or {}).get("live")]
-    note = ("Every locator of every candidate page object was counted on the live "
-            "page: one that resolves nowhere is broken, not unobserved."
+    note = ("Every locator these page objects declare with a fixed selector was "
+            "counted on the live page: one that resolves nowhere is broken, not "
+            "unobserved. A selector assembled when the test runs is not counted."
             if live and len(live) == len(rows) else
             "Rows marked \"resolve live\" were counted on the live page; the rest are "
             "measured against the elements exploration reported, a bounded sample — "

@@ -117,7 +117,7 @@ def start_url(plan: dict, scope: dict, workspace) -> str:
 
 
 def walk_section(scope: dict) -> str:
-    """The test's own step log and the data it types, as step 02 read them."""
+    """The test's own step log and the values it types, as step 02 read them."""
     walks = (scope or {}).get("test_walks") or []
     steps = [w for w in walks if w.get("steps")]
     data = [w for w in walks if w.get("data")]
@@ -131,11 +131,15 @@ def walk_section(scope: dict) -> str:
                 f"{n}. {text}" for n, text in enumerate(walk["steps"], 1)) + "\n"
     if data:
         out += ("\n## The values the test types\n"
-                "The data row the test loads. Type these, exactly.\n")
+                "Read from the test's own data: a row it loads, an object it builds, "
+                "the login its helper signs in with. Type these, exactly, except "
+                "where the change note gives a new value for one.\n")
         for walk in data:
             for row in walk["data"]:
-                out += f"\n`{row['file']}`\n" + "\n".join(
-                    f"- {column}: {value}" for column, value in row["row"].items()) + "\n"
+                out += (f"\n`{row['file']}`"
+                        + (f" — typed by `{row['typed_by']}`" if row.get("typed_by") else "")
+                        + "\n" + "\n".join(f"- {column}: {value}"
+                                           for column, value in row["row"].items()) + "\n")
     return out
 
 
@@ -143,8 +147,10 @@ def known_locators(sources: list) -> list:
     """Every exact locator the in-scope page objects declare, as
     `{owner, path, name, selector}` — what the browser helpers count live.
 
-    An approximated one (a selector assembled at runtime) is left out: counting
-    the approximation would report a working locator as broken.
+    `selector` is the locator as the browser can count it, which the framework
+    plugin decides (`live_selector`). An approximated one (a selector assembled
+    at runtime) is left out: counting the approximation would report a working
+    locator as broken. One no field declares is marked `inline`.
     """
     from shared.frameworks import get_active_plugin
     code = get_active_plugin().code
@@ -152,12 +158,94 @@ def known_locators(sources: list) -> list:
     for source in sources:
         owner = Path(source["path"]).stem
         for loc in code.extract_locators(source["snippet"]) or []:
-            if loc.get("selector") and not loc.get("approx"):
+            selector = code.live_selector(loc)
+            if selector:
                 out.append({"owner": owner, "path": source["path"],
                             # An inline locator (`page.locator(".row").count()`)
                             # has no field name; its selector is what names it.
-                            "name": loc.get("name") or loc["selector"],
-                            "selector": loc["selector"]})
+                            "name": loc.get("name") or selector,
+                            "selector": selector,
+                            **({} if loc.get("name") else {"inline": True})})
+    return out
+
+
+def uncovered_items(plan: dict, flow: dict) -> list:
+    """Change items that add a control, whose controls the walk left unproven.
+
+    `[{"index", "controls", "unverified"}]`. An edit may be justified only by a
+    step whose selector was counted unique, so an item none of whose controls
+    has one will be declined however much of it the browser did: a walk filled
+    two new fields, read them back, and reported a step for neither. Listed too
+    is a control a step did act on under a selector nothing counted.
+
+    Only for kinds whose work is adding interactions, and only when the walk was
+    not stopped: past a refusal, a second walk stops at the same control.
+    """
+    if flow.get("refusals") or flow.get("violations") or flow.get("unreachable"):
+        return []
+    found = []
+    for item in plan.get("items") or []:
+        if item.get("kind") not in check_changes.ADDITIVE:
+            continue
+        evidence = flow_map.evidence_for(flow, item.get("nouns") or [],
+                                         item.get("page_hint") or "")
+        if evidence is None:
+            continue
+        lacking = (evidence["controls"] if not evidence["verified"] else
+                   [noun for noun, steps in evidence["by_control"].items()
+                    if steps["unverified"] and not steps["verified"]])
+        if lacking:
+            found.append({"index": item["index"], "controls": lacking,
+                          "unverified": evidence["unverified"]})
+    return found
+
+
+def evidence_note(uncovered: list, unreported: list) -> str:
+    """What a second walk is told when the first left change items unproven."""
+    lines = ["\n## Your last walk left change items without evidence",
+             "A test edit can only be justified by a FLOW_STEP whose selector was "
+             "counted on exactly one visible element. These items have none for the "
+             "controls they name:"]
+    for entry in uncovered:
+        steps = ", ".join(str(n) for n in entry["unverified"])
+        lines.append(f"- item {entry['index']}: {', '.join(entry['controls'])} — "
+                     + (f"step {steps} acted on one under a selector nothing counted"
+                        if steps else "no step reported acting on any of them"))
+    if unreported:
+        lines += ["", "The browser recorded these being done, with no FLOW_STEP for them:"]
+        lines += [f"- {a['kind']} {a['name']}" + (f" (on {a['page']})" if a.get("page") else "")
+                  for a in unreported[:flow_map.UNREPORTED_SHOWN]]
+    lines += ["", "Walk the flow again from the start. Act on every control by naming "
+                  "its selector — `page.qa.step({ click: '<selector>' }, …)`, "
+                  "`{ fill: '<selector>', value: '…' }` — so it is counted as it is "
+                  "used, and write one FLOW_STEP for every control you act on, with "
+                  "that selector. Each field of a form is a step of its own.", ""]
+    return "\n".join(lines)
+
+
+def locators_section(known: list) -> str:
+    """The page objects' own locators, by page object, for the explorer to act
+    through on the steps the test already makes.
+
+    The helpers count these on every page; the explorer was never shown them.
+    Left to find each existing control again, a walk met two Save buttons under
+    one selector, took the second by position, and saved a different section:
+    nothing it had typed persisted, and every check on it read as failing.
+    Inline ones are left out: no field names them, so nothing says what for.
+    """
+    owners = {}
+    for entry in known or []:
+        if not entry.get("inline"):
+            owners.setdefault(entry["owner"], []).append(entry)
+    if not owners:
+        return ""
+    out = ("\n## The locators the tests use today\n"
+           "The page objects' own, by page object. Where a step the test already makes "
+           "acts on one of these controls, act through this locator when it matches "
+           "exactly one element.\n")
+    for owner, entries in sorted(owners.items()):
+        out += f"\n`{owner}`\n" + "\n".join(
+            f"- {entry['name']}: `{entry['selector']}`" for entry in entries) + "\n"
     return out
 
 
@@ -176,9 +264,9 @@ def checks_section(scope: dict) -> str:
 
 
 def build_prompt(plan: dict, rules: str, attempt_notes: str, stop_before: str,
-                 scope: dict = None, start: dict = None) -> str:
+                 scope: dict = None, start: dict = None, known: list = None) -> str:
     """`start` is `{"url", "signed_in"}` — where the walk begins and whether the
-    browser opens with a saved session."""
+    browser opens with a saved session. `known` is `known_locators()`."""
     start = start or {}
     # GET /agents/<a>/artifact serves from the audit dir; the workspace's
     # test-output does not survive the automation repo being re-cloned.
@@ -201,7 +289,7 @@ and stop. A human will confirm that last step. Do not look for a way around this
 """
     signed = ("The browser is already signed in through a saved session."
               if start.get("signed_in") else
-              "The browser starts signed out: this flow does not sign in.")
+              "The browser starts signed out: no saved session is loaded for this test.")
     return f"""You are exploring a web application to record how one of its flows works NOW.
 
 ## The product change (written by a human on the team)
@@ -217,7 +305,7 @@ Anything you save elsewhere cannot be shown next to the run.
 ## Where to start
 URL: {start.get('url') or plan.get('web_base_url') or '(use the module entry point)'}
 {signed}
-{walk_section(scope)}
+{walk_section(scope)}{locators_section(known)}
 ## What the flow is supposed to achieve
 {plan.get('expected_outcome') or '(not stated — record what the flow does)'}
 {checks_section(scope)}{destructive_note}{attempt_notes}
@@ -263,7 +351,7 @@ def silent_note() -> str:
 
 def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
                 stop_before: str, scope: dict = None, evidence_path: Path = None,
-                start: dict = None, sandbox: bool = False) -> tuple:
+                start: dict = None, sandbox: bool = False, known: list = None) -> tuple:
     """One exploration. Returns (flow, ClaudeResult).
 
     The flow map is built from the model's markers AND what the browser helpers
@@ -291,7 +379,7 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
 
     log("  Sending to Claude for exploration...")
     result = call_claude_ex(
-        prompt=build_prompt(plan, rules, notes, stop_before, scope, start),
+        prompt=build_prompt(plan, rules, notes, stop_before, scope, start, known),
         model=MODEL, effort=EFFORT, cwd=str(REPO_ROOT), timeout=TIMEOUT_S,
         on_output=on_output, log_dir=str(AUDIT_DIR),
         allowed_tools=mcp_allowed_tools(),
@@ -355,10 +443,12 @@ def main():
     result["entry_path"] = entry
 
     if entry.get("mode") == "none":
-        # A test that never signs in does not need a session, and demanding one
-        # is how this step used to refuse flows it could have explored.
-        log("The test signs in nowhere — exploring unauthenticated rather than "
-            "stopping for a session it never uses")
+        # A test that loads no session does not need one, and demanding one is how
+        # this step used to refuse flows it could have explored.
+        log("No saved session to load — "
+            + ("signing in is one of the test's own steps, walked with the values "
+               "its helper holds" if entry.get("login_call") else
+               "the test signs in nowhere, so the walk starts signed out"))
         session = {"ok": True, "path": None, "report": {}, "reason": ""}
     else:
         session = session_state.usable(workspace, module)
@@ -467,10 +557,10 @@ def main():
             log(f"Playwright MCP: {browser_mode.label(HEADLESS)}, "
                 f"config {mcp_path.name}, "
                 + ("storage-state reused (no credential in the prompt)"
-                   if session.get("path") else "no session — this flow does not sign in"))
+                   if session.get("path") else "no saved session — the test loads none"))
         flow, claude = run_attempt(plan, rules, notes, mcp_path, stop_before, scope,
                                    evidence_path, start=start,
-                                   sandbox=bool(sandbox_note))
+                                   sandbox=bool(sandbox_note), known=known)
         status, raw = claude.status, claude.stdout or ""
         if status == "usage_limit":
             # An empty flow map here would be read as "the flow could not be
@@ -496,8 +586,15 @@ def main():
             write(result)
             (AUDIT_DIR / ".skip-reason").write_text("infra")
             sys.exit(1)
+        # A walk that proved more of the note outranks one with more steps: what
+        # the run is for comes before how much of the flow was written down.
+        uncovered = uncovered_items(plan, flow)
         score = flow_map.score(flow, status)
+        score = score[:2] + (-len(uncovered),) + score[2:]
         log(f"  → {len(flow['steps'])} step(s), status {flow['status']}")
+        for entry in uncovered:
+            log(f"  WARNING: item {entry['index']} has no verified step for "
+                f"{', '.join(entry['controls'])} — nothing an edit could be justified by")
         missing = flow_map.pages_without_inventory(flow)
         if missing:
             log(f"  WARNING: no inventory for {', '.join(missing)} — no "
@@ -515,6 +612,7 @@ def main():
             # discard a complete flow map from attempt 1.
             result.update({"ran": True, "attempts": attempt,
                            "status": flow["status"], "flow": flow,
+                           "uncovered_items": uncovered,
                            "raw_output_tail": raw[-3000:]})
             write(result)
         failures = [s for s in flow["steps"]
@@ -540,12 +638,23 @@ def main():
             log("  not retrying — every failure was a login or a refusal, and a "
                 "retry would reproduce both exactly")
             break
-        if not failures and not uninventoried and not silent:
+        if not failures and not uninventoried and not silent and not uncovered:
             break
         notes = ""
         if silent:
             notes += silent_note()
+        if uncovered:
+            # Worth a whole attempt for the same reason an uninventoried page is:
+            # step 04 can only decline an item the walk left no verified step for.
+            notes += evidence_note(uncovered, flow.get("unreported_actions") or [])
         if failures:
+            # The other reasons to walk again each log a warning above. This one
+            # said nothing, and a second attempt started for no reason a reader
+            # of the console could find.
+            log(f"  walking again — {len(failures)} step(s) failed: "
+                + ", ".join(f"{s['action']['target'].get('name') or '?'} "
+                            f"({(s.get('result') or {}).get('category') or 'no category'})"
+                            for s in failures[:8]))
             notes += ("\n## Previous attempt\nThese steps failed; try a different "
                       "approach for them:\n"
                       + "\n".join(f"- {s['action']['target'].get('name')}: "

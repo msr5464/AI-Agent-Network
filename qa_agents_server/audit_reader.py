@@ -683,7 +683,9 @@ def _skipped_status(shape: str) -> str:
 def _healing_status(session_dir: Path, fix_gate: Optional[str],
                     ship_data: Optional[Dict], counts: Dict[str, int],
                     shape: str = "") -> str:
-    if (ship_data or {}).get("pr_url"):
+    # A draft PR holds repairs for a test that is still failing. The row links
+    # it like any other, and is judged by the gate like any other failing run.
+    if (ship_data or {}).get("pr_url") and not (ship_data or {}).get("pr_draft"):
         return "pr_created"
     # Cancelled before crashed: cancelling kills the step, which trips run.sh's
     # ERR trap into writing .crashed too. .cancelled only exists if the cancel

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from shared import frames
+from shared.locator_emit import testid_attribute
 
 _HEADER_RE = re.compile(r'<!--\s*qa-agent-network:dom-snapshot(.*?)-->', re.DOTALL)
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
@@ -291,7 +292,10 @@ def _fp_selector(element: Dict, scopes: List[str]) -> str:
     """
     tag = element.get("tag") or "*"
     if element.get("testid"):
-        core = f'[data-testid={_css_value(element["testid"])}]'
+        # Spelled the way this element spells it. A page that writes `data-test`
+        # has no `data-testid` anywhere, and a suggestion that matches nothing was
+        # the first candidate the model was shown — and the one it answered with.
+        core = f'[{testid_attribute(element)}={_css_value(element["testid"])}]'
     elif element.get("id"):
         core = f'#{element["id"]}'
     elif element.get("name"):
@@ -310,7 +314,7 @@ def _fp_selector(element: Dict, scopes: List[str]) -> str:
                 else f'{tag}:has-text({_css_value(text[:40].rstrip())})')
     else:
         core = tag
-    if core.startswith("#") or core.startswith("[data-testid"):
+    if element.get("testid") or core.startswith("#"):
         return core                      # already unique on its own
     # Only a container this element actually sits in. The failing selector's
     # own id is often the thing that vanished (`#random-text-locator`), and
@@ -404,7 +408,7 @@ def candidates_from_fingerprints(fingerprints: Dict, element_names: Optional[Lis
                "suggested_selector": frames.join(frame_path, _fp_selector(element, scopes))}
         if frame_path:
             out["inside_iframe"] = " > ".join(frame_path)
-        for src, dst in (("id", "id"), ("testid", "data-testid"), ("alt", "alt"),
+        for src, dst in (("id", "id"), ("testid", testid_attribute(element)), ("alt", "alt"),
                          ("aria_label", "aria-label"), ("role", "role"),
                          ("name", "name"), ("placeholder", "placeholder"),
                          ("accessible_name", "accessible-name")):

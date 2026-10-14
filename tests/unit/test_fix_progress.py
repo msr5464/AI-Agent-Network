@@ -407,8 +407,150 @@ class TestCarriedIssueNote:
         assert "landed" not in note
         assert note == "pays: the previous edit was reverted — trying #old-anchor again"
 
+    def test_a_rejection_before_any_run_says_the_work_is_unchanged(self):
+        note = fix.carried_issue_note("pkg.SomeTest.pays", "rejected_unsafe",
+                                      {"failed_selector": ".notice-typo"})
+        assert note == ("pays: the previous edit was rejected before any test ran — "
+                        "still working on .notice-typo")
+
     def test_anything_else_says_nothing(self):
-        assert fix.carried_issue_note("pkg.SomeTest.pays", "rejected_unsafe", {}) == ""
+        assert fix.carried_issue_note("pkg.SomeTest.pays", "unfixable", {}) == ""
+
+
+class TestAnAttemptThatRanNothingKeepsItsPlace:
+    """The bug this pins: a guard rejected an edit before any test ran, and the
+    record of that attempt carried no failure for the next one to start from. The
+    next attempt read the original handoff — a locator repaired two attempts
+    earlier — and asked the model to repair it again. It did, by rewriting a
+    selector that worked.
+    """
+
+    CURRENT = {"test_name": "pkg.SomeTest.pays", "failed_selector": ".notice-typo"}
+
+    def test_a_record_written_without_a_run_carries_the_failure_it_worked_on(self):
+        failed = [{"test_name": "pkg.SomeTest.pays", "status": "rejected_unsafe"}]
+        fix.carry_current_issues(failed, [self.CURRENT])
+        assert failed[0]["next_issue"] == self.CURRENT
+
+    @pytest.mark.parametrize("status", ["unfixable", "parse_error", "no_response",
+                                        "edit_failed", "locate_refused", "deferred"])
+    def test_whatever_stopped_it(self, status):
+        failed = [{"test_name": "pkg.SomeTest.pays", "status": status}]
+        fix.carry_current_issues(failed, [self.CURRENT])
+        assert failed[0]["next_issue"]["failed_selector"] == ".notice-typo"
+
+    def test_a_failure_refreshed_by_a_run_is_not_overwritten(self):
+        newer = {"test_name": "pkg.SomeTest.pays", "failed_selector": "#card-code"}
+        failed = [{"test_name": "pkg.SomeTest.pays", "status": "advanced",
+                   "next_issue": newer}]
+        fix.carry_current_issues(failed, [self.CURRENT])
+        assert failed[0]["next_issue"] is newer
+
+    def test_a_test_nothing_was_working_on_is_left_alone(self):
+        failed = [{"test_name": "pkg.OtherTest.ships", "status": "no_file"}]
+        fix.carry_current_issues(failed, [self.CURRENT])
+        assert "next_issue" not in failed[0]
+
+
+class TestParkingABrowserIsForASecondTry:
+    """The bug this pins: "from the second attempt on" was read off the attempt
+    number. A chain of broken locators is repaired one per attempt, so every link
+    after the first arrived on a later attempt, untried, and had the whole test
+    re-run to park a browser on a page its failure capture already described.
+    """
+
+    def _ctx(self, selector="#card-code", **outcome):
+        return {"failed_selector": selector, "prev_outcome": outcome}
+
+    def test_a_locator_the_last_fix_uncovered_has_not_been_tried(self):
+        assert not fix.tried_before(self._ctx(status="advanced",
+                                              failed_selector="#login-typo"))
+
+    def test_the_first_attempt_has_not_been_tried(self):
+        assert not fix.tried_before({"failed_selector": "#card-code", "prev_outcome": {}})
+
+    @pytest.mark.parametrize("status", ["test_failed", "rejected_unsafe", "unfixable",
+                                        "parse_error"])
+    def test_an_attempt_that_left_this_element_failing_has(self, status):
+        assert fix.tried_before(self._ctx(status=status, failed_selector="#card-code"))
+
+    def test_an_attempt_on_another_element_has_not(self):
+        assert not fix.tried_before(self._ctx(status="test_failed",
+                                              failed_selector="#something-else"))
+
+    def test_a_locator_put_off_for_the_budget_has_not(self):
+        assert not fix.tried_before(self._ctx(status="deferred",
+                                              failed_selector="#card-code"))
+
+
+CARD_PAGE_SOURCE = '''
+public class CardPage extends BasePage {
+    public CardPage(Config config) {
+        number = page.locator("#number-typo");
+        pay = page.locator("#pay-typo");
+        notice = page.locator(".notice-typo");
+    }
+}
+'''
+
+
+class TestALocatedFixCarriesWhatElseThePageLost:
+    """One edit, one run: the locators the same page lost with the failing one."""
+
+    @pytest.fixture
+    def page(self, tmp_path):
+        path = tmp_path / "CardPage.java"
+        path.write_text(CARD_PAGE_SOURCE)
+        return path
+
+    def _resolution(self, **extra):
+        base = {"page_object": "CardPage", "field": "number",
+                "failed_selector": "#number-typo", "new_locator": "#number",
+                "new_expression": 'page.locator("#number")',
+                "score": 1.0, "margin": 0.4, "tier": "T1_identity",
+                "strategy": "id", "verification": "unique in the failure capture"}
+        base.update(extra)
+        return base
+
+    def _build(self, page, resolution):
+        ctx = {"page_objects": [{"path": str(page)}]}
+        return fix.build_located_fix(resolution, ctx, page.parent)
+
+    def test_the_other_missing_locators_ride_on_the_same_edit(self, page):
+        sibling = {"page_object": "CardPage", "field": "pay", "locator_id": "CardPage#pay",
+                   "new_locator": "#pay", "new_expression": 'page.locator("#pay")'}
+        fix_json, _why = self._build(page, self._resolution(siblings=[sibling]))
+        updated, error = fix.apply_edits(page.read_text(), fix_json["edits"])
+        assert not error
+        assert 'number = page.locator("#number");' in updated
+        assert 'pay = page.locator("#pay");' in updated
+        assert 'notice = page.locator(".notice-typo");' in updated
+        assert fix_json["siblings"] == [sibling]
+        assert "pay → #pay" in fix_json["fix_description"]
+
+    def test_a_locator_on_another_page_object_is_not_touched(self, page):
+        sibling = {"page_object": "OtherPage", "field": "pay",
+                   "new_locator": "#pay", "new_expression": 'page.locator("#pay")'}
+        fix_json, _why = self._build(page, self._resolution(siblings=[sibling]))
+        assert fix_json["siblings"] == [] and len(fix_json["edits"]) == 1
+
+    def test_a_sibling_that_cannot_be_written_does_not_cost_the_main_fix(self, page):
+        sibling = {"page_object": "CardPage", "field": "noSuchField",
+                   "new_locator": "#x", "new_expression": 'page.locator("#x")'}
+        fix_json, _why = self._build(page, self._resolution(siblings=[sibling]))
+        assert fix_json["siblings"] == [] and len(fix_json["edits"]) == 1
+
+    def test_a_restored_selector_is_described_as_one(self, page):
+        fix_json, _why = self._build(page, self._resolution(
+            field="notice", failed_selector=".notice-typo", new_locator=".notice",
+            new_expression='page.locator(".notice")', tier="T0_recorded",
+            strategy="recorded", score=None, margin=None,
+            verification="not checked against the failure capture, which the "
+                         "element is not in — the test run is the proof"))
+        assert "the last passing run" in fix_json["fix_description"]
+        assert "Scored" not in fix_json["fix_description"]
+        assert fix.located_basis({"tier": "T0_recorded"}) == \
+            "the selector the last passing run used"
 
 
 class TestReusableInspection:

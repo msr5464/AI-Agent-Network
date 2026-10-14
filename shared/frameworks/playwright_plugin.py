@@ -82,9 +82,18 @@ class PlaywrightTelemetryParser(TelemetryParser):
         return actions
 
     def failing_action(self, actions: List[Dict]) -> Optional[Dict]:
-        errored = next((a for a in actions if a.get("error")), None)
-        if errored:
-            return errored
+        """The action the test died on, when one threw.
+
+        An error the flow carried on past was caught where it was raised, as a
+        visibility check on a locator that matches a whole list is, and is not
+        why the test stopped. Read from the end: the first error met is the
+        failure, unless the flow acted cleanly after it.
+        """
+        for action in reversed([a for a in actions if a.get("selector") or a.get("error")]):
+            if action.get("error"):
+                return action
+            if action.get("action") not in self._PROBES:
+                break
         return self._polled_to_death(actions)
 
     def read_network(self, trace_path: Path) -> List[Dict]:
@@ -124,8 +133,18 @@ class PlaywrightTelemetryParser(TelemetryParser):
                 "status_text": response.get("statusText", ""),
                 "time_ms": snapshot.get("time"),
                 "started": snapshot.get("startedDateTime", ""),
+                "sent_credentials": self._sent_credentials(request),
             })
         return entries
+
+    @staticmethod
+    def _sent_credentials(request: Dict) -> Optional[bool]:
+        """Whether a request carried a session to refuse. None when the log does not say."""
+        headers = request.get("headers")
+        if not isinstance(headers, list):
+            return None
+        names = {str(h.get("name", "")).lower() for h in headers if isinstance(h, dict)}
+        return bool(names & {"authorization", "cookie"} or request.get("cookies"))
 
     #: Calls that only measure the page. A framework that records why a wait
     #: failed makes these after giving up, into the same trace.
@@ -374,6 +393,18 @@ class PlaywrightCodeEngine(CodeEngine):
         if any(token in lowered for token in self._UNEVALUABLE_TOKEN):
             return None
         return selector
+
+    def live_selector(self, locator: Dict[str, str]) -> str:
+        # The agents' browser is driven by this engine, so a locator string is
+        # countable as written, `:has-text()` and `:text-is()` included. Reduced
+        # to plain CSS first, most of a page object written that way had nothing
+        # left to count, and what was counted stood for the whole of it.
+        if locator.get("approx"):
+            return ""
+        raw = locator.get("raw") or ""
+        if locator.get("kind", "css") == "css" and self.is_dom_selector(raw):
+            return raw
+        return locator.get("selector") or ""
 
     def extract_locators(self, source: str) -> List[Dict[str, str]]:
         found = []

@@ -70,6 +70,9 @@ class TelemetryParser(abc.ABC):
 
         Optional: most frameworks record no network log, and losing that
         evidence channel is the honest outcome for them.
+
+        `sent_credentials` on a record is True or False when the log shows what
+        the request carried, and left out or None when it does not.
         """
         return []
 
@@ -185,6 +188,18 @@ class CodeEngine(abc.ABC):
     def extract_locators(self, source: str) -> List[Dict[str, str]]:
         """Extract all locators declared in a page object source file."""
         pass
+
+    def live_selector(self, locator: Dict[str, str]) -> str:
+        """One of `extract_locators`' entries as a selector the agents' browser can
+        count on a live page, "" when there is none to count.
+
+        The plain CSS `normalize_selector` reduced it to, by default. That is the
+        form a captured document can be queried with, and it is narrower than
+        what a browser evaluates: a framework whose own selector syntax the
+        browser understands returns the locator as written. One assembled when
+        the test runs has nothing fixed to count.
+        """
+        return "" if locator.get("approx") else (locator.get("selector") or "")
 
     @abc.abstractmethod
     def quote_css_value(self, value: str) -> str:

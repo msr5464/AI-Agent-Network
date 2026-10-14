@@ -172,7 +172,9 @@ What the kinds mean:
                      have no locator for. This needs a locator AND an accessor,
                      so it is a larger edit than a rename.
 - api_contract     — a request/response shape, status code or header changed.
-- test_data        — a fixture, default or seeded record changed.
+- test_data        — a value the test types or seeds changed: a fixture, a default,
+                     a seeded record, an option it now picks. A check that reads that
+                     same value back follows it to the new value the item states.
 - page_object_new  — a genuinely new page exists that has no page object yet.
 - coverage_added   — nothing in the product changed: the team wants an existing test
                      to do more — extra steps, extra checks — while every check it
@@ -194,6 +196,12 @@ change, and not otherwise:
 - `content_changed` is where a genuine product bug hides most comfortably — a
   changed expected string looks identical whether it was intended or is a defect —
   so use it only when the note states the new text.
+
+`test_data` is not one of the five, and has one narrow allowance of its own: where
+the item replaces a value the test types, the check that reads that value back may
+move to the new value, when the item states it. Use it for exactly that — "now
+pick B instead of A, and expect B where it is validated". An item that changes what
+a check expects for any other reason, or removes one, is one of the five.
 
 Also extract, per item, the product nouns a reader would use to find the affected
 page objects (e.g. "workspace", "checkout", "cart").

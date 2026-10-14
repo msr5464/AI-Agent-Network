@@ -82,7 +82,7 @@ def summarize(trace_path, page_url: str = "") -> Dict:
         "available": False, "total": 0,
         "document_status": None, "document_url": "",
         "failed": [], "server_errors": [], "client_errors": [],
-        "auth_rejections": [], "redirects": [], "slow": [],
+        "auth_rejections": [], "anonymous_denials": [], "redirects": [], "slow": [],
         "first_party_failed": [], "first_party_server_errors": [],
         "first_party_auth_rejections": [],
     }
@@ -104,7 +104,15 @@ def summarize(trace_path, page_url: str = "") -> Dict:
         elif 500 <= status < 600:
             result["server_errors"].append(brief)
         elif status in (401, 403):
-            result["auth_rejections"].append(brief)
+            # A rejection needs something to reject. A request that carried no
+            # credential is the application asking who the visitor is and being
+            # told nobody, which any page that also works signed out does on
+            # every load. Only a known absence counts: a log that does not record
+            # what was sent leaves the request where it always was.
+            if entry.get("sent_credentials") is False:
+                result["anonymous_denials"].append(brief)
+            else:
+                result["auth_rejections"].append(brief)
         elif 400 <= status < 500:
             result["client_errors"].append(brief)
         elif 300 <= status < 400:
@@ -121,7 +129,7 @@ def summarize(trace_path, page_url: str = "") -> Dict:
     # First-party first, so the entries a rule reads and a human sees are the ones
     # that belong to the application rather than to its analytics vendors.
     for key in ("failed", "server_errors", "client_errors",
-                "auth_rejections", "redirects", "slow"):
+                "auth_rejections", "anonymous_denials", "redirects", "slow"):
         result[key].sort(key=lambda item: not item.get("first_party"))
         result[key] = result[key][:10]
     result["first_party_failed"] = [i for i in result["failed"] if i.get("first_party")]
@@ -146,7 +154,10 @@ def describe(summary: Dict, max_lines: int = 8) -> str:
     for label, key in (("failed request", "failed"),
                        ("server error", "server_errors"),
                        ("auth rejected", "auth_rejections"),
-                       ("client error", "client_errors")):
+                       ("client error", "client_errors"),
+                       # Last: it is the normal signed-out path, and must not
+                       # push a real failure past `max_lines`.
+                       ("signed out, no credentials sent", "anonymous_denials")):
         entries = list(summary.get(key) or [])
         for item in sorted(entries, key=lambda i: not i.get("first_party")):
             where = "" if item.get("first_party") else " [third-party]"

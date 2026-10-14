@@ -214,21 +214,53 @@ class TestAlreadyApplied:
     def adapt(self, tmp_path, monkeypatch):
         return _load("adapt_skip", "actions/04_adapt.py", tmp_path, monkeypatch)
 
-    @pytest.mark.parametrize("kind", ["step_insert", "locator", "route", "test_data"])
-    def test_items_that_only_add_or_retarget_steps_are_skipped_when_seen(self, adapt, kind):
+    @pytest.mark.parametrize("kind", ["step_insert", "field_added", "page_object_new"])
+    def test_items_that_only_add_steps_are_skipped_when_seen(self, adapt, kind):
         assert adapt.already_applied({"added": []}, [{"kind": kind}]) is True
 
     @pytest.mark.parametrize("kind", ["step_merge", "coverage_changed", "outcome_changed",
-                                      "content_changed", "coverage_added"])
-    def test_items_that_remove_or_check_are_never_skipped(self, adapt, kind):
-        # None of these adds an interaction, so each would always look applied.
+                                      "content_changed", "coverage_added",
+                                      "locator", "route", "interaction", "test_data"])
+    def test_items_that_add_no_control_are_never_skipped(self, adapt, kind):
+        # None of these adds a control the tests lack, so each would always look
+        # applied: a changed value or a moved route is walked through controls
+        # the page objects have had all along.
         assert adapt.already_applied({"added": []}, [{"kind": kind}]) is False
+
+    def test_one_such_item_keeps_the_whole_note_from_being_skipped(self, adapt):
+        items = [{"kind": "step_insert"}, {"kind": "test_data"}]
+        assert adapt.already_applied({"added": []}, items) is False
 
     def test_a_new_step_means_not_applied(self, adapt):
         assert adapt.already_applied({"added": [{"flow_index": 1}]}, [{"kind": "step_insert"}]) is False
 
     def test_a_note_of_only_unclassified_items_goes_on_to_escalate(self, adapt):
         assert adapt.already_applied({"added": []}, [{"kind": "unclassified"}]) is False
+
+
+class TestAnItemDeclinedOnce:
+    """A decline is the model saying the flow map and the files are not enough. A
+    second attempt showed it the same two and paid for the same answer."""
+
+    def _adapt(self, tmp_path, monkeypatch, attempt):
+        monkeypatch.setenv("ADAPT_ATTEMPT", str(attempt))
+        return _load(f"adapt_declined_{attempt}", "actions/04_adapt.py", tmp_path, monkeypatch)
+
+    def test_the_previous_attempts_declines_are_read_with_the_attempt_that_made_them(
+            self, tmp_path, monkeypatch):
+        (tmp_path / "04-adapt.json").write_text(json.dumps({"attempt": 1, "items": [
+            {"index": 1, "status": "rolled_back", "reason": "a guard"},
+            {"index": 2, "status": "declined", "reason": "no step for the new field"},
+            {"index": 3, "status": "declined", "reason": "carried", "declined_in_attempt": 1}]}))
+        found = self._adapt(tmp_path, monkeypatch, 2).earlier_declines()
+        assert sorted(found) == [2, 3], "only what the model declined, not what a guard stopped"
+        assert found[2]["reason"] == "no step for the new field"
+        assert {found[2]["declined_in_attempt"], found[3]["declined_in_attempt"]} == {1}
+
+    def test_a_first_attempt_has_none(self, tmp_path, monkeypatch):
+        (tmp_path / "04-adapt.json").write_text(json.dumps({"attempt": 1, "items": [
+            {"index": 2, "status": "declined", "reason": "left by an earlier session"}]}))
+        assert self._adapt(tmp_path, monkeypatch, 1).earlier_declines() == {}
 
 
 class TestCheckChangesGuard:

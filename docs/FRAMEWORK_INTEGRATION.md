@@ -47,9 +47,15 @@ matter as much as the one that did not: they establish how far the journey got.
   on `TelemetryParser.ACTION_KEYS`. Call `self.normalise(...)` on each record.
   Consumers index these keys directly, so returning your raw log records will
   raise `KeyError` inside prompt construction.
-- `failing_action(actions)` — the one that broke.
+- `failing_action(actions)` — the one the test died on. Not the first error in
+  the log: an error the flow carried on past was caught where it was raised, and
+  naming it reports every later failure against the wrong element.
 - `read_network(path)` — optional (defaults to `[]`): HAR-shaped network records
-  if your artifact carries them. `shared/trace_network.py` interprets them.
+  if your artifact carries them. `shared/trace_network.py` interprets them. Set
+  `sent_credentials` on a record when the log shows whether the request carried
+  an `Authorization` header or a cookie. A 401 on a request that carried neither
+  is a signed-out visitor, not a rejected session, and only this field tells the
+  two apart.
 - `NOISE_ACTIONS` — optional: action names to drop from the prompt timeline.
 
 ### `TestRunner`
@@ -78,6 +84,11 @@ produces, so it returned `False` for every input and the verdict never fired.
 The hardest part: parse and generate this repo's locator code.
 
 - `extract_locators(source)` — every locator declared in a page object.
+- `live_selector(locator)` — one of those entries as a selector the agents' browser
+  can count on a live page, `""` when there is none. Optional: by default the plain
+  CSS `normalize_selector` reduced it to. A framework whose own selector syntax the
+  browser evaluates returns the locator as written, so its text selectors are
+  counted too.
 - `normalize_selector(raw)` — to plain CSS so it can be evaluated against a
   captured DOM. Return `None` for XPath.
 - `is_dom_selector(raw)`, `remove_framework_suffixes(selector)`,

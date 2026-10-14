@@ -47,7 +47,8 @@ def log(msg): _log("locate", msg)
 import yaml
 
 from shared import baseline as baseline_store
-from shared import dom_snapshot, failure_context, frames, locator_assertions, page_identity
+from shared import dom_snapshot, failure_context, failure_identity, frames
+from shared import locator_assertions, locator_patch, page_identity
 from shared import locator_capture as capture
 from shared import locator_emit as emit_mod
 from shared import workspace as workspace_helper
@@ -508,6 +509,20 @@ def _locate(issue: dict, sources: dict, assertion_used: dict, cfg: dict,
                             f"name in the failure matched a locator field either")
         record["verdict"] = "NO_DECLARATION"
         return record
+    return _resolve_field(issue, record, class_name, field, raw, sources,
+                          assertion_used, cfg, vol, workspace, with_siblings=True)
+
+
+def _resolve_field(issue: dict, record: dict, class_name: str, field: str, raw: str,
+                   sources: dict, assertion_used: dict, cfg: dict, vol: Volatility,
+                   workspace: Path, with_siblings: bool = False) -> dict:
+    """One page-object field, once it is known which one: rank it, write it.
+
+    Apart from `_locate` because the field is not always found from a failure.
+    The page's other locators that went missing with the failing one are resolved
+    through here too, and they are known by name, not by a selector that failed.
+    """
+    failed = record["failed_selector"]
     record["locator_id"] = f"{class_name}#{field}"
     record["page_object"], record["field"] = class_name, field
 
@@ -645,7 +660,19 @@ def _locate(issue: dict, sources: dict, assertion_used: dict, cfg: dict,
          "score": round(r.score, 3), "tier": r.best_tier}
         for r in (decision.runners or [])]
 
+    restored = None
     if emitted is None:
+        absent = _absent_from_capture(stored, field, decision, cfg)
+        if absent:
+            record["absent_from_capture"] = absent
+        restored = _restored(stored, field, raw, bool(frame_path), soup, prints, absent)
+
+    if restored:
+        # The candidates passed over were ranked against a fingerprint; this
+        # answer was not chosen from among them.
+        record.pop("rejected", None)
+        record.update(restored)
+    elif emitted is None:
         record["verdict"] = NO_HEAL
         if decision.proceed:
             record["classification"] = "NO_STABLE_LOCATOR"
@@ -670,29 +697,150 @@ def _locate(issue: dict, sources: dict, assertion_used: dict, cfg: dict,
     # applied it, or a PR did — so the failure this was read from is older than
     # the source. Reporting it as a heal produces an edit that changes nothing
     # and spends an attempt saying so.
-    if emitted["sel"] == raw:
+    elif emitted["sel"] == raw:
         record["verdict"], record["classification"] = NO_HEAL, "ALREADY_CURRENT"
         record["reason"] = (f"{class_name}#{field} already declares {raw!r} — this "
                             f"failure predates the file and has nothing left to fix")
         return record
 
-    record.update({
+    else:
+        record.update({
+            "verdict": HEALED,
+            "classification": "LOCATOR_STALE",
+            "reason": decision.reason,
+            "score": round(cand.score, 3),
+            "margin": round(decision.margin, 3),
+            "tier": cand.best_tier,
+            # What stands behind the answer. Not "executed": Fix applies the edit
+            # and runs the real test, and claiming a proof this step did not
+            # perform is how an unverified fix gets reported as a verified one.
+            "verification": "unique in the failure capture",
+            "new_locator": emitted["sel"],
+            "new_expression": emitted.get("java") or emit_mod.code_for(emitted["sel"])["java"],
+            "strategy": emitted.get("strategy"),
+            "fragile": emitted.get("fragile"),
+        })
+
+    if with_siblings:
+        also = _siblings(issue, class_name, field, raw, stored, declared, details,
+                         sources, assertion_used, cfg, vol, workspace)
+        if also:
+            record["siblings"] = also
+    return record
+
+
+RECORDED = "T0_recorded"
+
+
+def _absent_from_capture(stored: dict, field: str, decision, cfg: dict) -> str:
+    """Why the failure capture cannot hold this element, or "" when it could.
+
+    Two facts, and it takes both. The last good run found nothing for this
+    locator as the page loaded and used it later, so the element exists only once
+    something is done to the page. And nothing captured at failure resembles what
+    that run recorded. A confirmation that shows and clears itself is gone again
+    by the time a wait for it gives up: the capture is of a page it has left.
+
+    Recorded because every check that asks "does the replacement match the
+    capture" has only one answer for such an element, and it is the wrong one.
+    """
+    if not baseline_store.appears_after_action(stored, field):
+        return ""
+    if decision.top is not None and decision.top.score >= cfg["thresholds"]["accept"]:
+        return ""
+    return (f"{field} exists only after an action (it matched nothing as the page "
+            f"loaded on the last good run, and was used later in that run), and "
+            f"nothing in the failure capture resembles it")
+
+
+def _restored(stored: dict, field: str, raw: str, in_frame: bool, soup, prints: dict,
+              absent: str) -> dict | None:
+    """The selector the last passing run used, when the source now declares another.
+
+    A locator can break because the page changed or because the code did. The
+    fingerprint search answers the first. For the second the answer was written
+    down: the baseline holds the selector each field was found with, and a source
+    that declares something else has been edited since. Putting it back needs no
+    search and cannot pick a different element.
+
+    Offered only on proof, like every other answer here: the recorded selector
+    matches exactly one visible element in the failure capture, or the element is
+    one the capture cannot hold and the test run is left to prove it.
+    """
+    recorded = failure_identity.bare_selector(
+        str((stored.get("selectors") or {}).get(field) or ""))
+    # A chain of hops prints as one string and is declared as several calls;
+    # writing it back as a single selector would not be the same locator.
+    if not recorded or in_frame or ">>" in recorded or "internal:" in recorded:
+        return None
+    if (page_identity.normalize_selector(recorded) or recorded) == \
+            (page_identity.normalize_selector(raw) or raw):
+        return None
+    if dom_snapshot.selector_visibility(recorded, soup, prints) == (1, 1):
+        verification = "unique in the failure capture"
+    elif absent:
+        verification = ("not checked against the failure capture, which the element "
+                        "is not in — the test run is the proof")
+    else:
+        return None
+    return {
         "verdict": HEALED,
         "classification": "LOCATOR_STALE",
-        "reason": decision.reason,
-        "score": round(cand.score, 3),
-        "margin": round(decision.margin, 3),
-        "tier": cand.best_tier,
-        # What stands behind the answer. Not "executed": Fix applies the edit and
-        # runs the real test, and claiming a proof this step did not perform is
-        # how an unverified fix gets reported as a verified one.
-        "verification": "unique in the failure capture",
-        "new_locator": emitted["sel"],
-        "new_expression": emitted.get("java") or emit_mod.code_for(emitted["sel"])["java"],
-        "strategy": emitted.get("strategy"),
-        "fragile": emitted.get("fragile"),
-    })
-    return record
+        "reason": (f"the source declares {raw!r}; the last passing run found this "
+                   f"element with {recorded!r}"),
+        "tier": RECORDED,
+        "verification": verification,
+        "new_locator": recorded,
+        "new_expression": emit_mod.code_for(recorded)["java"],
+        "strategy": "recorded",
+    }
+
+
+_SIBLING_KEYS = ("locator_id", "page_object", "field", "failed_selector", "new_locator",
+                 "new_expression", "score", "margin", "tier", "verification", "strategy")
+
+
+def _siblings(issue: dict, class_name: str, field: str, raw: str, stored: dict,
+              declared: list, details: dict, sources: dict, assertion_used: dict,
+              cfg: dict, vol: Volatility, workspace: Path) -> list:
+    """The page's other locators that went missing with this one, resolved too.
+
+    One broken locator hides the next, and each costs a whole test run to reach.
+    When two of them are on one page that run is spent learning something this
+    capture already shows: a locator that matched as the page loaded on the last
+    good run and matches nothing now.
+
+    Held to what the failing locator is held to: the same baseline, the same
+    capture, the same proof. One that does not reach it waits for its own
+    failure, and one an assertion reads is never repaired without having failed.
+    """
+    source = sources.get(class_name, "")
+    by_name = {d["name"]: d["raw"] for d in declared if d.get("name")}
+    wanted = []
+    for name, count in (stored.get("coverage") or {}).items():
+        if name == field or name in assertion_used or not isinstance(count, int) or count < 1:
+            continue
+        if name in by_name:
+            if details.get(name) == 0:
+                wanted.append((name, by_name[name]))
+        elif raw in ((locator_patch.declaration_edit(source, name, "")[0] or {})
+                     .get("old_string") or ""):
+            # Declared with the very selector that failed. A selector is listed
+            # once however many fields use it, so this one is found by its name.
+            wanted.append((name, raw))
+
+    found = []
+    for name, sibling_raw in wanted:
+        sibling = {"test_name": issue.get("test_name", ""), "failed_selector": sibling_raw,
+                   "verdict": "SKIPPED", "reason": "", "locator_id": ""}
+        try:
+            sibling = _resolve_field(issue, sibling, class_name, name, sibling_raw,
+                                     sources, assertion_used, cfg, vol, workspace)
+        except Exception:                              # noqa: BLE001 - never costs the main answer
+            continue
+        if sibling.get("verdict") == HEALED:
+            found.append({key: sibling[key] for key in _SIBLING_KEYS if key in sibling})
+    return found
 
 
 def main() -> int:
@@ -798,8 +946,10 @@ def main() -> int:
             resolutions.append({**resolution, "test_name": member.get("test_name", "")})
 
     located = [r for r in resolutions if r["verdict"] == HEALED]
-    log(f"located {len(located)} of {len(resolutions)} deterministically "
-        f"({'applied by fix' if HEALING_LOCATE_MODE == 'enforce' else 'shadow — fix unchanged'})")
+    also = len({s.get("locator_id") for r in located for s in r.get("siblings") or []})
+    log(f"located {len(located)} of {len(resolutions)} deterministically"
+        + (f", and {also} more missing from the same page" if also else "")
+        + f" ({'applied by fix' if HEALING_LOCATE_MODE == 'enforce' else 'shadow — fix unchanged'})")
 
     # Every link of the chain, not just this attempt's. Fix matches a resolution
     # by its failing selector and each link has a different one, so carrying the
@@ -827,9 +977,12 @@ def _log_resolution(r: dict) -> None:
     reviewer looking for *why* looks there rather than at a badge."""
     name = r.get("locator_id") or r.get("failed_selector", "")[:40]
     if r["verdict"] == HEALED:
-        log(f"{name}  {r.get('classification')}  score {r.get('score')} "
-            f"margin {r.get('margin'):+} tier {r.get('tier')} — {r.get('verification')}")
+        log(f"{name}  {r.get('classification')}  {_basis(r)} — {r.get('verification')}")
         log(f"  -> {r.get('new_expression', '')[:110]}")
+        for sibling in r.get("siblings") or []:
+            log(f"  also missing on this page: {sibling.get('locator_id')}  "
+                f"{_basis(sibling)} — {sibling.get('verification')}")
+            log(f"    -> {sibling.get('new_expression', '')[:110]}")
         for attribute, why in (r.get("anchors_passed_over") or {}).items():
             log(f"  not anchored on {attribute}: {why} — the page changes it")
         for rejected in (r.get("rejected") or [])[:2]:
@@ -841,6 +994,15 @@ def _log_resolution(r: dict) -> None:
         # Refusals carry the reason a human acts on — "no recorded good run",
         # "the feature was removed". The console scrolls; the advice should survive.
         log(f"{name}  {r.get('classification') or r['verdict']} — {r.get('reason','')[:220]}")
+
+
+def _basis(r: dict, report: bool = False) -> str:
+    """What an answer rests on, as the console says it or as the report does."""
+    if r.get("tier") == RECORDED:
+        return "the selector the last passing run used"
+    if report:
+        return f"score {r.get('score')} (margin {r.get('margin'):+}), {r.get('tier')}"
+    return f"score {r.get('score')} margin {r.get('margin'):+} tier {r.get('tier')}"
 
 
 def _counts(resolutions: list) -> dict:
@@ -879,8 +1041,11 @@ def _markdown(payload: dict) -> str:
         if r.get("new_expression"):
             lines += [f"- was: `{r.get('failed_selector')}`",
                       f"- now: `{r['new_expression']}`",
-                      f"- score {r.get('score')} (margin {r.get('margin'):+}), "
-                      f"{r.get('tier')}, {r.get('verification')}"]
+                      f"- {_basis(r, report=True)}, {r.get('verification')}"]
+        for sibling in r.get("siblings") or []:
+            lines.append(f"- also missing on this page: `{sibling.get('locator_id')}` "
+                         f"→ `{sibling.get('new_expression')}` "
+                         f"({_basis(sibling, report=True)}, {sibling.get('verification')})")
         lines.append("")
     return "\n".join(lines)
 

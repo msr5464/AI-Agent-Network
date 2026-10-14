@@ -222,6 +222,7 @@ def extract(workspace, test_id: str) -> Dict:
     result: Dict = {"mode": "none", "test": test_id, "reason": "",
                     "helper": "", "method": "", "arg_keys": [], "session": None}
     near_miss = ""
+    own_login = ""
 
     source_path = test_source(workspace, test_id)
     if source_path is None:
@@ -290,6 +291,13 @@ def extract(workspace, test_id: str) -> Dict:
                     "reason": f"the test calls {called}() with "
                               f"{', '.join(properties[a] for a in args)}"}
 
+        if not args and not own_login:
+            # A login the helper performs with values it holds itself. There is no
+            # session to load and none to mint, but the test does sign in: said
+            # to "never sign in", its explorer was sent to a login form with
+            # nothing to type and told the flow had no login in it.
+            own_login = called
+
         if credential_args:
             # A login call whose arguments are not all property-backed — GitHub's
             # OTP test passes a hardcoded "123456". Minting resolves property KEYS
@@ -303,6 +311,12 @@ def extract(workspace, test_id: str) -> Dict:
                          f"a property — minting has no way to supply "
                          f"{'it' if len(unresolved) == 1 else 'them'}")
 
+    if own_login and not near_miss:
+        result["login_call"] = own_login
+        result["reason"] = (f"the test signs in through {own_login}(), which holds its "
+                            f"own login — no saved session to load, so signing in is "
+                            f"walked as one of the test's steps")
+        return result
     result["reason"] = near_miss or (
         "the test never signs in — no stored session and no credential-taking "
         "login call in its body")
@@ -353,13 +367,154 @@ def _csv_row(workspace, read: Dict) -> Optional[Dict]:
     return {"file": str(found[0].relative_to(workspace)), "row": values} if values else None
 
 
-def test_walk(workspace, test_id: str) -> Dict:
-    """What the test does today, in its own words, and the data row it types.
+_LITERAL = r"\"(?:[^\"\\]|\\.)*\"|-?\d+(?:\.\d+)?|true|false"
+# `new OrderBuilder().withQuantity("2").build()` — the class, and the chain after it.
+_BUILT = re.compile(
+    r"\bnew\s+(\w+)\s*\(\s*\)((?:\s*\.\s*\w+\s*\((?:[^()\"]|\"(?:[^\"\\]|\\.)*\")*\))*?)"
+    r"\s*\.\s*build\s*\(\s*\)")
+# `.withQuantity("2")` in such a chain.
+_CHAIN_SET = re.compile(r"\.\s*(?:with|set)?(\w+)\s*\(\s*(" + _LITERAL + r")\s*\)")
+# `private String type = "Standard";`
+_FIELD_DEFAULT = re.compile(
+    r"^[ \t]*(?:private|protected|public)?[ \t]*(?:final[ \t]+)?[\w<>\[\].]+[ \t]+(\w+)"
+    r"[ \t]*=[ \t]*(" + _LITERAL + r")[ \t]*;", re.MULTILINE)
+# `if (name == null) name = "Asha";`
+_NULL_DEFAULT = re.compile(
+    r"\bif\s*\(\s*(?:this\.)?(\w+)\s*==\s*null\s*\)\s*\{?\s*(?:this\.)?(\w+)\s*=\s*("
+    + _LITERAL + r")\s*;")
+# `loginPage.login("admin", "secret")` — a call, its receiver and its raw arguments.
+_ANY_CALL = re.compile(r"(?<![\w.])(\w+)\s*\.\s*(\w+)\s*\(((?:[^()\"]|\"(?:[^\"\\]|\\.)*\")*)\)")
+# `public LoginPage loginPage;` / `LoginPage loginPage = new LoginPage(config);`
+_DECLARED = r"\b(\w+)\s+{name}\s*[;=]"
 
-    `{"test", "steps": [...], "data": [{"file", "row": {column: value}}]}`.
-    `steps` is the test's own step log, in call order. `data` is each row the
-    test method, or a method of its class that it calls, looks up by a literal
-    key. Either is empty when the source does not say; nothing is inferred.
+
+def _unquote(literal: str) -> str:
+    literal = literal.strip()
+    if len(literal) >= 2 and literal[0] == literal[-1] == '"':
+        return literal[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return literal
+
+
+def _relative(path: Path, workspace) -> str:
+    try:
+        return str(path.relative_to(workspace))
+    except ValueError:
+        return str(path)
+
+
+def built_values(workspace, source: str, bodies: List[str]) -> List[Dict]:
+    """The values a test types through an object it builds, one entry per builder.
+
+    `[{"file", "row": {field: value}}]`. A test that does
+    `new OrderBuilder().withQuantity("2").build()` types the builder's defaults
+    with that one field replaced, and none of it is in a data file. Read from the
+    builder's own source: a field's literal initialiser, and a literal it is given
+    when still unset. A value made up when the test runs is left out, and so is
+    anything a non-literal argument sets.
+
+    An explorer shown the steps without these typed a name with one part
+    missing, and reported the check on it as failing on the new flow.
+    """
+    found: List[Dict] = []
+    seen = set()
+    for body in bodies:
+        for built in _BUILT.finditer(body or ""):
+            name, chain = built.group(1), built.group(2) or ""
+            path = _resolve(name, source, workspace)
+            if path is None or (name, chain) in seen:
+                continue
+            seen.add((name, chain))
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            row = {field: _unquote(value) for field, value in _FIELD_DEFAULT.findall(text)}
+            row.update({assigned: _unquote(value)
+                        for tested, assigned, value in _NULL_DEFAULT.findall(text)
+                        if tested == assigned})
+            for setter, value in _CHAIN_SET.findall(chain):
+                row[setter[:1].lower() + setter[1:]] = _unquote(value)
+            if row:
+                found.append({"file": _relative(path, workspace), "row": row})
+    return found
+
+
+def _parameter_names(source: str, method: str, count: int) -> List[str]:
+    """The names a method gives its parameters, when it declares exactly `count`."""
+    for declared in re.finditer(r"\b" + re.escape(method) + r"\s*\(([^)]*)\)\s*(?:throws[\w\s,.]+)?\{",
+                                source or ""):
+        names = [part.split()[-1] for part in declared.group(1).split(",") if part.split()]
+        if len(names) == count:
+            return names
+    return []
+
+
+def login_values(workspace, source: str, body: str) -> List[Dict]:
+    """What a helper's own login types, for a test that signs in through it.
+
+    `[{"file", "row": {name: value}, "typed_by"}]`. The test calls
+    `shop.login()` and the helper holds the rest: a data row it looks up by a
+    literal key, or values it hands its login page, as literals or read from the
+    framework's properties. Each is named after the parameter it is passed as.
+    Nothing is returned for a value this cannot resolve to text.
+    """
+    from shared import mint_session   # imports this module at load time
+
+    helpers = {var: cls for cls, var, ctor in _HELPER_NEW.findall(body) if cls == ctor}
+    found: List[Dict] = []
+    for receiver, called, raw_args in _CALL.findall(body):
+        if receiver not in helpers or raw_args.strip() \
+                or not any(hint in called.lower() for hint in _LOGIN_HINTS):
+            continue
+        path = _resolve(helpers[receiver], source, workspace)
+        if path is None:
+            continue
+        helper = path.read_text(encoding="utf-8", errors="ignore")
+        inner = method_body(helper, called)
+        typed_by = f"{helpers[receiver]}.{called}()"
+        for read in csv_reads(inner):
+            row = _csv_row(workspace, read)
+            if row:
+                found.append({**row, "typed_by": typed_by})
+        properties = dict(_PROPERTY_READ.findall(inner))
+        values = None
+        for owner, method, raw in _ANY_CALL.findall(inner):
+            args = [a.strip() for a in re.split(r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", raw)
+                    if a.strip()]
+            if not args or not any(hint in method.lower() for hint in _LOGIN_HINTS):
+                continue
+            resolved = []
+            for arg in args:
+                if re.fullmatch(_LITERAL, arg):
+                    resolved.append(_unquote(arg))
+                elif arg in properties:
+                    if values is None:
+                        values = mint_session.read_properties(
+                            mint_session.properties_path(workspace))
+                    resolved.append(values.get(properties[arg], ""))
+                else:
+                    resolved.append("")
+            if not all(resolved):
+                continue
+            declared = re.search(_DECLARED.format(name=re.escape(owner)), helper)
+            owner_path = _resolve(declared.group(1), helper, workspace) if declared else None
+            names = _parameter_names(
+                owner_path.read_text(encoding="utf-8", errors="ignore") if owner_path else "",
+                method, len(resolved))
+            names = names or [f"{method} argument {n}" for n in range(1, len(resolved) + 1)]
+            found.append({"file": _relative(path, workspace),
+                          "row": dict(zip(names, resolved)), "typed_by": typed_by})
+            break
+    return found
+
+
+def test_walk(workspace, test_id: str) -> Dict:
+    """What the test does today, in its own words, and the values it types.
+
+    `{"test", "steps": [...], "data": [{"file", "row": {name: value}}]}`.
+    `steps` is the test's own step log, in call order. `data` is what the test
+    types, from wherever its source keeps it: each row the test method, or a
+    method of its class that it calls, looks up by a literal key; the fields of
+    each object it builds (`built_values`); and what a helper's own login types
+    (`login_values`, marked `typed_by`). Either is empty when the source does not
+    say; nothing is inferred.
 
     An explorer handed neither invents both: it chose its own order for a flow
     the test already spells out, and typed values that left the form invalid.
@@ -387,6 +542,9 @@ def test_walk(workspace, test_id: str) -> Dict:
         row = _csv_row(workspace, read)
         if row:
             result["data"].append(row)
+    live = [text for text in bodies if text]
+    result["data"] += login_values(workspace, source, body)
+    result["data"] += built_values(workspace, source, live)
     return result
 
 
@@ -404,4 +562,6 @@ def describe(entry: Dict) -> str:
     if mode == "credential":
         return (f"credential — {entry['helper'].rsplit('.', 1)[-1]}"
                 f".{entry['method']}({call_args(entry)})")
+    if entry.get("login_call"):
+        return f"no saved session — {entry.get('reason', '')}"
     return f"no login — {entry.get('reason', '')}"

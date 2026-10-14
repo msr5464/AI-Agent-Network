@@ -362,6 +362,20 @@ def _still_declared(selector: str, source: str) -> bool:
     return False
 
 
+def _same_locator(selector: str, failing: str) -> bool:
+    """Whether a selector in the source is the one that failed, or a hop of it.
+
+    Containment, not equality: the runtime reports a locator inside an iframe as
+    one chain and a positional one with its index appended, and the source
+    declares neither that way.
+    """
+    if not selector or not failing:
+        return False
+    left = _normalize_selector(selector) or selector
+    right = _normalize_selector(failing) or failing
+    return left == right or left in right or right in left
+
+
 def assertions_unchanged(original: str, updated: str) -> tuple:
     """A locator fix changes how an element is found, never what is asserted.
 
@@ -400,7 +414,8 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
                            snapshot_soup=None, fingerprints=None,
                            require_unique: bool = False,
                            failing_selector: str = "",
-                           declaring_source: str = "") -> tuple:
+                           declaring_source: str = "",
+                           element_in_capture: bool = True) -> tuple:
     """Reject an edit that does not match what the diagnosis actually found.
 
     Returns (ok, reason). Runs before the test does, so a fix that could only
@@ -422,7 +437,18 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
     when the edit may be to a different file. A selector absent from the file
     being edited has not necessarily been repaired: the edit may simply be aimed
     at another page, and then the capture is still exactly the failure in hand.
+
+    `element_in_capture` is False when the element being repaired is known not to
+    be in the capture: it exists only once something is done to the page, and
+    nothing captured resembles what the last good run recorded. No replacement
+    for it can match a page it has left, so the rules that ask the capture about
+    the replacement stand aside and the test run decides.
     """
+    # The capture as it arrived. Rule 2b reads this one: the rules that ask
+    # whether a REPLACEMENT is present need the capture to be about this failure,
+    # but a selector found resolving in it was resolving, whatever it was taken for.
+    seen_soup, seen_prints = snapshot_soup, fingerprints
+
     # A capture is evidence only for the failure it was captured for. When the
     # selector that failed is no longer in the file, an earlier edit already
     # repaired it and the flow has since moved on to a page this capture never
@@ -433,6 +459,12 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
             and not _still_declared(failing_selector, original)
             and not (declaring_source
                      and _still_declared(failing_selector, declaring_source))):
+        snapshot_soup, fingerprints = None, None
+    # Same principle, the other way it arises: the capture is about this failure
+    # and still cannot hold the element. A message that shows and clears itself is
+    # gone by the time a wait for it gives up, and the right selector for it
+    # "matches nothing" there exactly as a guess would.
+    if not element_in_capture:
         snapshot_soup, fingerprints = None, None
 
     changed = [line for line in difflib.unified_diff(
@@ -456,6 +488,22 @@ def validate_diagnosis_fit(original: str, updated: str, verdict: str,
     ok, reason = no_selector_broadening(original, updated)
     if not ok:
         return False, reason
+
+    # 2b. Never replace a selector that works. One matching exactly one visible
+    #     element in the capture resolved when the test failed, so it is not what
+    #     failed. Replacing it repairs nothing and ships a change to a locator
+    #     nobody reported, with a reason invented to fit: an attempt handed a
+    #     failure that an earlier edit had already repaired rewrote the repaired
+    #     selector, twice, each time explaining what had changed on the page.
+    kept = set(_selectors_in("\n".join(added)))
+    for candidate in _selectors_in("\n".join(removed)):
+        if candidate in kept or _same_locator(candidate, failing_selector):
+            continue
+        if selector_visibility(candidate, seen_soup, seen_prints or {}) == (1, 1):
+            return False, (f"the edit replaces {candidate!r}, which matches exactly one "
+                           f"visible element in the DOM captured at failure — it "
+                           f"resolved when the test failed, so it is not the locator "
+                           f"that broke")
 
     # 3. A genuinely stale locator has a replacement that exists on the page we
     #    were actually on, and that a user could actually have interacted with.

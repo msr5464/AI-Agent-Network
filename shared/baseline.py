@@ -219,6 +219,10 @@ def load(page_object: str, workspace=None, preserved: Optional[str] = None,
         # Empty for baselines written before the framework recorded it.
         "last_seen": data.get("lastSeen") or {},
         "recorded_at": data.get("recordedAt", ""),
+        # Field -> the selector it was found with on that run, as the locator
+        # prints itself. When the source now declares something else, the code
+        # changed and the page may not have.
+        "selectors": data.get("selectors") or {},
     })
     return result
 
@@ -248,6 +252,36 @@ def _is_older(recorded_at: str, not_after: str) -> bool:
     if not recorded or not failed:
         return True
     return recorded < failed
+
+
+def last_matched_earlier(base: Dict, field: str) -> bool:
+    """Whether a locator last matched on a run before the one this record is of.
+
+    False when it matched on this run, which a count of zero does not rule out:
+    the count is taken as the page loads, and a locator the test went on to use
+    is stamped with this run's own time. False as well when either time cannot be
+    read, because the answer decides whether an element was removed from the
+    product and that may not be guessed.
+    """
+    seen = _timestamp(str((base.get("last_seen") or {}).get(field) or ""))
+    recorded = _timestamp(base.get("recorded_at") or "")
+    return bool(seen and recorded and seen < recorded)
+
+
+def appears_after_action(base: Dict, field: str) -> bool:
+    """Whether a locator matched nothing as the page loaded on the last good run,
+    and was used later in that same run.
+
+    That is an element which exists only once something is done to the page: a
+    confirmation message, the contents of an opened menu. True only for a
+    recorded zero and a sighting stamped with the run's own time; a count or a
+    time that cannot be read is not evidence of either.
+    """
+    if (base.get("coverage") or {}).get(field) != 0:
+        return False
+    seen = _timestamp(str((base.get("last_seen") or {}).get(field) or ""))
+    recorded = _timestamp(base.get("recorded_at") or "")
+    return bool(seen and recorded and seen >= recorded)
 
 
 def _class_tokens(value) -> set:

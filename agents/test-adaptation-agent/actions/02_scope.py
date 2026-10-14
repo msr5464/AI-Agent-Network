@@ -272,8 +272,9 @@ def main():
                                for row in verify_rows[:WALK_TESTS])
              if walk["steps"] or walk["data"]]
     for walk in walks:
+        typed = sum(len(row.get("row") or {}) for row in walk["data"])
         log(f"Test walk: {walk['test'].rsplit('.', 1)[-1]} — {len(walk['steps'])} "
-            f"logged step(s), {len(walk['data'])} data row(s)")
+            f"logged step(s), {typed} typed value(s) from {len(walk['data'])} source(s)")
 
     scope = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

@@ -197,6 +197,27 @@ class TestCandidatesFromFingerprints:
         assert "#summary img[alt='PencilSimple']" in selectors
         assert "#education img[alt='PencilSimple']" in selectors
 
+    def test_a_test_id_is_spelled_the_way_the_page_spells_it(self):
+        """The bug this pins: a page that writes `data-test` was shown to the
+        model with `data-testid`, an attribute it has nowhere, and a suggested
+        selector that matched nothing. The model answered with it, and an attempt
+        went on an edit the guard then rejected as a guess."""
+        price = {"tag": "span", "testid": "unit-price", "attrs": {"data-test": "unit-price"},
+                 "is_visible": True, "is_interactive": False, "area_norm": 0.001,
+                 "text": "14.15", "ancestor_chain": []}
+        top = self._build(prints={"elements": [price]}, failed="[data-test='unit-old']")[
+            "likely_matches"][0]
+        assert top["suggested_selector"] == "[data-test='unit-price']"
+        assert top["data-test"] == "unit-price" and "data-testid" not in top
+
+    def test_a_test_id_with_no_recorded_spelling_keeps_the_common_one(self):
+        price = {"tag": "span", "testid": "unit-price", "is_visible": True,
+                 "is_interactive": False, "area_norm": 0.001, "text": "14.15",
+                 "ancestor_chain": []}
+        top = self._build(prints={"elements": [price]}, failed="[data-test='unit-old']")[
+            "likely_matches"][0]
+        assert top["suggested_selector"] == "[data-testid='unit-price']"
+
     def test_suggestions_quote_like_the_emitter(self):
         """The model copies these into a Java string, where double quotes arrive
         escaped. Single quotes, unless the value itself holds one."""

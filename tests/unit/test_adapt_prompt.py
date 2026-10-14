@@ -128,6 +128,77 @@ def test_a_verify_failure_that_is_only_rendering_is_named(tmp_path, monkeypatch)
          "actual": "User_x sample_last_name", "relation": "words"}]
 
 
+def _prompt(adapt, tmp_path, kind, flow=None):
+    return adapt.build_adapt_prompt(
+        {"index": 1, "kind": kind, "text": 'Pick "B" instead of "A".'}, {"type": "web"},
+        {"edit_candidates": [], "tiers": {"named": []}},
+        flow or {"steps": [], "pages": {}}, tmp_path, rules="", retry_note="")
+
+
+def test_the_flow_map_carries_the_selector_an_edit_is_transcribed_from(tmp_path, monkeypatch):
+    """Shown the control's label alone, the model had nothing to write a new
+    control's locator from but its own guess."""
+    adapt = _load_adapt(tmp_path, monkeypatch)
+    step = {"index": 4, "page": {"id": "list"}, "result": {"outcome": "ok"},
+            "selector_check": {"unique": True},
+            "action": {"verb": "click", "value": None, "target": {
+                "name": "removeSelectedButton", "accessible_name": "Remove Selected",
+                "selector": "button.danger.wide"}}}
+    prompt = _prompt(adapt, tmp_path, "step_insert", {"steps": [step], "pages": {}})
+    table = prompt.split("## 🔎 FLOW MAP", 1)[1].split("## 📜", 1)[0]
+    assert "| Name | Selector | Value |" in table
+    assert "removeSelectedButton | `button.danger.wide` |" in table
+    assert "counted on exactly one visible element" in table
+
+
+def test_a_test_data_item_is_told_what_it_may_do_to_a_check(tmp_path, monkeypatch):
+    adapt = _load_adapt(tmp_path, monkeypatch)
+    allowed = _prompt(adapt, tmp_path, "test_data")
+    assert "may be `change`d to the new value" in allowed
+    assert "to a value this item itself states" in allowed
+    assert "It may not remove or relax a check" in allowed
+    refused = _prompt(adapt, tmp_path, "step_insert")
+    assert "it may not remove or change any check listed here" in refused
+
+
+def test_the_rules_say_where_a_new_locator_comes_from(tmp_path, monkeypatch):
+    rules = _load_adapt(tmp_path, monkeypatch).load_adapt_rules()
+    assert "is that row's **Selector**, exactly as\nlisted" in rules
+    assert "In a `test_data` item only `change` is accepted" in rules
+
+
+def test_locators_in_the_frameworks_own_syntax_are_counted_and_inline_ones_marked(
+        tmp_path, monkeypatch):
+    """Reduced to plain CSS first, most of a page object written with text
+    selectors had nothing left to count, and what was counted stood for all of it."""
+    monkeypatch.setenv("AUDIT_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    is_lib = lambda n: n == "lib" or n.startswith("lib.")
+    for name in [n for n in sys.modules if is_lib(n)]:
+        monkeypatch.delitem(sys.modules, name)
+    spec = importlib.util.spec_from_file_location(
+        "explore_03_syntax", ROOT / "agents/test-adaptation-agent/actions/03_explore_web.py")
+    explore = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(explore)
+    for name in [n for n in sys.modules if is_lib(n)]:
+        del sys.modules[name]
+    source = ('public class MemberPage extends BasePage {\n'
+              '  private final Locator status;\n'
+              '  public MemberPage(Config config) {\n'
+              '    status = page.locator("div.group:has(label:has-text(\'Status\')) .select");\n'
+              '  }\n'
+              '  void closeCalendar() { dismiss(page.locator("div.calendar")); }\n'
+              '  Locator option(String v) { return page.locator("span:text-is(\'" + v + "\')"); }\n'
+              '}\n')
+    known = {k["name"]: k for k in explore.known_locators(
+        [{"path": "src/web/MemberPage.java", "snippet": source}])}
+    assert known["status"]["selector"] == "div.group:has(label:has-text('Status')) .select"
+    assert "inline" not in known["status"]
+    assert known["div.calendar"]["inline"] is True, "no field declares it"
+    assert not any("text-is" in k["selector"] for k in known.values()), (
+        "one assembled when the test runs is still left out")
+
+
 def test_the_explorer_counts_the_page_objects_exact_locators(tmp_path, monkeypatch):
     """Every exact locator of every page object in scope is handed to the browser
     helpers to count live; one assembled at runtime is left out, because counting

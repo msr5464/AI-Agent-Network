@@ -259,3 +259,154 @@ class TestWalk:
         assert entry_path.source_candidates(WALK_ID) == [
             "src/test/java/automation/shop/ShopWebTest.java",
             "src/main/java/automation/shop/ShopWebTest.java"]
+
+
+# ── A test that signs in through its helper and types what a builder holds ────
+
+PORTAL_TEST = """
+package automation.portal;
+import automation.modules.portal.PortalBuilder;
+import automation.modules.portal.PortalData;
+import automation.modules.portal.PortalHelper;
+public class PortalWebTest extends TestBase {
+    public void addMember(Config config) {
+        PortalHelper portal = new PortalHelper(config);
+        PortalData member = new PortalBuilder().withCity("Pune").build();
+        config.logStep("Sign in to the portal and validate the dashboard is shown");
+        portal.dashboardPage = portal.login();
+        config.logStep("Add the member and validate the name is shown");
+        portal.addMember(member);
+    }
+}
+"""
+
+PORTAL_HELPER = """
+package automation.modules.portal;
+import automation.modules.portal.web.SignInPage;
+public class PortalHelper extends ApiHelper {
+    public SignInPage signInPage;
+    public DashboardPage login() {
+        BrowserHelper.navigateTo(config, config.getRunTimeProperty("portal.url"));
+        signInPage = new SignInPage(config);
+        dashboardPage = signInPage.login("admin", "s3cret, x");
+        return dashboardPage;
+    }
+}
+"""
+
+SIGN_IN_PAGE = """
+package automation.modules.portal.web;
+public class SignInPage extends BasePage {
+    public DashboardPage login(String username, String password) {
+        fillText(usernameField, username, "Username");
+        return new DashboardPage(config);
+    }
+}
+"""
+
+PORTAL_BUILDER = """
+package automation.modules.portal;
+public class PortalBuilder {
+    private String firstName;
+    private String city;
+    private String tier = "Standard";
+    private String memberId;
+    public PortalBuilder withCity(String city) { this.city = city; return this; }
+    public PortalBuilder withDefaults() {
+        if (firstName == null) firstName = "Asha";
+        if (city == null) city = "Delhi";
+        if (memberId == null) memberId = "M_" + DataGenerator.randomAlphaString(5);
+        return this;
+    }
+    public PortalData build() {
+        withDefaults();
+        return new PortalData();
+    }
+}
+"""
+
+PORTAL_ID = "automation.portal.PortalWebTest#addMember"
+
+
+@pytest.fixture
+def portal(tmp_path):
+    _write(tmp_path, "src/test/java/automation/portal/PortalWebTest.java", PORTAL_TEST)
+    _write(tmp_path, "src/main/java/automation/modules/portal/PortalHelper.java", PORTAL_HELPER)
+    _write(tmp_path, "src/main/java/automation/modules/portal/web/SignInPage.java",
+           SIGN_IN_PAGE)
+    _write(tmp_path, "src/main/java/automation/modules/portal/PortalBuilder.java",
+           PORTAL_BUILDER)
+    return tmp_path
+
+
+def test_a_login_the_helper_holds_itself_is_still_a_sign_in(portal):
+    # Read as "never signs in", its explorer was sent to a login form with nothing
+    # to type and told the flow had no login in it.
+    entry = entry_path.extract(portal, PORTAL_ID)
+    assert entry["mode"] == "none", "there is no session to load and none to mint"
+    assert entry["login_call"] == "login"
+    assert "signs in through login()" in entry["reason"]
+    assert "never signs in" not in entry["reason"]
+
+
+def test_what_the_helpers_login_types_is_read_with_the_names_it_is_passed_as(portal):
+    walk = entry_path.test_walk(portal, PORTAL_ID)
+    signed = [row for row in walk["data"] if row.get("typed_by")]
+    assert signed == [{"file": "src/main/java/automation/modules/portal/PortalHelper.java",
+                       "row": {"username": "admin", "password": "s3cret, x"},
+                       "typed_by": "PortalHelper.login()"}]
+
+
+def test_a_login_read_from_the_frameworks_properties_is_resolved(portal, monkeypatch):
+    for name in ("ADAPT_ENVIRONMENT", "ADAPT_COUNTRY"):
+        monkeypatch.delenv(name, raising=False)
+    _write(portal, "src/main/java/automation/modules/portal/PortalHelper.java",
+           PORTAL_HELPER.replace(
+               'dashboardPage = signInPage.login("admin", "s3cret, x");',
+               'String user = config.getRunTimeProperty("portal.username");\n'
+               '        String pass = config.getRunTimeProperty("portal.password");\n'
+               '        dashboardPage = signInPage.login(user, pass);'))
+    _write(portal, "parameters/staging-sg.properties",
+           "portal.username=asha\nportal.password=pw-1\n")
+    signed = [row["row"] for row in entry_path.test_walk(portal, PORTAL_ID)["data"]
+              if row.get("typed_by")]
+    assert signed == [{"username": "asha", "password": "pw-1"}]
+
+
+def test_a_login_value_that_cannot_be_resolved_is_left_out(portal):
+    _write(portal, "src/main/java/automation/modules/portal/PortalHelper.java",
+           PORTAL_HELPER.replace('"s3cret, x"', "vault.secret()"))
+    assert [row for row in entry_path.test_walk(portal, PORTAL_ID)["data"]
+            if row.get("typed_by")] == []
+
+
+def test_the_fields_of_an_object_the_test_builds_are_its_values(portal):
+    # Shown the steps without these, an explorer typed a name with one part
+    # missing and reported the check on it as failing on the new flow.
+    built = [row for row in entry_path.test_walk(portal, PORTAL_ID)["data"]
+             if not row.get("typed_by")]
+    assert built == [{"file": "src/main/java/automation/modules/portal/PortalBuilder.java",
+                      "row": {"tier": "Standard", "firstName": "Asha", "city": "Pune"}}], (
+        "a literal default, a literal given when unset, and the test's own override; "
+        "nothing for a value made up when the test runs")
+
+
+def test_a_test_that_builds_nothing_and_signs_in_nowhere_reads_as_before(tmp_path):
+    _write(tmp_path, "src/test/java/automation/portal/PlainTest.java", """
+package automation.portal;
+public class PlainTest extends TestBase {
+    public void opens(Config config) {
+        config.logStep("Open the home page");
+        HomePage home = new HomePage(config);
+    }
+}
+""")
+    walk = entry_path.test_walk(tmp_path, "automation.portal.PlainTest#opens")
+    assert walk["steps"] == ["Open the home page"] and walk["data"] == []
+    entry = entry_path.extract(tmp_path, "automation.portal.PlainTest#opens")
+    assert "never signs in" in entry["reason"] and "login_call" not in entry
+
+
+def test_a_sign_in_through_the_helper_is_not_described_as_no_login(portal):
+    described = entry_path.describe(entry_path.extract(portal, PORTAL_ID))
+    assert described.startswith("no saved session — the test signs in through login()")

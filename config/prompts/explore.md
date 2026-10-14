@@ -34,7 +34,9 @@ change note says changes. The note says what is different; the test's steps say
 everything else, including when in the flow each thing happens.
 
 When the prompt lists **the values the test types**, type those values exactly, and
-never substitute your own for one that is listed. A value written `{like:this}` is
+never substitute your own for one that is listed. The one exception is a value the
+change note replaces: where the note gives a new value for a field, the new value is
+the change you are walking, so type that. A value written `{like:this}` is
 generated when the test runs, so type any value of that shape. Where a field the
 flow needs has no listed value, keep the page's own default or type a plainly valid
 one, and report what you typed in the step's `value`.
@@ -42,16 +44,37 @@ one, and report what you typed in the step's `value`.
 Every page this browser opens has helpers preloaded; use them instead of writing
 inspection code or taking snapshots.
 
-Each step is ONE `browser_run_code_unsafe` call:
+Each step is ONE `browser_run_code_unsafe` call, and the action is written as what
+it does to which selector:
 
 ```
-async (page) => page.qa.step(() => page.locator('#login-button').click(),
-                             { page: 'products', scope: 'main' })
+async (page) => page.qa.step({ click: '#login-button' }, { page: 'products', scope: 'main' })
+async (page) => page.qa.step({ fill: "input[name='q']", value: 'shoes' }, { page: 'search' })
 ```
 
-It performs the action, waits until every frame has stopped changing (never add
-sleeps), and returns what is on the page: every visible control with its best
-stable selector and how many elements that selector matches, already counted.
+It counts the selector, performs the action, waits until every frame has stopped
+changing (never add sleeps), and returns what is on the page: every visible control
+with its best stable selector and how many elements that selector matches, already
+counted. `used` in the result is the count of the selector you passed, taken the
+moment before it was used.
+
+- The verbs are `click`, `fill`, `select`, `check`, `uncheck`, `hover` and `press`;
+  `fill`, `select` and `press` take a `value`. **The selector you pass is the
+  selector you report in that step's `FLOW_STEP`**, unchanged: it is the one that
+  was counted and the one that worked. A step reported under any other spelling is
+  unverified, and an unverified step can justify no test edit.
+- Several fields of one form go in one call as a list, in order —
+  `page.qa.step([{ fill: '<a>', value: '…' }, { fill: '<b>', value: '…' }], { page })`
+  — and each is still its own `FLOW_STEP`. A call that only fills returns no
+  harvest, since typing changes no control; pass `harvest: true` to get one. For
+  any other call pass `harvest: false` when you already have the page's controls
+  and only need the action done.
+- Only when no verb fits (a drag, a key chord, a file upload) pass a function,
+  `page.qa.step(() => …, { page, before: { name: '<selector>' } })`, with the
+  control's selector in `before` so that it is counted.
+- Never act on the page outside these calls. A click or a keystroke made with your
+  own `page.locator(…)` is recorded by the browser and belongs to no step: nothing
+  counts its selector, and the change it was part of cannot be adapted.
 
 - `page` is the id of the page the step LANDS on — the same id you use in
   `PAGE_ENTER` and `FLOW_STEP`. It is how what the helpers measure is filed:
@@ -65,13 +88,20 @@ stable selector and how many elements that selector matches, already counted.
   redirect notice — is a page too, and the only call that can measure it is the one
   that records it (see "Frames and brief screens"). Name it there, as a third
   argument: `page.qa.record(action, ms, { page: '<pageId>' })`, and use that id in
-  its `PAGE_ENTER` and in the `FLOW_STEP` of the action that shows it. Recorded
+  its `PAGE_ENTER` and in the `FLOW_STEP` of the action that shows it. The action
+  is written as on a step, so its selector is counted too:
+  `page.qa.record({ click: '<selector>' }, 8000, { page: '<pageId>' })`, with an
+  element inside an iframe named by its whole chain. Recorded
   without a name it has no inventory, and the whole walk has to be done again. For
   a toast or message shown on the page you are already on, pass that page's id.
   When the recording ends, the browser is on whatever page that screen led to, and
   that page has **not** been measured: the recording files only what came and went.
   Before you report anything on it, measure it with
   `page.qa.step(null, { page: '<pageId>' })`.
+- A harvest lists the first 60 elements of the page. A frame that comes back with
+  `unlisted: <n>` had that many more: a control you cannot find in the list was
+  left out, not missing. Ask again with a `scope` for the section it is in before
+  you act on it, and never write a selector of your own for it instead.
 - `scope` narrows the returned harvest to a section, in CSS or Playwright syntax.
   A field with no unique selector of its own comes back anchored on the text
   beside it (`tr:has-text('Name') input`), already counted. Inside an iframe name the
@@ -93,15 +123,32 @@ undefined, say `QA_HELPERS_MISSING` once and fall back to your own code, emittin
 full `PAGE_STATE` markers as below.
 
 After every page transition emit a `PAGE_ENTER`, and emit a `FLOW_STEP` for every
-action you take, including the ones that fail. Emit each marker **the moment you
-have it**. Never batch them to the end: the run has a wall-clock budget, and if it
-is hit only markers already printed survive.
+action you take, including the ones that fail. Every control you act on is a step of
+its own: each field you fill, each option you pick, each box you tick, and above all
+every control the change note adds or changes. A form reported as its Save button
+alone leaves the fields the note is about with nothing to adapt them from. Emit each
+marker **the moment you have it**. Never batch them to the end: the run has a
+wall-clock budget, and if it is hit only markers already printed survive.
 
 ### 2. Selectors
 
 Prefer, in order: a test id (`[data-cy]`/`[data-testid]`/`[data-test]`) > `id` >
-`name` > a short CSS path. Never use a positional XPath. The harvest already gives
-each element's best stable selector; use it, or narrow it and `check` the result.
+`name` > a short CSS path. Never use a positional XPath, and never a class that
+names a passing state (`--focus`, `is-active`, `selected`): it stops matching when
+the state does. The harvest already gives each element's best stable selector; use
+it, or narrow it and `check` the result. A field with nothing of its own to select
+by comes back anchored on its label (`div.field:has-text('Name') input`), and a
+control that only its section tells apart on the section
+(`form:has-text('Billing address') button[type='submit']`).
+
+**Never pick one of several matches by position** — `>> nth=`, `.nth()`,
+`.first()`, `:nth-match()`. A selector that needs a position matches several
+elements, which one it picks changes with the page, and a step reported under one
+is not verified. When a selector matches several, tell them apart by what encloses
+each or by the text beside it. When the prompt lists **the locators the tests use
+today**, a step the test already makes acts through the test's own locator for
+that control: it is the one the test's checks depend on, and it is what tells two
+controls with the same label apart.
 
 You no longer type inventories or counts: `PAGE_STATE` is optional, and a
 `FLOW_STEP`'s `match_count` is re-measured in Python from what the helpers counted

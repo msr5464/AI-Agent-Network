@@ -63,7 +63,7 @@ CACHE_STEPS="${CACHE_STEPS:-true}"
 # Bumped whenever what steps 01-03 write changes shape. A hit from before the
 # bump would restore a plan whose kinds mean something else now, and an
 # exploration that was never asked about the tests' checks.
-CACHE_VERSION=2
+CACHE_VERSION=3
 # What the exploration was allowed to do. One made without the sandbox assertion
 # stops at the first control the checker flags by name; restored after the
 # assertion is turned on, it reports the same refusal and the switch seems to do
@@ -320,7 +320,7 @@ if [[ "$START_FROM_STEP" -le 4 ]]; then
     [[ -f "$AUDIT_DIR/.fix-passed" ]] && ADAPT_RESULT=$(tr -d '\n' < "$AUDIT_DIR/.fix-passed")
     if [[ "$ADAPT_RESULT" == "true" || "$ADAPT_RESULT" == "skipped" ]]; then break; fi
     if [[ "$ADAPT_ATTEMPT" -ge "$ADAPTATION_RETRY_COUNT" ]]; then
-      log "Still failing after $ADAPT_ATTEMPT attempt(s) — shipping for review"
+      log "No verified change after $ADAPT_ATTEMPT attempt(s) — shipping what there is for review"
       break
     fi
     ADAPT_ATTEMPT=$((ADAPT_ATTEMPT + 1))

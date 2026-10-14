@@ -1384,7 +1384,7 @@ def locate_route(outcome: dict) -> tuple:
     classification = outcome.get("classification") or ""
     if verdict == "HEALED":
         return "consume", (f"Locate proved {outcome.get('new_locator')!r} "
-                           f"({outcome.get('strategy')}, score {outcome.get('score')}, "
+                           f"({located_basis(outcome)}, "
                            f"verification {outcome.get('verification')})")
     for name, why in _LOCATE_DEFER.items():
         if name in (verdict, classification):
@@ -1393,6 +1393,13 @@ def locate_route(outcome: dict) -> tuple:
                              if name == "ASSERTION_LOCATOR" else why)
     return "own", (outcome.get("reason")
                    or f"Locate returned {verdict or classification or 'nothing'}")
+
+
+def located_basis(resolution: dict) -> str:
+    """What a located answer rests on, in a few words."""
+    if resolution.get("tier") == "T0_recorded":
+        return "the selector the last passing run used"
+    return f"{resolution.get('strategy')}, score {resolution.get('score')}"
 
 
 def locate_resolution(ctx: dict):
@@ -1454,16 +1461,42 @@ def build_located_fix(resolution: dict, ctx: dict, workspace: Path):
     if not edits:
         return None, error
 
-    return {
-        "fixable": True,
-        "target_file": str(target),
-        "edits": edits,
-        "fix_description": (
+    if resolution.get("tier") == "T0_recorded":
+        description = (
+            f"Located deterministically: {resolution['failed_selector']} no longer "
+            f"matches, and it is not what the last passing run used. Restored the "
+            f"selector that run found this element with; it is "
+            f"{resolution.get('verification')}.")
+    else:
+        description = (
             f"Located deterministically: {resolution['failed_selector']} no longer "
             f"matches. Scored {resolution.get('score')} against the fingerprint "
             f"recorded on the last good run (margin {resolution.get('margin'):+}, "
             f"{resolution.get('tier')}), and the new selector is "
-            f"{resolution.get('verification')}. This run is what verifies it."),
+            f"{resolution.get('verification')}. This run is what verifies it.")
+
+    # The page's other locators that went missing with this one. Same file, same
+    # run to prove them: a locator on this page that the test reaches later would
+    # otherwise cost a whole attempt to find out what the capture already shows.
+    also = []
+    for sibling in resolution.get("siblings") or []:
+        if sibling.get("page_object") != page_object:
+            continue
+        more, _error = locator_patch.edits_for(source, sibling.get("field") or "",
+                                               sibling.get("new_expression") or "")
+        if more:
+            edits += [edit for edit in more if edit not in edits]
+            also.append(sibling)
+    if also:
+        description += (" Also repaired on this page, from the same capture: "
+                        + "; ".join(f"{s['field']} → {s['new_locator']}" for s in also) + ".")
+
+    return {
+        "fixable": True,
+        "target_file": str(target),
+        "edits": edits,
+        "fix_description": description,
+        "siblings": also,
     }, ""
 
 
@@ -1483,11 +1516,12 @@ def _refresh_baseline_after_heal(ctx: dict, workspace: Path) -> None:
                                  module=baseline.module_of(ctx.get("test_name", "")))
         if not path:
             return
-        locator_patch.update_baseline(
-            path, located["field"], located.get("new_locator", ""),
-            fingerprint={}, score=located.get("score", 0.0),
-            source_expression=located.get("new_expression", ""))
-        log(f"  Baseline history updated for {located['page_object']}#{located['field']}")
+        for healed in [located] + list(ctx.get("located_siblings") or []):
+            locator_patch.update_baseline(
+                path, healed["field"], healed.get("new_locator", ""),
+                fingerprint={}, score=healed.get("score") or 0.0,
+                source_expression=healed.get("new_expression", ""))
+            log(f"  Baseline history updated for {healed['page_object']}#{healed['field']}")
     except Exception as exc:                       # noqa: BLE001 - advisory only
         log(f"  Could not update the baseline ({type(exc).__name__}) — "
             f"the next green run will re-record it")
@@ -1596,7 +1630,47 @@ def carried_issue_note(test_name: str, status: str, issue: dict) -> str:
     if status == "test_failed":
         return (f"{short}: the previous edit was reverted — trying "
                 f"{target or 'the same failure'} again")
+    if status in _REJECTED_UNRUN:
+        return (f"{short}: the previous edit was rejected before any test ran — "
+                f"still working on {target or 'the same failure'}")
     return ""
+
+
+def carry_current_issues(failed_fixes: list, working_on: list) -> None:
+    """Give every test still failing the failure it was last seen on.
+
+    The next attempt starts from `next_issue`. A record written after a
+    verification run has one. A record written without a run did not: a guard's
+    rejection, a refusal, a model response nothing could be read from. The next
+    attempt then read the ORIGINAL handoff instead, and asked the model to repair
+    a locator this session had fixed several attempts earlier, which it did, by
+    rewriting a selector that worked.
+
+    Nothing ran, so nothing changed: the failure the attempt was working on is
+    still the failure.
+    """
+    current = {issue.get("test_name"): issue for issue in working_on}
+    for entry in failed_fixes:
+        if not entry.get("next_issue") and entry.get("test_name") in current:
+            entry["next_issue"] = current[entry["test_name"]]
+
+
+# Outcomes that say nothing was attempted on the element itself.
+_NOT_AN_ATTEMPT = ("", "advanced", "deferred")
+
+
+def tried_before(ctx: dict) -> bool:
+    """Whether an earlier attempt already worked on this element and left it failing.
+
+    The attempt number cannot say. A chain of broken locators is repaired one per
+    attempt, so every link after the first arrives on a later attempt having never
+    been tried, and "second attempt onwards" parked a browser for each of them: a
+    whole extra test run to inspect a page the failure capture already describes.
+    """
+    outcome = ctx.get("prev_outcome") or {}
+    if (outcome.get("status") or "") in _NOT_AN_ATTEMPT:
+        return False
+    return (outcome.get("failed_selector") or "") == (ctx.get("failed_selector") or "")
 
 
 def reusable_inspection(ctx: dict) -> dict:
@@ -1737,6 +1811,15 @@ What it already tried, so you do not repeat it:
 Literal repair of the old selector, identity attributes, role + accessible name
 and anchoring to a surviving ancestor have all been ruled out. A different
 strategy is needed — the evidence below, not another variation on the string.
+"""
+        if outcome.get("absent_from_capture"):
+            # Otherwise the model reads "not in the snapshot" as "removed from the
+            # product", or picks a replacement from a page the element has left.
+            locate_text += f"""
+**The element is not in the DOM captured at failure, and that is expected:**
+{outcome['absent_from_capture']}. Do not look for its replacement in the snapshot
+and do not report it as removed. The fingerprint recorded for it on the last good
+run is in the page object's baseline file; the test run will judge your answer.
 """
 
     # Observed DOM outranks everything else in this prompt: the source below is
@@ -2660,11 +2743,15 @@ def main():
             fix_json, why = build_located_fix(located, ctx, workspace)
             if fix_json:
                 ctx["located"] = located
+                ctx["located_siblings"] = fix_json.get("siblings") or []
                 ctx["dom_findings"] = {
                     "status": "not needed — Locate resolved this from the failure capture",
                     "selectors": {}, "page_dump": "", "absent": [], "raw": ""}
-                log(f"  Located deterministically: {located.get('strategy')} "
-                    f"score {located.get('score')} — no model call, no DOM inspection")
+                log(f"  Located deterministically: {located_basis(located)} — "
+                    f"no model call, no DOM inspection")
+                for sibling in ctx["located_siblings"]:
+                    log(f"  Also repairing {sibling.get('locator_id')}, missing from "
+                        f"this page since its last good run: {sibling.get('new_locator')}")
                 if located.get("assertion_site"):
                     ctx["assertion_site"] = located["assertion_site"]
                     log(f"  Read by an assertion: {located['assertion_site']} — the "
@@ -2681,8 +2768,8 @@ def main():
             #   3. re-opening the page in a browser — URL-addressable pages only;
             #   4. none of the above: the prompt says so and Claude infers.
             # A browser someone already parked (a developer ran with -DrepairMode=true)
-            # always wins. Otherwise the agent parks one itself, but only from the
-            # second attempt on — see park_browser_for_repair for why.
+            # always wins. Otherwise the agent parks one itself, but only once an
+            # attempt on THIS element has failed — see park_browser_for_repair for why.
             failure_url = issue.get("failure_url", "") or ctx.get("page_url", "")
             reused = reusable_inspection(ctx) if INSPECT_DOM else {}
             if reused:
@@ -2692,7 +2779,7 @@ def main():
                               if INSPECT_DOM and not reused else {})
             if not repair_session and INSPECT_DOM and not reused:
                 explicit = os.environ.get("REPAIR", "").lower() == "true"
-                if explicit or FIX_ATTEMPT > 1:
+                if explicit or tried_before(ctx):
                     repair_session = park_browser_for_repair(workspace, test_name,
                                                              failure_url)
 
@@ -2813,12 +2900,17 @@ def main():
             # also applies when the diagnosis abstained: the asymmetry is that a
             # blocked fix is visible and retryable, while a weakened assertion
             # ships a permanently green broken test. FORCE is the way past it.
+            absent = (ctx.get("locate_outcome") or {}).get("absent_from_capture") or ""
+            if absent:
+                log(f"  The replacement is not judged against the failure capture: "
+                    f"{absent}. The test run decides.")
             valid, invalid_reason = validate_diagnosis_fit(
                 target_original, fixed_content,
                 (ctx.get("diagnosis") or {}).get("verdict", ""), snapshot_soup,
                 snapshot_prints, require_unique=acted_on,
                 failing_selector=ctx.get("failed_selector") or "",
-                declaring_source=page_object_sources(ctx, workspace))
+                declaring_source=page_object_sources(ctx, workspace),
+                element_in_capture=not absent)
         if valid:
             # Not waived by FORCE. Overriding a diagnosis is a decision about
             # which locator to edit; it is never licence to change what is checked.
@@ -2997,6 +3089,8 @@ def main():
                                  "fix_description": fix_description, "fix_diff": fix_diff,
                                  "test_passed": False, "test_output": member_output[-2000:]})
 
+    carry_current_issues(failed_fixes, eligible)
+
     # Merge in anything earlier attempts already committed, so a later attempt
     # never reports a landed fix as missing.
     def merge(current: list, carried: list) -> list:
@@ -3054,6 +3148,14 @@ def main():
             log(blocked(f"commit failed ({(err or out).strip()[:120]})",
                         "no PR will be raised; edits remain in the working tree",
                         f"git -C {workspace} status"))
+
+    # An attempt that applied nothing still stands on what earlier attempts kept:
+    # those are commits on this branch. Unnamed here, Ship has nothing to push
+    # and they are left in a worktree that is about to be removed.
+    if pr_branch is None and on_branch and any(
+            entry.get("status") == "advanced"
+            for attempt in prev_history for entry in attempt.get("entries") or []):
+        pr_branch = branch_name
 
     # Gate
     _stop_statuses = {v.lower() for v in diagnosis.STOP}

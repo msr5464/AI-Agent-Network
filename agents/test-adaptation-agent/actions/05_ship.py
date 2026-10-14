@@ -65,6 +65,10 @@ SLACK_NOTIFY = os.environ.get("SLACK_NOTIFY_CHANNEL", "")
 SLACK_ALERT = os.environ.get("SLACK_ALERT_CHANNEL", "") or SLACK_NOTIFY
 
 # Skip reasons that mean a person has to look at this, not that nothing happened.
+# An item's edit is in the branch: applied (wholly or with tests still failing),
+# or done by another item's edit.
+LANDED = ("applied", "partial", "covered")
+
 ESCALATING = ("escalate", "unsafe", "no-session", "unreachable", "stuck")
 
 
@@ -247,7 +251,10 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
         "| **Agent** | `test-adaptation-agent` |",
         f"| **Target** | `{MODULE}` |",
         "| **Status** | `⚠️ Needs Review` |",
-        f"| **Items Adapted** | `{len(items)}` |",
+        # Of how many: counted as the note's items, a run that declined all three
+        # of its items reported three adapted.
+        f"| **Items Adapted** | `{sum(1 for i in items if i.get('status') in LANDED)}"
+        f" of {len(items)}` |",
         f"| **Tests Verified** | `{len(verified)}` |",
         f"| **Session ID** | `{SESSION_ID}` |",
         "",
@@ -260,7 +267,9 @@ def build_body(plan: dict, scope: dict, explore: dict, adapt: dict,
         "```",
         "</details>",
         "",
-        "### 🛠️ Changes Applied",
+        "### 🛠️ Changes Applied" if statuses & {"applied", "partial"}
+        else "### 🛠️ Changes Proposed" if "proposed" in statuses
+        else "### 🔎 What Was Observed",
         "",
     ]
     if flow.get("steps"):

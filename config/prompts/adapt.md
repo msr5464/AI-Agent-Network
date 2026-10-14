@@ -32,6 +32,11 @@ says so, and only as you declare.
   `coverage_changed` may remove or change a check — but only one you list in
   `check_changes`, by its id, with the reason. Everything you do not list must stay
   exactly as it is.
+- `test_data` has one narrow allowance: where the item replaces a value the test
+  types, a check that reads that same value back may be `change`d to the new value.
+  Only its expected value, only to a value the item itself states, only when the
+  explorer's report beside the check shows the page displaying it, and only as
+  declared in `check_changes`. It may not `remove` or `relax` a check.
 - `coverage_added` and `coverage_changed` are the cases where nothing in the product
   changed: the team wants the test to do more, or to do something differently.
 - Adding a check is always allowed. Moving one to another method, or rewording its
@@ -68,6 +73,13 @@ reached, you cannot add it — say so instead.
 A flow-map step whose selector could not be verified unique justifies nothing.
 `unique: unverified` is not `unique: yes`; treat it as absent.
 
+A locator you add for a step's control is that row's **Selector**, exactly as
+listed, written the way the page objects in this repo write theirs, and named after
+the row's **Name**. It was counted on the live page on exactly one visible element
+at the moment the step used it; a selector of your own was counted by nothing. The
+same goes for a value: what a new step types is the row's **Value**, or the value
+the change note states.
+
 ### What you may and may not do
 
 You may: change a locator; change the wrapper call when the control type changed
@@ -99,7 +111,8 @@ the old signature, or an optional data field instead.
 Return `adaptable: false` and say why, when:
 
 - the note says a check must change, but your item's kind does not allow it — say
-  that the note needs a separate item for the changed expectation;
+  that the note needs a separate item for the changed expectation. A `test_data`
+  item moving a check to the new value it states is allowed, as above;
 - exploration never reached the part of the flow the item describes;
 - the browser saw something other than what the note claims;
 - making the test pass would require weakening what it checks;
@@ -156,6 +169,8 @@ Rules for `check_changes`:
 - `new_expected` only for `change`: the full list of the check's expected values
   after your edit, in the order the check has them, without quotes. A check that
   expects `"1"` and becomes `"2"` is `["2"]`. Omit it for `remove`.
+- In a `test_data` item only `change` is accepted, and every value it changes must
+  be one the item's own text states.
 - A check listed as **expects no expected value** compares expressions, not a
   literal, so it cannot be `change`d. Replacing it with a different assertion — a
   "total decreases" comparison that becomes an equality — is a `remove`; the

@@ -122,6 +122,23 @@ class TestElementGone:
         assert verdict["verdict"] == "LOCATOR_STALE"
         assert verdict["actionable"] is True
 
+    def test_an_element_that_appears_after_an_action_was_not_removed(self, tmp_path):
+        """The bug this pins: a confirmation message that only shows once a button
+        is clicked counts as zero when the page loads, on every run. The passing
+        run used it all the same, and stamped it as seen at that run's own time.
+        Read without the time, zero-and-once-seen said the element had been taken
+        off the page, and a renamed selector was sent to the team instead of fixed.
+        """
+        verdict, _ = _setup(
+            tmp_path, fx.DASHBOARD_RENAMED, _page_objects(),
+            context=fx.context(coverage=self.RIGHT_PAGE),
+            baseline=fx.baseline_record(
+                coverage={"userMenu": 1, "avatarWidget": 0},
+                last_seen={"userMenu": "2026-08-01T00:00:00",
+                           "avatarWidget": "2026-08-01T00:00:00"}))
+        assert verdict["verdict"] == "LOCATOR_STALE"
+        assert verdict["actionable"] is True
+
     def test_a_baseline_older_than_lastseen_abstains(self, tmp_path):
         """Baselines written before the framework recorded `lastSeen` cannot tell
         removal from a selector that never worked, so the verdict that stops a

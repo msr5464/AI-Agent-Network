@@ -13,6 +13,7 @@ between verdicts is always the DOM, never the code being repaired.
 
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,39 @@ class TestLocatorStale:
         verdict, _ = _diagnose(fx.DASHBOARD_OK, tmp_path,
                                failed_selector="img[class*='avatar'] >> nth=0")
         assert verdict["verdict"] != "WRONG_PAGE"
+
+
+class TestRejectedSession:
+    """The bug this pins: a renamed locator on a page that needs no sign-in was
+    reported as a rejected session, and the run stopped before any fix.
+
+    The page had asked who was signed in, as it does on every load, and been told
+    nobody. That request carried no credential, so there was no session to reject.
+    """
+
+    def _trace(self, tmp_path, request_headers):
+        path = tmp_path / "trace.zip"
+        records = [("https://app.example.com/", 200, {}),
+                   ("https://api.example.com/users/me", 401, request_headers)]
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("trace.network", "\n".join(json.dumps({"snapshot": {
+                "request": {"url": url, "method": "GET",
+                            "headers": [{"name": k, "value": v} for k, v in headers.items()]},
+                "response": {"status": status}}}) for url, status, headers in records))
+        return {"trace_path": str(path)}
+
+    def test_a_signed_out_page_load_does_not_stop_a_locator_fix(self, tmp_path):
+        verdict, evidence = _diagnose(fx.DASHBOARD_RENAMED, tmp_path,
+                                      **self._trace(tmp_path, {}))
+        assert evidence["network"]["anonymous_denials"]
+        assert verdict["verdict"] == "LOCATOR_STALE"
+        assert verdict["actionable"] is True
+
+    def test_a_refused_credential_still_stops(self, tmp_path):
+        verdict, _ = _diagnose(fx.DASHBOARD_RENAMED, tmp_path,
+                               **self._trace(tmp_path, {"Authorization": "Bearer expired"}))
+        assert verdict["verdict"] == "ERROR_STATE"
+        assert verdict["actionable"] is False
 
 
 class TestPresentButNotVisible:
