@@ -20,13 +20,13 @@ class TestConfigDefaults:
 
     # All env keys that Config reads
     _CONFIG_KEYS = [
-        'DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME',
+        'TRIAGING_DB_HOST', 'TRIAGING_DB_PORT', 'TRIAGING_DB_USER', 'TRIAGING_DB_PASSWORD', 'TRIAGING_DB_NAME',
         'LLM_PROVIDER', 'OLLAMA_MODEL', 'OLLAMA_BASE_URL',
         'OPENAI_API_KEY', 'OPENAI_MODEL',
         'GEMINI_API_KEY', 'GEMINI_MODEL',
-        'INPUT_DIR', 'OUTPUT_DIR', 'REPORT_FORMAT_VERSION',
-        'DASHBOARD_BASE_URL', 'JIRA_BASE_URL',
-        'FLAKY_TESTS_LAST_RUNS', 'FLAKY_TESTS_MIN_FAILURES',
+        'TRIAGING_INPUT_DIR', 'TRIAGING_OUTPUT_DIR', 'REPORT_FORMAT_VERSION',
+        'TRIAGING_DASHBOARD_BASE_URL', 'TRIAGING_JIRA_BASE_URL',
+        'TRIAGING_FLAKY_TESTS_LAST_RUNS', 'TRIAGING_FLAKY_TESTS_MIN_FAILURES',
         'GITHUB_TOKEN', 'GITHUB_ORG', 'GITHUB_REPO_AUTOMATION',
         'GITHUB_DEFAULT_BRANCH', 'GITHUB_PR_REVIEWERS',
     ]
@@ -54,11 +54,11 @@ class TestConfigDefaults:
     def test_database_defaults(self):
         """Config should expose sensible database defaults."""
         Cfg = self._load_config_with_env()
-        assert Cfg.DB_HOST == 'localhost'
-        assert Cfg.DB_PORT == 3306
-        assert Cfg.DB_USER == 'root'
-        assert Cfg.DB_PASSWORD == ''
-        assert Cfg.DB_NAME == 'qa_results'
+        assert Cfg.TRIAGING_DB_HOST == 'localhost'
+        assert Cfg.TRIAGING_DB_PORT == 3306
+        assert Cfg.TRIAGING_DB_USER == 'root'
+        assert Cfg.TRIAGING_DB_PASSWORD == ''
+        assert Cfg.TRIAGING_DB_NAME == 'qa_results'
 
     def test_llm_defaults(self):
         """Default LLM provider should be ollama with llama3.2:3b."""
@@ -74,14 +74,14 @@ class TestConfigDefaults:
     def test_report_path_defaults(self):
         """Input and output directories should default to testdata/reports."""
         Cfg = self._load_config_with_env()
-        assert Cfg.INPUT_DIR == 'testdata'
-        assert Cfg.OUTPUT_DIR == 'reports'
+        assert Cfg.TRIAGING_INPUT_DIR == 'testdata'
+        assert Cfg.TRIAGING_OUTPUT_DIR == 'reports'
 
     def test_flaky_detection_defaults(self):
         """Flaky detection constants should have documented defaults."""
         Cfg = self._load_config_with_env()
-        assert Cfg.FLAKY_TESTS_LAST_RUNS == 10
-        assert Cfg.FLAKY_TESTS_MIN_FAILURES == 5
+        assert Cfg.TRIAGING_FLAKY_TESTS_LAST_RUNS == 10
+        assert Cfg.TRIAGING_FLAKY_TESTS_MIN_FAILURES == 5
 
     def test_github_defaults_empty(self):
         """GitHub config should default to empty when not configured."""
@@ -105,13 +105,13 @@ class TestConfigEnvOverrides:
     def _load_config_with_env(self, env_overrides):
         """Reload Config with specific environment overrides."""
         config_keys = [
-            'DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME',
+            'TRIAGING_DB_HOST', 'TRIAGING_DB_PORT', 'TRIAGING_DB_USER', 'TRIAGING_DB_PASSWORD', 'TRIAGING_DB_NAME',
             'LLM_PROVIDER', 'OLLAMA_MODEL', 'OLLAMA_BASE_URL',
             'OPENAI_API_KEY', 'OPENAI_MODEL',
             'GEMINI_API_KEY', 'GEMINI_MODEL',
-            'INPUT_DIR', 'OUTPUT_DIR', 'REPORT_FORMAT_VERSION',
-            'DASHBOARD_BASE_URL', 'JIRA_BASE_URL',
-            'FLAKY_TESTS_LAST_RUNS', 'FLAKY_TESTS_MIN_FAILURES',
+            'TRIAGING_INPUT_DIR', 'TRIAGING_OUTPUT_DIR', 'REPORT_FORMAT_VERSION',
+            'TRIAGING_DASHBOARD_BASE_URL', 'TRIAGING_JIRA_BASE_URL',
+            'TRIAGING_FLAKY_TESTS_LAST_RUNS', 'TRIAGING_FLAKY_TESTS_MIN_FAILURES',
             'GITHUB_TOKEN', 'GITHUB_ORG', 'GITHUB_REPO_AUTOMATION',
             'GITHUB_DEFAULT_BRANCH', 'GITHUB_PR_REVIEWERS',
         ]
@@ -126,15 +126,15 @@ class TestConfigEnvOverrides:
             return FreshConfig
 
     def test_db_host_override(self):
-        """DB_HOST env var should override the default."""
-        Cfg = self._load_config_with_env({'DB_HOST': 'db.prod.internal'})
-        assert Cfg.DB_HOST == 'db.prod.internal'
+        """TRIAGING_DB_HOST env var should override the default."""
+        Cfg = self._load_config_with_env({'TRIAGING_DB_HOST': 'db.prod.internal'})
+        assert Cfg.TRIAGING_DB_HOST == 'db.prod.internal'
 
     def test_db_port_override_int_conversion(self):
-        """DB_PORT should be converted to int from env string."""
-        Cfg = self._load_config_with_env({'DB_PORT': '5432'})
-        assert Cfg.DB_PORT == 5432
-        assert isinstance(Cfg.DB_PORT, int)
+        """TRIAGING_DB_PORT should be converted to int from env string."""
+        Cfg = self._load_config_with_env({'TRIAGING_DB_PORT': '5432'})
+        assert Cfg.TRIAGING_DB_PORT == 5432
+        assert isinstance(Cfg.TRIAGING_DB_PORT, int)
 
     def test_llm_provider_override_normalized(self):
         """LLM_PROVIDER should be lowercased."""
@@ -151,9 +151,9 @@ class TestConfigEnvOverrides:
         assert Cfg.GEMINI_MODEL == 'gemini-1.5-pro'
 
     def test_flaky_tests_int_conversion(self):
-        """FLAKY_TESTS_LAST_RUNS should be converted to int."""
-        Cfg = self._load_config_with_env({'FLAKY_TESTS_LAST_RUNS': '20'})
-        assert Cfg.FLAKY_TESTS_LAST_RUNS == 20
+        """TRIAGING_FLAKY_TESTS_LAST_RUNS should be converted to int."""
+        Cfg = self._load_config_with_env({'TRIAGING_FLAKY_TESTS_LAST_RUNS': '20'})
+        assert Cfg.TRIAGING_FLAKY_TESTS_LAST_RUNS == 20
 
     def test_github_pr_reviewers_split(self):
         """GITHUB_PR_REVIEWERS should be split into a list."""
@@ -184,11 +184,11 @@ class TestConfigGetDbConfig:
         """get_db_config() values should match Config class attributes."""
         from lib.settings import Config
         db_config = Config.get_db_config()
-        assert db_config['host'] == Config.DB_HOST
-        assert db_config['port'] == Config.DB_PORT
-        assert db_config['user'] == Config.DB_USER
-        assert db_config['password'] == Config.DB_PASSWORD
-        assert db_config['database'] == Config.DB_NAME
+        assert db_config['host'] == Config.TRIAGING_DB_HOST
+        assert db_config['port'] == Config.TRIAGING_DB_PORT
+        assert db_config['user'] == Config.TRIAGING_DB_USER
+        assert db_config['password'] == Config.TRIAGING_DB_PASSWORD
+        assert db_config['database'] == Config.TRIAGING_DB_NAME
 
     def test_get_db_config_port_is_int(self):
         """Port in the db config dict should be an integer."""

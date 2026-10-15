@@ -3,8 +3,11 @@ set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
 # scripts/setup-mcp.sh
-# Reads connectors/mcp/*.json and writes the mcpServers block into ~/.claude.json.
-# Run once before first use, or whenever connector config changes.
+# Reads connectors/mcp/*.json and merges the URL-based connectors (GitHub, Slack)
+# into the mcpServers block of ~/.claude.json. Entries you added yourself are
+# kept; a connector of the same name is replaced. A backup is written first.
+# Optional: the agents open PRs with the gh CLI and post to Slack directly, and
+# the Playwright MCP server is configured per run by shared/mcp_config.py.
 #
 # Usage:
 #   make setup-mcp
@@ -65,7 +68,11 @@ for connector_file in "$CONNECTORS_DIR"/*.json; do
   [[ "$status" != "active" ]] && continue
 
   conn_name=$(jq -r '.name' "$connector_file")
-  conn_url=$(jq -r '.url' "$connector_file")
+  conn_url=$(jq -r '.url // empty' "$connector_file")
+  if [[ -z "$conn_url" ]]; then
+    echo "[setup-mcp] Skipping $conn_name — not a URL connector (configured per run by shared/mcp_config.py)"
+    continue
+  fi
   auth_type=$(jq -r '.auth.type' "$connector_file")
   env_var=$(jq -r '.auth.env_var' "$connector_file")
 
@@ -89,5 +96,12 @@ for connector_file in "$CONNECTORS_DIR"/*.json; do
   echo "[setup-mcp] Registered: $conn_name"
 done
 
-echo "$EXISTING" | jq --argjson mcp "$MCP_SERVERS" '. + {mcpServers: $mcp}' > "$CLAUDE_JSON"
+if [[ -f "$CLAUDE_JSON" ]]; then
+  cp "$CLAUDE_JSON" "$CLAUDE_JSON.bak"
+  echo "[setup-mcp] Backed up $CLAUDE_JSON → $CLAUDE_JSON.bak"
+fi
+# Merge, never replace: servers already in ~/.claude.json stay.
+tmp="$(mktemp)"
+echo "$EXISTING" | jq --argjson mcp "$MCP_SERVERS" '.mcpServers = ((.mcpServers // {}) + $mcp)' > "$tmp"
+mv "$tmp" "$CLAUDE_JSON"
 echo "[setup-mcp] Done → $CLAUDE_JSON"

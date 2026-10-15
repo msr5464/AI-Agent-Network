@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 import pytest
-import yaml
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
 
@@ -138,63 +137,3 @@ class TestArgparse:
         assert args.output_dir is None
         assert args.skip_report is False
         assert args.skip_autofix is False
-
-
-class TestPromptsYaml:
-    """Test that config/prompts.yaml is well-formed and contains expected prompt templates."""
-
-    @pytest.fixture
-    def prompts(self):
-        """Load prompts.yaml once per test."""
-        prompts_path = _repo_root / 'config' / 'prompts.yaml'
-        assert prompts_path.exists(), f"prompts.yaml not found at {prompts_path}"
-        with open(prompts_path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
-
-    def test_prompts_yaml_is_valid(self, prompts):
-        """prompts.yaml should parse as a valid YAML dict."""
-        assert isinstance(prompts, dict)
-
-    def test_classification_prompt_exists(self, prompts):
-        """classification_prompt key should exist."""
-        assert 'classification_prompt' in prompts
-
-    def test_summary_prompt_exists(self, prompts):
-        """summary_prompt key should exist."""
-        assert 'summary_prompt' in prompts
-
-    def test_recurring_analysis_prompt_exists(self, prompts):
-        """recurring_analysis_prompt key should exist."""
-        assert 'recurring_analysis_prompt' in prompts
-
-    def test_classification_prompt_has_placeholder(self, prompts):
-        """classification_prompt should contain {failure_details} placeholder."""
-        assert '{failure_details}' in prompts['classification_prompt']
-
-    def test_summary_prompt_has_placeholders(self, prompts):
-        """summary_prompt should contain key placeholders for test metrics."""
-        prompt = prompts['summary_prompt']
-        assert '{total_tests}' in prompt
-        assert '{passed}' in prompt
-        assert '{failed}' in prompt
-        assert '{pass_rate}' in prompt
-
-    def test_recurring_prompt_has_placeholders(self, prompts):
-        """recurring_analysis_prompt should contain {failure_count} and {days}."""
-        prompt = prompts['recurring_analysis_prompt']
-        assert '{failure_count}' in prompt
-        assert '{days}' in prompt
-
-    def test_classification_prompt_mentions_all_categories(self, prompts):
-        """classification_prompt should mention PRODUCT_BUG, AUTOMATION_ISSUE, and PRODUCT_CHANGE."""
-        prompt = prompts['classification_prompt']
-        assert 'PRODUCT_BUG' in prompt
-        assert 'AUTOMATION_ISSUE' in prompt
-        assert 'PRODUCT_CHANGE' in prompt
-
-    def test_classification_prompt_requests_json(self, prompts):
-        """classification_prompt should instruct the LLM to respond with JSON."""
-        prompt = prompts['classification_prompt']
-        assert 'JSON' in prompt or 'json' in prompt.lower()
-
-

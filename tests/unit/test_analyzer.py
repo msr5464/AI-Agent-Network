@@ -70,3 +70,80 @@ class TestFailureClassification:
             root_cause_category="OTHER",
         )
         assert "🔧" in repr(fc) and "AUTOMATION_ISSUE" in repr(fc)
+
+
+class TestExtractElementNames:
+    """Reading the element out of a failure the framework actually writes.
+
+    Only the page-load assertion says "in DashboardPage". Interaction failures —
+    the majority — name the element and its selector and nothing else, and used
+    to match no pattern here at all: the fix step then logged "no page object
+    matched" and Claude was asked to repair a locator it had never seen.
+    """
+
+    CLICK = ("Failed to click on element 'Edit Profile Summary button' with locator: "
+             "Locator@#profile-section-profile-summary img[alt='mukesh']: Error {\n"
+             "  message='Timeout 30000ms exceeded.")
+    ENTER = ("Failed to enter data in element 'Profile Summary Text Area' with "
+             "locator: Locator@textarea[placeholder='Craft a compelling summary']: Error {")
+
+    def _names(self, text, category="ELEMENT_NOT_FOUND"):
+        from shared.code_analyzer import CodeAnalyzer
+        return CodeAnalyzer().extract_element_names(root_cause=text, category=category)
+
+    def test_a_click_failure_yields_the_element_and_its_selector(self):
+        names = self._names(self.CLICK)
+        assert "Edit Profile Summary button" in names
+        assert "#profile-section-profile-summary img[alt='mukesh']" in names
+
+    def test_a_data_entry_failure_too(self):
+        names = self._names(self.ENTER)
+        assert "Profile Summary Text Area" in names
+        assert "textarea[placeholder='Craft a compelling summary']" in names
+
+    def test_the_selector_stops_before_the_exception_body(self):
+        # "Locator@<selector>: Error {" — the trailing ": Error {" is not part of
+        # the selector, and a selector with a colon in it would swallow the rest.
+        assert not any("Error" in name for name in self._names(self.CLICK))
+
+    FRAMED_PAGE_LOAD = (
+        "Failed to load Element Locator@#pay-frame >> internal:control=enter-frame >> "
+        "div.order-total in CheckoutPage\n"
+        "\tat shop.web.CheckoutPage.<init>(CheckoutPage.java:26)\n"
+        "\tat shop.web.CartPage.fillDetailsAndCheckout(CartPage.java:42)")
+
+    def test_a_stack_frame_is_not_an_element(self):
+        # `CartPage.fillDetailsAndCheckout(` is the method that was RUNNING, on
+        # the page before the one that failed. It used to head the list, and it
+        # matched no declaration anywhere.
+        names = self._names(self.FRAMED_PAGE_LOAD)
+        assert not any("fillDetailsAndCheckout" in name for name in names)
+
+    def test_a_field_reference_is_still_an_element(self):
+        names = self._names("not visible: CheckoutPage.orderTotal after 30s")
+        assert "orderTotal" in names
+
+    def test_a_locator_in_an_iframe_is_named_the_way_the_source_spells_it(self):
+        # Reported as one chain of hops, declared as several calls: the chain is
+        # a literal nowhere in the source. Its last hop is.
+        names = self._names(self.FRAMED_PAGE_LOAD)
+        assert names[0] == "div.order-total"
+        assert "#pay-frame >> internal:control=enter-frame >> div.order-total" in names
+
+    def test_an_interaction_inside_an_iframe_too(self):
+        names = self._names(
+            "Failed to enter data in element 'Card code field' with locator: "
+            "Locator@#pay-frame >> internal:control=enter-frame >> #card-code: Error {")
+        assert "Card code field" in names and "#card-code" in names
+
+    def test_extraction_does_not_depend_on_the_classification(self):
+        # It used to return nothing unless the failure was already classified
+        # ELEMENT_NOT_FOUND or TIMEOUT, which made the evidence conditional on
+        # the conclusion it feeds: a WRONG_PAGE verdict switched off the lookup
+        # that would have shown it was a stale locator.
+        assert self._names(self.CLICK, category="WRONG_PAGE")
+        assert self._names(self.CLICK, category="")
+
+    def test_the_page_load_wording_still_works(self):
+        names = self._names("Failed to load Element Locator@.heading in ProductsPage")
+        assert ".heading" in names

@@ -10,27 +10,29 @@ no Claude call at all.
 Runs alongside 02_validate_web.py under the same pipeline step (run.sh calls
 this first, then validate_web, when test_type == "both") — see CLAUDE.md.
 
-Scope (deliberately conservative):
+Scope:
   - Confirms api_base_url is reachable.
   - Performs the real auth recipe from plan["api_auth"] and confirms it
     actually succeeds (this is the single highest-value, zero-side-effect
     check — most real API test failures are auth-related).
-  - For every GET endpoint: makes the real call and records the actual status
+  - For every endpoint: makes the real call and records the actual status
     code and top-level response JSON keys, so codegen can see real shape
-    instead of guessing from prose. Path params are safe to resolve and call
-    for real too, AS LONG AS a real literal value for them is actually known
-    at parse time (plan["api_endpoints"][i]["sample_path_params"], set by
-    01_parse.py only when the input text gave a concrete example value, e.g.
-    "GET /users/octocat"). A GET is read-only regardless of whether its path
-    is templated — the path shape was never the actual risk.
-  - A path param with NO known literal value (its real value only exists at
-    test-run time — e.g. an id returned by an earlier create call) is NOT
-    invoked here; there's nothing safe to substitute. Deferred to step 04's
-    real test run, same as before this step existed.
-  - POST/PUT/DELETE endpoints are NEVER invoked here — firing those against a
-    real backend risks creating/mutating real data with no generically-safe
-    way to clean up, regardless of whether a literal value is known. Those
-    are exercised for real by step 04's actual `mvn test` run.
+    instead of guessing from prose. Path params are resolved from a real
+    literal value known at parse time (plan["api_endpoints"][i]["sample_path_params"],
+    set by 01_parse.py only when the input text gave a concrete example value,
+    e.g. "GET /users/octocat").
+  - An endpoint the input gave a `curl` for (plan["api_endpoints"][i]["curl"])
+    is run exactly as written — it carries the body, headers and ids the author
+    meant — and never through a shell (see _run_curl).
+  - POST/PUT/DELETE without a curl are called too, with no body. That proves the
+    route is reachable and nothing about how it answers a real request, so the
+    result is marked `body_sent: false` and neither this step's verdict nor step
+    03's codegen hint treats its status as the endpoint's. These calls DO create
+    or change data on the target backend — the accepted cost of calling them.
+  - A path param with NO known literal value and no curl (its real value only
+    exists at test-run time — e.g. an id returned by an earlier create call) is
+    NOT invoked; there's nothing safe to substitute. Deferred to step 04's real
+    test run.
     KNOWN LIMITATION: full CRUD-chain validation (create → capture id → use
     it in a follow-up call) is not attempted — a reasonable v2, not built here.
 
@@ -41,6 +43,8 @@ Writes: $AUDIT_DIR/02-validate-api.json
 
 import json
 import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -56,6 +60,7 @@ RETRY_ON_CONNECTION_ERROR = os.environ.get("VALIDATE_API_RETRY_ON_ERROR", "true"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → shared.*
 from shared.log import log as _log
+from shared.credential_extraction import credentials_from_plan
 
 
 def log(msg: str) -> None:
@@ -206,15 +211,50 @@ def _resolve_path(path: str, path_params: list, sample_values: dict) -> tuple:
     return resolved, missing
 
 
+def _run_curl(curl: str) -> tuple:
+    """Run the author's curl command. Returns (status, response_keys, error).
+
+    Never through a shell: the command comes from a user-written queue file, and a
+    shell would also run whatever follows a `;` or sits inside `$(...)`. Parsed into
+    argv instead — which also means `$VARS` are sent literally, not expanded.
+    """
+    # ponytail: curl's own file options (-o, -K, -T, -d @file) are not filtered; the
+    # queue author can already run arbitrary code through step 04's mvn test.
+    try:
+        argv = shlex.split(curl.replace("\\\n", " "))
+    except ValueError as exc:                       # unbalanced quotes
+        return None, [], f"could not parse the curl command: {exc}"
+    if not argv or Path(argv[0]).name not in ("curl", "curl.exe"):
+        return None, [], "the endpoint's curl does not start with curl — not run"
+    try:
+        proc = subprocess.run(argv + ["-s", "-w", "\n%{http_code}"], capture_output=True,
+                              text=True, timeout=REQUEST_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return None, [], f"curl timed out after {REQUEST_TIMEOUT_S}s"
+    except OSError as exc:                          # curl not installed
+        return None, [], f"could not run curl: {exc}"
+    if proc.returncode != 0:
+        return None, [], f"curl exited {proc.returncode}: {proc.stderr.strip()[:300]}"
+    body, _, code = proc.stdout.rpartition("\n")
+    if not code.strip().isdigit():
+        return None, [], f"no HTTP status in the curl output: {proc.stdout[-200:]!r}"
+    try:
+        parsed = json.loads(body) if body.strip() else None
+    except ValueError:
+        parsed = None
+    return int(code), (list(parsed.keys()) if isinstance(parsed, dict) else []), None
+
+
 def check_safe_endpoints(base_url: str, endpoints: list, headers: dict, auth) -> tuple:
     """Returns (checked: list, skipped: list).
 
-    Every GET endpoint is a candidate for a real call — a GET is read-only
-    regardless of whether its path is templated. Only two things disqualify
-    an endpoint from actually being invoked: (1) it's a mutating method
-    (POST/PUT/DELETE — never invoked here, see module docstring), or (2) it's
-    a GET with a path param whose real value isn't known until test-run time
-    (no entry in sample_path_params) — nothing safe to substitute for that.
+    Every endpoint is called for real. One the input gave a `curl` for is run
+    exactly as written; the rest go through requests. A mutating call made that
+    way has no body, so it proves reachability and nothing about the status a real
+    request would get — recorded as `body_sent: False`, so neither this step's
+    verdict nor step 03's hint mistakes a 400 for the endpoint's real status. The
+    only endpoint not called is one with a path param whose real value isn't known
+    until test-run time and no curl to supply it — nothing safe to substitute.
     """
     checked, skipped = [], []
     for ep in endpoints:
@@ -223,17 +263,10 @@ def check_safe_endpoints(base_url: str, endpoints: list, headers: dict, auth) ->
         path_params = ep.get("path_params") or []
         sample_values = ep.get("sample_path_params") or {}
         enum_name = ep.get("enum_name", path)
-
-        if method != "GET":
-            skipped.append({
-                "enum_name": enum_name, "method": method, "path": path,
-                "reason": "mutating method — not safely invokable without side effects; "
-                          "validated by step 04's test run instead",
-            })
-            continue
+        curl_cmd = (ep.get("curl") or "").strip()
 
         resolved_path, missing_params = _resolve_path(path, path_params, sample_values)
-        if missing_params:
+        if missing_params and not curl_cmd:
             skipped.append({
                 "enum_name": enum_name, "method": method, "path": path,
                 "reason": f"no known value for path param(s) {missing_params} — its real value "
@@ -241,33 +274,33 @@ def check_safe_endpoints(base_url: str, endpoints: list, headers: dict, auth) ->
             })
             continue
 
-        url = base_url.rstrip("/") + "/" + resolved_path.lstrip("/")
-        resp, exc = _request_with_retry("GET", url, headers=headers, auth=auth)
-        if exc is not None:
-            checked.append({
-                "enum_name": enum_name, "method": method, "path": path,
-                "resolved_path": resolved_path,
-                "expected_status": ep.get("expected_status"), "actual_status": None,
-                "matched_expected": False, "response_keys": [],
-                "error": f"{exc.__class__.__name__}: {exc}",
-            })
-            continue
-
         expected = ep.get("expected_status")
-        response_keys = []
-        try:
-            body = resp.json()
-            if isinstance(body, dict):
-                response_keys = list(body.keys())
-        except ValueError:
-            pass
+        if curl_cmd:
+            status, response_keys, error = _run_curl(curl_cmd)
+        else:
+            url = base_url.rstrip("/") + "/" + resolved_path.lstrip("/")
+            resp, exc = _request_with_retry(method, url, headers=headers, auth=auth)
+            status, response_keys, error = None, [], None
+            if exc is not None:
+                error = f"{exc.__class__.__name__}: {exc}"
+            else:
+                status = resp.status_code
+                try:
+                    body = resp.json()
+                    if isinstance(body, dict):
+                        response_keys = list(body.keys())
+                except ValueError:
+                    pass
         checked.append({
             "enum_name": enum_name, "method": method, "path": path,
             "resolved_path": resolved_path,
-            "expected_status": expected, "actual_status": resp.status_code,
-            "matched_expected": (expected is not None and resp.status_code == expected),
+            "expected_status": expected, "actual_status": status,
+            "matched_expected": error is None and expected is not None and status == expected,
             "response_keys": response_keys,
-            "error": None,
+            "error": error,
+            "via": "curl" if curl_cmd else "requests",
+            # A mutating call with no body proves the route exists, not its status.
+            "body_sent": bool(curl_cmd) or method == "GET",
         })
     return checked, skipped
 
@@ -292,12 +325,15 @@ def _write_result(data: dict) -> None:
                 mark = "✓" if ep.get("matched_expected") else ("✗" if ep.get("error") is None else "⚠")
                 resolved = ep.get("resolved_path", "")
                 endpoint_desc = f"{ep['method']} {ep['path']}"
-                if resolved and resolved != ep["path"]:
+                if ep.get("via") == "curl":
+                    endpoint_desc += " (the input's curl)"
+                elif resolved and resolved != ep["path"]:
                     endpoint_desc += f" (called as {resolved})"
                 lines.append(
                     f"- {mark} `{endpoint_desc}` → expected {ep.get('expected_status')}, "
                     f"got {ep.get('actual_status') if ep.get('error') is None else ep['error']}"
                     + (f" (keys: {ep['response_keys']})" if ep.get("response_keys") else "")
+                    + ("" if ep.get("body_sent", True) else " — sent without a body, reachability only")
                 )
         if skipped_eps:
             lines += ["", "## Endpoints Not Independently Checked"]
@@ -334,7 +370,7 @@ def main() -> None:
         return
 
     api_auth = plan.get("api_auth") or {"type": "none"}
-    demo_creds = plan.get("demo_credentials", {})
+    demo_creds = credentials_from_plan(plan)
 
     log(f"Authenticating against {base_url} (type={api_auth.get('type')})...")
     auth_result = perform_auth(base_url, api_auth, demo_creds)
@@ -359,9 +395,10 @@ def main() -> None:
         })
         return
 
-    log(f"Checking {len(endpoints)} endpoint(s) — every GET is called for real "
-        f"(with known path-param values substituted); POST/PUT/DELETE and GETs "
-        f"with an unresolvable path param are deferred to step 04...")
+    log(f"Checking {len(endpoints)} endpoint(s) — every method is called for real "
+        f"(the input's curl where it gave one; POST/PUT/DELETE without one go out with "
+        f"no body and prove reachability only); an unresolvable path param with no curl "
+        f"is deferred to step 04...")
     checked, skipped_eps = check_safe_endpoints(
         base_url, endpoints, auth_result["headers"], auth_result["auth"]
     )
@@ -372,11 +409,15 @@ def main() -> None:
         else:
             mark = "✓" if ep["matched_expected"] else "⚠"
             log(f"  {mark} {ep['method']} {called} → {ep['actual_status']} "
-                f"(expected {ep['expected_status']}), keys={ep['response_keys']}")
+                f"(expected {ep['expected_status']}), keys={ep['response_keys']}"
+                + ("" if ep["body_sent"] else " — sent without a body, reachability only"))
     for ep in skipped_eps:
         log(f"  – {ep['method']} {ep['path']}: {ep['reason']}")
 
-    any_mismatch = any((not e["matched_expected"]) for e in checked if not e.get("error"))
+    # A body-less POST answering 400 is the expected result of sending nothing, not
+    # a disagreement with the endpoint's documented status.
+    any_mismatch = any((not e["matched_expected"]) for e in checked
+                       if not e.get("error") and e.get("body_sent", True))
     any_error = any(e.get("error") for e in checked)
     overall = "ok" if not (any_mismatch or any_error) else "endpoint_mismatch"
 

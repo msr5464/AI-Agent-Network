@@ -21,9 +21,11 @@ import logging
 logging.basicConfig(level=logging.WARNING)
 
 from shared.log import log as _log
+from shared.log import blocked
 from shared.slack import send_slack as _send_slack
 from shared.github import create_pr
 from shared.git import run_git
+from shared import workspace as workspace_helper
 def log(msg): _log("ship", msg)
 def send_slack(channel: str, text: str) -> bool:
     return _send_slack(SLACK_BOT_TOKEN, channel, text)
@@ -33,6 +35,7 @@ def send_slack(channel: str, text: str) -> bool:
 AUDIT_DIR  = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR  = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT  = Path(os.environ.get("REPO_ROOT",  Path(__file__).resolve().parents[3]))
+SESSION_ID = os.environ.get("SESSION_ID", AUDIT_DIR.name)
 
 AUTO_PUSH              = os.environ.get("AUTO_PUSH", "true").lower() == "true"
 GITHUB_TOKEN           = os.environ.get("GITHUB_TOKEN", "")
@@ -64,12 +67,9 @@ def read_gate() -> str:
 
 
 def get_workspace() -> Optional[Path]:
-    workspace = Path(WORKSPACE_DIR)
-    if GITHUB_REPO_AUTOMATION:
-        repo_path = workspace / GITHUB_REPO_AUTOMATION
-        if repo_path.exists():
-            return repo_path
-    return None
+    """The automation checkout: FRAMEWORK_DIR, else WORKSPACE_DIR/repo."""
+    candidate = workspace_helper.expected(WORKSPACE_DIR, GITHUB_REPO_AUTOMATION)
+    return candidate if candidate and candidate.exists() else None
 
 
 def _authenticated_url() -> str:
@@ -83,6 +83,69 @@ def _authenticated_url() -> str:
             f"{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}.git")
 
 
+def test_count(entries: list) -> int:
+    """How many TESTS these entries cover, not how many edits they are.
+
+    Clustering is the whole point of the fix step: one locator edit greens every
+    test that walked past it, so `fixes` holds one entry per edit and each entry
+    names the tests it repaired in `test_names`. Counting the entries reported
+    "Fixed 2" for a run that turned five tests green, in the PR title, the
+    summary table and the Slack message — the clustering was doing its job and
+    the reporting hid it. A failure entry is always exactly one test.
+    """
+    return sum(len(e.get("test_names") or [e.get("test_name")]) for e in entries)
+
+
+def tests_in(entry: dict) -> list:
+    """Every test one fix entry repaired, oldest field first for older files."""
+    return entry.get("test_names") or [entry.get("test_name", "unknown")]
+
+
+def edit_count(fixes: list) -> int:
+    """Every edit behind these fixes: the one that greened each test, plus the
+    ones earlier attempts kept on the way there."""
+    return len(fixes) + sum(len(f.get("earlier_edits") or []) for f in fixes)
+
+
+def earlier_edit_lines(entry: dict, indent: str = "  ") -> list:
+    """One line per edit an earlier attempt kept for this test.
+
+    A chain of broken locators is repaired one per attempt, and the record of a
+    fixed test holds only the edit that finally greened it. Without these lines a
+    PR whose diff changes three page objects describes one of them.
+    """
+    lines = []
+    for edit in entry.get("earlier_edits") or []:
+        target = Path(edit["target_file"]).name if edit.get("target_file") else "unknown file"
+        lines.append(f"{indent}- ↳ kept from attempt {edit.get('attempt')}: "
+                     f"{edit.get('fix_description') or '(no description)'} (`{target}`)")
+    return lines
+
+
+def kept_edits(failed_fixes: list) -> list:
+    """Every edit still on the branch for tests that are not green yet, oldest first.
+
+    A chain of broken locators is repaired one per attempt. A run that stops
+    part-way has repaired some of them, each kept because the test got past it,
+    and none of them is a "fix" by the measure the rest of this step uses: no
+    test passed. They are in the branch all the same.
+    """
+    seen, out = set(), []
+    for entry in failed_fixes:
+        edits = list(entry.get("earlier_edits") or [])
+        if entry.get("status") == "advanced":
+            edits.append({"attempt": entry.get("fix_attempt"),
+                          "target_file": entry.get("target_file"),
+                          "fix_description": entry.get("fix_description") or "",
+                          "fix_diff": entry.get("fix_diff") or ""})
+        for edit in edits:
+            key = (edit.get("target_file"), edit.get("fix_diff"))
+            if edit.get("target_file") and key not in seen:
+                seen.add(key)
+                out.append(edit)
+    return out
+
+
 def short_name(test_name: str) -> str:
     """Return the simple class.method portion of a fully-qualified test name."""
     parts = test_name.split(".")
@@ -92,7 +155,13 @@ def short_name(test_name: str) -> str:
 def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: list) -> Optional[str]:
     pr_branch = fix_data.get("pr_branch")
     if not pr_branch:
-        log("No PR branch from fix step — skipping PR creation")
+        # With AUTO_PUSH off this is the dry run the user asked for. With it on,
+        # the fix step could not get onto a branch and already said why — this is
+        # the second half of that story, at the point the PR fails to appear.
+        log("No PR branch from fix step — skipping PR creation" if not AUTO_PUSH
+            else blocked("the fix step produced no branch to push",
+                         "no PR will be raised; see the BLOCKED line above for the "
+                         "git failure that caused it"))
         return None
 
     if not AUTO_PUSH:
@@ -100,18 +169,28 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
         return None
 
     if not GITHUB_ORG or not GITHUB_REPO_AUTOMATION:
-        log("GitHub config not set — skipping PR")
+        log(blocked("GITHUB_ORG or GITHUB_REPO_AUTOMATION is not set",
+                    "no PR will be raised",
+                    "set both in config/.env, or Agent Settings"))
         return None
 
     workspace = get_workspace()
     if not workspace:
-        log("Automation workspace not found — skipping PR")
+        log(blocked("the automation repo was not found",
+                    "no PR will be raised",
+                    "set FRAMEWORK_DIR, or WORKSPACE_DIR and GITHUB_REPO_AUTOMATION"))
         return None
 
     full_repo = f"{GITHUB_ORG}/{GITHUB_REPO_AUTOMATION}"
     build_tag = fix_data.get("build_tag", "unknown")
     fixes     = fix_data.get("fixes", [])
-    total     = len(fixes) + len(unverified_fixes) + len(failed_fixes)
+    n_fixed   = test_count(fixes)
+    total     = n_fixed + test_count(unverified_fixes) + len(failed_fixes)
+    # Nothing is green, but the branch holds repairs the test got past. Raised as
+    # a draft: it is real work a reviewer should be able to see and finish, and
+    # it must not read as something to merge.
+    kept      = kept_edits(failed_fixes)
+    partial   = not fixes and not unverified_fixes and bool(kept)
 
     # Push branch. run_git swaps "origin" for a token-bearing URL for this one
     # command, so the credential never lands in .git/config.
@@ -122,14 +201,19 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
     )
     if not ok:
         redacted = (err or "").replace(GITHUB_TOKEN, "***") if GITHUB_TOKEN else (err or "")
-        log(f"Push failed: {redacted[:500]}")
+        log(blocked(f"push of {pr_branch} was rejected ({redacted.strip()[:160]})",
+                    "no PR will be raised; the commits are on the local branch",
+                    f"git -C {workspace} log --oneline {GITHUB_DEFAULT_BRANCH}..{pr_branch}"))
         return None
 
     # PR title reflects partial/full fix
-    if failed_fixes or unverified_fixes:
-        pr_title = f"fix(automation): {len(fixes)}/{total} locator fixes — {build_tag}"
+    if partial:
+        pr_title = (f"Healing: {len(kept)} locator edit(s) kept, test still failing "
+                    f"for {build_tag} [PARTIAL]")
+    elif failed_fixes or unverified_fixes:
+        pr_title = f"Healing: Fixed {n_fixed}/{total} failing tests for {build_tag} [NEEDS-REVIEW]"
     else:
-        pr_title = f"fix(automation): {len(fixes)} locator fix(es) — {build_tag}"
+        pr_title = f"Healing: Fixed {n_fixed}/{total} failing tests for {build_tag} [PASSED]"
 
     def target_name(f: dict) -> str:
         target = f.get("target_file") or f.get("test_file")
@@ -152,11 +236,31 @@ def push_and_create_pr(fix_data: dict, unverified_fixes: list, failed_fixes: lis
 
     def fixed_line(f: dict) -> str:
         dom = " _(selector confirmed in a live browser)_" if f.get("dom_verified") else ""
-        return (f"- ✅ `{short_name(f.get('test_name', 'unknown'))}` — "
-                f"{f.get('fix_description', '')} (`{target_name(f)}`){dom}"
+        names = tests_in(f)
+        # One edit, every test it repaired. Naming only the first made a
+        # five-test fix read as a two-test one.
+        head = f"- ✅ `{short_name(names[0])}`" + (
+            f" _(+{len(names) - 1} more)_" if len(names) > 1 else "")
+        line = (f"{head} — {f.get('fix_description', '')} (`{target_name(f)}`){dom}"
                 f"{evidence_links(f)}")
+        for name in names[1:]:
+            line += f"\n  - ✅ `{short_name(name)}`"
+        # Repaired on proof from the recorded fingerprint, and still the one kind
+        # of fix a reviewer should look at: the test passing says the check is
+        # satisfied, not that it is satisfied by the element it was written for.
+        if f.get("assertion_site"):
+            line += (f"\n  - 👀 read by an assertion (`{f['assertion_site']}`) — "
+                     f"confirm the repaired locator is the same element")
+        for extra in earlier_edit_lines(f):
+            line += f"\n{extra}"
+        return line
 
     fixed_lines = "\n".join(fixed_line(f) for f in fixes) or "_(none)_"
+    if partial:
+        fixed_lines = "\n".join(
+            f"- ⏩ kept from attempt {e.get('attempt')}: "
+            f"{e.get('fix_description') or '(no description)'} "
+            f"(`{Path(e['target_file']).name}`)" for e in kept)
 
     # Applied but never executed — must be visibly distinct from a verified fix.
     needs_review = ""
@@ -177,7 +281,10 @@ executed**. Review and run them manually before merging.
 
     # Failed tests section
     if failed_fixes:
-        failed_lines = "\n".join(_failed_pr_line(f) for f in failed_fixes)
+        # A partial PR already lists every kept edit under Changes Applied.
+        failed_lines = "\n".join(
+            "\n".join([_failed_pr_line(f)] + ([] if partial else earlier_edit_lines(f)))
+            for f in failed_fixes)
         needs_manual = f"""
 ### ❌ Needs Manual Fix ({len(failed_fixes)})
 
@@ -186,40 +293,82 @@ executed**. Review and run them manually before merging.
     else:
         needs_manual = ""
 
-    if fixes and not unverified_fixes:
+    if partial:
+        validation = ("⚠️ **No test passes yet.** Each edit above was kept because the test "
+                      "got past the element it repaired and stopped at a later one. The run "
+                      "ended before the failure listed under **Needs Manual Fix** was "
+                      "repaired, so this is a draft.")
+    elif fixes and not unverified_fixes:
         validation = ("Every fix listed above was re-run locally and passed before this PR "
                       "was created.")
     elif fixes and unverified_fixes:
-        validation = (f"The {len(fixes)} fix(es) under **Fixed** were re-run locally and "
-                      f"passed. The {len(unverified_fixes)} under **Applied but NOT Verified** "
+        validation = (f"The {n_fixed} test(s) under **Fixed** were re-run locally and "
+                      f"passed. The {test_count(unverified_fixes)} under **Applied but NOT Verified** "
                       f"were not executed — no test runner was available.")
     else:
         validation = ("⚠️ **Nothing in this PR was verified by a test run** — no test runner "
                       "was available in the workspace.")
 
-    pr_body = f"""## QA Auto-Fix — {build_tag}
+    status_tag = ("PARTIAL" if partial
+                  else "NEEDS-REVIEW" if (failed_fixes or unverified_fixes) else "PASSED")
+    status_summary = (f"{len(kept)} locator edit(s) kept; 0/{total} failing tests pass yet."
+                      if partial
+                      else f"{n_fixed}/{total} failing tests verified and passing locally "
+                           f"({edit_count(fixes)} locator edit(s))."
+                      if not (failed_fixes or unverified_fixes)
+                      else f"{n_fixed}/{total} failing tests fixed; manual review needed.")
+    status_label = {"PASSED": "✅ Passed", "PARTIAL": "🚧 Partial — test still failing"}.get(
+        status_tag, "⚠️ Needs Review")
 
-### Summary
-| | Count |
+    all_files = {target_name(f) for f in (fixes + unverified_fixes + failed_fixes) if target_name(f) != "unknown file"}
+    # ...and the files earlier attempts changed and kept, which are in the diff too.
+    all_files |= {Path(edit["target_file"]).name
+                  for f in (fixes + unverified_fixes + failed_fixes)
+                  for edit in (f.get("earlier_edits") or []) if edit.get("target_file")}
+    files_changed_count = len(all_files) or len(fixes)
+
+    # A heal is exactly what makes the committed fingerprint stale, so the PR
+    # carries refreshed ones in their own path-scoped commit. Say so: a reviewer
+    # who does not know to expect that commit reads it as unrelated noise.
+    committed_baselines = fix_data.get("baselines_committed") or []
+    baselines_line = ("\n> 🔍 Also refreshed {n} locator baseline(s): {names}\n".format(
+        n=len(committed_baselines),
+        names=", ".join(f"`{Path(b).name}`" for b in committed_baselines[:8]))
+        if committed_baselines else "")
+
+    pr_body = f"""## 🤖 Test Healing Agent — {build_tag}
+
+> Status: **{status_tag}** — {status_summary}
+
+### 📋 Overview
+| Property | Value |
 |---|---|
-| Queued for fix | {total} |
-| ✅ Auto-fixed (tests pass) | {len(fixes)} |
-| ⚠️ Applied but not verified | {len(unverified_fixes)} |
-| ❌ Could not fix | {len(failed_fixes)} |
-| Fix attempts | {fix_data.get('fix_attempt', 1)} |
+| **Agent** | `test-healing-agent` |
+| **Target** | `{build_tag}` |
+| **Status** | `{status_label}` |
+| **Files Changed** | `{files_changed_count}` |
+| **Fix Attempts** | `{fix_data.get('fix_attempt', 1)}` |
+| **Session ID** | `{SESSION_ID}` |
 
-### ✅ Fixed ({len(fixes)})
+### 🛠️ Changes Applied
 
 {fixed_lines}
+{baselines_line}
 {needs_review}{needs_manual}
-### Validation
+### 🧪 Validation & Test Results
+
 {validation}
 
-> Audit trail: `{AUDIT_DIR.name}`
-> 🤖 Generated by test-healing-agent
+### 🔍 How to Review
+1. Review the locator updates in the changed page objects / test files.
+2. Check the attached DOM snapshot and screenshot links to confirm the element selector matches the live page.
+3. Run the healed test(s) locally against the target environment.
+
+---
+> 🤖 Generated by **test-healing-agent** · Audit Session: `{AUDIT_DIR.name}`
 """
 
-    log("Creating PR...")
+    log("Creating draft PR — the test is still failing..." if partial else "Creating PR...")
     pr_url, pr_err = create_pr(
         workspace=workspace,
         full_repo=full_repo,
@@ -228,11 +377,15 @@ executed**. Review and run them manually before merging.
         branch=pr_branch,
         base=GITHUB_DEFAULT_BRANCH,
         reviewers=GITHUB_PR_REVIEWERS,
+        draft=partial,
     )
     if not pr_url:
-        log(f"PR creation failed: {pr_err}")
+        log(blocked(f"PR creation failed ({str(pr_err).strip()[:160]})",
+                    f"no PR will be raised; {pr_branch} is pushed and can be "
+                    f"opened by hand",
+                    f"https://github.com/{full_repo}/pull/new/{pr_branch}"))
         return None
-    log(f"PR created: {pr_url}")
+    log(f"{'Draft PR' if partial else 'PR'} created: {pr_url}")
     return pr_url
 
 
@@ -243,6 +396,12 @@ def _failed_pr_line(f: dict) -> str:
         return f"- ❌ `{name}` — Claude declared unfixable: {f.get('unfixable_reason', '')}"
     if status == "test_failed":
         return f"- ❌ `{name}` — fix applied but test still failing"
+    if status == "advanced":
+        # Kept, not reverted: the element it targeted works now. Reporting this
+        # as a plain failure hides the only progress the run made.
+        moved = (f.get("progressed_to") or {}).get("element") or "a later element"
+        return (f"- ⏩ `{name}` — the locator it targeted is fixed; the test now "
+                f"stops at {moved}")
     if status == "no_file":
         return f"- ❌ `{name}` — test file not found in workspace"
     if status == "rejected_unsafe":
@@ -254,14 +413,14 @@ def _failed_pr_line(f: dict) -> str:
 
 def _build_slack_message(build_tag: str, fixes: list, unverified_fixes: list,
                           failed_fixes: list, pr_url: Optional[str], fix_gate: str,
-                          fix_attempt: int) -> Tuple[str, str]:
+                          fix_attempt: int, draft: bool = False) -> Tuple[str, str]:
     """
     Build a rich Slack message. Returns (channel, text).
     Uses SLACK_ALERT_CHANNEL if any failures, SLACK_NOTIFY_CHANNEL otherwise.
     """
-    total      = len(fixes) + len(unverified_fixes) + len(failed_fixes)
-    n_fixed    = len(fixes)
-    n_unverif  = len(unverified_fixes)
+    n_fixed    = test_count(fixes)
+    n_unverif  = test_count(unverified_fixes)
+    total      = n_fixed + n_unverif + len(failed_fixes)
     n_failed   = len(failed_fixes)
 
     if fix_gate == "skipped":
@@ -297,8 +456,10 @@ def _build_slack_message(build_tag: str, fixes: list, unverified_fixes: list,
         lines.append(f":white_check_mark: *Fixed ({n_fixed}):*")
         for f in fixes[:8]:
             dom = " _(live-DOM confirmed)_" if f.get("dom_verified") else ""
+            kept = len(f.get("earlier_edits") or [])
+            more = f" _(+{kept} edit(s) kept from earlier attempts)_" if kept else ""
             lines.append(f"  • `{short_name(f.get('test_name', 'unknown'))}` — "
-                         f"{f.get('fix_description', '')}{dom}")
+                         f"{f.get('fix_description', '')}{dom}{more}")
         if n_fixed > 8:
             lines.append(f"  _...and {n_fixed - 8} more_")
         lines.append("")
@@ -324,6 +485,10 @@ def _build_slack_message(build_tag: str, fixes: list, unverified_fixes: list,
                 lines.append(f"  • `{name}` — unfixable: {reason[:80]}")
             elif status == "test_failed":
                 lines.append(f"  • `{name}` — fix applied but test still failing")
+            elif status == "advanced":
+                moved = (f.get("progressed_to") or {}).get("element") or "a later element"
+                lines.append(f"  • `{name}` — locator fixed and kept; now stops at "
+                             f"{moved}")
             elif status == "no_file":
                 lines.append(f"  • `{name}` — test file not found in workspace")
             elif status == "rejected_unsafe":
@@ -336,7 +501,7 @@ def _build_slack_message(build_tag: str, fixes: list, unverified_fixes: list,
         lines.append("")
 
     if pr_url:
-        lines.append(f"PR: {pr_url}")
+        lines.append(f"Draft PR, test still failing: {pr_url}" if draft else f"PR: {pr_url}")
     elif (fixes or unverified_fixes) and not AUTO_PUSH:
         lines.append("_(AUTO_PUSH=false — no PR created)_")
     lines.append(f"_Audit: `{AUDIT_DIR.name}`_")
@@ -364,7 +529,10 @@ def main():
 
     # ── Create PR whenever anything was applied ───────────────────────────────
     # Even a partial result (some fixed, some not) deserves a PR for what landed.
-    if fixes or unverified_fixes:
+    # That includes a run with nothing green yet whose branch holds repairs the
+    # test got past: those went nowhere, in a worktree removed minutes later.
+    kept = kept_edits(failed_fixes)
+    if fixes or unverified_fixes or kept:
         pr_url = push_and_create_pr(fix_data, unverified_fixes, failed_fixes)
     elif fix_gate == "skipped":
         log("No fixes attempted — skipping PR")
@@ -372,9 +540,10 @@ def main():
         log("No successful fixes — skipping PR")
 
     # ── Slack ─────────────────────────────────────────────────────────────────
+    draft = bool(pr_url) and not fixes and not unverified_fixes
     channel, text = _build_slack_message(
-        build_tag, fixes, unverified_fixes, failed_fixes, pr_url, fix_gate, fix_attempt
-    )
+        build_tag, fixes, unverified_fixes, failed_fixes, pr_url, fix_gate, fix_attempt,
+        draft=draft)
     if channel and text:
         slack_notified = send_slack(channel, text)
 
@@ -389,13 +558,18 @@ def main():
         "unverified":     len(unverified_fixes),
         "failed":         len(failed_fixes),
         "pr_url":         pr_url,
+        # A draft holds kept repairs for a test that is still failing. The UI
+        # links it; it must not be read as the run having succeeded.
+        "pr_draft":       draft,
         "slack_notified": slack_notified,
         "slack_channel":  channel,
     }
     (AUDIT_DIR / "02-ship.json").write_text(json.dumps(result, indent=2))
 
     # ── Write Markdown ─────────────────────────────────────────────────────────
-    total = len(fixes) + len(unverified_fixes) + len(failed_fixes)
+    n_fixed = test_count(fixes)
+    n_unverified = test_count(unverified_fixes)
+    total = n_fixed + n_unverified + len(failed_fixes)
     md_lines = [
         "# Ship Results",
         "",
@@ -408,16 +582,19 @@ def main():
         "| | Count |",
         "|---|---|",
         f"| Queued for fix | {total} |",
-        f"| ✅ Fixed (verified) | {len(fixes)} |",
-        f"| ⚠️ Applied but not verified | {len(unverified_fixes)} |",
+        f"| ✅ Fixed (verified) | {n_fixed} |",
+        f"| ⚠️ Applied but not verified | {n_unverified} |",
         f"| ❌ Could not fix | {len(failed_fixes)} |",
-        f"| PR | {pr_url or 'Not created'} |",
+        f"| PR | {(pr_url + ' (draft)' if draft else pr_url) or 'Not created'} |",
         f"| Slack | {'Sent to ' + channel if slack_notified else 'Skipped'} |",
     ]
     if fixes:
-        md_lines += ["", "## Fixed Tests (verified)", ""]
+        md_lines += ["", f"## Fixed Tests (verified) — {edit_count(fixes)} edit(s)", ""]
         for f in fixes:
-            md_lines.append(f"- ✅ `{short_name(f['test_name'])}` — {f.get('fix_description', '')}")
+            names = tests_in(f)
+            md_lines.append(f"- ✅ `{short_name(names[0])}` — {f.get('fix_description', '')}")
+            md_lines += earlier_edit_lines(f)
+            md_lines += [f"- ✅ `{short_name(n)}` — same edit" for n in names[1:]]
     if unverified_fixes:
         md_lines += ["", "## Applied but Not Verified", ""]
         for f in unverified_fixes:
@@ -426,11 +603,13 @@ def main():
         md_lines += ["", "## Could Not Fix", ""]
         for f in failed_fixes:
             md_lines.append(f"- ❌ {_failed_pr_line(f)}")
+            md_lines += earlier_edit_lines(f)
 
     (AUDIT_DIR / "02-ship.md").write_text("\n".join(md_lines) + "\n")
 
     applied = len(fixes) + len(unverified_fixes)
-    status = "PR_CREATED" if pr_url else ("DRY_RUN" if applied and not AUTO_PUSH else "NO_PR")
+    status = ("DRAFT_PR_CREATED" if draft else "PR_CREATED" if pr_url
+              else "DRY_RUN" if (applied or kept) and not AUTO_PUSH else "NO_PR")
     log(f"Done — status={status} | {len(fixes)}/{total} verified, "
         f"{len(unverified_fixes)} unverified")
     if pr_url:

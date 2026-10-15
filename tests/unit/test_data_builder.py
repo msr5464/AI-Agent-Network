@@ -87,6 +87,13 @@ class TestDbRowToTestResult:
         row_err = {"testcaseName": "C.M.m2", "testStatus": "ERROR"}
         assert db_row_to_test_result(row_err).status == TestStatus.ERROR
 
+    def test_an_aborted_test_is_not_a_pass(self):
+        """It never finished. As an unknown status it fell through to PASS and
+        lifted the build's pass rate."""
+        row = {"testcaseName": "C.M.m", "testStatus": "ABORTED",
+               "failureReason": "org.testng.SkipException: Suite aborted after infra timeout"}
+        assert db_row_to_test_result(row).status == TestStatus.SKIP
+
     def test_execution_log_and_duration_injected(self):
         row = {"testcaseName": "A.B.m", "testStatus": "PASS"}
         r = db_row_to_test_result(row, execution_log="log line", duration=12.5)

@@ -1,0 +1,777 @@
+"""Mechanical guards on an automated code edit, and the machinery to apply one.
+
+Extracted from test-healing-agent's fix step so test-adaptation-agent can reuse
+them. Nothing here knows which agent called it, what the failure was, or how the
+edit was generated — that is the point. These are the checks a re-run cannot do
+for us.
+
+The reasoning they encode, which is worth keeping in one place: **the
+verification loop cannot catch a fix built on a wrong diagnosis, because the
+easiest way to make a page assertion pass is to weaken it.** A run that had
+already been told the avatar was missing "fixed" it by moving the page-load
+anchor onto a link that exists on the logged-out page too — that would have gone
+green while the login was still broken.
+
+`agents/test-healing-agent/actions/01_fix.py` re-exports every public name here,
+so its own callers and tests keep working unchanged.
+"""
+
+import difflib
+import re
+from typing import Iterable
+
+from shared.code_analyzer import split_class_members, without_comments
+from shared.dom_snapshot import selector_visibility
+from shared.page_identity import extract_locators as _extract_locators
+from shared.page_identity import normalize_selector as _normalize_selector
+
+# How large a diff may be before it stops looking like a targeted edit. The
+# caller passes its own budget; healing reads AUTOFIX_MAX_DIFF_LINES.
+DEFAULT_MAX_DIFF_LINES = 40
+
+def _line_of(text: str, needle: str) -> int:
+    """1-based line where needle starts, or 0."""
+    idx = text.find(needle)
+    return text.count("\n", 0, idx) + 1 if idx >= 0 else 0
+
+
+def _condense(value: str, width: int = 100) -> str:
+    """One readable line: collapse whitespace, elide the middle if long."""
+    flat = " ".join((value or "").split())
+    if len(flat) <= width:
+        return flat
+    return flat[: width - 20] + " … " + flat[-17:]
+
+
+def log_edits(target_file, original: str, edits: list, log_fn) -> None:
+    """Print what actually changed, file and line, before -> after.
+
+    The prose fix_description says WHY; without this nobody could see WHAT.
+    Reading a run meant scrolling maven output hunting for the new selector in
+    the next failure message, and a reverted attempt left no record at all.
+    """
+    total = len(edits or [])
+    for n, edit in enumerate(edits or [], 1):
+        old = edit.get("old_string", "")
+        new = edit.get("new_string", "")
+        line = _line_of(original, old)
+        where = f"{target_file.name}:{line}" if line else target_file.name
+        log_fn(f"    edit {n}/{total} — {where}")
+        log_fn(f"      - {_condense(old)}")
+        log_fn(f"      + {_condense(new)}")
+
+
+def apply_edits(original: str, edits: list) -> tuple:
+    """Apply search/replace edits. Returns (updated_text, error).
+
+    Every old_string must appear exactly once — an ambiguous match means the
+    model did not give enough context, and guessing which occurrence it meant is
+    how an autofix corrupts a file.
+    """
+    if not edits:
+        return None, "no edits supplied"
+
+    updated = original
+    for i, edit in enumerate(edits, 1):
+        if not isinstance(edit, dict):
+            return None, f"edit {i} is not an object"
+        old = edit.get("old_string")
+        new = edit.get("new_string")
+        if old is None or new is None:
+            return None, f"edit {i} missing old_string/new_string"
+        if old == new:
+            return None, f"edit {i} is a no-op"
+        count = updated.count(old)
+        if count == 0:
+            return None, f"edit {i}: old_string not found in file"
+        if count > 1:
+            return None, f"edit {i}: old_string matches {count} times — not unique"
+        updated = updated.replace(old, new, 1)
+
+    return updated, ""
+
+
+def validate_fix(original: str, updated: str, filename: str,
+                 max_diff_lines: int = DEFAULT_MAX_DIFF_LINES, *,
+                 may_remove: Iterable[str] = ()) -> tuple:
+    """Reject a 'locator fix' that is actually a rewrite. Returns (ok, reason).
+
+    The model only ever sees part of a large file, so a change far bigger than a
+    locator is the signature of it regenerating content it never read.
+    `may_remove` names the methods the edit is meant to take out — a copy moved
+    to one place — so only those may disappear.
+    """
+    if not updated.strip():
+        return False, "fix produced an empty file"
+
+    changed = [line for line in difflib.unified_diff(
+        original.splitlines(), updated.splitlines(), lineterm="", n=0)
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
+    if not changed:
+        return False, "fix changed nothing"
+    if len(changed) > max_diff_lines:
+        return False, (f"fix touches {len(changed)} lines (limit {max_diff_lines}) — "
+                       f"too large to be a targeted edit; this is the signature of "
+                       f"the model regenerating a file it only saw part of")
+
+    # Losing a method is the classic whole-file-rewrite failure: the model
+    # regenerates a file it only saw an excerpt of and silently drops the rest.
+    if filename.endswith((".java", ".kt")):
+        try:
+            before = {m["name"] for m in split_class_members(original)
+                      if m["kind"] in ("method", "constructor") and m["name"]}
+            after = {m["name"] for m in split_class_members(updated)
+                     if m["kind"] in ("method", "constructor") and m["name"]}
+            lost = before - after - set(may_remove)
+            if lost:
+                return False, f"fix removed method(s): {', '.join(sorted(lost))}"
+        except Exception:
+            pass  # never let the guard itself break a valid fix
+
+    return True, ""
+
+
+
+
+# ── Fix-integrity guards ──────────────────────────────────────────────────────
+#
+# The verification loop cannot catch a fix built on a wrong diagnosis, because
+# the easiest way to make a page assertion pass is to weaken it. A run that had
+# already been told the avatar was missing "fixed" it by moving the page-load
+# anchor onto a link that exists on the logged-out page too — and that would have
+# gone green while the login was still broken. These guards are what the re-run
+# cannot do for us.
+
+# Selectors that assert *which page* we are on. Broadening one of these turns a
+# real failure into a silent pass.
+_IDENTITY_CALL = re.compile(r"assertPageLoaded\s*\(")
+
+# A quoted selector, so a replacement can be compared against what it replaced.
+_QUOTED = re.compile(r"""(["'])((?:\\.|(?!\1).)+)\1""")
+
+
+# Only the argument of a locator call is a selector. Framework code is full of
+# quoted human labels passed alongside one — click(loginButton, "Login button"),
+# isElementDisplayed(toast, "Success Toast") — and treating those as selectors made
+# the broadening check compare a label against a real selector: "Success Toast" vs
+# "[class*='toast'], [role='alert']" trips the comma rule and rejects a valid fix.
+#
+# Scoping to the call rather than to how the string LOOKS is what keeps a bare tag
+# (page.locator("input"), a real collapse-to-tag broadening) in scope while leaving
+# labels out — a shape-based filter cannot separate those two.
+#
+# Which calls take a selector is the framework's business (its CodeEngine's
+# LOCATOR_CALLS); the DOM API's own are the same in every framework.
+_DOM_SELECTOR_CALLS = ("querySelectorAll", "querySelector")
+
+
+def _locator_calls() -> str:
+    """Regex alternation of every call whose first string argument is a selector."""
+    from shared.frameworks import get_active_plugin
+    return "|".join(get_active_plugin().code.LOCATOR_CALLS + _DOM_SELECTOR_CALLS)
+
+
+def _selectors_in(text: str) -> list:
+    # A locator inside an iframe is one selector, written as a chain. Read as its
+    # parts, the element's own selector was checked against the top document,
+    # matched nothing there, and a correct fix was rejected as a guess.
+    from shared.frameworks import get_active_plugin
+    chains = get_active_plugin().code.frame_chains(text or "")
+    pattern = re.compile(rf"""(?:{_locator_calls()})\s*\(\s*(["'])((?:\\.|(?!\1).)*)\1""", re.I)
+    plain = [(m.start(), m.group(2)) for m in pattern.finditer(text or "")
+             if not any(start <= m.start() < end for start, end, _ in chains)]
+    return [sel for _, sel in sorted(plain + [(start, chain) for start, _, chain in chains])]
+
+
+def _is_broader(before: str, after: str) -> bool:
+    """Whether `after` is a strictly weaker version of `before`.
+
+    Only the unambiguous cases: adding comma-alternatives, dropping attribute or
+    class constraints, or collapsing to a bare tag. A different-but-equally-tight
+    selector is a normal fix and must pass.
+    """
+    if not before or not after or before == after:
+        return False
+    # Every added comma is another alternative the assertion will accept, so a
+    # selector that already had one gets looser the same way one that had none
+    # does. Counting rather than testing presence is what catches
+    # "[a], [b], [c]" -> "[a], [b], [c], [d], [role='alert']", which is a guess
+    # widening its net until something matches.
+    if after.count(",") > before.count(","):
+        return True
+    def tightness(selector):
+        return (selector.count("[") + selector.count("#") + selector.count(".")
+                + selector.count(":"))
+    if tightness(after) == 0 and tightness(before) > 0:
+        return True
+    return False
+
+
+def _selector_literals(text: str) -> list:
+    """(literal, assembled) for each selector literal a locator call opens with."""
+    from shared.frameworks.base import literal_is_assembled
+    pattern = re.compile(rf"""(?:{_locator_calls()})\s*\(\s*(["'])((?:\\.|(?!\1).)*)\1""", re.I)
+    return [(m.group(2), literal_is_assembled(text, m.end(), m.group(2)))
+            for m in pattern.finditer(text or "")]
+
+
+def _template_collapsed(removed: str, added: str) -> tuple:
+    """(template prefix, literal) when an edit hard-codes one value into a template.
+
+    A locator built from an option's key — `"a[data-option='" + option.getKey() +
+    "']"` — serves every value of the option's enum. Only the value the failing
+    test used is ever exercised, so a fix that "repairs" it by writing that one
+    value out in full passes, and silently breaks every other option.
+    """
+    prefixes = [raw for raw, assembled in _selector_literals(removed) if assembled and raw]
+    if not prefixes:
+        return ()
+    for raw, assembled in _selector_literals(added):
+        if assembled:
+            continue
+        for prefix in prefixes:
+            if raw.startswith(prefix) and len(raw) > len(prefix):
+                return prefix, raw
+    return ()
+
+
+def no_selector_broadening(original: str, updated: str) -> tuple:
+    """Reject an edit that replaces a selector with a looser one. (ok, reason).
+
+    Verdict-independent, which is why it lives on its own: broadening is how a
+    wrong-page failure gets papered over into a pass, and that is true whatever
+    the diagnosis said — or whether one was made at all. validate_diagnosis_fit()
+    calls this as its rule 2, so healing's behaviour is unchanged.
+
+    Narrowing a template to one of its values is rejected here too: it is the
+    same failure seen from the other options' side.
+    """
+    changed = [line for line in difflib.unified_diff(
+        original.splitlines(), updated.splitlines(), lineterm="", n=0)
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
+    removed = [line[1:] for line in changed if line.startswith("-")]
+    added = [line[1:] for line in changed if line.startswith("+")]
+    for before, after in zip(_selectors_in("\n".join(removed)),
+                             _selectors_in("\n".join(added))):
+        if _is_broader(before, after):
+            return False, (f"fix broadens the selector {before!r} to {after!r}, "
+                           f"which would make the assertion weaker rather than correct")
+    collapsed = _template_collapsed("\n".join(removed), "\n".join(added))
+    if collapsed:
+        prefix, literal = collapsed
+        return False, (f"fix bakes one option's value into a selector the code builds for "
+                       f"every option ({prefix!r}… became {literal!r}) — fix the template's "
+                       f"fixed parts instead, so every option keeps working")
+    return True, ""
+
+
+_FIELD_TAGS = ("input", "textarea", "select")
+
+
+def _typed_into(name: str, code: str) -> bool:
+    """Whether `code` types into the locator `name`, through a wrapper that takes
+    it as an argument or a call on it."""
+    from shared.frameworks import get_active_plugin
+    calls = "|".join(get_active_plugin().code.TYPING_CALLS)
+    if not calls or not name:
+        return False
+    n = re.escape(name)
+    return bool(re.search(rf"\b(?:{calls})\s*\([^;]*?\b{n}\b|\b{n}\s*\.\s*(?:{calls})\s*\(",
+                          code))
+
+
+def replacement_is_the_field(original: str, updated: str, snapshot_soup=None,
+                             failing_selector: str = "") -> tuple:
+    """Reject an edit that re-points a field the code types into at an element
+    that is not that field. (ok, reason).
+
+    A fix moved `amountField` off a cart's total cell onto
+    `tr:nth-child(2) input`, guessed from the name and phone rows. That is
+    the Email input. Unique and editable, it passed every other guard; the test
+    typed the amount into Email, and the next attempt built a theory about
+    keystroke events on top.
+
+    Judged in the DOM captured at failure, and only when that capture is about
+    this file: its failing selector is one of the file's locators. A field must
+    be an input, textarea or select, and what it says about itself (label, row,
+    column header — see field_context) must share a word with its name. The
+    correct element there was named only by its column header.
+    """
+    if snapshot_soup is None or not failing_selector:
+        return True, ""
+    from shared.check_provenance import _akin, subject_words
+    from shared.dom_snapshot import field_context, select_nodes
+    from shared.frameworks import get_active_plugin
+    code = get_active_plugin().code
+    before = {loc["name"]: loc["raw"] for loc in code.extract_locators(original)
+              if loc.get("name")}
+    if failing_selector not in original and failing_selector not in before.values():
+        return True, ""            # a capture of some other page says nothing here
+    for loc in code.extract_locators(updated):
+        name, raw = loc.get("name"), loc.get("raw")
+        if not name or before.get(name) == raw or not _typed_into(name, updated):
+            continue
+        found = select_nodes(raw, snapshot_soup)
+        if not found or len(found[0]) != 1:
+            continue               # absent or several: the other guards and the run decide
+        (node,), doc = found
+        if node.name not in _FIELD_TAGS and not node.has_attr("contenteditable"):
+            return False, (f"{name} is typed into, but {raw!r} is a <{node.name}> in the "
+                           f"DOM captured at failure, and nothing can be typed there")
+        context = field_context(node, doc)
+        said, wanted = subject_words(context), subject_words(name)
+        if said and wanted and not any(_akin(a, b) for a in said for b in wanted):
+            return False, (f"{name} would point at a field that reads {context[:80]!r} in "
+                           f"the DOM captured at failure, which does not name it. Use the "
+                           f"field whose label, row or column header says what {name} holds")
+    return True, ""
+
+
+# A locator field used as a collection or by position: Playwright only demands a
+# single match from a locator that is acted on directly.
+_LIST_USE = re.compile(r"\b(\w+)\s*\.\s*(?:first|last|nth|all|count|allTextContents|"
+                       r"allInnerTexts|all_text_contents|all_inner_texts)\s*\(")
+
+
+def _acted_on_as_one(line: str, original: str) -> bool:
+    """Whether the locator this edited line assigns must resolve to one element."""
+    if "nth=" in line or ":nth-match(" in line:
+        return False                     # the selector narrows by position itself
+    field = re.search(rf"(\w+)\s*=\s*[^=;]*\b(?:{_locator_calls()})\s*\(", line)
+    # ponytail: usage is read from this file only; a field handed elsewhere and
+    # used as a list there is not seen — FORCE=true is the way past that.
+    return not (field and field.group(1) in {m.group(1) for m in _LIST_USE.finditer(original)})
+
+
+def _still_declared(selector: str, source: str) -> bool:
+    """Whether the file still declares this selector, however it spells it.
+
+    A runtime selector is not always a literal in the source. A locator inside an
+    iframe is reported as one chain of hops and declared as several calls, so a
+    substring test called every such selector "no longer in the file" — and the
+    rule below then set the failure capture aside for exactly the locators it was
+    captured for.
+    """
+    if selector in source:
+        return True
+    wanted = _normalize_selector(selector) or selector
+    for declared in _extract_locators(source):
+        raw = declared.get("raw") or ""
+        if raw == selector or (declared.get("selector") or raw) == wanted:
+            return True
+    return False
+
+
+def _same_locator(selector: str, failing: str) -> bool:
+    """Whether a selector in the source is the one that failed, or a hop of it.
+
+    Containment, not equality: the runtime reports a locator inside an iframe as
+    one chain and a positional one with its index appended, and the source
+    declares neither that way.
+    """
+    if not selector or not failing:
+        return False
+    left = _normalize_selector(selector) or selector
+    right = _normalize_selector(failing) or failing
+    return left == right or left in right or right in left
+
+
+def assertions_unchanged(original: str, updated: str) -> tuple:
+    """A locator fix changes how an element is found, never what is asserted.
+
+    Returns (ok, reason). Every assertion call in the file is compared before and
+    after, as written: an edit that alters an expected value, swaps what is
+    compared, or adds or drops a check has changed what the test verifies, and
+    the test passing afterwards proves nothing about the application.
+
+    Page-load assertions are left to the rules that already govern them — their
+    anchor is how a page is recognised, and a stale one is a locator to repair.
+    """
+    from shared.assertion_graph import asserts_in
+    from shared.frameworks import get_active_plugin
+    page_loads = set(get_active_plugin().code.PAGE_LOAD_ASSERTIONS)
+
+    def calls(text: str) -> list:
+        return [(a["callee"], " ".join((a.get("args") or "").split()))
+                for a in asserts_in(without_comments(text), "")
+                if a["callee"].split(".")[-1] not in page_loads]
+
+    before, after = calls(original), calls(updated)
+    if before == after:
+        return True, ""
+    if len(before) != len(after):
+        return False, (f"the edit {'adds' if len(after) > len(before) else 'removes'} "
+                       f"an assertion ({len(before)} before, {len(after)} after) — a "
+                       f"locator fix may change how an element is found, never what "
+                       f"the test verifies")
+    was, now = next((b, a) for b, a in zip(before, after) if b != a)
+    return False, (f"the edit changes an assertion: {was[0]}({_condense(was[1], 70)}) "
+                   f"became {now[0]}({_condense(now[1], 70)}) — a locator fix may "
+                   f"change how an element is found, never what the test verifies")
+
+
+def validate_diagnosis_fit(original: str, updated: str, verdict: str,
+                           snapshot_soup=None, fingerprints=None,
+                           require_unique: bool = False,
+                           failing_selector: str = "",
+                           declaring_source: str = "",
+                           element_in_capture: bool = True) -> tuple:
+    """Reject an edit that does not match what the diagnosis actually found.
+
+    Returns (ok, reason). Runs before the test does, so a fix that could only
+    pass by weakening the test never reaches a runner at all.
+
+    `fingerprints` is the sidecar captured beside the DOM snapshot. It is optional
+    because callers without one must keep working unchanged, but supplying it is
+    what makes rule 3 able to see visibility — the saved markup cannot.
+
+    `require_unique` says the test failed acting on this element (a click, a
+    fill), so a replacement matching more than one fails the same way. Off by
+    default: callers that cannot say keep the previous behaviour.
+
+    `failing_selector` is the selector the capture was taken for. Supplying it is
+    what lets the snapshot rules tell "this replacement is a guess" from "this
+    capture is no longer about the failure in front of us".
+
+    `declaring_source` is the source of the page objects the failure is about,
+    when the edit may be to a different file. A selector absent from the file
+    being edited has not necessarily been repaired: the edit may simply be aimed
+    at another page, and then the capture is still exactly the failure in hand.
+
+    `element_in_capture` is False when the element being repaired is known not to
+    be in the capture: it exists only once something is done to the page, and
+    nothing captured resembles what the last good run recorded. No replacement
+    for it can match a page it has left, so the rules that ask the capture about
+    the replacement stand aside and the test run decides.
+    """
+    # The capture as it arrived. Rule 2b reads this one: the rules that ask
+    # whether a REPLACEMENT is present need the capture to be about this failure,
+    # but a selector found resolving in it was resolving, whatever it was taken for.
+    seen_soup, seen_prints = snapshot_soup, fingerprints
+
+    # A capture is evidence only for the failure it was captured for. When the
+    # selector that failed is no longer in the file, an earlier edit already
+    # repaired it and the flow has since moved on to a page this capture never
+    # saw — so every replacement for that later page "matches nothing" here, and
+    # rule 3 rejects correct fixes as guesses. Unevaluable is not absent: drop
+    # the capture rather than rule against it, and let the test run decide.
+    if (failing_selector and snapshot_soup is not None
+            and not _still_declared(failing_selector, original)
+            and not (declaring_source
+                     and _still_declared(failing_selector, declaring_source))):
+        snapshot_soup, fingerprints = None, None
+    # Same principle, the other way it arises: the capture is about this failure
+    # and still cannot hold the element. A message that shows and clears itself is
+    # gone by the time a wait for it gives up, and the right selector for it
+    # "matches nothing" there exactly as a guess would.
+    if not element_in_capture:
+        snapshot_soup, fingerprints = None, None
+
+    changed = [line for line in difflib.unified_diff(
+        original.splitlines(), updated.splitlines(), lineterm="", n=0)
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
+    removed = [line[1:] for line in changed if line.startswith("-")]
+    added = [line[1:] for line in changed if line.startswith("+")]
+
+    # 1. Never weaken a page-identity assertion unless the locator really is the
+    #    thing that broke.
+    if verdict != "LOCATOR_STALE":
+        touched_identity = any(_IDENTITY_CALL.search(line) for line in removed + added)
+        if touched_identity:
+            return False, (f"fix changes a page-load assertion, but the diagnosis is "
+                           f"{verdict or 'unknown'} rather than a stale locator — "
+                           f"weakening a page check would make the test pass on the "
+                           f"wrong page. Re-run with FORCE=true to override.")
+
+    # 2. Never broaden a selector. That is how a wrong-page failure gets papered
+    #    over into a pass.
+    ok, reason = no_selector_broadening(original, updated)
+    if not ok:
+        return False, reason
+
+    # 2b. Never replace a selector that works. One matching exactly one visible
+    #     element in the capture resolved when the test failed, so it is not what
+    #     failed. Replacing it repairs nothing and ships a change to a locator
+    #     nobody reported, with a reason invented to fit: an attempt handed a
+    #     failure that an earlier edit had already repaired rewrote the repaired
+    #     selector, twice, each time explaining what had changed on the page.
+    kept = set(_selectors_in("\n".join(added)))
+    for candidate in _selectors_in("\n".join(removed)):
+        if candidate in kept or _same_locator(candidate, failing_selector):
+            continue
+        if selector_visibility(candidate, seen_soup, seen_prints or {}) == (1, 1):
+            return False, (f"the edit replaces {candidate!r}, which matches exactly one "
+                           f"visible element in the DOM captured at failure — it "
+                           f"resolved when the test failed, so it is not the locator "
+                           f"that broke")
+
+    # 3. A genuinely stale locator has a replacement that exists on the page we
+    #    were actually on, and that a user could actually have interacted with.
+    #    One matching nothing is a guess; one matching only hidden elements is a
+    #    fix that cannot work. The failure-time DOM says so before maven spends a
+    #    minute discovering it.
+    if verdict == "LOCATOR_STALE" and snapshot_soup is not None:
+        prints = fingerprints or {}
+        known_visibility = bool(prints.get("elements"))
+        checked = matched = visible = 0
+        for candidate in _selectors_in("\n".join(added)):
+            result = selector_visibility(candidate, snapshot_soup, prints)
+            if result is None:
+                continue                 # cannot evaluate: not evidence either way
+            hits, seen = result
+            checked += 1
+            matched += 1 if hits else 0
+            visible += seen
+        if checked and not matched:
+            return False, ("the replacement selector matches nothing in the DOM "
+                           "captured at failure, so it is a guess rather than a fix")
+        # Only assert invisibility when the capture actually recorded some, so a
+        # missing sidecar degrades to the match-count rule rather than to "reject".
+        if known_visibility and matched and not visible:
+            return False, ("the replacement selector matches only elements that "
+                           "were not visible when the test failed, so the click "
+                           "would time out exactly as the original did")
+        # 3b. The test failed acting on this element, and Playwright refuses to act
+        #     on a selector matching more than one: `#loginForm button:has-text('Login')`
+        #     also matched "Use OTP to Login" and failed the same way, 40 s later.
+        if require_unique:
+            for line in added:
+                if not _acted_on_as_one(line, original):
+                    continue
+                for candidate in _selectors_in(line):
+                    result = selector_visibility(candidate, snapshot_soup, prints)
+                    if result and result[0] > 1:
+                        return False, (f"the replacement selector {candidate!r} matches "
+                                       f"{result[0]} elements in the DOM captured at "
+                                       f"failure; the test acts on this element, so "
+                                       f"the selector must match exactly one")
+
+    # 4. A fix for an ambiguous locator has to be unambiguous. Playwright refuses
+    #    to act on a selector that resolves to more than one element, so a
+    #    "narrower" selector that still matches two fails identically — as
+    #    `#loginForm button[type='submit']` did, scoping to a form that contained
+    #    both buttons. The captured DOM answers this in a millisecond; discovering
+    #    it by running the test costs half a minute and a revert.
+    if verdict == "AMBIGUOUS_LOCATOR" and snapshot_soup is not None:
+        for candidate in _selectors_in("\n".join(added)):
+            result = selector_visibility(candidate, snapshot_soup, fingerprints or {})
+            if result is None:
+                continue                 # cannot evaluate: not evidence either way
+            hits, _seen = result
+            if hits > 1:
+                return False, (f"the replacement selector still matches {hits} "
+                               f"elements in the DOM captured at failure, and the "
+                               f"diagnosis is that matching more than one IS the "
+                               f"failure — it would throw the same ambiguous locator "
+                               f"error")
+            if hits == 0:
+                return False, ("the replacement selector matches nothing in the "
+                               "DOM captured at failure, so it is a guess rather "
+                               "than a fix")
+
+    return True, ""
+
+
+def compute_diff(original: str, fixed: str, filename: str) -> str:
+    diff_lines = list(difflib.unified_diff(
+        original.splitlines(keepends=True),
+        fixed.splitlines(keepends=True),
+        fromfile=f"a/{filename}",
+        tofile=f"b/{filename}",
+        n=3,
+    ))
+    return "".join(diff_lines[:100])
+
+
+
+# ── Guards for edits larger than a locator ────────────────────────────────────
+#
+# The guards above bound a *locator* edit: keep the diff small, do not lose a
+# method, do not broaden a selector. Once an edit may add and remove steps those
+# stop applying, because a legitimate flow change is large by definition. What
+# still applies is that the test must go on proving what it proved before, and
+# that the model must be transcribing something it observed rather than inventing
+# something plausible. These check exactly that.
+
+def _added_lines(before: str, after: str) -> list:
+    return [line[1:] for line in difflib.unified_diff(
+        before.splitlines(), after.splitlines(), lineterm="", n=0)
+        if line.startswith("+") and not line.startswith("+++")]
+
+
+# An edit that makes a failure survivable rather than fixing it. Each of these
+# turns a red test green without changing what the product does.
+_SWALLOW_PATTERNS = (
+    (re.compile(r"\bThread\.sleep\s*\("), "Thread.sleep — a fixed sleep is banned; "
+     "use the framework's waits"),
+    (re.compile(r"@Ignore\b"), "@Ignore — disables the test rather than fixing it"),
+    (re.compile(r"\benabled\s*=\s*false"), "enabled=false — disables the test"),
+    (re.compile(r"\bassumeTrue\s*\("), "assumeTrue — skips the test at runtime"),
+    (re.compile(r"\bthrow\s+new\s+SkipException"), "SkipException — skips the test"),
+)
+
+# A catch whose body neither rethrows nor records a failure: the exception
+# happened, and nobody will ever know.
+_CATCH = re.compile(r"\bcatch\s*\([^)]*\)\s*\{")
+_CATCH_OK = re.compile(r"\b(throw|AssertHelper|logFail|logFailToEndExecution|fail)\b")
+
+# Raw driver calls. config/skills/automation-repo.md forbids these, and until
+# now nothing checked — the rule lived only in a prompt. What counts as raw is the
+# framework's business: its CodeEngine's RAW_DRIVER_CALLS.
+
+_LOGSTEP = re.compile(r"\blogStep\s*\(")
+
+# One interaction with the page, as a line of page-object or test code: the
+# Selenium framework's static `Element.*` wrappers, or the Playwright framework's
+# inherited BasePage wrappers, called unqualified (`click(locator, "Next")`).
+_INTERACTION = re.compile(
+    r"\bElement\s*\.\s*(click\w*|enterData|clearData|selectBy\w*|hover\w*)\s*\("
+    r"|(?<![\w.])(?:click|clickForce|clickViaJS|clickUntilNextElementIsLoaded|doubleClick"
+    r"|fillText|typeText|inputOTP|selectOption|selectOptionBySearch|check|uncheck|hover"
+    r"|pressKey|uploadFile|navigateTo|navigateToFeature)\s*\(")
+
+# A call that only reads — data, state, a property — is wiring, not a step.
+_QUERY_CALLEE = re.compile(
+    r"^(?:get|read|load|build|parse|format|is|has|to)(?:[A-Z]|$)"
+    r"|^(?:size|length|equals|contains|stream|map|filter|collect|trim)$")
+_RECEIVER_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*(\w+)\s*\(")
+
+
+def _added_interactions(code: str) -> list:
+    """Statements in `code` that drive the app, in either framework.
+
+    Built on logstep_narration.acting_statements — the same notion of "a step"
+    the narration check uses — minus assertions (a check inside an existing
+    step needs no new narration) and minus pure reads. Selenium tests call
+    `Element.click(...)`; Playwright-framework tests call helpers and page
+    objects (`products.addToCart(...)`), which a wrapper-name list never saw.
+    """
+    from shared.logstep_narration import acting_statements, _ASSERT_CALL, _PLUMBING_RECEIVERS
+    found = []
+    for statement in acting_statements(code):
+        if _ASSERT_CALL.search(statement):
+            continue
+        calls = [(r, c) for r, c in _RECEIVER_CALL.findall(statement)
+                 if r not in _PLUMBING_RECEIVERS]
+        if any(not _QUERY_CALLEE.search(callee) for _r, callee in calls):
+            found.append(statement)
+    return found
+
+
+def no_new_swallowing(before: str, after: str) -> tuple:
+    """Reject an edit that makes the test survive a failure instead of fixing it."""
+    added = _added_lines(before, after)
+    blob = "\n".join(added)
+    reasons = []
+
+    for pattern, why in _SWALLOW_PATTERNS:
+        if pattern.search(blob):
+            reasons.append(why)
+
+    for match in _CATCH.finditer(blob):
+        tail = blob[match.end():match.end() + 400]
+        body = tail.split("}")[0]
+        if not _CATCH_OK.search(body):
+            reasons.append("a catch block that neither rethrows nor records a "
+                           "failure — the exception happened and nobody will know")
+            break
+
+    return (not reasons), "; ".join(reasons)
+
+
+def wrapper_compliance(before: str, after: str) -> tuple:
+    """Reject raw driver calls, as the active framework defines them, in added code."""
+    from shared.frameworks import get_active_plugin
+    blob = "\n".join(_added_lines(before, after))
+    found = [name for pattern, name in get_active_plugin().code.RAW_DRIVER_CALLS
+             if pattern.search(blob)]
+    if found:
+        return False, (f"added raw driver calls ({', '.join(found)}) — the framework "
+                       f"wrappers exist so waits, retries and logging happen")
+    return True, ""
+
+
+def logstep_present(before: str, after: str, is_test_class: bool) -> tuple:
+    """An added interaction in a test class must say what it is doing.
+
+    CONVENTIONS.md §10 requires it, and it is not bookkeeping: the derived intent
+    contract is built from these strings, so a step added without one quietly
+    degrades the contract that protects the *next* adaptation.
+    """
+    if not is_test_class:
+        return True, ""
+    added = "\n".join(_added_lines(before, after))
+    if (_INTERACTION.search(added) or _added_interactions(added)) and not _LOGSTEP.search(added):
+        return False, ("added an interaction to a test class with no logStep — "
+                       "every test step must be narrated, and the intent contract "
+                       "is derived from those strings")
+    return True, ""
+
+
+def matches_negative(selectors: list, negatives: list) -> tuple:
+    """Reject an anchor that also matches a page the test must NOT be on.
+
+    A selector that matches the logged-out page is not proof of a successful
+    login. The negatives are DOM snapshots of pages that represent failure —
+    logged-out, error, empty-state — which the agents already produce in volume
+    and have never been compared against.
+    """
+    from shared.page_identity import parse as _parse, select as _select
+
+    for candidate in selectors or []:
+        normalized = _normalize_selector(candidate)
+        if not normalized:
+            continue
+        for negative in negatives or []:
+            try:
+                soup = negative if hasattr(negative, "select") else _parse(negative)
+                if soup is not None and _select(soup, normalized, limit=1):
+                    return False, (f"the new anchor {candidate!r} also matches a "
+                                   f"page the test must not be on — it would pass "
+                                   f"there too, so it proves nothing")
+            except Exception:
+                continue
+    return True, ""
+
+
+def steps_justified(before: str, after: str, flow_steps: list) -> tuple:
+    """Every interaction the edit ADDS must correspond to one that was observed.
+
+    This is the inversion the whole design rests on: the model transcribes what
+    exploration saw, it does not invent what would be convenient. A step whose
+    selector could not be verified unique justifies nothing — an unverifiable
+    observation is not an observation.
+    """
+    added = _added_lines(before, after)
+    interactions = [line.strip() for line in added if _INTERACTION.search(line)]
+    if not interactions:
+        return True, ""
+
+    usable = [s for s in (flow_steps or [])
+              if (s.get("maps_to_test") or {}).get("kind") in ("new", "replaces")
+              and (s.get("selector_check") or {}).get("unique") is True]
+    if not usable:
+        return False, (f"{len(interactions)} interaction(s) added but exploration "
+                       f"observed no new step with a uniquely verified selector — "
+                       f"this is invention, not transcription")
+    if len(interactions) > len(usable):
+        return False, (f"{len(interactions)} interaction(s) added against "
+                       f"{len(usable)} observed new step(s) — more steps than were "
+                       f"seen in the product")
+
+    observed = set()
+    for step in usable:
+        target = (step.get("action") or {}).get("target") or {}
+        for key in ("name", "selector", "accessible_name"):
+            if target.get(key):
+                observed.add(re.sub(r"[^a-z0-9]+", "", str(target[key]).lower()))
+
+    unjustified = []
+    for line in interactions:
+        flat = re.sub(r"[^a-z0-9]+", "", line.lower())
+        if not any(token and token in flat for token in observed):
+            unjustified.append(line[:80])
+    if unjustified:
+        return False, ("added interaction(s) matching nothing exploration observed: "
+                       + "; ".join(unjustified[:3]))
+    return True, ""

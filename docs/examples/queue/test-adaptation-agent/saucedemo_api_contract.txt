@@ -1,0 +1,22 @@
+Module: SauceDemo
+Type: api
+API URL: https://jsonplaceholder.typicode.com
+Tests: automation.saucedemo.SauceDemoApiTest#getPostById, automation.saucedemo.SauceDemoApiTest#createPost, automation.saucedemo.SauceDemoApiTest#updatePost
+
+Auth: none. JSONPlaceholder is a public mock API — no token or API key.
+
+What changed:
+1. GET /posts/{id}, POST /posts and PUT /posts/{id} now return the post
+   identifier as "postId" instead of "id". The old key is gone, not deprecated.
+2. "body" is no longer a top-level response field — it moved under a new
+   "content" object as "content.text".
+3. POST /posts and PUT /posts/{id} now require an "X-Request-Id" header and
+   reject requests without it with 400. The value is any fresh UUID generated
+   per request (java.util.UUID.randomUUID(), or `uuidgen` in a shell) — there
+   is nothing to fetch. For example:
+   curl -X POST https://jsonplaceholder.typicode.com/posts \
+     -H "Content-Type: application/json; charset=UTF-8" \
+     -H "X-Request-Id: 3f6c1e2a-7b4d-4c9e-9a51-2d8f0b6e4a17" \
+     -d '{"userId": 1, "title": "My Test Post", "body": "Some content"}'
+
+Expected outcome unchanged: a post can be fetched by its identifier with a title and body, created, and updated with a new title and body.

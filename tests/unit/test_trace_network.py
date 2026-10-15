@@ -18,13 +18,18 @@ from shared import trace_network
 
 
 def _trace(tmp_path, records, name="t.zip"):
+    """A record is (url, method, status, time_ms), plus the request headers when
+    the log is to carry them."""
     path = tmp_path / name
     lines = "\n".join(json.dumps({
         "type": "resource-snapshot",
-        "snapshot": {"request": {"url": url, "method": method},
+        "snapshot": {"request": {"url": url, "method": method,
+                                 **({"headers": [{"name": k, "value": v}
+                                                 for k, v in headers[0].items()]}
+                                    if headers else {})},
                      "response": {"status": status, "statusText": ""},
                      "time": time_ms, "startedDateTime": "2026-08-26T00:00:00Z"},
-    }) for url, method, status, time_ms in records)
+    }) for url, method, status, time_ms, *headers in records)
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("trace.network", lines)
         archive.writestr("trace.trace", "")
@@ -75,6 +80,30 @@ class TestSummarize:
         assert len(summary["auth_rejections"]) == 1
         assert summary["client_errors"] == []
 
+    def test_a_refusal_with_nothing_sent_is_not_a_rejection(self, tmp_path):
+        # A page that also works signed out asks who the visitor is on every
+        # load. Being told nobody is the answer, not a session that died.
+        trace = _trace(tmp_path, [(PAGE + "api/me", "GET", 401, 20,
+                                   {"Origin": "https://app.example.com"})])
+        summary = trace_network.summarize(trace, PAGE)
+        assert summary["first_party_auth_rejections"] == []
+        assert len(summary["anonymous_denials"]) == 1
+
+    @pytest.mark.parametrize("header", ["Authorization", "authorization", "Cookie"])
+    def test_a_refused_credential_is_a_rejection(self, tmp_path, header):
+        trace = _trace(tmp_path, [(PAGE + "api/me", "GET", 401, 20, {header: "x"})])
+        summary = trace_network.summarize(trace, PAGE)
+        assert len(summary["first_party_auth_rejections"]) == 1
+        assert summary["anonymous_denials"] == []
+
+    def test_a_log_without_headers_cannot_clear_a_refusal(self, tmp_path):
+        # Unevaluable is not absent: not knowing what was sent is no evidence
+        # that nothing was.
+        trace = _trace(tmp_path, [(PAGE + "api/me", "GET", 403, 20)])
+        summary = trace_network.summarize(trace, PAGE)
+        assert len(summary["first_party_auth_rejections"]) == 1
+        assert summary["anonymous_denials"] == []
+
     def test_failed_requests_are_collected(self, tmp_path):
         trace = _trace(tmp_path, [(PAGE, "GET", 200, 10),
                                   ("https://collector.example/x", "POST", -1, -1)])
@@ -93,3 +122,49 @@ class TestDescribe:
         trace = _trace(tmp_path, [(PAGE, "GET", 200, 10)])
         assert "document request -> HTTP 200" in trace_network.describe(
             trace_network.summarize(trace, PAGE))
+
+    def test_a_signed_out_refusal_is_not_reported_as_a_rejection(self, tmp_path):
+        trace = _trace(tmp_path, [(PAGE, "GET", 200, 10, {}),
+                                  (PAGE + "api/me", "GET", 401, 20, {})])
+        rendered = trace_network.describe(trace_network.summarize(trace, PAGE))
+        assert "no credentials sent: GET https://app.example.com/api/me (401)" in rendered
+        assert "auth rejected" not in rendered
+
+
+class TestDescribeOrdering:
+    """The bug this pins: a diagnosis block whose network evidence was two
+    failed Google ad beacons and "… 1 more".
+
+    `summarize` already marks each request first- or third-party. `describe`
+    ignored that and listed them in arrival order, so third-party noise pushed
+    the requests the application actually made past `max_lines` and out of the
+    report.
+    """
+
+    SUMMARY = {
+        "available": True, "total": 9, "document_status": 200,
+        "document_url": PAGE,
+        "failed": [
+            {"url": "https://www.google.co.in/pagead/1p-user-list/123",
+             "method": "GET", "status": None, "first_party": False},
+            {"url": "https://www.google.co.in/pagead/1p-user-list/456",
+             "method": "GET", "status": None, "first_party": False},
+            {"url": "https://app.example.com/api/profile",
+             "method": "POST", "status": None, "first_party": True},
+        ],
+        "server_errors": [], "auth_rejections": [], "client_errors": [], "slow": [],
+    }
+
+    def test_the_application_request_is_reported_first(self):
+        lines = trace_network.describe(self.SUMMARY).splitlines()
+        assert "api/profile" in lines[1]
+
+    def test_third_party_requests_are_labelled(self):
+        rendered = trace_network.describe(self.SUMMARY)
+        assert "pagead/1p-user-list/123 (None) [third-party]" in rendered
+
+    def test_a_first_party_failure_survives_a_tight_budget(self):
+        # The failure mode itself: with max_lines low, the one request that
+        # matters must not be the one that gets truncated away.
+        rendered = trace_network.describe(self.SUMMARY, max_lines=2)
+        assert "api/profile" in rendered

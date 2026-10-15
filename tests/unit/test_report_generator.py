@@ -117,6 +117,25 @@ class TestReportGeneratorGenerateHtmlReport:
         assert "All Flaky Tests" in html_content
         assert "1 tests" in html_content or "(1 tests)" in html_content or "1 test" in html_content
 
+    def test_failures_card_split_adds_up_to_its_count(self):
+        """A known failure has its own card ("marked as passed") and is not in the
+        Failures count, so it must not be in that card's split either. It was, and
+        a build showed "3" over "2 Potential Bugs, 2 Automation Issues"."""
+        gen = ReportGenerator()
+        summary = _minimal_summary()          # failed=2
+        known = TestResult(class_name="OtpTest", method_name="login", duration_seconds=1.0,
+                           status=TestStatus.ERROR, known_failure="QA-1")
+        html_content, _ = gen.generate_html_report(
+            summary,
+            [_minimal_classification("CartTest.add"),
+             _minimal_classification("ApiTest.get", automation=False),
+             _minimal_classification("OtpTest.login", automation=False)],
+            "TestReport-1",
+            report_dir=self._REPORT_DIR,
+            test_results=[known],
+        )
+        assert "1 Potential Bugs, 1 Automation Issues" in html_content
+
     def test_generate_html_report_includes_no_flaky_message_when_empty(self):
         gen = ReportGenerator()
         summary = _minimal_summary()

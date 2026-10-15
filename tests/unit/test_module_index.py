@@ -1,0 +1,230 @@
+"""Tests for shared/module_index.py — what code exists, and what a change changed.
+
+Codegen cannot reuse a method it never saw, and a reviewer cannot judge a change
+to existing code nobody listed. These pin both halves: the index the model is
+shown, and the diffs the review notes and the regression re-run are built from.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from shared import module_index as mi  # noqa: E402
+
+HELPER = '''package automation.modules.shop;
+
+/** The shop's flow API. See {@link ShopEnums}. */
+public class ShopHelper extends ApiHelper
+{
+    public ShopHelper(Config config)
+    {
+        super(config, config.getRunTimeProperty("shop.api.url"));
+    }
+
+    @SafeVarargs
+    public final CartPage addToCart(Map<String, String>... products)
+    {
+        CartPage cart = new CartPage(config);
+        for (Map<String, String> product : products) { cart.add(product.get("slug")); }
+        return cart;
+    }
+
+    public String checkout(ShopData order)
+    {
+        CartPage cart = new CartPage(config);
+        cart.fillDetails(order);
+        cart.confirm();
+        return cart.submit().getTotal();
+    }
+
+    private void wiring() {}
+
+    @Value
+    public static class Receipt
+    {
+        String amount;
+        String reference;
+    }
+}
+'''
+
+ENUMS = '''package automation.modules.shop;
+
+public class ShopEnums
+{
+    public enum PaymentMethod
+    {
+        CreditCard("card", "Card"), BankTransfer("bank", "Bank, transfer"), Wallet("wallet", "Wallet");
+
+        private final String key;
+        private final String label;
+
+        PaymentMethod(String key, String label) { this.key = key; this.label = label; }
+
+        public String getKey() { return key; }
+    }
+}
+'''
+
+
+def test_public_signatures_skip_private_members_and_keep_varargs_and_generics():
+    signatures = mi.public_signatures(HELPER)
+    assert signatures["ShopHelper"] == [
+        "ShopHelper(Config config)",
+        "CartPage addToCart(Map<String, String>... products)",
+        "String checkout(ShopData order)",
+    ]
+    assert signatures["ShopHelper.Receipt"] == []
+
+
+def test_enum_constants_are_found_in_nested_enums_with_arguments():
+    assert mi.enum_constants(ENUMS) == {"ShopEnums.PaymentMethod": ["CreditCard", "BankTransfer", "Wallet"]}
+
+
+def test_describe_lists_each_class_with_its_members(tmp_path):
+    module = tmp_path / "src/main/java/automation/modules/shop"
+    module.mkdir(parents=True)
+    (module / "ShopHelper.java").write_text(HELPER)
+    (module / "ShopEnums.java").write_text(ENUMS)
+    text = mi.describe_module(tmp_path, "src/main/java/automation/modules/shop")
+    assert "class ShopHelper  (src/main/java/automation/modules/shop/ShopHelper.java)" in text
+    assert "    String checkout(ShopData order)" in text
+    assert "    fields: amount, reference" in text            # the nested value class
+    assert "enum ShopEnums.PaymentMethod: CreditCard, BankTransfer, Wallet" in text
+    assert "wiring" not in text
+
+
+def test_describe_lists_a_helpers_page_fields_with_their_types(tmp_path):
+    module = tmp_path / "src/main/java/automation/modules/shop"
+    module.mkdir(parents=True)
+    (module / "ShopHelper.java").write_text(HELPER.replace(
+        "{\n    public ShopHelper(Config config)",
+        "{\n    public CartPage cartPage;\n    public static final String KEY = \"k\";\n"
+        "    private Wiring wiring;\n\n    public ShopHelper(Config config)", 1))
+    text = mi.describe_module(tmp_path, "src/main/java/automation/modules/shop")
+    assert "    page fields: CartPage cartPage" in text      # the page a test continues from
+    assert "KEY" not in text and "Wiring" not in text
+
+
+def test_a_page_constructed_mid_flow_is_a_rebuilt_page():
+    # Both operations build their own CartPage instead of continuing from the
+    # page the previous step returned.
+    assert mi.rebuilt_pages(HELPER, {"CartPage"}) == [
+        {"method": "ShopHelper.addToCart(Map<String,String>...)", "page": "CartPage"},
+        {"method": "ShopHelper.checkout(ShopData)", "page": "CartPage"},
+    ]
+    assert mi.rebuilt_pages(HELPER, {"CartPage"}, only=["ShopHelper.checkout(ShopData)"]) == [
+        {"method": "ShopHelper.checkout(ShopData)", "page": "CartPage"}]
+
+
+def test_the_first_page_after_navigating_is_not_rebuilt():
+    entry = HELPER.replace("CartPage cart = new CartPage(config);\n        cart.fillDetails",
+                           'BrowserHelper.navigateTo(config, url);\n'
+                           '        CartPage cart = new CartPage(config);\n        cart.fillDetails')
+    assert [r["method"] for r in mi.rebuilt_pages(entry, {"CartPage"})] == [
+        "ShopHelper.addToCart(Map<String,String>...)"]
+    assert mi.rebuilt_pages(HELPER, set()) == []       # not a page class: not a page
+
+
+def test_changed_methods_tells_a_changed_body_from_an_added_overload():
+    after = HELPER.replace("cart.confirm();", "cart.confirm(true);").replace(
+        "    private void wiring() {}",
+        "    public String checkout(ShopData order, boolean express) { return checkout(order); }\n"
+        "    private void wiring() {}")
+    diff = mi.changed_methods(HELPER, after)
+    assert diff["changed"] == ["ShopHelper.checkout(ShopData)"]
+    assert diff["added"] == ["ShopHelper.checkout(ShopData,boolean)"]
+    assert diff["removed"] == []
+
+
+def test_lost_api_names_removed_public_methods_and_enum_constants():
+    after = HELPER.replace("public String checkout(ShopData order)", "public String checkout(ShopData order, int n)")
+    assert mi.lost_api(HELPER, after) == ["public String checkout(ShopData order)"]
+    assert mi.lost_api(ENUMS, ENUMS.replace(', Wallet("wallet", "Wallet")', "")) == \
+        ["ShopEnums.PaymentMethod.Wallet"]
+
+
+def test_changed_fields_lists_changed_initializers_not_added_fields():
+    page = 'public class CartPage { private final Locator pay = page.locator("#pay"); }'
+    assert mi.changed_fields(page, page.replace("#pay", "#pay-now")) == ["CartPage.pay"]
+    added = page.replace("}", 'private final Locator total = page.locator("#total"); }', 1)
+    assert mi.changed_fields(page, added) == []
+
+
+def test_a_copy_with_only_literals_changed_is_a_near_duplicate():
+    copy = HELPER.replace(
+        "    private void wiring() {}",
+        "    public String checkoutExpress(ShopData order)\n    {\n"
+        "        CartPage cart = new CartPage(config);\n        cart.fillDetails(order);\n"
+        "        cart.confirm();\n        return cart.submit().getTotal();\n    }\n"
+        "    private void wiring() {}")
+    found = mi.near_duplicates({"Shop.java": copy}, {"Shop.java": HELPER},
+                               only={"Shop.java": ["ShopHelper.checkoutExpress(ShopData)"]})
+    assert found == [{"methods": ["ShopHelper.checkout(ShopData)",
+                                  "ShopHelper.checkoutExpress(ShopData)"], "ratio": 1.0}]
+
+
+def test_one_method_in_four_classes_is_one_finding():
+    """Observed: normalizeAmount() written into four page objects was logged as six
+    pairs. It is one method, written four times."""
+    body = ("    private String normalizeAmount(String raw)\n    {\n"
+            "        String s = raw.replaceAll(\"[^0-9.]\", \"\");\n"
+            "        int dot = s.lastIndexOf('.');\n"
+            "        return dot < 0 ? s : s.substring(0, dot);\n    }\n")
+    pages = {f"{name}.java": f"public class {name} extends BasePage {{\n{body}}}\n"
+             for name in ("SnapPage", "CardPage", "BankPage", "SuccessPage")}
+    found = mi.near_duplicates(pages, {})
+    assert found == [{"methods": sorted(f"{n}.normalizeAmount(String)"
+                                        for n in ("SnapPage", "CardPage", "BankPage", "SuccessPage")),
+                      "ratio": 1.0}]
+    assert mi.describe_duplicates(found[0]) == (
+        "`normalizeAmount(String)` is written 4 times (identical): "
+        "BankPage, CardPage, SnapPage, SuccessPage")
+    copies = mi.copied_methods(pages)
+    assert len(copies) == 1 and len(copies[0]) == 4
+    assert mi.copied_methods({"SnapPage.java": pages["SnapPage.java"]}) == [], \
+        "one file is not a copy"
+
+
+def test_methods_doing_different_things_are_not_duplicates():
+    other = HELPER.replace(
+        "    private void wiring() {}",
+        "    public void refund(ShopData order)\n    {\n        OrdersPage orders = openOrders();\n"
+        "        orders.find(order.getId()).requestRefund();\n        WaitHelper.waitForPageLoad(config);\n    }\n"
+        "    private void wiring() {}")
+    assert mi.near_duplicates({"Shop.java": other}, {"Shop.java": HELPER},
+                              only={"Shop.java": ["ShopHelper.refund(ShopData)"]}) == []
+
+
+def test_a_reuse_claim_is_checked_against_what_exists(tmp_path):
+    module = tmp_path / "src/main/java/automation/modules/shop"
+    module.mkdir(parents=True)
+    (module / "ShopHelper.java").write_text(HELPER)
+    known = mi.known_members(tmp_path, ["src/main/java/automation/modules/shop"])
+    assert mi.parse_member_reference("static String ShopHelper.checkout(ShopData order)") == \
+        ("ShopHelper", "checkout")
+    assert mi.is_known(known, "ShopHelper", "checkout")
+    assert mi.is_known(known, "ShopHelper.Receipt", "getAmount")   # a Lombok getter
+    assert not mi.is_known(known, "ShopHelper", "makePayment")
+    assert mi.parse_member_reference("no method named here") is None
+
+
+def test_page_constructors_and_selections_through_different_enums_are_not_copies():
+    pages = '''public class PaymentPage extends BasePage {
+    public PaymentPage(Config config) { super(config); total = page.locator("#total"); assertPageLoaded(total); }
+    public CardPage choose(PaymentMethod method) {
+        click(page.frameLocator("#pay").locator("a[data-option='" + method.getKey() + "']"), method.getLabel());
+        return new CardPage(config);
+    }
+}
+'''
+    cards = '''public class CardPage extends BasePage {
+    public CardPage(Config config) { super(config); total = page.locator("#total"); assertPageLoaded(total); }
+    public CardPage applyPromo(Promo promo) {
+        click(page.frameLocator("#pay").locator("label[for='" + promo.getKey() + "']"), promo.getLabel());
+        return new CardPage(config);
+    }
+}
+'''
+    assert mi.near_duplicates({"PaymentPage.java": pages, "CardPage.java": cards}, {}) == []

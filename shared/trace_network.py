@@ -1,8 +1,12 @@
-"""Read the network log out of a Playwright trace zip.
+"""Summarise the network log a framework's execution artifact carries.
 
-A trace carries two logs. `trace.trace` holds the action timeline and is already
-parsed by `shared/playwright_trace.py`; `trace.network` holds every HTTP request
-the page made, in HAR-shaped records, and until now was never opened at all.
+Reading the log is the framework plugin's job (`TelemetryParser.read_network`),
+which returns HAR-shaped records; this module only interprets them.
+
+**Optional, on purpose.** This is an enrichment channel rather than a required
+one: a framework that records no network log returns [] and simply loses this
+evidence channel rather than failing. That is the honest outcome; synthesising
+one would be worse.
 
 That file is the generic evidence channel for a whole family of failures that
 reach the fixer disguised as a missing element: the host was unreachable, the
@@ -15,10 +19,7 @@ Deliberately conservative: anything unreadable yields empty findings, never a
 guess. A trace that cannot be parsed must not manufacture a diagnosis.
 """
 
-import json
-import zipfile
-from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 from urllib.parse import urlsplit
 
 # A request Playwright could not complete is recorded with status 0 or -1.
@@ -29,44 +30,9 @@ _SLOW_MS = 3000
 
 
 def read_entries(trace_path) -> List[Dict]:
-    """Every network record in the trace, flattened. [] for anything unreadable."""
-    if not trace_path:
-        return []
-    path = Path(trace_path)
-    if not path.exists():
-        return []
-    try:
-        with zipfile.ZipFile(path) as archive:
-            names = [n for n in archive.namelist() if n.endswith("trace.network")]
-            if not names:
-                return []
-            raw = archive.read(names[0]).decode("utf-8", errors="ignore")
-    except (zipfile.BadZipFile, OSError, KeyError):
-        return []
-
-    entries = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        snapshot = event.get("snapshot") if isinstance(event, dict) else None
-        if not isinstance(snapshot, dict):
-            continue
-        request = snapshot.get("request") or {}
-        response = snapshot.get("response") or {}
-        entries.append({
-            "url": request.get("url", ""),
-            "method": request.get("method", ""),
-            "status": response.get("status"),
-            "status_text": response.get("statusText", ""),
-            "time_ms": snapshot.get("time"),
-            "started": snapshot.get("startedDateTime", ""),
-        })
-    return entries
+    """Every network record the framework's artifact carries. [] for anything unreadable."""
+    from shared.frameworks import get_active_plugin
+    return get_active_plugin().telemetry.read_network(trace_path)
 
 
 def _registrable(host: str) -> str:
@@ -116,7 +82,7 @@ def summarize(trace_path, page_url: str = "") -> Dict:
         "available": False, "total": 0,
         "document_status": None, "document_url": "",
         "failed": [], "server_errors": [], "client_errors": [],
-        "auth_rejections": [], "redirects": [], "slow": [],
+        "auth_rejections": [], "anonymous_denials": [], "redirects": [], "slow": [],
         "first_party_failed": [], "first_party_server_errors": [],
         "first_party_auth_rejections": [],
     }
@@ -138,7 +104,15 @@ def summarize(trace_path, page_url: str = "") -> Dict:
         elif 500 <= status < 600:
             result["server_errors"].append(brief)
         elif status in (401, 403):
-            result["auth_rejections"].append(brief)
+            # A rejection needs something to reject. A request that carried no
+            # credential is the application asking who the visitor is and being
+            # told nobody, which any page that also works signed out does on
+            # every load. Only a known absence counts: a log that does not record
+            # what was sent leaves the request where it always was.
+            if entry.get("sent_credentials") is False:
+                result["anonymous_denials"].append(brief)
+            else:
+                result["auth_rejections"].append(brief)
         elif 400 <= status < 500:
             result["client_errors"].append(brief)
         elif 300 <= status < 400:
@@ -155,7 +129,7 @@ def summarize(trace_path, page_url: str = "") -> Dict:
     # First-party first, so the entries a rule reads and a human sees are the ones
     # that belong to the application rather than to its analytics vendors.
     for key in ("failed", "server_errors", "client_errors",
-                "auth_rejections", "redirects", "slow"):
+                "auth_rejections", "anonymous_denials", "redirects", "slow"):
         result[key].sort(key=lambda item: not item.get("first_party"))
         result[key] = result[key][:10]
     result["first_party_failed"] = [i for i in result["failed"] if i.get("first_party")]
@@ -173,13 +147,22 @@ def describe(summary: Dict, max_lines: int = 8) -> str:
     lines: List[str] = []
     if summary.get("document_status") is not None:
         lines.append(f"document request -> HTTP {summary['document_status']}")
+    # First party first, and third party last. An ad or analytics beacon fails on
+    # most pages and says nothing about the test; listing those in arrival order
+    # pushed the requests the application actually made past `max_lines` and out
+    # of the report entirely.
     for label, key in (("failed request", "failed"),
                        ("server error", "server_errors"),
                        ("auth rejected", "auth_rejections"),
-                       ("client error", "client_errors")):
-        for item in summary.get(key) or []:
+                       ("client error", "client_errors"),
+                       # Last: it is the normal signed-out path, and must not
+                       # push a real failure past `max_lines`.
+                       ("signed out, no credentials sent", "anonymous_denials")):
+        entries = list(summary.get(key) or [])
+        for item in sorted(entries, key=lambda i: not i.get("first_party")):
+            where = "" if item.get("first_party") else " [third-party]"
             lines.append(f"{label}: {item['method']} {item['url'][:90]} "
-                         f"({item['status']})")
+                         f"({item['status']}){where}")
     for item in summary.get("slow") or []:
         lines.append(f"slow: {round(item['time_ms'])}ms {item['url'][:90]}")
     if not lines:

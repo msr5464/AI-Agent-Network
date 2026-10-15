@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → li
 
 from shared.log import log as _log
 from shared import diagnosis
+from shared import workspace as workspace_helper
 from lib.root_cause_groups import (group_failures, pick_representative,
                                     is_groupable, signature as cause_signature)
 def log(msg): _log("classify", msg)
@@ -27,8 +28,12 @@ AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path(__file__).resolve().parents[1]))
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
 
-CLASSIFIER_MODEL = os.environ.get("CLASSIFIER_MODEL", "claude-opus-4-6")
-CLASSIFIER_EFFORT = os.environ.get("CLASSIFIER_EFFORT", "medium")
+# One model and effort for the whole agent, shared with 04_review. The reviewer's
+# independence comes from being a separate call with no shared context. Both are
+# set in config/.env, with no default here: run.sh stops the run without a model,
+# and an empty effort is not passed, so the runner's own effortLevel applies.
+TRIAGING_MODEL = os.environ.get("TRIAGING_MODEL", "")
+TRIAGING_EFFORT = os.environ.get("TRIAGING_EFFORT") or None
 
 MAX_LOG_CHARS = 4000   # Truncate execution log per failure to fit context
 BATCH_SIZE = 10        # Failures per Claude call (avoid context limits)
@@ -45,7 +50,9 @@ def load_json(filename):
 
 from shared.claude import call_claude as _call_claude
 def call_claude(prompt: str) -> str:
-    output = _call_claude(prompt, CLASSIFIER_MODEL, str(REPO_ROOT))
+    output = _call_claude(prompt, TRIAGING_MODEL, str(REPO_ROOT),
+                          log_dir=str(AUDIT_DIR),
+                          effort=TRIAGING_EFFORT or None)
     if not output:
         log("Claude CLI returned empty response")
     return output
@@ -228,7 +235,7 @@ def apply_category_rules(classifications: list[dict], all_failures: list[dict]) 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def diagnose_failures(failures: list, report_dir: str) -> dict:
+def diagnose_failures(failures: list, workspace) -> dict:
     """Deterministic verdicts for the failures whose evidence supports one.
 
     Runs before the model. Where the engine is confident it is authoritative — it
@@ -239,7 +246,7 @@ def diagnose_failures(failures: list, report_dir: str) -> dict:
     verdicts = {}
     for failure in failures:
         try:
-            evidence = diagnosis.collect(failure, workspace=report_dir or None)
+            evidence = diagnosis.collect(failure, workspace=workspace or None)
             verdict = diagnosis.diagnose(evidence)
         except Exception as e:
             log(f"  Diagnosis failed for {failure.get('full_name')}: {e}")
@@ -326,7 +333,14 @@ def main():
     # The engine measured the page; the classifier can only read the sentence
     # describing it. Where the engine is confident, it is the better answer and
     # the model is not asked at all.
-    diagnosed = diagnose_failures(representatives, collect.get("report_dir", ""))
+    # The automation checkout, not the CI report directory: the page object that
+    # declares a failing selector, its baseline and the test's preconditions all
+    # live in source. The report dir was passed here, so all three looked in the
+    # wrong place and every lookup came back empty.
+    workspace = workspace_helper.find(os.environ.get("WORKSPACE_DIR", ""),
+                                      os.environ.get("GITHUB_REPO_AUTOMATION", ""),
+                                      exclude=REPO_ROOT)
+    diagnosed = diagnose_failures(representatives, workspace)
     if diagnosed:
         log(f"Diagnosed {len(diagnosed)} of {len(representatives)} representative(s) "
             f"from evidence — no model call needed for those")

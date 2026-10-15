@@ -4,32 +4,32 @@ Extracted from report_generator.py for better maintainability.
 """
 
 
-def get_html_scripts(dashboard_base_url: str, project_name: str, job_name: str, jira_base_url: str = '') -> str:
+def get_html_scripts(triaging_dashboard_base_url: str, project_name: str, job_name: str, triaging_jira_base_url: str = '') -> str:
     """
     Generate JavaScript code for the HTML report.
 
     Args:
-        dashboard_base_url: Base URL for the dashboard (e.g., "https://dashboard.qa.example.com")
+        triaging_dashboard_base_url: Base URL for the dashboard (e.g., "https://dashboard.qa.example.com")
         project_name: Project name for building URLs
         job_name: Job name for building URLs
-        jira_base_url: Base URL for Jira (e.g., "https://jira.example.com") for known-failure ticket links
+        triaging_jira_base_url: Base URL for Jira (e.g., "https://jira.example.com") for known-failure ticket links
 
     Returns:
         JavaScript code as a string
     """
     # Escape single quotes in the values to prevent JavaScript errors
-    dashboard_base_url_escaped = dashboard_base_url.replace("'", "\\'")
+    dashboard_base_url_escaped = triaging_dashboard_base_url.replace("'", "\\'")
     project_name_escaped = project_name.replace("'", "\\'")
     job_name_escaped = job_name.replace("'", "\\'")
-    jira_base_url_escaped = (jira_base_url or '').rstrip('/').replace("'", "\\'")
+    jira_base_url_escaped = (triaging_jira_base_url or '').rstrip('/').replace("'", "\\'")
 
     # Use triple quotes with string concatenation to avoid issues with JavaScript braces
     return (
         """            // Configuration from server
-            const DASHBOARD_BASE_URL = '""" + dashboard_base_url_escaped + """';
+            const TRIAGING_DASHBOARD_BASE_URL = '""" + dashboard_base_url_escaped + """';
             const PROJECT_NAME = '""" + project_name_escaped + """';
             const JOB_NAME = '""" + job_name_escaped + """';
-            const JIRA_BASE_URL = '""" + jira_base_url_escaped + """';
+            const TRIAGING_JIRA_BASE_URL = '""" + jira_base_url_escaped + """';
             const newlineChar = '\\n';
             
             // Handle expand icon click to toggle details and update animation
@@ -594,10 +594,10 @@ def get_html_scripts(dashboard_base_url: str, project_name: str, job_name: str, 
                     `;
                 }
                 
-                // Show known failure info if applicable (JIRA_BASE_URL from Config, injected by report generator)
+                // Show known failure info if applicable (TRIAGING_JIRA_BASE_URL from Config, injected by report generator)
                 const knownFailureTicket = dot.getAttribute('data-known-failure') || '';
                 if (isKnownFailure && knownFailureTicket && knownFailureTicket.trim() !== '') {
-                    const jiraBase = (JIRA_BASE_URL || '').trim();
+                    const jiraBase = (TRIAGING_JIRA_BASE_URL || '').trim();
                     const jiraUrl = jiraBase ? (jiraBase + '/browse/' + knownFailureTicket) : '';
                     const ticketHtml = jiraUrl
                         ? `<a href="${jiraUrl}" target="_blank" style="color: #ff9800; text-decoration: none; font-weight: 600;">${knownFailureTicket}</a>`

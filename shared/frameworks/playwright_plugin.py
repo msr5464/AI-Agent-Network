@@ -1,0 +1,639 @@
+import json
+import os
+import re
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from shared import frames
+from shared.frameworks.base import (
+    CodeEngine,
+    DiagnosticEngine,
+    FrameworkPlugin,
+    TelemetryParser,
+    TestRunner,
+    literal_is_assembled,
+)
+
+
+class PlaywrightTelemetryParser(TelemetryParser):
+    
+    NOISE_ACTIONS = frozenset({"BrowserContext.newPage", "Frame.content", "BrowserContext.close",
+                               "Browser.close", "Page.close", "Tracing.start", "Tracing.stop"})
+
+    def discover(self, results_dir: Path, method_name: str) -> List[Path]:
+        """Playwright's tracing writes one zip per test under traces/."""
+        results_dir = Path(results_dir)
+        if not results_dir.is_dir():
+            return []
+        return [p for p in results_dir.rglob(f"traces/{method_name}_*.zip") if p.is_file()]
+
+    def read_actions(self, trace_path: Path) -> List[Dict]:
+        trace_path = Path(trace_path)
+        if not trace_path.exists():
+            return []
+
+        try:
+            with zipfile.ZipFile(trace_path) as archive:
+                names = [n for n in archive.namelist() if n.endswith("trace.trace")]
+                if not names:
+                    return []
+                raw = archive.read(names[0]).decode("utf-8", errors="ignore")
+        except (zipfile.BadZipFile, OSError, KeyError):
+            return []
+
+        events = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                continue
+
+        outcomes: Dict[str, Dict] = {}
+        for event in events:
+            if event.get("type") == "after" and event.get("callId"):
+                outcomes[event["callId"]] = event
+
+        actions: List[Dict] = []
+        for event in events:
+            if event.get("type") != "before" or not event.get("class"):
+                continue
+            name = f"{event['class']}.{event['method']}"
+            params = event.get("params") or {}
+            after = outcomes.get(event.get("callId"), {})
+            error = (after.get("error") or {}).get("message", "")
+            duration = ""
+            if after.get("endTime") and event.get("startTime"):
+                duration = f"{after['endTime'] - event['startTime']:.0f}ms"
+            actions.append({
+                "action": name,
+                "selector": params.get("selector", ""),
+                "url": params.get("url", ""),
+                # fill() sends `value`; type() and pressSequentially() send `text`.
+                # Reading only the first left every keystroke-typed field blank in the
+                # timeline, which hid a card number field that was typed "India".
+                "value": str(params.get("value") or params.get("text") or "")[:60],
+                "error": error.splitlines()[0] if error else "",
+                "duration": duration,
+            })
+        return actions
+
+    def failing_action(self, actions: List[Dict]) -> Optional[Dict]:
+        """The action the test died on, when one threw.
+
+        An error the flow carried on past was caught where it was raised, as a
+        visibility check on a locator that matches a whole list is, and is not
+        why the test stopped. Read from the end: the first error met is the
+        failure, unless the flow acted cleanly after it.
+        """
+        for action in reversed([a for a in actions if a.get("selector") or a.get("error")]):
+            if action.get("error"):
+                return action
+            if action.get("action") not in self._PROBES:
+                break
+        return self._polled_to_death(actions)
+
+    def read_network(self, trace_path: Path) -> List[Dict]:
+        """Every record in the trace's `trace.network` log, flattened. [] for anything unreadable."""
+        if not trace_path:
+            return []
+        path = Path(trace_path)
+        if not path.exists():
+            return []
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = [n for n in archive.namelist() if n.endswith("trace.network")]
+                if not names:
+                    return []
+                raw = archive.read(names[0]).decode("utf-8", errors="ignore")
+        except (zipfile.BadZipFile, OSError, KeyError):
+            return []
+
+        entries = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            snapshot = event.get("snapshot") if isinstance(event, dict) else None
+            if not isinstance(snapshot, dict):
+                continue
+            request = snapshot.get("request") or {}
+            response = snapshot.get("response") or {}
+            entries.append({
+                "url": request.get("url", ""),
+                "method": request.get("method", ""),
+                "status": response.get("status"),
+                "status_text": response.get("statusText", ""),
+                "time_ms": snapshot.get("time"),
+                "started": snapshot.get("startedDateTime", ""),
+                "sent_credentials": self._sent_credentials(request),
+            })
+        return entries
+
+    @staticmethod
+    def _sent_credentials(request: Dict) -> Optional[bool]:
+        """Whether a request carried a session to refuse. None when the log does not say."""
+        headers = request.get("headers")
+        if not isinstance(headers, list):
+            return None
+        names = {str(h.get("name", "")).lower() for h in headers if isinstance(h, dict)}
+        return bool(names & {"authorization", "cookie"} or request.get("cookies"))
+
+    #: Calls that only measure the page. A framework that records why a wait
+    #: failed makes these after giving up, into the same trace.
+    _PROBES = frozenset({"Frame.queryCount", "Frame.isVisible", "Frame.isHidden",
+                         "Frame.isEnabled"})
+
+    def _polled_to_death(self, actions: List[Dict], min_repeats: int = 3) -> Optional[Dict]:
+        """The selector a wait re-checked until it gave up, when nothing threw.
+
+        The last run of identical-selector calls, provided nothing but measuring
+        followed it. Reading only the very tail missed every wait whose framework
+        then counted its anchors and the page object's other locators as evidence:
+        those calls land after the polling and end the streak at one.
+        """
+        tail = [a for a in actions if a.get("selector")]
+        runs: List[List[Dict]] = []
+        for action in tail:
+            if runs and runs[-1][0]["selector"] == action["selector"]:
+                runs[-1].append(action)
+            else:
+                runs.append([action])
+        after: List[Dict] = []
+        for run in reversed(runs):
+            if len(run) >= min_repeats:
+                if any(a.get("action") not in self._PROBES for a in after):
+                    return None     # the flow acted again; that streak was not the end
+                return {**run[-1],
+                        "error": f"polled {len(run)}x without ever becoming visible",
+                        "inferred": True}
+            after.extend(run)
+        return None
+
+
+class PlaywrightTestRunner(TestRunner):
+    _NON_MODULE_DIRS = {"target", "build", "node_modules", "test-output", "venv", ".venv"}
+
+    def detect_command(self, workspace: Path, class_simple: str, method: str) -> Optional[List[str]]:
+        gradle_filter = f"*.{class_simple}.{method}" if method else f"*.{class_simple}"
+        maven_filter = f"{class_simple}#{method}" if method else class_simple
+
+        def build_cmd(root: Path) -> Optional[List[str]]:
+            if (root / "gradlew").exists():
+                return ["./gradlew", "test", "--tests", gradle_filter, "-q", "--rerun-tasks"]
+            if (root / "build.gradle").exists() or (root / "build.gradle.kts").exists():
+                return ["gradle", "test", "--tests", gradle_filter, "-q"]
+            if (root / "pom.xml").exists():
+                return ["mvn", "test", f"-Dtest={maven_filter}", "--no-transfer-progress"]
+            if (root / "package.json").exists():
+                return ["npx", "playwright", "test", "--grep", method or class_simple, "-x"]
+            return None
+
+        cmd = build_cmd(workspace)
+        if cmd:
+            return cmd
+
+        try:
+            children = sorted(p for p in workspace.iterdir() if p.is_dir())
+        except OSError:
+            return None
+        for child in children:
+            if child.name.startswith(".") or child.name in self._NON_MODULE_DIRS:
+                continue
+            cmd = build_cmd(child)
+            if cmd:
+                return cmd
+        return None
+
+    def apply_browser_mode(self, cmd: List[str], properties: Dict[str, str]) -> Tuple[List[str], Dict[str, str]]:
+        from shared import browser_mode
+        decided = browser_mode.configured()
+        if decided is None or "headless" in properties:
+            return cmd, properties
+        runner = " ".join(cmd[:3]).lower()
+        if any(tool in runner for tool in ("mvn", "maven", "gradle")):
+            properties = {**properties, **browser_mode.maven_properties()}
+        elif "playwright" in runner and not decided and "--headed" not in cmd:
+            cmd = cmd + ["--headed"]
+        return cmd, properties
+
+
+class PlaywrightDiagnosticEngine(DiagnosticEngine):
+    # A null handed to fill().
+    NULL_VALUE_SIGNALS = ("value: expected string, got undefined",)
+
+    # What Playwright prints when a locator resolves to nothing usable. A strict
+    # mode violation is included: the locator no longer identifies one element.
+    _RESOLUTION_SIGNALS = (
+        "waiting for locator", "waiting for selector", "locator resolved to",
+        "locator.click", "locator.fill", "strict mode violation",
+    )
+
+    def is_ambiguous_locator(self, error_message: str) -> bool:
+        return "strict mode violation" in (error_message or "").lower()
+
+    def is_locator_resolution_failure(self, error_message: str) -> bool:
+        text = (error_message or "").lower()
+        return any(signal in text for signal in self._RESOLUTION_SIGNALS)
+
+
+class PlaywrightCodeEngine(CodeEngine):
+    ELEMENT_TYPES = ("Locator",)
+    LOCATOR_CALLS = ("locator", "waitForSelector")
+    TYPING_CALLS = ("fillText", "typeText", "enterData", "fill", "type", "pressSequentially")
+    PAGE_LOAD_ASSERTIONS = ("assertPageLoaded",)
+    # Only the wrapper classes may make these calls. `Element.click(...)` is a
+    # wrapper itself, hence the lookbehind.
+    RAW_DRIVER_CALLS = (
+        (re.compile(r"(?<!\bElement)\s*\.\s*(?:click|dblclick|fill|press|check|uncheck"
+                    r"|selectOption|hover|setInputFiles)\s*\("), "locator.click()/fill()/…"),
+        (re.compile(r"\bpage\s*\.\s*(?:navigate|waitForTimeout)\s*\("), "page.navigate()/waitForTimeout()"),
+    )
+
+    _HAS_TEXT_RE = re.compile(r':has-text\([^)]+\)')
+    
+    _NARROWING_SUFFIX = re.compile(r"\s*>>\s*(nth=-?\d+|first|last|visible=(true|false))\s*$", re.IGNORECASE)
+    _UNEVALUABLE_PREFIX = ("xpath=", "text=", "//", "(//", "..", "id=", "data-testid=")
+    _UNEVALUABLE_TOKEN = (">>", ":has-text(", ":text(", ":text-is(", ":visible",
+                          ":near(", ":right-of(", ":left-of(", ":above(", ":below(")
+    _LOCATOR_PATTERNS = (
+        re.compile(r"""(?:(?P<name>\w+)\s*=\s*)?(?:page|this\.page)\s*\.\s*locator\s*\(\s*(?P<q>["'])(?P<sel>(?:\\.|(?!(?P=q)).)*)(?P=q)"""),
+        re.compile(r"""(?:(?P<name>\w+)\s*=\s*)?By\s*\.\s*(?:cssSelector|id)\s*\(\s*(?P<q>["'])(?P<sel>(?:\\.|(?!(?P=q)).)*)(?P=q)"""),
+        re.compile(r"""@FindBy\s*\(\s*(?:css|id)\s*=\s*(?P<q>["'])(?P<sel>(?:\\.|(?!(?P=q)).)*)(?P=q)"""),
+    )
+    _FINDBY_FIELD = re.compile(r"\b(?:WebElement|MobileElement|Locator|By)\s+(\w+)")
+    _ACCESSOR_NAME = re.compile(r"\b(?:Locator|WebElement|MobileElement|By)\s+(\w+)\s*\([^)]*\)\s*\{(?:[^{}]|\{[^{}]*\})*$")
+
+    # page.frameLocator("a")[.frameLocator("b")].locator("c"), and the same through
+    # page.locator("a").contentFrame() — Java and Python spellings. A chain ending
+    # in getBy*() is read by `_GETBY_PATTERNS` below, which take the same hops.
+    _STR = r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'"""
+    _HOP = (rf"""(?:frameLocator|frame_locator)\s*\(\s*(?:{_STR})\s*\)"""
+            rf"""|locator\s*\(\s*(?:{_STR})\s*\)\s*\.\s*(?:contentFrame\s*\(\s*\)|content_frame\b)""")
+    _CHAIN = re.compile(rf"""\b(?:this\s*\.\s*)?page\s*\.\s*(?:{_HOP})(?:\s*\.\s*(?:{_HOP}))*"""
+                        rf"""\s*\.\s*locator\s*\(\s*(?:{_STR})\s*\)""")
+    _CHAIN_NAME = re.compile(r"\b(\w+)\s*=\s*$")
+
+    def frame_chains(self, source: str) -> List[Tuple[int, int, str]]:
+        def unquote(literal: str) -> str:
+            return (literal[1:-1].replace('\\"', '"').replace("\\'", "'")
+                    .replace("\\\\", "\\"))
+
+        found = []
+        for match in self._CHAIN.finditer(source or ""):
+            pieces = [unquote(m.group(0)) for m in re.finditer(self._STR, match.group(0))]
+            found.append((match.start(), match.end(), frames.join(pieces[:-1], pieces[-1])))
+        return found
+    
+    # `page.getByX(...)`, and the same at the end of an iframe chain. A heal writes
+    # whichever builder proved unique, inside a frame as readily as outside one;
+    # a declaration this could not read was a field that had silently stopped
+    # being one of the page object's locators.
+    _GETBY_HEAD = (rf"""(?:(?P<name>\w+)\s*=\s*)?(?<![\w.])(?:this\s*\.\s*)?page"""
+                   rf"""(?P<hops>(?:\s*\.\s*(?:{_HOP}))*)\s*\.\s*""")
+    _GETBY_VALUE = r"""\s*\(\s*(?P<q>["'])(?P<val>(?:\\.|(?!(?P=q)).)*)(?P=q)"""
+    _GETBY_PATTERNS = (
+        (re.compile(_GETBY_HEAD + r"""getByRole\s*\(\s*(?:[\w.]*AriaRole\s*\.\s*)?(?P<role>\w+)"""), "role"),
+        (re.compile(_GETBY_HEAD + "getByTestId" + _GETBY_VALUE), "testid"),
+        (re.compile(_GETBY_HEAD + "getByPlaceholder" + _GETBY_VALUE), "placeholder"),
+        (re.compile(_GETBY_HEAD + "getByText" + _GETBY_VALUE), "text"),
+        (re.compile(_GETBY_HEAD + "getByLabel" + _GETBY_VALUE), "label"),
+        (re.compile(_GETBY_HEAD + "getByAltText" + _GETBY_VALUE), "alt"),
+        (re.compile(_GETBY_HEAD + "getByTitle" + _GETBY_VALUE), "title"),
+    )
+    # The attribute builders, as a selector and as the call that declares them.
+    _GETBY_ATTRIBUTES = {"testid": ("data-testid", "getByTestId"),
+                         "placeholder": ("placeholder", "getByPlaceholder"),
+                         "alt": ("alt", "getByAltText"),
+                         "title": ("title", "getByTitle")}
+    # What those builders are at runtime: `internal:attr=[placeholder="123"s]`,
+    # `internal:testid=[data-testid="pay"s]`. The trailing flag says how the value
+    # is matched (s: exactly, i: ignoring case); it is not part of the attribute.
+    _INTERNAL_ATTR = re.compile(
+        r"""^internal:(?:attr|testid)=\[\s*([\w-]+)\s*=\s*"((?:\\.|[^"\\])*)"\s*[si]?\s*\]$""")
+    _SET_NAME = re.compile(r"""setName\s*\(\s*(["'])(?P<val>(?:\\.|(?!\1).)*)\1""")
+    _ARIA_REF = re.compile(r"(?:^|[\[\s])(?:aria-)?ref\s*=", re.I)
+    _BARE_REF = re.compile(r"^(?=.*\d)[a-f][0-9a-f]{2,}$", re.I)
+    _TEXT_ATTR = re.compile(r"\[\s*text\s*=", re.I)
+
+    _ROLE_TO_JAVA = {
+        "button": "BUTTON", "link": "LINK", "textbox": "TEXTBOX", "checkbox": "CHECKBOX",
+        "radio": "RADIO", "combobox": "COMBOBOX", "listbox": "LISTBOX", "heading": "HEADING",
+        "img": "IMG", "option": "OPTION", "tab": "TAB", "dialog": "DIALOG", "list": "LIST",
+        "listitem": "LISTITEM", "searchbox": "SEARCHBOX", "slider": "SLIDER",
+        "spinbutton": "SPINBUTTON", "table": "TABLE", "menuitem": "MENUITEM",
+    }
+
+    _ROLE_TAGS = {
+        "LINK": "a[href], [role='link']",
+        "BUTTON": "button, [role='button'], input[type='submit'], input[type='button']",
+        "TEXTBOX": "input[type='text'], input[type='email'], input[type='search'], "
+                   "input[type='password'], input:not([type]), textarea, [role='textbox']",
+        "CHECKBOX": "input[type='checkbox'], [role='checkbox']",
+        "RADIO": "input[type='radio'], [role='radio']",
+        "HEADING": "h1, h2, h3, h4, h5, h6, [role='heading']",
+        "IMG": "img, [role='img']",
+        "LISTITEM": "li, [role='listitem']",
+        "COMBOBOX": "select, [role='combobox']",
+        "TAB": "[role='tab']",
+        "DIALOG": "[role='dialog'], dialog",
+        "ALERT": "[role='alert']",
+    }
+
+    def remove_framework_suffixes(self, selector: str) -> str:
+        return self._HAS_TEXT_RE.sub('', selector)
+
+    def is_dom_selector(self, raw: str) -> bool:
+        if not raw or not raw.strip():
+            return False
+        selector = raw.strip()
+        if self._ARIA_REF.search(selector):
+            return False
+        if self._TEXT_ATTR.search(selector):
+            return False
+        if self._BARE_REF.match(selector):
+            return False
+        return True
+
+    def normalize_selector(self, raw: str) -> Optional[str]:
+        if not raw:
+            return None
+        if frames.scoped(raw):
+            # Each hop on its own: the chain's `>>` is not CSS, but every piece is.
+            path, inner = frames.split(raw)
+            pieces = [self.normalize_selector(piece) for piece in path + [inner]]
+            return None if not all(pieces) else frames.join(pieces[:-1], pieces[-1])
+        selector = raw.strip()
+        if selector.startswith("Locator@"):
+            selector = selector[len("Locator@"):].strip()
+        while True:
+            stripped = self._NARROWING_SUFFIX.sub("", selector)
+            if stripped == selector:
+                break
+            selector = stripped.strip()
+        if not selector:
+            return None
+        internal = self._INTERNAL_ATTR.match(selector)
+        if internal:
+            # A failure quotes the builder the way the runtime holds it; the
+            # declaration reads as the attribute it stands for. One form for both,
+            # or a failing locator never matches the field that declares it.
+            value = internal.group(2).replace('\\"', '"').replace("\\\\", "\\")
+            return f"[{internal.group(1)}={self.quote_css_value(value)}]"
+        lowered = selector.lower()
+        if lowered.startswith(self._UNEVALUABLE_PREFIX):
+            return None
+        if any(token in lowered for token in self._UNEVALUABLE_TOKEN):
+            return None
+        return selector
+
+    def live_selector(self, locator: Dict[str, str]) -> str:
+        # The agents' browser is driven by this engine, so a locator string is
+        # countable as written, `:has-text()` and `:text-is()` included. Reduced
+        # to plain CSS first, most of a page object written that way had nothing
+        # left to count, and what was counted stood for the whole of it.
+        if locator.get("approx"):
+            return ""
+        raw = locator.get("raw") or ""
+        if locator.get("kind", "css") == "css" and self.is_dom_selector(raw):
+            return raw
+        return locator.get("selector") or ""
+
+    def extract_locators(self, source: str) -> List[Dict[str, str]]:
+        found = []
+        seen = set()
+        if not source:
+            return found
+
+        def _unescape(sel: str) -> str:
+            return sel.replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
+
+        # A locator inside an iframe, as one entry. Its hops are masked from the
+        # plain patterns below: `page.locator("#frame").contentFrame()...` would
+        # otherwise register the IFRAME as the field's locator.
+        chains = self.frame_chains(source)
+        for start, _end, raw in chains:
+            if raw in seen:
+                continue
+            seen.add(raw)
+            name = ""
+            lead = self._CHAIN_NAME.search(source[:start])
+            if lead:
+                name = lead.group(1)
+            else:
+                head = self._ACCESSOR_NAME.search(source[:start])
+                name = head.group(1) if head else ""
+            path, _inner = frames.split(raw)
+            found.append({"name": name, "raw": raw, "kind": "css", "value": "",
+                          "approx": False, "frame_path": path,
+                          "selector": self.normalize_selector(raw) or ""})
+
+        def _in_chain(position: int) -> bool:
+            return any(start <= position < end for start, end, _raw in chains)
+
+        for index, pattern in enumerate(self._LOCATOR_PATTERNS):
+            is_findby = index == 2
+            for match in pattern.finditer(source):
+                if _in_chain(match.start("sel")):
+                    continue
+                raw = _unescape(match.group("sel"))
+                if not raw or raw in seen:
+                    continue
+                seen.add(raw)
+                name = match.groupdict().get("name") or ""
+                if not name and is_findby:
+                    tail = source[match.end():match.end() + 200]
+                    field = self._FINDBY_FIELD.search(tail)
+                    if field:
+                        name = field.group(1)
+                if not name:
+                    head = self._ACCESSOR_NAME.search(source[:match.start()])
+                    if head:
+                        name = head.group(1)
+                found.append({"name": name, "raw": raw, "kind": "css",
+                              "value": "",
+                              "approx": literal_is_assembled(source, match.end(), raw),
+                              "selector": self.normalize_selector(raw) or ""})
+
+        for pattern, kind in self._GETBY_PATTERNS:
+            for match in pattern.finditer(source):
+                if _in_chain(match.start()):
+                    continue
+                groups = match.groupdict()
+                value = groups.get("val") or groups.get("role") or ""
+                if not value:
+                    continue
+                name = groups.get("name") or ""
+                if not name:
+                    field = self._FINDBY_FIELD.search(source[max(0, match.start() - 200):match.start()])
+                    if field:
+                        name = field.group(1)
+                value = _unescape(value)
+                entry = {"name": name, "kind": kind, "value": value,
+                         "approx": kind in ("role", "text", "label"),
+                         "selector": "", "accessible_name": ""}
+                if kind == "role":
+                    tail = source[match.end():match.end() + 300]
+                    name_match = self._SET_NAME.search(tail)
+                    entry["accessible_name"] = _unescape(name_match.group("val")) if name_match else ""
+                    entry["selector"] = self._ROLE_TAGS.get(value.upper(), "")
+                    entry["raw"] = (f"getByRole({value}"
+                                    + (f', name="{entry["accessible_name"]}"' if entry["accessible_name"] else "")
+                                    + ")")
+                elif kind in self._GETBY_ATTRIBUTES:
+                    attribute, builder = self._GETBY_ATTRIBUTES[kind]
+                    entry["selector"] = f"[{attribute}={self.quote_css_value(value)}]"
+                    entry["raw"] = f'{builder}("{value}")'
+                else:
+                    entry["accessible_name"] = value
+                    entry["raw"] = f'getBy{kind.capitalize()}("{value}")'
+
+                # Inside an iframe the entry is the whole chain, as a plain
+                # `.locator()` chain is: every reader follows the hops from there.
+                path = [_unescape(m.group(0)[1:-1])
+                        for m in re.finditer(self._STR, groups.get("hops") or "")]
+                if path:
+                    entry["frame_path"] = path
+                    entry["raw"] = frames.join(path, entry["raw"])
+                    if entry["selector"]:
+                        entry["selector"] = frames.join(path, entry["selector"])
+
+                if entry["raw"] in seen:
+                    continue
+                seen.add(entry["raw"])
+                found.append(entry)
+        return found
+
+    def quote_css_value(self, value: str) -> str:
+        text = value or ""
+        if "'" not in text:
+            return "'" + text + "'"
+        return '"' + text.replace('"', '\\"') + '"'
+
+    def build_has_text_selector(self, anchor: str, text: str, tag: str) -> str:
+        return f'{anchor}:has-text({self.quote_css_value(text)}) {tag}'
+
+    def map_role(self, role: str) -> Optional[str]:
+        return self._ROLE_TO_JAVA.get((role or "").lower())
+
+    # The types a Java snippet can name, and where they live. A builder's options
+    # hang off the type it was called on (`Page.GetByRoleOptions`,
+    # `FrameLocator.GetByPlaceholderOptions`); a page object declaring plain
+    # `.locator()` fields imports none of them.
+    _JAVA_TYPES = {"Page": "com.microsoft.playwright.Page",
+                   "FrameLocator": "com.microsoft.playwright.FrameLocator",
+                   "Locator": "com.microsoft.playwright.Locator",
+                   "AriaRole": "com.microsoft.playwright.options.AriaRole"}
+    _JAVA_TYPE_USE = re.compile(r"\b(Page|FrameLocator|Locator|AriaRole)\s*\.\s*[A-Z]")
+
+    def imports_for(self, snippet: str) -> List[str]:
+        return sorted({self._JAVA_TYPES[m.group(1)]
+                       for m in self._JAVA_TYPE_USE.finditer(snippet or "")})
+
+    def emit_locator(self, **kwargs) -> Dict[str, str]:
+        def _q(s: str) -> str:
+            return '"' + (s or "").replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+        path = list(kwargs.pop("frame_path", None) or [])
+        if frames.scoped(kwargs.get("selector") or ""):
+            outer, kwargs["selector"] = frames.split(kwargs["selector"])
+            path = outer + path
+        if path:
+            # The same call, rooted in the iframe instead of the page. Options
+            # classes belong to the receiver in Java, so they move with it.
+            code = self.emit_locator(**kwargs)
+            java_root = "page" + "".join(f".frameLocator({_q(h)})" for h in path)
+            python_root = "page" + "".join(f".frame_locator({_q(h)})" for h in path)
+            return {
+                "python": python_root + code["python"][len("page"):] if code["python"] else "",
+                "java": (java_root + code["java"][len("page"):]).replace(
+                    "new Page.Get", "new FrameLocator.Get") if code["java"] else "",
+            }
+
+        if "testid" in kwargs:
+            return {
+                "python": f"page.get_by_test_id({_q(kwargs['testid'])})",
+                "java": f"page.getByTestId({_q(kwargs['testid'])})"
+            }
+        if "role" in kwargs:
+            jrole = kwargs["role"]
+            name = kwargs.get("name", "")
+            exact = kwargs.get("exact", False)
+            if exact:
+                return {
+                    "python": f"page.get_by_role({_q(jrole.lower())}, name={_q(name)}, exact=True)",
+                    "java": (f"page.getByRole(AriaRole.{jrole}, new Page.GetByRoleOptions()"
+                             f".setName({_q(name)}).setExact(true))")
+                }
+            return {
+                "python": f"page.get_by_role({_q(jrole.lower())}, name={_q(name)})",
+                "java": f"page.getByRole(AriaRole.{jrole}, new Page.GetByRoleOptions().setName({_q(name)}))"
+            }
+        # The attribute builders match by substring unless told otherwise, so a
+        # caller that proved an exact value has to get an exact builder back.
+        for key, python_name, java_name in (
+                ("placeholder", "get_by_placeholder", "getByPlaceholder"),
+                ("label", "get_by_label", "getByLabel"),
+                ("alt", "get_by_alt_text", "getByAltText"),
+                ("title", "get_by_title", "getByTitle")):
+            if key not in kwargs:
+                continue
+            value = _q(kwargs[key])
+            if kwargs.get("exact", False):
+                return {
+                    "python": f"page.{python_name}({value}, exact=True)",
+                    "java": (f"page.{java_name}({value}, new Page."
+                             f"{java_name[0].upper()}{java_name[1:]}Options().setExact(true))"),
+                }
+            return {"python": f"page.{python_name}({value})",
+                    "java": f"page.{java_name}({value})"}
+        if "text" in kwargs:
+            text = kwargs["text"]
+            exact = kwargs.get("exact", False)
+            if exact:
+                return {
+                    "python": f"page.get_by_text({_q(text)}, exact=True)",
+                    "java": f"page.getByText({_q(text)}, new Page.GetByTextOptions().setExact(true))"
+                }
+            return {
+                "python": f"page.get_by_text({_q(text)})",
+                "java": f"page.getByText({_q(text)})"
+            }
+        if "selector" in kwargs:
+            return {
+                "python": f"page.locator({_q(kwargs['selector'])})",
+                "java": f"page.locator({_q(kwargs['selector'])})"
+            }
+        return {"python": "", "java": ""}
+
+
+class PlaywrightPlugin(FrameworkPlugin):
+    def __init__(self):
+        self._telemetry = PlaywrightTelemetryParser()
+        self._runner = PlaywrightTestRunner()
+        self._diagnostics = PlaywrightDiagnosticEngine()
+        self._code = PlaywrightCodeEngine()
+
+    @property
+    def telemetry(self) -> TelemetryParser:
+        return self._telemetry
+
+    @property
+    def runner(self) -> TestRunner:
+        return self._runner
+
+    @property
+    def diagnostics(self) -> DiagnosticEngine:
+        return self._diagnostics
+
+    @property
+    def code(self) -> CodeEngine:
+        return self._code
+

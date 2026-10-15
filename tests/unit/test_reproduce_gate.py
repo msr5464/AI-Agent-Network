@@ -13,6 +13,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -30,8 +31,6 @@ def reproduce(tmp_path_factory):
     front of the path, and both are restored afterwards so the tests that run
     next are unaffected either way.
     """
-    os.environ.setdefault("AUDIT_DIR", str(tmp_path_factory.mktemp("audit")))
-
     saved_path = list(sys.path)
     saved_modules = {name: module for name, module in sys.modules.items()
                      if name == "lib" or name.startswith("lib.")}
@@ -43,7 +42,10 @@ def reproduce(tmp_path_factory):
         spec = importlib.util.spec_from_file_location(
             "reproduce_step", AGENT / "actions" / "00_reproduce.py")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Set only for the import (the step reads them into module constants); left in
+        # os.environ they leaked into every later test in the session.
+        with mock.patch.dict(os.environ, {"AUDIT_DIR": str(tmp_path_factory.mktemp("audit"))}):
+            spec.loader.exec_module(module)
         yield module
     finally:
         for name in [n for n in sys.modules
@@ -108,6 +110,43 @@ class TestSkipReasonMapping:
     def test_actionable_verdicts_are_not_skips(self):
         from shared import diagnosis
         assert diagnosis.skip_reason("LOCATOR_STALE") == "no-work"
+
+
+class TestRelabel:
+    """A verdict that is not allowed to act is not allowed to relabel either.
+
+    `root_cause_category` is what the fix step keys off, so rewriting it in
+    shadow mode let an unenforced verdict reach the model as the classification
+    and suppress the page-object lookup that would have contradicted it.
+    """
+
+    def _issue(self):
+        return {"root_cause_category": "ELEMENT_NOT_FOUND",
+                "recommended_action": "Update the broken locator"}
+
+    def test_shadow_mode_changes_nothing(self, reproduce):
+        issue = self._issue()
+        reproduce.relabel(issue, {"verdict": "WRONG_PAGE",
+                                  "remediation": "fix what happens before it"}, "shadow")
+        assert issue["root_cause_category"] == "ELEMENT_NOT_FOUND"
+        assert issue["recommended_action"] == "Update the broken locator"
+
+    def test_enforce_applies_the_verdict(self, reproduce):
+        issue = self._issue()
+        reproduce.relabel(issue, {"verdict": "WRONG_PAGE",
+                                  "remediation": "fix what happens before it"}, "enforce")
+        assert issue["root_cause_category"] == "WRONG_PAGE"
+        assert issue["recommended_action"] == "fix what happens before it"
+
+    def test_a_stale_locator_maps_to_the_category_the_fixer_knows(self, reproduce):
+        issue = dict(self._issue(), root_cause_category="TIMEOUT")
+        reproduce.relabel(issue, {"verdict": "LOCATOR_STALE"}, "enforce")
+        assert issue["root_cause_category"] == "ELEMENT_NOT_FOUND"
+
+    def test_an_abstention_relabels_nothing(self, reproduce):
+        issue = self._issue()
+        reproduce.relabel(issue, {"verdict": "INSUFFICIENT_EVIDENCE"}, "enforce")
+        assert issue["root_cause_category"] == "ELEMENT_NOT_FOUND"
 
 
 class TestGateDecision:

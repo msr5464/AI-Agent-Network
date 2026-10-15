@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 from shared.dom_snapshot import find_snapshot
 
-from lib.test_runner import run_test, split_test_name
+from shared.test_runner import run_test, split_test_name
 
 # What "give it more time" means for a probe. Large enough that a genuinely slow
 # element appears, small enough that a hung page still ends the run.

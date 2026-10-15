@@ -9,19 +9,20 @@ Two entry points:
                          output, plus any partial output recovered from a timeout.
 
 Optional kwargs: on_output, system_prompt_file, log_dir, allowed_tools, add_dir,
-stream_json, partial_on_timeout.
+stream_json, tools, disable_slash_commands, partial_on_timeout.
 """
 
 import json
 import os
 import shlex
+
 import signal
 import subprocess
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 
 # ── Result type ────────────────────────────────────────────────────────────────
@@ -42,10 +43,57 @@ class ClaudeResult(NamedTuple):
     status:     str
     timed_out:  bool
     duration_s: float
+    # Usage reported by the CLI itself. Trailing defaults keep every existing
+    # positional construction and unpacking of this NamedTuple working.
+    cost_usd:       float = 0.0
+    usage:          dict = {}
+    by_model:       dict = {}
+    num_turns:      int = 0
+    duration_api_s: float = 0.0
+    model_resolved: str = ""
+    # How many REAL tool_use blocks the model emitted. None means "not counted"
+    # (the non-streaming path cannot see them), which is not the same as zero:
+    # zero on a run that was supposed to drive tools means the model had none and
+    # narrated the work instead. Only meaningful with stream_json=True.
+    tool_uses:      Optional[int] = None
+    # Every URL the model actually told a browser to open, in order. The most
+    # trustworthy record of where a validation run went: a step summary is prose
+    # the model chose to write, this is the argument it passed. Step 02 harvests
+    # URL properties from it, so a navigation whose summary omits the URL still
+    # mints a key. Only meaningful with stream_json=True.
+    navigated_urls: list = []
+    # The CLI's usage-cap message, when that is why the call stopped.
+    limit_message:  str = ""
+    # Browser tool calls the model made, how many came back without an error, and
+    # the first error's text. None when not counted (no stream_json). Read them
+    # through browser_unavailable().
+    browser_calls:  Optional[int] = None
+    browser_ok:     Optional[int] = None
+    browser_error:  str = ""
+    # How many times restart_if_slow killed a stalled stream and sent the call again.
+    slow_restarts:  int = 0
 
     @property
     def ok(self) -> bool:
         return self.status == "ok"
+
+    def browser_unavailable(self) -> str:
+        """Why no browser ever answered this call, or "" when one did.
+
+        Only meaningful for a call handed a browser. Either the model never called
+        a browser tool, or every call it made errored — a browser that cannot
+        launch fails every call the same way, behind a server that connected
+        fine. Nothing in the output was then observed on a page, however the
+        model wrote it up. Check usage_limit first: a capped call never ran a turn.
+        """
+        if self.browser_calls is None:
+            return ""
+        if self.browser_calls == 0:
+            return "the model never called a browser tool"
+        if self.browser_ok == 0:
+            return (f"all {self.browser_calls} browser call(s) failed — "
+                    f"{self.browser_error}")
+        return ""
 
     def describe(self) -> str:
         """One-line explanation suitable for logging when output is missing/short."""
@@ -60,6 +108,9 @@ class ClaudeResult(NamedTuple):
                 tail = self.stderr.strip().splitlines()[-1][:200]
             return (f"exited {self.returncode} after {self.duration_s:.0f}s"
                     + (f" — {tail}" if tail else " with no stderr"))
+        if self.status == "usage_limit":
+            return (f"stopped on a usage cap — "
+                    f"{self.limit_message or usage_limit(self.stdout) or 'limit reached'}")
         return f"exited 0 after {self.duration_s:.0f}s but produced no output"
 
 
@@ -77,6 +128,76 @@ def _describe_tool_use(block: dict) -> str:
     return name
 
 
+_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+# The CLI spells the same counts two ways: snake_case in the top-level `usage`
+# block, camelCase inside `modelUsage`.
+_MODEL_USAGE_KEYS = {
+    "input_tokens": "inputTokens",
+    "output_tokens": "outputTokens",
+    "cache_read_input_tokens": "cacheReadInputTokens",
+    "cache_creation_input_tokens": "cacheCreationInputTokens",
+}
+
+
+def _absorb_usage(target: dict, ev: dict) -> None:
+    """Pull cost/token/turn fields out of a CLI `result` event into `target`.
+
+    Shared by the stream-json decoder and the single-object --output-format json
+    path, so both report identically. Best-effort — a shape change in the CLI
+    envelope must degrade to zeroes, never raise into the caller's step.
+    """
+    try:
+        cost = ev.get("total_cost_usd")
+        if isinstance(cost, (int, float)):
+            target["cost_usd"] = float(cost)
+
+        usage = ev.get("usage")
+        if isinstance(usage, dict):
+            for field in _TOKEN_FIELDS:
+                value = usage.get(field)
+                if isinstance(value, (int, float)):
+                    target[field] = int(value)
+
+        by_model: dict = {}
+        for name, stats in (ev.get("modelUsage") or {}).items():
+            if not isinstance(stats, dict):
+                continue
+            entry = {"cost_usd": float(stats.get("costUSD") or 0.0)}
+            for field in _TOKEN_FIELDS:
+                # modelUsage is camelCase while the top-level `usage` block is
+                # snake_case — same numbers, different spelling. Accept both so a
+                # future CLI that unifies them keeps working.
+                entry[field] = int(stats.get(_MODEL_USAGE_KEYS[field])
+                                   or stats.get(field) or 0)
+            by_model[name] = entry
+        if by_model:
+            target["by_model"] = by_model
+            # `system.init` reports the model the session opened with; modelUsage
+            # reports every model that actually billed. Prefer the latter when it
+            # names exactly one, since that is what the cost belongs to.
+            if len(by_model) == 1:
+                target["model_resolved"] = next(iter(by_model))
+
+        for src, dst in (("num_turns", "num_turns"),
+                         ("duration_api_ms", "duration_api_s"),
+                         ("session_id", "cli_session_id")):
+            value = ev.get(src)
+            if src.endswith("_ms") and isinstance(value, (int, float)):
+                target[dst] = round(float(value) / 1000.0, 3)
+            elif src == "num_turns" and isinstance(value, (int, float)):
+                target[dst] = int(value)
+            elif isinstance(value, str) and value:
+                target[dst] = value
+    except Exception:
+        pass
+
+
 class _StreamJsonDecoder:
     """Turns `--output-format stream-json` JSONL events back into assistant text.
 
@@ -88,6 +209,63 @@ class _StreamJsonDecoder:
     def __init__(self):
         self.text_parts:  list = []
         self.result_text: str = ""
+        self.tool_uses:   int = 0
+        self.navigated_urls: list = []
+        # Browser tool calls, and how many came back without an error. A server
+        # that connects can still fail to launch its browser, and then every call
+        # errors while the run looks like an ordinary short one.
+        self.browser_calls: int = 0
+        self.browser_ok:    int = 0
+        self.browser_error: str = ""
+        self._browser_ids:  set = set()
+        # Usage reported by the CLI in its `result` / `system.init` events. The
+        # CLI computes cost itself, so no rate card is needed on our side.
+        self.usage: dict = {}
+        # For the slow-stream watchdog: tokens seen arriving (answer text from
+        # partial messages, thinking from the CLI's running estimate), whether a
+        # tool is running, and when the CLI last started a retry of its own.
+        self.tokens_seen:   float = 0.0
+        self.awaiting_tool: bool = False
+        self.last_retry_at: float = float("-inf")
+
+    def _note_navigation(self, block: dict) -> None:
+        """Record the URL of a browser_navigate call, first occurrence wins.
+
+        Matched on the tool-name suffix rather than the full MCP name, because the
+        server prefix (`mcp__playwright__`) is configuration, not protocol.
+        """
+        name = block.get("name") or ""
+        if not name.endswith("browser_navigate"):
+            return
+        inp = block.get("input")
+        url = inp.get("url") if isinstance(inp, dict) else None
+        if isinstance(url, str) and url.strip() and url.strip() not in self.navigated_urls:
+            self.navigated_urls.append(url.strip())
+
+    def _note_browser_call(self, block: dict) -> None:
+        """Remember a browser tool call, so its result can be told apart.
+
+        Matched on the tool part of the MCP name, as _note_navigation is.
+        """
+        name = block.get("name") or ""
+        if name.startswith("mcp__") and name.rsplit("__", 1)[-1].startswith("browser_"):
+            self.browser_calls += 1
+            self._browser_ids.add(block.get("id"))
+
+    def _note_browser_result(self, block: dict) -> None:
+        """Count a browser call's result: answered, or the first error's text."""
+        if block.get("tool_use_id") not in self._browser_ids:
+            return
+        if not block.get("is_error"):
+            self.browser_ok += 1
+            return
+        if not self.browser_error:
+            content = block.get("content")
+            if isinstance(content, list):
+                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+            lines = [ln.strip() for ln in str(content or "").splitlines()
+                     if ln.strip() and ln.strip() != "### Error"]
+            self.browser_error = (lines[0] if lines else "error")[:300]
 
     def feed(self, raw_line: str) -> list:
         """Consume one JSONL line. Returns progress lines to surface to the caller."""
@@ -109,6 +287,20 @@ class _StreamJsonDecoder:
         etype = ev.get("type")
         progress: list = []
 
+        if etype == "stream_event":
+            # --include-partial-messages: the answer as it is written. The whole
+            # message still arrives as an `assistant` event, which is what the text
+            # is rebuilt from, so a delta only counts towards the stream's speed.
+            delta = (ev.get("event") or {}).get("delta") or {}
+            written = delta.get("text") or delta.get("partial_json") or ""
+            if written:
+                self.tokens_seen += max(1.0, len(written) / 4)
+            return []
+
+        if etype == "system" and ev.get("subtype") == "thinking_tokens":
+            self.tokens_seen += float(ev.get("estimated_tokens_delta") or 0)
+            return []
+
         if etype == "assistant":
             content = (ev.get("message") or {}).get("content") or []
             for block in content:
@@ -120,13 +312,30 @@ class _StreamJsonDecoder:
                         self.text_parts.append(text)
                         progress.extend(text.splitlines())
                 elif block.get("type") == "tool_use":
+                    self.tool_uses += 1
+                    self.awaiting_tool = True
+                    self._note_navigation(block)
+                    self._note_browser_call(block)
                     progress.append(f"→ {_describe_tool_use(block)}")
+
+        elif etype == "user":
+            content = (ev.get("message") or {}).get("content")
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    self.awaiting_tool = False
+                    self._note_browser_result(block)
 
         elif etype == "result":
             if isinstance(ev.get("result"), str):
                 self.result_text = ev["result"]
+            _absorb_usage(self.usage, ev)
 
         elif etype == "system" and ev.get("subtype") == "init":
+            # The CLI resolves the model itself and may not honour what was
+            # requested — an observed run asked for opus and ran sonnet — so cost
+            # must be attributed to what actually ran, never to the --model flag.
+            if isinstance(ev.get("model"), str) and ev["model"]:
+                self.usage["model_resolved"] = ev["model"]
             # Surfacing MCP connection state here is what makes a genuine
             # "MCP server unavailable" failure distinguishable from a timeout.
             for srv in ev.get("mcp_servers") or []:
@@ -134,6 +343,19 @@ class _StreamJsonDecoder:
                     progress.append(
                         f"MCP server '{srv.get('name')}': {srv.get('status')}"
                     )
+
+        elif etype == "system" and ev.get("subtype") == "api_retry":
+            self.last_retry_at = time.monotonic()
+            # The CLI retries an overloaded/rate-limited API up to max_retries,
+            # and each retry regenerates the response FROM THE TOP. On a long
+            # single-message call that is minutes of invisible rework, and an
+            # exhausted chain exits non-zero with nothing — which looks exactly
+            # like a hang unless the retries themselves are reported.
+            progress.append(
+                f"API retry {ev.get('attempt')}/{ev.get('max_retries')} — "
+                f"{ev.get('error_status')} {ev.get('error')} "
+                f"(waiting {round((ev.get('retry_delay_ms') or 0) / 1000, 1)}s)"
+            )
 
         return progress
 
@@ -146,6 +368,28 @@ class _StreamJsonDecoder:
         return self.result_text
 
 
+# ── Slow-stream watchdog ───────────────────────────────────────────────────────
+
+# Healthy single calls stream at a median of ~107 tokens/s, and 90% of them above
+# ~50. The stalls this exists for ran at 3-13 tokens/s for five to eleven minutes,
+# while the same request sent again ran at the usual speed.
+SLOW_WINDOW_S = 60
+SLOW_STREAM_TOKENS_PER_S = 20
+
+
+def _stream_rate(samples: list, now: float, decoder) -> Optional[float]:
+    """Tokens per second over the last SLOW_WINDOW_S, or None while that cannot be
+    judged: the window is not full yet, a tool is running, or the CLI is waiting out
+    a retry of its own."""
+    if decoder.awaiting_tool or now - decoder.last_retry_at < SLOW_WINDOW_S:
+        return None
+    before = [x for x in samples if x[0] <= now - SLOW_WINDOW_S]
+    if not before:
+        return None
+    then, seen = before[-1]
+    return (decoder.tokens_seen - seen) / (now - then)
+
+
 # ── Pipe streaming ─────────────────────────────────────────────────────────────
 
 def _stream_pipe(pipe, label: str, chunks: list, log_file, on_output=None,
@@ -153,7 +397,9 @@ def _stream_pipe(pipe, label: str, chunks: list, log_file, on_output=None,
     """Read lines from pipe, append to chunks, log, and call on_output callback."""
     for line in iter(pipe.readline, ""):
         chunks.append(line)
-        if log_file:
+        # A partial-message delta is a few characters of an answer the whole message
+        # repeats, one line each: thousands per call, and nothing to read afterwards.
+        if log_file and not line.startswith('{"type":"stream_event"'):
             log_file.write(f"[{label}] {line}")
             log_file.flush()
         if decoder is not None and label == "stdout":
@@ -179,7 +425,12 @@ def call_claude_ex(
     add_dir: str = None,
     stream_json: bool = False,
     mcp_config=None,
-    strict_mcp_config: bool = False,
+    strict_mcp_config: bool = True,
+    tools=None,
+    disable_slash_commands: bool = False,
+    effort: str = None,
+    setting_sources: str = None,
+    restart_if_slow: bool = False,
 ) -> ClaudeResult:
     """Call `claude -p <prompt> --model <model>` and report the full outcome.
 
@@ -194,14 +445,70 @@ def call_claude_ex(
                           --mcp-config.
       strict_mcp_config — ignore user/global MCP configuration and use only the
                           servers in mcp_config. Without mcp_config this loads NO
-                          servers at all, so the two are passed together.
+                          servers at all, so the two are passed together. On by
+                          default: this repo's own .mcp.json starts a Playwright
+                          server, and a text-only call that inherits it pays for a
+                          browser it never uses. A caller that wants MCP names the
+                          servers in mcp_config.
+      tools             — which BUILT-IN tools to load, as --tools. "" loads none.
+                          Distinct from allowed_tools, which only gates permission:
+                          a tool excluded by allowed_tools is still *defined*, so it
+                          still costs system-prompt tokens on every turn. Verified
+                          against the CLI: MCP tools are unaffected by this flag and
+                          stay available, and dropping the built-ins also stops them
+                          arriving deferred — which is what removes the ToolSearch
+                          round-trips a browser-driving run would otherwise spend
+                          before its first real tool call.
+      disable_slash_commands — pass --disable-slash-commands, dropping the user's
+                          skills and slash commands from the system prompt. Nothing
+                          run headless can invoke them anyway.
+      restart_if_slow   — with stream_json: when the stream has averaged under
+                          SLOW_STREAM_TOKENS_PER_S for SLOW_WINDOW_S, kill the call
+                          and send it once more. Only for calls whose tools return at
+                          once: a browser step's tool time would read as a stall.
+      effort            — pass --effort (low | medium | high | xhigh | max). Unset,
+                          the call inherits the effortLevel in whoever-runs-it's
+                          ~/.claude/settings.json, so thinking time varies by machine.
+      setting_sources   — pass --setting-sources (e.g. "project,local") to keep the
+                          user's settings out: their plugins, hooks and permission
+                          allows. Only safe for a call that uses no tools, since those
+                          allows are what let a headless tool call run.
     """
+    if not (model or "").strip():
+        # Models come only from config/.env, and each run.sh refuses to start without
+        # one. Reaching here means a step ran outside run.sh with nothing set, and
+        # dropping --model would let the CLI pick whatever the machine's own settings
+        # name — a different model per machine, with nothing in the logs to say so.
+        return ClaudeResult(stdout="", returncode=2, status="error", timed_out=False,
+                            duration_s=0.0,
+                            stderr="no Claude model given — set this agent's *_MODEL "
+                                   "in config/.env")
     claude_cli = os.environ.get("CLAUDE_CLI_PATH", "claude")
     cmd = [claude_cli, "-p", prompt, "--model", model]
     if system_prompt_file:
         cmd.extend(["--system-prompt-file", str(system_prompt_file)])
     if allowed_tools:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+    if tools is not None:
+        # `is not None`, not truthiness: "" is the meaningful value that loads no
+        # built-in tools at all, and is the whole point of the flag.
+        names = [t for t in (tools.split(",") if isinstance(tools, str) else tools) if t]
+        if mcp_config and "ToolSearch" not in names:
+            # MCP tools arrive DEFERRED: the turn's tool list carries their names
+            # only, and ToolSearch is the sole way to load their schemas. Dropping
+            # it along with the other built-ins leaves a run holding an MCP server
+            # and zero callable tools — and a model told to "use the browser tools"
+            # then writes the entire session as prose: invented <function_calls>,
+            # invented results, invented selectors, no browser ever launched, for
+            # the full wall-clock budget. Verified against CLI 2.1.265.
+            names.append("ToolSearch")
+        cmd.extend(["--tools", ",".join(names)])
+    if disable_slash_commands:
+        cmd.append("--disable-slash-commands")
+    if effort:
+        cmd.extend(["--effort", effort])
+    if setting_sources:
+        cmd.extend(["--setting-sources", setting_sources])
     if add_dir:
         # Adds a working directory. Verified empirically: this is additive, not
         # restrictive — it does NOT confine a granted tool to that directory, and
@@ -215,9 +522,22 @@ def call_claude_ex(
         # (Google Drive, etc.), paying connection and tool-registry cost on every
         # step that only ever needs the browser.
         cmd.append("--strict-mcp-config")
+    watch = bool(stream_json and restart_if_slow)
     if stream_json:
         # --verbose is required by the CLI whenever stream-json is combined with -p.
         cmd.extend(["--output-format", "stream-json", "--verbose"])
+        if watch:
+            # The answer as it is written. Without it nothing arrives between the
+            # start of a message and its end, and a long healthy answer looks like
+            # a stall.
+            cmd.append("--include-partial-messages")
+    else:
+        # Plain `-p` prints the answer and nothing else — no usage, no cost. The
+        # json envelope carries the same text in ev["result"] plus the accounting,
+        # so this is what stops ~2/3 of spend reporting as $0. Every downstream
+        # parser still sees byte-identical text; if the envelope fails to parse we
+        # fall back to raw stdout below, so the switch cannot break a call site.
+        cmd.extend(["--output-format", "json"])
 
     # Resolve log path if requested
     log_path = None
@@ -231,6 +551,7 @@ def call_claude_ex(
     stdout_chunks: list = []
     stderr_chunks: list = []
     timed_out = {"hit": False}
+    slow = {"rate": None, "restarts": 0}
     started = time.monotonic()
 
     def _run(log_file):
@@ -300,11 +621,29 @@ def call_claude_ex(
 
         try:
             try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out["hit"] = True
-                _kill_group()
-                proc.wait()
+                began, samples = time.monotonic(), []
+                while True:
+                    try:
+                        proc.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    now = time.monotonic()
+                    if now - began >= timeout:
+                        timed_out["hit"] = True
+                        _kill_group()
+                        proc.wait()
+                        break
+                    if not watch or slow["restarts"]:
+                        continue
+                    samples.append((now, decoder.tokens_seen))
+                    samples = [x for x in samples if x[0] >= now - SLOW_WINDOW_S - 5]
+                    rate = _stream_rate(samples, now, decoder)
+                    if rate is not None and rate < SLOW_STREAM_TOKENS_PER_S:
+                        slow["rate"] = rate
+                        _kill_group()
+                        proc.wait()
+                        break
             except BaseException:
                 # Ctrl-C, or anything else unwinding this frame: never leave the
                 # child group running behind us.
@@ -328,18 +667,48 @@ def call_claude_ex(
             if proc.poll() is None:
                 _kill_group()
 
+    def _run_once_more_if_slow(log_file):
+        returncode = _run(log_file)
+        if slow["rate"] is None:
+            return returncode
+        note = (f"API retry — stream too slow: {slow['rate']:.0f} tokens/s over the last "
+                f"{SLOW_WINDOW_S}s (healthy calls run at ~100); sending the call again")
+        if on_output:
+            on_output("stdout", note)
+        if log_file:
+            log_file.write(f"\n--- {note} ---\n\n")
+        slow["restarts"] += 1
+        stdout_chunks.clear()
+        stderr_chunks.clear()
+        decoder.__init__()
+        return _run(log_file)
+
     if log_path:
         with log_path.open("w", encoding="utf-8") as log_file:
-            returncode = _run(log_file)
+            returncode = _run_once_more_if_slow(log_file)
     else:
-        returncode = _run(None)
+        returncode = _run_once_more_if_slow(None)
 
-    stdout = decoder.text() if decoder is not None else "".join(stdout_chunks)
     stderr = "".join(stderr_chunks)
     duration = time.monotonic() - started
 
+    if decoder is not None:
+        stdout = decoder.text()
+        usage = dict(decoder.usage)
+    else:
+        raw_stdout = "".join(stdout_chunks)
+        stdout, usage = _unwrap_json_envelope(raw_stdout)
+
+    # A cap is not a bad answer, it is no answer — and the CLI reports it as
+    # ordinary prose with exit code 0, so every caller expecting JSON called it a
+    # malformed model response instead of an infra stop. A cap mid-run instead
+    # exits 1 with the message only in the final result event (the assistant text
+    # before it hides it), and was logged as whatever stderr last said.
+    cap = usage_limit(stdout) or usage_limit(decoder.result_text if decoder else "")
     if timed_out["hit"]:
         status = "timeout"
+    elif cap:
+        status = "usage_limit"
     elif returncode != 0:
         status = "error"
     elif not stdout.strip():
@@ -347,14 +716,88 @@ def call_claude_ex(
     else:
         status = "ok"
 
-    return ClaudeResult(
+    result = ClaudeResult(
         stdout=stdout,
         stderr=stderr,
         returncode=returncode if returncode is not None else -1,
         status=status,
         timed_out=timed_out["hit"],
         duration_s=duration,
+        cost_usd=float(usage.get("cost_usd") or 0.0),
+        usage={f: int(usage.get(f) or 0) for f in _TOKEN_FIELDS},
+        by_model=dict(usage.get("by_model") or {}),
+        num_turns=int(usage.get("num_turns") or 0),
+        duration_api_s=float(usage.get("duration_api_s") or 0.0),
+        model_resolved=str(usage.get("model_resolved") or ""),
+        tool_uses=decoder.tool_uses if decoder is not None else None,
+        navigated_urls=list(decoder.navigated_urls) if decoder is not None else [],
+        limit_message=cap,
+        browser_calls=decoder.browser_calls if decoder is not None else None,
+        browser_ok=decoder.browser_ok if decoder is not None else None,
+        browser_error=decoder.browser_error if decoder is not None else "",
+        slow_restarts=slow["restarts"],
     )
+
+    # One choke point instruments every call site. Best-effort by construction —
+    # record_llm_call never raises.
+    try:
+        from shared import metrics
+        metrics.record_llm_call(result, model_requested=model)
+    except Exception:
+        pass
+
+    return result
+
+
+def usage_limit(text: str) -> str:
+    """The CLI's usage-cap message if `text` is one, otherwise "".
+
+    The cap arrives on stdout, in prose, with exit code 0:
+
+        You've hit your session limit · resets 11:50am (Asia/Calcutta)
+
+    An observed adaptation run parsed that as the model's answer and reported
+    "could not parse the model's response as JSON" for both change items, which
+    reads as the model failing rather than the account being out of budget.
+
+    Bounded by length on purpose: an answer that happens to discuss rate limits
+    is not a cap, and must never be reported as one.
+    """
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > 400:
+        return ""
+    # An answer is never a cap, however short. A model that declines a change item
+    # with {"adaptable": false, "unadaptable_reason": "the rate limit resets
+    # hourly"} is inside both word tests below, and swallowing it would hand the
+    # caller "" for a perfectly good reply.
+    if stripped[0] in "{[" or "\n" in stripped.strip():
+        return ""
+    low = stripped.lower()
+    capped = ("hit your" in low and "limit" in low) or \
+             ("limit" in low and "reset" in low)
+    return stripped if capped else ""
+
+
+def _unwrap_json_envelope(raw: str):
+    """Split `--output-format json` stdout into (text, usage).
+
+    Returns the raw string untouched when the payload is not the expected
+    envelope — a CLI banner, a plain-text response from an older CLI, or a
+    truncated write after a timeout kill. That fallback is what makes adding
+    --output-format json safe for the call sites that json.loads() the result.
+    """
+    text = raw.strip()
+    if not text.startswith("{"):
+        return raw, {}
+    try:
+        ev = json.loads(text)
+    except (ValueError, TypeError):
+        return raw, {}
+    if not isinstance(ev, dict) or not isinstance(ev.get("result"), str):
+        return raw, {}
+    usage: dict = {}
+    _absorb_usage(usage, ev)
+    return ev["result"], usage
 
 
 def call_claude(
@@ -369,15 +812,18 @@ def call_claude(
     add_dir: str = None,
     stream_json: bool = False,
     mcp_config=None,
-    strict_mcp_config: bool = False,
+    strict_mcp_config: bool = True,
+    tools=None,
+    disable_slash_commands: bool = False,
     partial_on_timeout: bool = False,
+    effort: str = None,
 ) -> str:
     """Call `claude -p <prompt> --model <model>` as a subprocess.
 
     Returns stdout on success, empty string on error.
     cwd should be the repo root so relative paths in prompts resolve correctly.
 
-    Optional args (all default to None/False for full backward compatibility):
+    Optional args (default to None/False, except strict_mcp_config — see call_claude_ex):
       on_output(label, line)  — called for each streamed output line
       system_prompt_file      — path passed as --system-prompt-file to claude CLI
       log_dir                 — directory to write a timestamped claude-*.log file
@@ -388,6 +834,7 @@ def call_claude(
                                 discarding it. Off by default: callers that
                                 json.loads() the output are better served by an
                                 obvious empty string than by truncated JSON.
+      effort                  — passed as --effort (see call_claude_ex)
 
     Callers that need to know *why* the result was empty should use
     call_claude_ex(), which returns a ClaudeResult with a status field.
@@ -405,6 +852,9 @@ def call_claude(
         stream_json=stream_json,
         mcp_config=mcp_config,
         strict_mcp_config=strict_mcp_config,
+        tools=tools,
+        disable_slash_commands=disable_slash_commands,
+        effort=effort,
     )
     if result.status == "ok":
         return result.stdout

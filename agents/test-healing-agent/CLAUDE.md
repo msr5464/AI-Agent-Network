@@ -26,12 +26,13 @@ a baseline of what the page looked like when the test last passed.
 
 | Verdict | Meaning | What the agent may do |
 |---|---|---|
-| `LOCATOR_STALE` | Right page, element renamed or moved | **edit the selector — the only verdict that authorises a change** |
+| `LOCATOR_STALE` | Right page, element renamed or moved | **edit the selector** |
+| `AMBIGUOUS_LOCATOR` | The selector matches several elements, so Playwright refuses to act | **narrow the selector to the one element meant** |
 | `WRONG_PAGE` | None of the page object's own locators are here | stop |
 | `PRIOR_STEP_FAILED` | An earlier interaction happened and the page never moved | stop |
 | `NOT_READY` | Page still rendering when the wait expired | stop — suggests a readiness wait |
 | `TOO_SLOW` | Element arrived after the budget ran out | stop — suggests raising `ObjectWaitTime` deliberately |
-| `BLOCKED` | Present but covered or off-screen | stop — suggests dismissing the obstruction |
+| `BLOCKED` | Present, and still hidden after the wait spent its budget | stop — suggests revealing it rather than reselecting |
 | `ERROR_STATE` / `ENV_UNREACHABLE` | The application or its host failed | stop |
 | `DATA_PRECONDITION` | A fixture the test loads is stale or missing | stop |
 | `ELEMENT_GONE` | Right page, and absent on the last passing run too | stop |
@@ -71,14 +72,116 @@ One session = one handoff file = one PR (or Slack escalation if fixes fail).
 ```
 run.sh (orchestrator)
   │
+  ├─ 01_locate.py [Python only]       Read handoff → match the baseline fingerprint
+  │                                   against the failure capture → propose a locator
   ├─ 01_fix.py    [Python + Claude]   Read handoff → inspect live DOM → fix locators
   │                                   → run tests → commit
   └─ 02_ship.py   [Python only]       Push branch → create PR → Slack notify
 ```
 
+**Locate proposes; Fix proves.** Locate is deterministic and offline: no model, no
+browser, no credentials. It scores the fingerprint recorded on the last good run
+against the element capture the framework wrote at the moment of failure, and
+proves the new selector unique against the DOM saved beside it. With
+`HEALING_LOCATE_MODE=enforce` (the code default is `shadow`, which only logs the
+proposal) Fix applies that answer instead of calling the model — through the same edit
+guards, diff cap and test run as a model-written fix, which is what actually
+verifies it. It resolves one locator once however many tests it broke, and every
+refusal hands the work back to Fix with its reason — missing evidence
+(`NO_BASELINE`, `NO_FINGERPRINT`, `NO_CAPTURE`, `NO_DECLARATION`), not a locator
+problem (`NOT_LOCATOR`, `WRONG_STATE`, `APP_BUG`, `FEATURE_REMOVED`, `MISBOUND`), no
+safe answer (`LOW_CONFIDENCE`, `AMBIGUOUS`, `UNSTABLE_LOCATOR`, `NO_STABLE_LOCATOR`),
+or nothing new to try (`ALREADY_CURRENT`, `REVERTED`).
+
+Two of those names exist so the run's summary says what happened.
+`NO_FINGERPRINT` is a page that was recorded with nothing held for this one
+locator; `NO_BASELINE` is a page never recorded at all, and counting the first as
+the second reads as "no good run exists" when one does. `REVERTED` is an answer
+Locate gave that Fix applied, saw fail on the same element and took back out: the
+record keeps the locator it was for and the code that was tried, and it holds for
+the rest of the session, so no later attempt is offered the same answer again.
+
+Three things Locate does beyond the fingerprint search:
+
+- **Puts back the selector the last passing run used** (`T0_recorded`). A locator
+  breaks because the page changed or because the code did. The baseline holds the
+  selector each field was found with, so when the fingerprint search has no
+  answer and the source now declares something else, that selector is restored.
+  Only on proof: it matches exactly one visible element in the failure capture,
+  or the element is one the capture cannot hold (next point).
+- **Says when the capture cannot hold the element** (`absent_from_capture` on the
+  record). A message that shows after a click and clears itself is gone by the
+  time the wait for it gives up. Two facts together establish it: the last good
+  run found nothing for the locator as the page loaded and used it later, and
+  nothing in the capture resembles what that run recorded. Fix then lets the
+  test run judge the replacement, because a check against that capture rejects
+  the right selector exactly as it rejects a guess.
+- **Resolves the page's other missing locators in the same pass** (`siblings` on
+  the record). A locator of the same page object that matched as the page loaded
+  on the last good run and matches nothing now is resolved with the same
+  baseline, capture and proof, and Fix applies it in the same edit. One that
+  cannot be proved, or that an assertion reads, waits for its own failure. A
+  sibling the test never reaches is repaired on that proof alone: the run that
+  verifies the edit does not exercise it.
+
+**A locator an assertion reads is repaired on proof, and only on proof.** Keeping
+the expected value fixed does not stop a repair pointing the locator at a
+*different element*; a check that compares a value catches that in the
+verification run, a presence check passes on anything visible, and a caught
+regression becomes a green build. The fingerprint match does not make that
+mistake, so when Locate proves the replacement is the same element the fix is
+applied (and the report names the assertion for the reviewer). When it cannot,
+whatever the reason, the verdict is `ASSERTION_LOCATOR` and Fix stops without
+asking the model, which is the one path that can pick an element nothing proved.
+`classify.heal_assertions` in `config/locator.yaml` chooses `never`, `proven`
+(shipped) or `always`.
+
+An assertion that a **page has loaded** is not one of these. Its anchor is how the
+page is recognised, and whether the test is on that page is decided from the rest
+of the page — the diagnosis, the other locators, the baseline — not from the
+anchor. A stale anchor is repaired like any other locator, by Locate or by the
+model. The framework plugin names those calls (`CodeEngine.PAGE_LOAD_ASSERTIONS`).
+
+**The code written for an answer is the selector that was proved.** Locate proves
+a selector unique and writes a snippet for it, and the two must match the same
+elements: a builder that matches by substring is a different locator from an
+exact attribute selector, however alike they read. Where the proved selector is
+exact, the emitted builder is asked for an exact match too.
+
+**Proved unique is proved for one moment.** A hint the user is shown —
+placeholder, alt text, title — reads well and ranks above an id, and it is also
+what a page rewrites while it is being used: a placeholder blanked while its
+field has focus matches until the test touches the field, then matches nothing.
+The capture cannot show that about the element being repaired, but its
+neighbours can. When another locator of the same page object still finds exactly
+one element and that element holds a different hint than the last good run
+recorded, the page has shown that it changes that attribute, and Locate leaves
+it off the ladder — along with a role-and-name locator whose name is only that
+hint — and takes the next rung. The console line names the attribute and the
+field that gave it away. The failing field is never its own witness.
+
+An answer also has to leave the file compiling. A builder with an option object,
+or a role, names a type that a page object of plain locator fields never
+imported, so the edit carries the import with it (`locator_patch.edits_for`, from
+the plugin's `imports_for`). Without it the answer fails its own verification run
+in the compiler — and a build failure names no element, so a right locator is
+reverted as one that did not help.
+
+**The failing selector comes from three places, best first:** the action that
+threw in the trace; the locator the failure message quotes; the anchor the
+framework recorded in its failure context. Only the first exists for an action
+that threw. A wait that polls until its budget runs out throws nothing, so a
+page-load failure is filed under what the message and the context say — without
+that, `failed_selector` is empty and Locate has nothing to look up.
+
+It deliberately does **not** drive the application to recreate the failure —
+signing in, minting sessions, replaying a journey. It used to, and that is where
+it spent its time and where it broke; the capture is already the failure state,
+and Fix's test run is a better proof than a click in a scratch browser.
+
 **How a locator actually gets fixed.** A locator breaks because the DOM changed,
 so the correct new value exists nowhere in the source — inferring it from stale
-code is guessing. Step 01 grounds the fix in the real DOM, in three tiers:
+code is guessing. Step 01 grounds the fix in the real DOM, in four tiers:
 
 | Tier | Source | Mid-flow? | Can count selector matches? |
 |---|---|---|---|
@@ -92,10 +195,13 @@ Independently of all four, when the handoff carries a **Playwright trace**
 the test really used and exactly which one failed. That comes from the recorded
 run, so it is not subject to the source being out of date.
 
-**Tier 1 is automatic, and only on retry.** The first attempt works from the
-failure-time DOM snapshot, which handles most broken locators and stays fast and
-headless. If that attempt produces no working fix, the agent re-runs the test
-with the browser parked and attaches to it — the one thing a snapshot cannot do
+**Tier 1 is automatic, and only for a second try at the same element.** The
+first attempt at an element works from the failure-time DOM snapshot, which
+handles most broken locators and stays fast and headless. "First attempt at an
+element" is not "attempt 1": a chain of broken locators is repaired one per
+attempt, so each later link arrives on a later attempt having never been tried
+(`tried_before` in `01_fix.py`). If an attempt at an element produces no working
+fix, the agent re-runs the test with the browser parked and attaches to it — the one thing a snapshot cannot do
 is count how many elements a candidate selector matches, or try the corrected
 locator for real before the code is edited.
 
@@ -110,7 +216,11 @@ the session file — including when the inspection fails.
 
 It is skipped automatically when: the run came from a triaging handoff rather
 than a named test, `CI` is set, there is no display, the port is already busy, or
-`REPAIR=false`. `REPAIR=true` forces it from the first attempt.
+`REPAIR=false`. `REPAIR=true` forces it from the first attempt. It is also skipped
+when the previous attempt already inspected the same failing selector live and the
+source has since been put back: that page and those elements have not changed, so
+the earlier findings are reused instead of paying for another test run and model
+call to read them again.
 
 Tier 2 is the normal unattended path and needs no browser, no credentials and no replay: the
 automation framework writes the page's HTML next to the failure screenshot
@@ -133,7 +243,26 @@ themselves read via `config.getRunTimeProperty()`.
 Claude returns minimal search/replace `edits`, never a whole file: it is only ever
 shown an excerpt of a large page object, so a regenerated file would silently drop
 what it never saw. A safety guard rejects any fix that empties a file, removes a
-method, or changes more lines than a locator change plausibly needs.
+method, or changes more lines than a locator change plausibly needs — and any fix
+that alters an assertion call or its expected value, for a located edit and a
+model-written one alike, with or without `FORCE`.
+
+Two more rules read the DOM captured at failure (`validate_diagnosis_fit`). A
+replacement that matches nothing there is a guess, unless Locate has said the
+capture cannot hold the element, in which case the test run decides. And an edit
+may not replace a selector that matches exactly one visible element there: that
+selector resolved when the test failed, so it is not the one that broke.
+
+The fix call is given `Read`, `Grep` and `Glob` and nothing that runs. With a shell
+it could read the repository's history — which holds the answer to a locator
+someone broke on purpose and no answer at all to one that drifted with the
+application — and what it was allowed to run depended on the permission settings
+of whichever machine the agent was on.
+
+The page object a failure names is always in the prompt, whether or not ranking by
+element name found it. A selector is not always a literal in the source (one
+inside an iframe is declared as several calls), and a Locate answer can only be
+applied to a page object listed in the fix context.
 
 ---
 
@@ -145,9 +274,8 @@ drains it. This is the nightly path.
 **Standalone mode** — you already know which test is broken, so name it:
 
 ```bash
-make run AGENT=test-healing-agent TEST=LoginTest#testLogin
-make run AGENT=test-healing-agent TEST=automation.saucedemo.SauceDemoWebTest   # whole class
-./scripts/run-fix-test.sh LoginTest#testLogin
+./scripts/run-healing-agent.sh --test LoginTest#testLogin
+./scripts/run-healing-agent.sh --test automation.saucedemo.SauceDemoWebTest   # whole class
 ```
 
 Step `00_reproduce.py` runs the test locally with `-DtraceMode=on`, reproduces the
@@ -181,7 +309,7 @@ never touches the queue that triaging feeds.
 
 ## Driving it from the GUI
 
-`qa_agents_server` (`bash scripts/run-server.sh`, port 8765) exposes this agent at
+`qa_agents_server` (`bash scripts/run-server.sh`, port 6001) exposes this agent at
 `/agents/test-healing-agent/*`, alongside the authoring agent. AI-Test-Studio
 proxies those paths under `/api/agents/*` and renders the **Auto-Heal Tests**
 panel against them.
@@ -195,10 +323,13 @@ GET  /agents/test-healing-agent/queue                # handoffs waiting from tri
 GET  /agents/test-healing-agent/sessions             # history
 ```
 
-The run slot is **global across agents**, not per agent: both drive the same
-automation-repo checkout, and repair mode binds a fixed CDP port, so a second
-request is queued rather than run concurrently. Steps stream as
-Reproduce → Fix → Ship; Reproduce only appears in standalone mode.
+Runs execute in parallel, up to `QA_MAX_CONCURRENT_RUNS` (default 4). Each gets
+its own detached git worktree under `/tmp/qa-runs/<session>`, so agents no longer
+share one automation-repo checkout, and each derives its own CDP port from the
+session id — so repair mode works in several runs at once. Beyond the limit,
+requests queue, drained fewest-active-runs-first so one user cannot starve
+another. Steps stream as
+Reproduce → Locate → Fix → Ship; Reproduce only appears in standalone mode.
 
 ## Fixing by defect, not by test
 
@@ -212,7 +343,7 @@ is usually a handful of defects, so the agent works in phases:
    one unit of work. The selector recorded in the trace is the strongest key;
    element names and the triage grouping are fallbacks. The same element name in
    two different page objects is never merged.
-3. **`AUTO_FIX_MAX_FIXES_PER_RUN` caps distinct fixes, not tests.** Clusters are
+3. **`HEALING_MAX_FIXES_PER_RUN` caps distinct fixes, not tests.** Clusters are
    attempted largest-first, so a capped run unblocks the most tests it can.
    Deferred clusters are reported as such, not silently dropped.
 4. **One investigation, one edit, per cluster.** The member with the best
@@ -221,10 +352,33 @@ is usually a handful of defects, so the agent works in phases:
 5. **Every affected test must still prove it.** All members are re-run. A fix is
    credited only for the ones that actually pass; members that still fail keep
    their own failure record so the next attempt re-investigates them separately.
+6. **A test that now fails on a *different* element is progress, not failure.**
+   The edit is kept, and the next attempt is handed the NEW failure — refreshed
+   from the artifacts the verification run just wrote. Only a test that still
+   fails on the *same* element condemns the edit, and only then is it reverted.
+   Which element a failure is about is worked out once, from the run's whole
+   output, and carried on the record (`shared/failure_identity.py`); a record's
+   own text and the selector it was filed under are the fallbacks. Two page-load
+   failures on the same page object are the same failure whatever anchor the
+   message quotes — a replacement anchor that is also absent is not progress.
+
+Rule 6 is what lets one run walk a chain of broken locators. Without it the gate
+was whole-test pass/fail: a fix that repaired the login button, got the flow onto
+a page it had never reached, and then met a second broken locator scored as a
+failure and was reverted — so the next attempt started over on the locator that
+was already fixed, and the run could never get past the first one.
 
 Without this, the first test's fix lands and the other four arrive to find the
 file already corrected — their edit fails to apply, and they get reported as
 "needs manual fix" while their fix is sitting in the same PR.
+
+**Every edit kept on the way is reported with the test it was kept for.** Only the
+last edit of a chain sees the test go green, and the record of a fixed test used
+to hold that one alone: a run that repaired three locators reported one, in the
+summary, the PR body and the count, while the diff it shipped carried all three.
+Each record now carries the edits earlier attempts kept for its tests
+(`earlier_edits`, from `kept_edits` in `01_fix.py`), a still-failing test
+included, and `distinct_fixes` counts them.
 
 Repository scans are cached for the run, so 30 failures cost one walk of the
 source tree rather than 30.
@@ -233,8 +387,9 @@ source tree rather than 30.
 
 | Step | Owns | Does NOT do |
 |------|------|-------------|
+| **01 Locate** | Identify the owning page-object field, rank the failure capture against the baseline, emit a unique selector — once per attempt, so each link of a chain is resolved as the run uncovers it | No model, no browser, no credentials, no file edits |
 | **01 Fix** | Read handoff, build context, inspect live DOM, call Claude, apply edits, run test, commit | No DB, no HTML parsing |
-| **02 Ship** | Push branch, create PR, Slack notify | No AI, no code changes |
+| **02 Ship** | Push branch, create PR (a draft when no test is green yet but edits were kept), Slack notify | No AI, no code changes |
 
 ---
 
@@ -243,19 +398,47 @@ source tree rather than 30.
 ```
 agents/test-healing-agent/queue/<build_tag>.json   ← written by test-triaging-agent
     ↓
+01-locate.json              (one resolution per broken locator; accumulates across attempts)
+    ↓
 01-fix.json + .fix-passed   (per-test results, pr_branch)
-   + .skip-reason            (infra / no-work — controls whether the handoff is consumed)
+   + .fix-retry             (retry / stop: <reason> — the loop reads only this)
+   + .skip-reason            (infra / no-work / diagnosed — controls whether the handoff is consumed)
+    ↓  (loop back to 01-locate.json while .fix-retry says retry)
     ↓
 02-ship.json                (pr_url, slack_notified)
     ↓
 queue/processed/<build_tag>.json   ← moved after completion
 ```
 
-**Retry loop (in run.sh):** If `.fix-passed=false`, re-runs `01_fix.py` up to `MAX_FIX_ATTEMPTS`.
+**Retry loop (in run.sh):** Locate and Fix both run inside it, once per attempt. One broken
+locator hides the next — the test cannot reach locator #2 until #1 is repaired and it is
+re-run — so Locate works each time from the artifacts the last verification run wrote, and
+every link of a chain gets a deterministic answer instead of only the first.
+
+`01_fix.py` decides when to stop and writes `.fix-retry`; run.sh just reads it. The budget
+counts attempts that made **no progress**: an edit that repairs one locator and moves the test
+on to the next one leaves the run red but is not a failed retry, and charging it as one meant a
+long chain could never finish. `HEALING_RETRY_COUNT` (default 4) caps consecutive attempts that
+moved nothing; `HEALING_MAX_ATTEMPTS` (default 12) is the absolute ceiling, so progress cannot
+spin forever. See `retry_verdict` in `01_fix.py`.
+
 A retry re-attempts **only the tests that actually failed** — fixes already applied and
 committed by an earlier attempt are carried forward into the report rather than redone.
-On retry, `01_fix.py` injects the previous test failure output into the Claude prompt so it
-tries a different locator strategy.
+On retry, the prompt says what actually became of the previous attempt
+(`retry_section` in `01_fix.py`). An edit that was **reverted** is shown, with the
+statement that the source is back as it was and the output of the run made with
+it. An edit **rejected before any test ran** is shown with the guard's reason and
+no test output, since none belongs to it. Where the previous edit *worked* and
+merely uncovered the next broken locator, the retry gets that new failure — new
+selector, new DOM snapshot, new diagnosis (`next_issue` in `01-fix.json`) — and is
+told this is the first attempt at that element, not asked to avoid the approach
+that just succeeded.
+
+Every test still failing carries the failure it was last seen on, whatever ended
+the attempt (`carry_current_issues`). An attempt that ran no test — a guard's
+rejection, a refusal, an unreadable model response — changed nothing, so the
+failure it was working on is still the failure. Without that the next attempt
+reads the original handoff: a locator the session has already repaired.
 
 If `01_fix.py` crashes, run.sh's ERR trap posts to `SLACK_ALERT_CHANNEL` and leaves the
 handoff queued — a crash is never silent.
@@ -294,18 +477,128 @@ Written by `test-triaging-agent/actions/05_ship.py`. Contains everything needed 
 }
 ```
 
-Only issues with `AUTOMATION_ISSUE + HIGH + ELEMENT_NOT_FOUND` are included.
+Only `AUTOMATION_ISSUE` + `HIGH` issues whose category is `LOCATOR_STALE`,
+`AMBIGUOUS_LOCATOR` or `ELEMENT_NOT_FOUND` are included — see
+[the handoff criteria](../../docs/ARCHITECTURE.md#handoff-criteria).
 
 `dom_snapshot` and `failure_url` are empty when the framework captured no DOM for
 that test (an API test, screenshots disabled, or a framework without the capture
-hook). The healing agent then falls back to tier 2.
+hook). The healing agent then falls back to tier 3 (re-opening the page) or 4.
+
+`failed_selector` is the trace's failing action when one threw, otherwise the
+locator the failure message or the failure context names
+(`run_artifacts.name_failing_selector`). It is empty only when none of the three
+names one.
 
 ---
+
+## Elements inside iframes
+
+A locator inside an iframe fails with a chain in its message —
+`Locator@#checkout >> internal:control=enter-frame >> #amount`, which is what
+`page.frameLocator("#checkout").locator("#amount")` compiles to — and every step
+reads it as one selector (`shared/frames.py`):
+
+- the framework writes each iframe's HTML and element capture to a `.frames.json`
+  sidecar named in the snapshot header, and fingerprints a frame element in its
+  own frame (`LocatorCapture.frames`, `Baseline.collect`);
+- `page_identity.parse` hangs each frame's document on its `<iframe>`, and
+  `page_identity.select` / `dom_snapshot.selector_visibility` follow the chain;
+- Locate ranks the failing frame's own capture and emits the replacement with the
+  same hops (`candidates_for(..., frame_path=)`), so the page object gets
+  `page.frameLocator(...).locator(...)` back, never a top-document locator;
+- whichever builder proved unique is what gets written, inside a frame as readily
+  as outside one, so a chain ending in a `getBy…` builder is read back as a
+  declared locator like any other. The runtime's own form of such a builder
+  (`internal:attr=[…]`) normalises to the form the declaration reads as, so a
+  failing one still matches the field that declares it;
+- the guards read a frame fix as one chain, so a correct one is no longer rejected
+  as "matches nothing".
+
+A hop that matches several iframes, or a frame the capture does not hold, is
+unevaluable rather than absent: Playwright counts through the first matching
+iframe and then refuses to act, so no count through it is honest. A framework
+that cannot put a locator inside a frame in one expression (Selenium switches
+frames) gets no code rather than a wrong one, and Locate refuses the heal.
+
+## Locator baselines are committed with the fix
+
+`src/main/resources/baselines/<PageObject>.json` is the framework's record of what each
+locator matched while the test worked, and a heal is exactly what makes the committed
+one stale: the locator that broke has just been replaced, so the fingerprint in the repo
+describes an element the page no longer uses. `_refresh_baseline_after_heal()` already
+rewrote the file on disk; what was missing was committing it, because the fix commit
+stages only `fix["target_file"]`.
+
+`_commit_baselines()` adds a second, path-scoped commit for the fingerprints that
+actually changed — measured with `recordedAt` excluded, through `shared/baseline.py`, so
+two runs that differ only in their timestamp commit nothing. Never `git add -A`: this
+step holds a write token.
+
+It runs after **either** commit outcome, not just a fresh fix commit. A retry whose edit
+an earlier attempt already committed takes git's "nothing to commit" path — which is the
+normal way a chain of broken locators finishes — and committing baselines only on the
+other branch skipped exactly those runs.
+
+**The run has to record them where this step reads them.** `baselineDir` in
+`parameters/config.properties` is a relative path, and `Baseline.java` resolves it against
+the JVM's working directory — one directory for the main checkout, another for a
+per-session worktree. So a verification run could promote its fingerprints somewhere the
+ship step never looked, `baseline.changed()` compared a directory nothing had written to,
+found no diff, and committed nothing; the worktree was then deleted with the fingerprints
+still in it. `shared/test_runner.run_test` now pins `-Dbaseline.dir` to an absolute path
+inside the workspace it is running in, for every JVM runner and every agent at once.
+
+An empty result is logged either way, and the two cases are distinguished: fingerprints on
+disk that genuinely match HEAD is the ordinary no-op, none on disk at all names the
+directory that was searched. They used to share one silent `return []`, which is why this
+went unnoticed across ten PRs in a single day.
+
+**What a baseline holds, and when it is thin.** A fingerprint is taken when the page
+object loads, for every locator that resolves then, and again the first time the
+test finds a locator visible, for any the first pass missed. The second pass is
+what covers an overlay that was still closed, an iframe inside an iframe that had
+not loaded, and a header that re-rendered under the handle just taken — without
+it those locators had no fingerprint at all, and Locate answered `NO_FINGERPRINT`
+for every one of them. `coverage` is untouched by the second pass: it stays a
+count of the page as it loaded, which is what a failing page-load is compared
+with.
+
+A passing run replaces the whole file, so the framework keeps what the old record
+knew and the new one does not: a fingerprint, as long as the field still holds the
+same locator (`selectors`), and the repair history, which only this agent writes.
+One capture that missed used to erase the fingerprints of every earlier run, and
+every promotion erased the history the `UNSTABLE_LOCATOR` rule counts.
+
+When Locate still finds no fingerprint it says which gap it is: matched on the
+last good run and never fingerprinted (an incomplete baseline, which says nothing
+about the element), matched nothing at load and was not used afterwards, or could
+not be evaluated at load.
+
+**The session copies them before it starts.** The framework re-records a page's
+baseline whenever a test that walks through it passes — so a class where four tests
+pass and one fails rewrites four pages' worth before the failure is even diagnosed,
+and a repair that greens a test does it again. Every later reader then asks for "the
+page when it last worked" and is handed a record written minutes ago, which
+`baseline.load` correctly refuses as younger than the failure it would explain. On a
+real run that cost the second locator of a chain its deterministic answer and sent it
+to the model.
+
+`baseline.preserve()` takes the copy into `audit/<session>/baselines/` before the
+reproduce run and stamps `healing_baseline_dir` on every issue; the triaging agent
+does the same for the pipeline path (`artifacts.attach_baselines`). `baseline.load`
+and `baseline.directory` prefer that copy over the live tree, so what the session
+writes can never stand as evidence about the run before it.
+
 
 ## Fix Gate Values (.fix-passed)
 
 - `true`    — every attempted fix was applied, and passed wherever a runner existed → PR created
-- `false`   — one or more fixes failed tests → retry loop, then Slack alert
+- `false`   — one or more fixes failed tests → retry loop, then Slack alert. If the
+              run kept edits on the way (the test got past each repaired element and
+              stopped at a later one), Ship raises them as a **draft** PR titled
+              `[PARTIAL]`, records `pr_draft: true` in `02-ship.json`, and the run
+              is still reported as needing review
 - `skipped` — no eligible issues or infra not configured → clean exit
 
 A fix applied where **no test runner could be found** is recorded as
@@ -318,6 +611,9 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 - `infra`   — nothing was attempted (no GitHub token, workspace missing). run.sh
               leaves the handoff in the queue so the work is not lost.
 - `no-work` — the handoff held nothing eligible. The handoff is consumed.
+- `diagnosed` — the diagnosis returned a stop verdict under `DIAGNOSIS_MODE=enforce`
+              (e.g. `WRONG_PAGE`); the handoff is consumed, except for
+              `ENV_UNREACHABLE` / `ERROR_STATE`, which map to `infra` and stay queued.
 
 ---
 
@@ -330,8 +626,11 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | `00-session-init.md` | run.sh | Session metadata |
 | `00-reproduce.json` + `.md` | Reproduce | Standalone only: what was run, the failure shape, why it did or did not proceed |
 | `00-handoff.json` | Reproduce | Standalone only: the synthesised handoff |
+| `baselines/` | Reproduce | The recorded good-run fingerprints, copied before this run could overwrite them |
 | `01-fix.json` + `.md` | Fix | Per-test context, diffs, test output |
+| `01-locate.json` + `.md` | Locate | Per-locator resolution and the reason for every refusal |
 | `.fix-passed` | Fix | Gate: true / false / skipped |
+| `.fix-retry` | Fix | `retry`, or `stop: <reason>` — the only thing run.sh's loop reads |
 | `02-ship.json` + `.md` | Ship | PR URL, Slack status |
 
 ---
@@ -341,32 +640,38 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 | Variable | Purpose |
 |---|---|
 | `CLAUDE_CLI_PATH` | Path to claude CLI binary (default: claude) |
-| `AUTOFIX_MODEL` | Claude model for fix generation (default: `claude-opus-5`) |
-| `AUTOFIX_INSPECT_DOM` | Read the failing page in a real browser before fixing (default: true) |
-| `AUTOFIX_BASE_URL` | Page URL for DOM inspection, overriding whatever is recovered from the execution log |
+| `HEALING_MODEL` | Claude model for fix generation (required — set in `config/.env`, no default in code; run.sh stops without it) |
+| `HEALING_EFFORT` | Thinking effort for those calls: `low`, `medium`, `high`, `xhigh`, `max` (set in `config/.env`; empty — the runner's `effortLevel` in `~/.claude/settings.json`) |
+| `BROWSER_EFFORT` | Thinking effort for the live DOM inspections, shared with every agent's browser-driving calls (set in `config/.env`; empty — `HEALING_EFFORT`) |
+| `HEALING_INSPECT_DOM` | Read the failing page in a real browser before fixing (default: true) |
+| `HEALING_BASE_URL` | Page URL for DOM inspection, overriding whatever is recovered from the execution log |
 | `AUTOFIX_DOM_TIMEOUT_S` | Wall-clock budget for one browser inspection (default: 600) |
-| `PLAYWRIGHT_HEADLESS` | Set `false` to watch the browser during inspection |
+| `HEADLESS_BROWSER` | Set `false` to watch every browser this agent starts: DOM inspection and the reproduce / verification / probe runs (as `-Dheadless`). Locate opens no browser |
 | `AUTOFIX_LOGIN_USERNAME`, `AUTOFIX_LOGIN_PASSWORD` | Credentials override. Normally unnecessary — a saved session or `parameters/*.properties` is used first |
 | `AUTOFIX_ENVIRONMENT`, `AUTOFIX_COUNTRY` | Which `parameters/{environment}-{country}.properties` to read (default: `staging` / `SG`) |
 | `AUTOFIX_REPAIR_SESSION` | Explicit path to a `.repair-session.json`. Unset → looked for under the workspace's `test-output/` |
 | `AUTOFIX_MAX_DIFF_LINES` | Reject a fix whose diff exceeds this many lines (default: 40) |
 | `DIAGNOSIS_PROBE` | `false` to skip confirmation probes (default: on). A probe costs one test run and buys a measured verdict instead of an assumed one |
-| `BASELINE_DIR` | Where page baselines are read from. Unset → `<workspace>/test-output/baselines`. Point CI at a path that survives between builds, or baselines are discarded with every report directory |
+| `HEALING_BASELINE_DIR` | Where page baselines are read from. Order: a copy preserved in the session, then this variable, then the framework's `baselineDir` in `config.properties` (`src/main/resources/baselines` in Playwright-Automation-Framework), then `<workspace>/test-output/baselines`. In CI, use a path that survives between builds |
+| `HEALING_LOCATE_MODE` | `shadow` (default) — Locate's proposal is logged in `01-locate.md` and Fix decides as before. `enforce` — Fix applies a verified Locate proposal instead of calling the model |
+| `HEALING_MAX_ATTEMPTS` | Hard ceiling on Locate+Fix attempts (default: 12); `HEALING_RETRY_COUNT` counts only attempts without progress |
 | `DIAGNOSIS_MODE` | `shadow` (default) — diagnose and log, but let the old behaviour decide. `enforce` — a stop verdict skips the work before any model call. Shadow exists so the verdicts can be measured against real outcomes before they refuse work the agent used to do |
 | `AUTOFIX_PAGE_OBJECT_CHARS` | Budget per page object shown to Claude (default: 8000). Declarations are always kept in full |
 | `PAGE_OBJECT_DIRS` | Comma-separated page-object search dirs. Unset → derived from the repo layout |
-| `AUTOFIX_TEST_TIMEOUT_S` | Timeout for one verification test run (default: 300) |
+| `HEALING_TEST_TIMEOUT_S` | Timeout for one verification test run (default: 300) |
 | `WORKSPACE_DIR` | Parent directory for the automation repo. Must be outside QA-Agent-Network. If the repo is not present, test-healing-agent clones it automatically using `GITHUB_TOKEN` + `GITHUB_ORG` + `GITHUB_REPO_AUTOMATION`. |
-| `GITHUB_REPO_AUTOMATION` | Name of the automation repo dir under `WORKSPACE_DIR` |
+| `GITHUB_REPO_AUTOMATION` | Name of the automation repo — the dir under `WORKSPACE_DIR` and the repo name on GitHub |
+| `FRAMEWORK_DIR` | Absolute path to the checkout, overriding `WORKSPACE_DIR/GITHUB_REPO_AUTOMATION`. Unset → the derived path |
 | `GITHUB_TOKEN` | GitHub authentication for PR creation |
 | `GITHUB_ORG` | GitHub org owning the automation repo |
 | `GITHUB_DEFAULT_BRANCH` | Base branch for PRs (default: main) |
-| `AUTOFIX_BRANCH_PREFIX` | Prefix for fix branches (default: `chore/qa-autofix`). Full name: `<prefix>/<build-tag>` |
+| `HEALING_BRANCH_PREFIX` | Prefix for fix branches (default: `healing`). Full name: `<prefix>/<session-id>`, e.g. `healing/20260923-111221-fix-saucedemowebtest` — one branch per run, so re-running the same test never collides with an earlier run's branch |
 | `GITHUB_PR_REVIEWERS` | Comma-separated list of PR reviewers |
-| `REPO_CONTEXT_FILE` | Path to conventions file in the automation repo (relative to repo root or absolute). If unset or not found, falls back to `agents/test-healing-agent/CONVENTIONS.md` bundled in this agent. |
+| `REPO_CONTEXT_FILE` | Conventions file to show the model (relative to the repo root, or absolute). Unset or missing → the first of `CONVENTIONS.md`, `CLAUDE.md`, `docs/TESTING.md`, `TESTING.md`, `CONTRIBUTING.md` in the automation repo; with none, the generic `config/skills/automation-repo.md` rules still apply. Up to 64,000 characters are used (`MAX_CONVENTIONS_CHARS`) |
 | `TEST_RUNNER_CMD` | Override test runner — use `{class}`, `{class_simple}`, `{method}` placeholders. Without it, runners are auto-detected at the repo root and one level down; if none is found, fixes are reported `unverified` |
-| `AUTO_FIX_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
-| `MAX_FIX_ATTEMPTS` | Max retry cycles if tests fail (default: 2) |
+| `HEALING_MAX_FIXES_PER_RUN` | Max **distinct locator fixes** per session, not tests (default: 5). One fix can green several tests |
+| `HEALING_RETRY_COUNT` | Max **consecutive attempts that made no progress** before the loop gives up (default: 4). An attempt that repairs one locator and uncovers the next does not count |
+| `HEALING_MAX_ATTEMPTS` | Absolute ceiling on Locate+Fix attempts, however much progress is being made (default: 12) |
 | `AUTO_PUSH` | Set `false` to skip PR creation (dry-run) |
 | `SLACK_BOT_TOKEN`, `SLACK_NOTIFY_CHANNEL` | Slack notifications on success |
 | `SLACK_ALERT_CHANNEL` | Slack channel for failures/partial fixes |
@@ -382,13 +687,13 @@ Slack message and `01-fix.md` all mark it "Applied but NOT Verified". Set
 
 ```bash
 # Queue mode — picks the oldest unprocessed handoff
-make run AGENT=test-healing-agent
+./scripts/run-healing-agent.sh
 
 # Direct mode — process a specific build tag
-make run AGENT=test-healing-agent BUILD_TAG=ProdSanity-All-Tests-541
+./scripts/run-healing-agent.sh ProdSanity-All-Tests-541
 
 # Dry-run — fixes applied and tested locally, but no PR pushed
-AUTO_PUSH=false make run AGENT=test-healing-agent
+AUTO_PUSH=false ./scripts/run-healing-agent.sh
 
 # View audit trail
 make audit AGENT=test-healing-agent
@@ -401,17 +706,25 @@ make audit AGENT=test-healing-agent SESSION=20260328-143022-fix-ProdSanity-All-T
 
 1. **Diagnose before editing.** `shared/diagnosis.py` decides *why* the element was
    missing — a stale locator is one answer among several, and only `LOCATOR_STALE`
-   authorises a selector edit. Stop verdicts exit without a model call. Abstention
+   and `AMBIGUOUS_LOCATOR` authorise a selector edit (the two defects that live in
+   the selector itself: one no longer matches its element, the other matches more
+   than one). Stop verdicts exit without a model call. Abstention
    (`INSUFFICIENT_EVIDENCE`) falls through to the pre-existing behaviour, so a weak
    signal never blocks a genuine fix
 2. **Every fix must pass the test before it is committed** — restore original on failure
 3. **Write audit entry before any irreversible action** (git commit, push)
-4. **Use wrapper methods, not raw Selenium** — CONVENTIONS.md teaches Claude the patterns
-   (plus `config/skills/automation-repo.md`, passed as `--system-prompt-file`, and
-   `config/prompts/fix.md`, which holds the instructions and output contract)
+4. **Use wrapper methods, never raw driver calls** — the automation repo's
+   conventions file (normally its `CLAUDE.md`, see `REPO_CONTEXT_FILE`) teaches
+   Claude the patterns, alongside `config/skills/automation-repo.md` (framework-neutral
+   rules, passed as `--system-prompt-file`) and `config/prompts/fix.md` (the
+   instructions and output contract)
 5. **Exit cleanly** — success or failure. Not a daemon.
 6. **Secrets never logged** — env var names are fine, never their values
 7. **Tokens never persisted** — clone and push supply the credential per-invocation
    via `shared/git.py`'s `push_url`; it is never written into `.git/config`
 8. **Never report an unverified fix as verified** — the three states are
    verified / unverified / failed, and they stay distinct all the way to the PR
+9. **A fix changes how an element is found, never what is asserted** — an edit
+   that alters an assertion call or its expected value is rejected before any
+   test runs, and a locator an assertion reads is repaired only on proof that
+   the replacement is the same element

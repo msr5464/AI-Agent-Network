@@ -27,11 +27,11 @@ class Config:
     """Centralized configuration class"""
     
     # Database Configuration
-    DB_HOST = os.getenv('DB_HOST', 'localhost')
-    DB_PORT = int(os.getenv('DB_PORT', '3306'))
-    DB_USER = os.getenv('DB_USER', 'root')
-    DB_PASSWORD = os.getenv('DB_PASSWORD', '')
-    DB_NAME = os.getenv('DB_NAME', 'qa_results')
+    TRIAGING_DB_HOST = os.getenv('TRIAGING_DB_HOST', 'localhost')
+    TRIAGING_DB_PORT = int(os.getenv('TRIAGING_DB_PORT', '3306'))
+    TRIAGING_DB_USER = os.getenv('TRIAGING_DB_USER', 'root')
+    TRIAGING_DB_PASSWORD = os.getenv('TRIAGING_DB_PASSWORD', '')
+    TRIAGING_DB_NAME = os.getenv('TRIAGING_DB_NAME', 'qa_results')
     
     # LLM Configuration
     LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama').lower()
@@ -43,24 +43,24 @@ class Config:
     GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
     
     # Report Configuration
-    INPUT_DIR = os.getenv('INPUT_DIR', 'testdata')
-    OUTPUT_DIR = os.getenv('OUTPUT_DIR', 'reports')
+    TRIAGING_INPUT_DIR = os.getenv('TRIAGING_INPUT_DIR', 'testdata')
+    TRIAGING_OUTPUT_DIR = os.getenv('TRIAGING_OUTPUT_DIR', 'reports')
     # Bump this when report HTML/CSS/JS template or behavior changes so viewers refresh and support can identify format
     REPORT_FORMAT_VERSION = os.getenv('REPORT_FORMAT_VERSION', '2')
     
     # Dashboard URL Configuration (for linking to test reports)
-    DASHBOARD_BASE_URL = os.getenv('DASHBOARD_BASE_URL', 'https://qa.dashboard.example.com')
+    TRIAGING_DASHBOARD_BASE_URL = os.getenv('TRIAGING_DASHBOARD_BASE_URL', 'https://qa.dashboard.example.com')
     
     # Jira URL Configuration (for linking to known failure tickets)
-    JIRA_BASE_URL = os.getenv('JIRA_BASE_URL', 'https://jira.example.com')
+    TRIAGING_JIRA_BASE_URL = os.getenv('TRIAGING_JIRA_BASE_URL', 'https://jira.example.com')
     
     # Logging Configuration
     LOG_FILE_NAME = 'agent.log'
     LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     
     # Flaky Tests Detection Constants
-    FLAKY_TESTS_LAST_RUNS = int(os.getenv('FLAKY_TESTS_LAST_RUNS', '10'))  # X: Number of last runs to check
-    FLAKY_TESTS_MIN_FAILURES = int(os.getenv('FLAKY_TESTS_MIN_FAILURES', '5'))  # Y: Minimum failures required
+    TRIAGING_FLAKY_TESTS_LAST_RUNS = int(os.getenv('TRIAGING_FLAKY_TESTS_LAST_RUNS', '10'))  # X: Number of last runs to check
+    TRIAGING_FLAKY_TESTS_MIN_FAILURES = int(os.getenv('TRIAGING_FLAKY_TESTS_MIN_FAILURES', '5'))  # Y: Minimum failures required
 
     # GitHub Configuration (read-only — test-triaging-agent does not push code)
     GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
@@ -73,10 +73,10 @@ class Config:
     def get_db_config(cls) -> dict:
         """Get database configuration dictionary"""
         return {
-            'host': cls.DB_HOST,
-            'port': cls.DB_PORT,
-            'user': cls.DB_USER,
-            'password': cls.DB_PASSWORD,
-            'database': cls.DB_NAME
+            'host': cls.TRIAGING_DB_HOST,
+            'port': cls.TRIAGING_DB_PORT,
+            'user': cls.TRIAGING_DB_USER,
+            'password': cls.TRIAGING_DB_PASSWORD,
+            'database': cls.TRIAGING_DB_NAME
         }
 

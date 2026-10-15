@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from shared.log import emit
+
 
 def load_json(audit_dir: Path, filename: str, required: bool = True) -> Any:
     """
@@ -15,7 +17,7 @@ def load_json(audit_dir: Path, filename: str, required: bool = True) -> Any:
     path = audit_dir / filename
     if not path.exists():
         if required:
-            print(f"ERROR: {filename} not found in {audit_dir}", flush=True)
+            emit(f"ERROR: {filename} not found in {audit_dir}")
             sys.exit(1)
         return {}
     return json.loads(path.read_text())

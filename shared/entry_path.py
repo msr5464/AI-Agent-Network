@@ -1,0 +1,567 @@
+"""How does the test under adaptation get itself signed in? Read it, don't guess.
+
+The adaptation agent edits an *existing* test. That test already states its own
+entry path — which credentials, which login method, or which saved session — so
+deriving login from repo-wide conventions was always answering a question the
+source had already answered.
+
+Conventions lost, repeatedly, because the framework has no single convention:
+
+  * the login page object is `LoginPage` in two modules and `NaukriLoginPage` in
+    a third;
+  * the URL key is `saucedemo.url` and `naukari.url` — but `githubUrl`;
+  * `GitHubLoginTest` logs in two different ways in one file: one test calls
+    `loginWithStoredSession()`, the next reads `github.username` / `.password`
+    and calls `doLogin(u, p)`.
+
+So `extract()` reads the test's setup prefix and reports one of three modes:
+
+  `stored_session` — the test loads a saved storage state. Reuse that exact file.
+  `credential`     — the test reads named properties and calls a login method.
+                     Use *those* keys and *that* method.
+  `none`           — the test never signs in. Explore unauthenticated rather than
+                     hard-stopping on a session it was never going to need.
+
+This is the same guess-then-measure rule the agent already applies to page
+objects, finally applied to login as well.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Dict, List, Optional
+
+# `String username = config.getRunTimeProperty("naukari.username");`
+_PROPERTY_READ = re.compile(
+    r"(?:String\s+)?(\w+)\s*=\s*\w+\s*\.\s*getRunTimeProperty\s*\(\s*\"([^\"]+)\"")
+
+# `NaukriProfileSummaryHelper naukri = new NaukriProfileSummaryHelper(config);`
+_HELPER_NEW = re.compile(r"(\w+)\s+(\w+)\s*=\s*new\s+(\w+)\s*\(")
+
+# `NaukriProfilePage profilePage = naukri.doLogin(username, password);`
+# also bare `github.loginWithStoredSession();`
+_CALL = re.compile(r"(?:\w+\s+\w+\s*=\s*)?(\w+)\s*\.\s*(\w+)\s*\(([^)]*)\)\s*;")
+
+# `Map<String, String> user = sauceDemo.getUser("standard");`
+_DATA_READ = re.compile(r"(\w+)\s*=\s*(\w+)\s*\.\s*(\w+)\s*\(\s*\"([^\"]*)\"\s*\)\s*;")
+
+# `import automation.modules.naukari.NaukriProfileSummaryHelper;`
+_IMPORT = re.compile(r"^\s*import\s+(static\s+)?([\w.]+)\s*;", re.MULTILINE)
+
+# `BrowserHelper.initBrowserWithStoredSession(config, ProjectName.GitHub, SESSION_FILE);`
+_STORED_SESSION = re.compile(
+    r"initBrowserWithStoredSession\s*\(\s*\w+\s*,\s*(?:\w+\s*\.\s*)?(\w+)\s*,\s*(\w+)")
+
+# `private static final String SESSION_FILE = "GitHubLoginStorage.json";`
+_STRING_CONST = re.compile(
+    r"static\s+final\s+String\s+(\w+)\s*=\s*\"([^\"]+)\"")
+
+# Method names worth following when the call's arguments do not identify it.
+_LOGIN_HINTS = ("login", "signin", "authenticate", "session")
+
+
+def source_candidates(test_id: str) -> List[str]:
+    """Where `automation.shop.CartTest#pay` would be declared, repo-relative."""
+    relative = Path(*test_id.split("#", 1)[0].split(".")).with_suffix(".java")
+    return [str(Path(root) / relative) for root in ("src/test/java", "src/main/java")]
+
+
+def test_source(workspace, test_id: str) -> Optional[Path]:
+    """`automation.naukari.FooTest#bar` → the .java file that declares it."""
+    for relative in source_candidates(test_id):
+        candidate = Path(workspace) / relative
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def method_body(source: str, method: str) -> str:
+    """The body of one method, brace-matched from its signature."""
+    start = re.search(r"\b" + re.escape(method) + r"\s*\([^)]*\)\s*\{", source)
+    if not start:
+        return ""
+    depth, index = 0, start.end() - 1
+    for index in range(start.end() - 1, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+    return source[start.end():index]
+
+
+def _resolve(simple_name: str, source: str, workspace) -> Optional[Path]:
+    """A simple class name → its file, via the importing file's own imports."""
+    for _static, imported in _IMPORT.findall(source):
+        if imported.rsplit(".", 1)[-1] == simple_name:
+            path = Path(workspace) / "src" / "main" / "java" / Path(
+                *imported.split(".")).with_suffix(".java")
+            if path.exists():
+                return path
+    matches = list((Path(workspace) / "src" / "main").rglob(f"{simple_name}.java"))
+    return matches[0] if matches else None
+
+
+def _stored_session_path(workspace, helper_source: str, method: str) -> Optional[Dict]:
+    """If this helper method loads a saved session, where that session lives."""
+    body = method_body(helper_source, method)
+    found = _STORED_SESSION.search(body)
+    if not found:
+        return None
+    project, file_ref = found.group(1), found.group(2)
+    constants = dict(_STRING_CONST.findall(helper_source))
+    file_name = constants.get(file_ref, file_ref.strip('"'))
+    return {
+        "project": project,
+        "file_name": file_name,
+        "path": str(Path("src/test/resources") / project.lower()
+                    / "loginStorage" / file_name),
+    }
+
+
+# `TestDataReader.loadCsvRowByColumnValue("saucedemo", "users", "user_key", key, env)`
+# — the data method's own call, with the module, file and key column it reads.
+# Matched by shape rather than by class name so a repo that wraps or renames the
+# reader still resolves; the three leading string literals are the contract.
+_CSV_READ = re.compile(
+    r"\b(\w*[Cc]sv\w*)\s*\(\s*\"([^\"]+)\"\s*,\s*\"([^\"]+)\"\s*,\s*\"([^\"]+)\"\s*(,[^;]*)?\)")
+
+
+def _tail_args(tail: str) -> List[tuple]:
+    """The arguments in `tail`, the text after a CSV read's key column from its
+    comma on, up to the call's own closing parenthesis.
+
+    [(text, start, end)]: `start` is the offset of the comma before the argument,
+    `end` the offset just past it. `_CSV_READ` runs on to the last `)` before a
+    `;`, so a chained `.get("x")` would otherwise be read as one more argument.
+    """
+    args, depth, quote, comma, i = [], 0, "", None, 0
+    while i < len(tail):
+        ch = tail[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            if comma is not None:
+                args.append((tail[comma + 1:i].strip(), comma, i))
+            comma = i
+        i += 1
+    if comma is not None:
+        args.append((tail[comma + 1:i].strip(), comma, i))
+    return args
+
+
+def csv_reads(source: str) -> List[Dict]:
+    """Every CSV row lookup in `source`, in order.
+
+    [{"module", "file", "column", "value", "environment_scoped", "filter_span"}].
+    `value` is the key value when it is a string literal, "" when it is a variable.
+    The environment-aware overload takes an argument after the key value and
+    requires the row's environment column to match it; the four-argument form
+    does not look at environment at all. `filter_span` is the (start, end) in
+    `source` of that extra argument with its leading comma, (0, 0) without one.
+    """
+    source = source or ""
+    reads = []
+    for match in _CSV_READ.finditer(source):
+        # A Javadoc or line-comment example is not a read.
+        if source[source.rfind("\n", 0, match.start()) + 1:match.start()].lstrip() \
+                .startswith(("*", "//", "/*")):
+            continue
+        _call, module, csv_file, column, tail = match.groups()
+        args = _tail_args(tail or "")
+        value = args[0][0] if args else ""
+        literal = len(value) >= 2 and value[0] == value[-1] == '"'
+        scoped = len(args) > 1
+        base = match.start(5)
+        reads.append({
+            "module": module, "file": csv_file, "column": column,
+            "value": value[1:-1] if literal else "",
+            "environment_scoped": scoped,
+            "filter_span": (base + args[1][1], base + args[-1][2]) if scoped else (0, 0),
+        })
+    return reads
+
+
+def _data_source(helper_source: str, data_method: str) -> Dict:
+    """Where `data_method` actually reads its row from. {} when it cannot be read.
+
+    The test does not hold its credentials; it names a row — `getUser("standard")`
+    — and the helper knows which file and column that row lives in. Reading the
+    helper is what turns "some CSV under this module, probably" into the file the
+    test itself opens. Without it a caller has to scan for a file that looks
+    right, and "looks right" is how you sign in as the wrong user.
+    """
+    reads = csv_reads(method_body(helper_source or "", data_method or ""))
+    if not reads:
+        return {}
+    read = reads[0]
+    return {
+        "kind": "csv", "module": read["module"], "file": read["file"],
+        "column": read["column"],
+        # Demanding an environment of a four-argument read would reject a
+        # perfectly good row.
+        "environment_scoped": read["environment_scoped"],
+    }
+
+
+def extract(workspace, test_id: str) -> Dict:
+    """The entry path the named test uses. See the module docstring for modes."""
+    result: Dict = {"mode": "none", "test": test_id, "reason": "",
+                    "helper": "", "method": "", "arg_keys": [], "session": None}
+    near_miss = ""
+    own_login = ""
+
+    source_path = test_source(workspace, test_id)
+    if source_path is None:
+        result["reason"] = f"could not find the source for {test_id}"
+        return result
+    source = source_path.read_text(encoding="utf-8", errors="ignore")
+
+    method = test_id.split("#", 1)[1] if "#" in test_id else ""
+    body = method_body(source, method) if method else source
+    if not body:
+        result["reason"] = f"could not read the body of {test_id}"
+        return result
+
+    # variable -> property key, and variable -> helper type
+    properties = dict(_PROPERTY_READ.findall(body))
+    helpers = {var: cls for cls, var, ctor in _HELPER_NEW.findall(body) if cls == ctor}
+    # variable -> (receiver, method, literal): credentials fetched through the
+    # helper itself, as SauceDemo's CSV-backed getUser("standard") is.
+    data_reads = {var: (recv, meth, lit) for var, recv, meth, lit in _DATA_READ.findall(body)}
+
+    for receiver, called, raw_args in _CALL.findall(body):
+        if receiver not in helpers:
+            continue
+        args = [a.strip() for a in raw_args.split(",") if a.strip()]
+        credential_args = [a for a in args if a in properties]
+        looks_like_login = any(h in called.lower() for h in _LOGIN_HINTS)
+        if not credential_args and not looks_like_login:
+            continue
+
+        helper_path = _resolve(helpers[receiver], source, workspace)
+        helper_source = (helper_path.read_text(encoding="utf-8", errors="ignore")
+                         if helper_path else "")
+        fqcn = ""
+        if helper_path:
+            parts = helper_path.parts
+            if "java" in parts:
+                after = parts[parts.index("java") + 1:]
+                fqcn = ".".join(after).removesuffix(".java")
+
+        # A saved session beats running a login: it is what the test itself does,
+        # it costs nothing, and it cannot be raced by a broken login flow.
+        if helper_source:
+            session = _stored_session_path(workspace, helper_source, called)
+            if session:
+                return {**result, "mode": "stored_session", "helper": fqcn,
+                        "method": called, "session": session,
+                        "reason": f"{test_id.split('#')[0].rsplit('.', 1)[-1]} "
+                                  f"calls {called}(), which loads "
+                                  f"{session['file_name']}"}
+
+        if len(args) == 1 and data_reads.get(args[0], ("",))[0] == receiver:
+            _, data_method, data_arg = data_reads[args[0]]
+            return {**result, "mode": "credential", "helper": fqcn,
+                    "method": called, "data_method": data_method,
+                    "data_arg": data_arg,
+                    # Which file and column that row name refers to, read from
+                    # the helper rather than guessed at by the caller.
+                    "data_source": _data_source(helper_source, data_method),
+                    "reason": f"the test calls {called}() with "
+                              f"{data_method}(\"{data_arg}\")"}
+
+        if credential_args and len(credential_args) == len(args):
+            return {**result, "mode": "credential", "helper": fqcn,
+                    "method": called,
+                    "arg_keys": [properties[a] for a in args],
+                    "reason": f"the test calls {called}() with "
+                              f"{', '.join(properties[a] for a in args)}"}
+
+        if not args and not own_login:
+            # A login the helper performs with values it holds itself. There is no
+            # session to load and none to mint, but the test does sign in: said
+            # to "never sign in", its explorer was sent to a login form with
+            # nothing to type and told the flow had no login in it.
+            own_login = called
+
+        if credential_args:
+            # A login call whose arguments are not all property-backed — GitHub's
+            # OTP test passes a hardcoded "123456". Minting resolves property KEYS
+            # inside the JVM precisely so no value crosses a command line, and it
+            # has nowhere to get this one. Say which argument, rather than claiming
+            # the test never signs in.
+            unresolved = [a for a in args if a not in properties]
+            near_miss = (f"the test calls {called}(), but "
+                         f"{', '.join(repr(a) for a in unresolved)} "
+                         f"{'is' if len(unresolved) == 1 else 'are'} not read from "
+                         f"a property — minting has no way to supply "
+                         f"{'it' if len(unresolved) == 1 else 'them'}")
+
+    if own_login and not near_miss:
+        result["login_call"] = own_login
+        result["reason"] = (f"the test signs in through {own_login}(), which holds its "
+                            f"own login — no saved session to load, so signing in is "
+                            f"walked as one of the test's steps")
+        return result
+    result["reason"] = near_miss or (
+        "the test never signs in — no stored session and no credential-taking "
+        "login call in its body")
+    return result
+
+
+# A bare call in a method body — `buildOrder()`, not `helper.buildOrder()`.
+_OWN_CALL = re.compile(r"(?<![.\w])([a-z]\w*)\s*\(")
+# Followed by `(` and then a `{` too, without being a method of the class.
+_KEYWORDS = frozenset(("if", "for", "while", "switch", "catch", "try",
+                       "synchronized", "return", "super", "this"))
+
+
+def _csv_row(workspace, read: Dict) -> Optional[Dict]:
+    """The one row a literal CSV lookup reads, every column of it.
+
+    A login is test data like the rest of the row: a test that signs in as one of
+    its own steps types it, and an explorer shown the row without its password
+    was told to sign in with nothing to sign in with.
+
+    None unless it is certain: the file must be the only one of that name (the
+    read's module decides between two), and exactly one row may hold the key.
+    Typing the wrong row into a live product is worse than typing none.
+    """
+    import csv
+
+    if not read.get("value"):
+        return None
+    name = f"{read['file']}.csv"
+    found = [path for root in ("src/test/resources", "src/main/resources")
+             if (Path(workspace) / root).is_dir()
+             for path in (Path(workspace) / root).rglob(name)]
+    module = read.get("module", "").lower()
+    found = [p for p in found if module in (part.lower() for part in p.parts)] or found
+    if len(found) != 1:
+        return None
+    try:
+        text = found[0].read_text(encoding="utf-8", errors="ignore")
+        rows = list(csv.DictReader(text.splitlines()))
+    except (OSError, csv.Error):
+        return None
+    hits = [row for row in rows
+            if (row.get(read["column"]) or "").strip() == read["value"]]
+    if len(hits) != 1:
+        return None
+    values = {column: (value or "").strip() for column, value in hits[0].items()
+              if column and (value or "").strip()}
+    return {"file": str(found[0].relative_to(workspace)), "row": values} if values else None
+
+
+_LITERAL = r"\"(?:[^\"\\]|\\.)*\"|-?\d+(?:\.\d+)?|true|false"
+# `new OrderBuilder().withQuantity("2").build()` — the class, and the chain after it.
+_BUILT = re.compile(
+    r"\bnew\s+(\w+)\s*\(\s*\)((?:\s*\.\s*\w+\s*\((?:[^()\"]|\"(?:[^\"\\]|\\.)*\")*\))*?)"
+    r"\s*\.\s*build\s*\(\s*\)")
+# `.withQuantity("2")` in such a chain.
+_CHAIN_SET = re.compile(r"\.\s*(?:with|set)?(\w+)\s*\(\s*(" + _LITERAL + r")\s*\)")
+# `private String type = "Standard";`
+_FIELD_DEFAULT = re.compile(
+    r"^[ \t]*(?:private|protected|public)?[ \t]*(?:final[ \t]+)?[\w<>\[\].]+[ \t]+(\w+)"
+    r"[ \t]*=[ \t]*(" + _LITERAL + r")[ \t]*;", re.MULTILINE)
+# `if (name == null) name = "Asha";`
+_NULL_DEFAULT = re.compile(
+    r"\bif\s*\(\s*(?:this\.)?(\w+)\s*==\s*null\s*\)\s*\{?\s*(?:this\.)?(\w+)\s*=\s*("
+    + _LITERAL + r")\s*;")
+# `loginPage.login("admin", "secret")` — a call, its receiver and its raw arguments.
+_ANY_CALL = re.compile(r"(?<![\w.])(\w+)\s*\.\s*(\w+)\s*\(((?:[^()\"]|\"(?:[^\"\\]|\\.)*\")*)\)")
+# `public LoginPage loginPage;` / `LoginPage loginPage = new LoginPage(config);`
+_DECLARED = r"\b(\w+)\s+{name}\s*[;=]"
+
+
+def _unquote(literal: str) -> str:
+    literal = literal.strip()
+    if len(literal) >= 2 and literal[0] == literal[-1] == '"':
+        return literal[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return literal
+
+
+def _relative(path: Path, workspace) -> str:
+    try:
+        return str(path.relative_to(workspace))
+    except ValueError:
+        return str(path)
+
+
+def built_values(workspace, source: str, bodies: List[str]) -> List[Dict]:
+    """The values a test types through an object it builds, one entry per builder.
+
+    `[{"file", "row": {field: value}}]`. A test that does
+    `new OrderBuilder().withQuantity("2").build()` types the builder's defaults
+    with that one field replaced, and none of it is in a data file. Read from the
+    builder's own source: a field's literal initialiser, and a literal it is given
+    when still unset. A value made up when the test runs is left out, and so is
+    anything a non-literal argument sets.
+
+    An explorer shown the steps without these typed a name with one part
+    missing, and reported the check on it as failing on the new flow.
+    """
+    found: List[Dict] = []
+    seen = set()
+    for body in bodies:
+        for built in _BUILT.finditer(body or ""):
+            name, chain = built.group(1), built.group(2) or ""
+            path = _resolve(name, source, workspace)
+            if path is None or (name, chain) in seen:
+                continue
+            seen.add((name, chain))
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            row = {field: _unquote(value) for field, value in _FIELD_DEFAULT.findall(text)}
+            row.update({assigned: _unquote(value)
+                        for tested, assigned, value in _NULL_DEFAULT.findall(text)
+                        if tested == assigned})
+            for setter, value in _CHAIN_SET.findall(chain):
+                row[setter[:1].lower() + setter[1:]] = _unquote(value)
+            if row:
+                found.append({"file": _relative(path, workspace), "row": row})
+    return found
+
+
+def _parameter_names(source: str, method: str, count: int) -> List[str]:
+    """The names a method gives its parameters, when it declares exactly `count`."""
+    for declared in re.finditer(r"\b" + re.escape(method) + r"\s*\(([^)]*)\)\s*(?:throws[\w\s,.]+)?\{",
+                                source or ""):
+        names = [part.split()[-1] for part in declared.group(1).split(",") if part.split()]
+        if len(names) == count:
+            return names
+    return []
+
+
+def login_values(workspace, source: str, body: str) -> List[Dict]:
+    """What a helper's own login types, for a test that signs in through it.
+
+    `[{"file", "row": {name: value}, "typed_by"}]`. The test calls
+    `shop.login()` and the helper holds the rest: a data row it looks up by a
+    literal key, or values it hands its login page, as literals or read from the
+    framework's properties. Each is named after the parameter it is passed as.
+    Nothing is returned for a value this cannot resolve to text.
+    """
+    from shared import mint_session   # imports this module at load time
+
+    helpers = {var: cls for cls, var, ctor in _HELPER_NEW.findall(body) if cls == ctor}
+    found: List[Dict] = []
+    for receiver, called, raw_args in _CALL.findall(body):
+        if receiver not in helpers or raw_args.strip() \
+                or not any(hint in called.lower() for hint in _LOGIN_HINTS):
+            continue
+        path = _resolve(helpers[receiver], source, workspace)
+        if path is None:
+            continue
+        helper = path.read_text(encoding="utf-8", errors="ignore")
+        inner = method_body(helper, called)
+        typed_by = f"{helpers[receiver]}.{called}()"
+        for read in csv_reads(inner):
+            row = _csv_row(workspace, read)
+            if row:
+                found.append({**row, "typed_by": typed_by})
+        properties = dict(_PROPERTY_READ.findall(inner))
+        values = None
+        for owner, method, raw in _ANY_CALL.findall(inner):
+            args = [a.strip() for a in re.split(r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", raw)
+                    if a.strip()]
+            if not args or not any(hint in method.lower() for hint in _LOGIN_HINTS):
+                continue
+            resolved = []
+            for arg in args:
+                if re.fullmatch(_LITERAL, arg):
+                    resolved.append(_unquote(arg))
+                elif arg in properties:
+                    if values is None:
+                        values = mint_session.read_properties(
+                            mint_session.properties_path(workspace))
+                    resolved.append(values.get(properties[arg], ""))
+                else:
+                    resolved.append("")
+            if not all(resolved):
+                continue
+            declared = re.search(_DECLARED.format(name=re.escape(owner)), helper)
+            owner_path = _resolve(declared.group(1), helper, workspace) if declared else None
+            names = _parameter_names(
+                owner_path.read_text(encoding="utf-8", errors="ignore") if owner_path else "",
+                method, len(resolved))
+            names = names or [f"{method} argument {n}" for n in range(1, len(resolved) + 1)]
+            found.append({"file": _relative(path, workspace),
+                          "row": dict(zip(names, resolved)), "typed_by": typed_by})
+            break
+    return found
+
+
+def test_walk(workspace, test_id: str) -> Dict:
+    """What the test does today, in its own words, and the values it types.
+
+    `{"test", "steps": [...], "data": [{"file", "row": {name: value}}]}`.
+    `steps` is the test's own step log, in call order. `data` is what the test
+    types, from wherever its source keeps it: each row the test method, or a
+    method of its class that it calls, looks up by a literal key; the fields of
+    each object it builds (`built_values`); and what a helper's own login types
+    (`login_values`, marked `typed_by`). Either is empty when the source does not
+    say; nothing is inferred.
+
+    An explorer handed neither invents both: it chose its own order for a flow
+    the test already spells out, and typed values that left the form invalid.
+    """
+    from shared.logstep_narration import log_steps
+
+    result = {"test": test_id, "steps": [], "data": []}
+    path = test_source(workspace, test_id)
+    method = test_id.split("#", 1)[1] if "#" in test_id else ""
+    if not path or not method:
+        return result
+    source = path.read_text(encoding="utf-8", errors="ignore")
+    body = method_body(source, method)
+    result["steps"] = log_steps(body)
+
+    bodies = [body] + [method_body(source, name)
+                       for name in dict.fromkeys(_OWN_CALL.findall(body))
+                       if name != method and name not in _KEYWORDS]
+    seen = set()
+    for read in (r for text in bodies if text for r in csv_reads(text)):
+        key = (read["module"], read["file"], read["column"], read["value"])
+        if key in seen:
+            continue
+        seen.add(key)
+        row = _csv_row(workspace, read)
+        if row:
+            result["data"].append(row)
+    live = [text for text in bodies if text]
+    result["data"] += login_values(workspace, source, body)
+    result["data"] += built_values(workspace, source, live)
+    return result
+
+
+def call_args(entry: Dict) -> str:
+    """What the login call is handed: property keys, or the helper's data call."""
+    if entry.get("data_method"):
+        return f"{entry['data_method']}(\"{entry.get('data_arg', '')}\")"
+    return ", ".join(entry.get("arg_keys") or [])
+
+
+def describe(entry: Dict) -> str:
+    mode = entry.get("mode")
+    if mode == "stored_session":
+        return f"stored session — {entry['session']['path']}"
+    if mode == "credential":
+        return (f"credential — {entry['helper'].rsplit('.', 1)[-1]}"
+                f".{entry['method']}({call_args(entry)})")
+    if entry.get("login_call"):
+        return f"no saved session — {entry.get('reason', '')}"
+    return f"no login — {entry.get('reason', '')}"

@@ -1,0 +1,738 @@
+# test-adaptation-agent — Master Context
+
+Read this file first. Every time. Before doing anything else.
+
+## What This Agent Does
+
+Updates automation tests when the **product** changes — a step is inserted, a
+wizard's pages merge, a `<select>` becomes a combobox, a route changes, a form
+gains a required field. Driven by a plain-English change note a human writes, so
+it can run **before** the tests go red.
+
+That makes it a different job from `test-healing-agent`, not a bigger version of
+one. Healing is reactive: a test failed, and the question is why. This is
+proactive: somebody knows what changed, and the question is what the tests should
+now do about it.
+
+## Why this is not a setting on the healing agent
+
+Healing holds exactly one repair hypothesis — the selector string is stale — and
+that narrowness is enforced at six separate layers on purpose. Its own CLAUDE.md
+says why: *the verification loop cannot catch a fix built on a wrong diagnosis,
+because the easiest way to make a page assertion pass is to weaken it.*
+
+So widening its diff budget does not buy the ability to repair a changed flow. It
+buys the ability to delete an assertion and ship a permanently green broken test,
+with a passing run as proof. Once an edit may add and remove steps, "the test
+passes" stops being evidence — a test that asserts nothing passes fastest of all.
+
+**What replaces it is the intent contract.** The mechanism is mutable: locators,
+waits, step order, which pages get visited. The proof is not.
+
+## The change note
+
+`queue/<module>.txt` (CLI runs; a run started from the server reads
+`queue/<user-id>/<module>.txt`), same convention as the authoring agent:
+
+```
+Module: checkout
+Type: web                      # api | web | both
+URL: https://app.staging.example.com
+Affects: automation.checkout.*
+
+What changed:
+1. After login a "Choose workspace" screen now appears before the dashboard.
+2. The 3-step checkout wizard is now 2 steps.
+3. "Place Order" was renamed to "Confirm & Pay".
+
+Expected outcome unchanged: an order is placed and a confirmation number is shown.
+```
+
+Each numbered item is classified into a **kind**, and the kind decides how much
+authority the repair gets. This is the whole payoff of being triggered by a note
+rather than by a failure: telling "a step was inserted" apart from "the previous
+step silently did nothing" is the hardest inference in the problem, and a human
+writing it down has already answered it.
+
+| kind | what changes | diff budget |
+|---|---|---|
+| `locator` | an **existing** selector string is replaced | 6 |
+| `interaction` | the wrapper call *and* the selector (select → combobox) | 20 |
+| `route` | a URL or route constant | 10 |
+| `step_insert` | a new step in the flow | 40/file |
+| `step_merge` | steps merged or removed | 40/file |
+| `field_added` | something the page object does not model at all — a new required field, or a control with no locator yet | 60 across ≤3 files |
+| `coverage_added` | no product change — extra steps and checks on an existing test; every existing assertion stays | 60/file, 120 per item |
+| `coverage_changed` | no product change — a test should stop doing something, or do it differently; may remove or change **declared** checks | 60/file, 120 per item |
+| `api_contract` | request/response shape, status, header | 30 |
+| `test_data` | a value the test types or seeds: a fixture, a default, an option it now picks. A check that reads that value back may follow it to the value the item states (see "Changing a check") | 30 |
+| `page_object_new` | a whole new page object | 300 (the one whole-file case) |
+| `content_changed` | expected copy only; may change **declared** checks | 10 |
+| `outcome_changed` | what the feature *does*; may remove or change **declared** checks | 60/file, 120 per item |
+| `unclassified` | the classifier could not place the item (never offered to it) | **escalate — no authority to edit** |
+
+`step_merge`, `content_changed`, `outcome_changed`, `api_contract` and
+`coverage_changed` may remove or change a check — see "Changing a check" below.
+`test_data` may move a check's expected value and nothing else. Every other kind
+must leave every check exactly as it is.
+
+---
+
+## Architecture
+
+```
+run.sh (orchestrator)
+  │
+  ├─ 01_parse_change.py   [Python + Claude]  change note → classified items
+  ├─ 02_scope.py          [Python only]      blast radius + FROZEN intent contracts
+  ├─ 03_explore_api.py    [Python only]      real GETs against the live API
+  ├─ 03_explore_web.py    [Python + Claude]  drive a browser → ordered flow map
+  ├─ 03_combine_explore.py[Python only]      one summary file for both halves
+  ├─ 04_adapt.py          [Python + Claude]  edit → guards → compile → verify
+  └─ 05_ship.py           [Python only]      branch, commit per item, PR, Slack
+```
+
+Step 03 is split by interface, mirroring authoring's `02_validate_api` +
+`02_validate_web` sharing one numeric slot. The framework tests APIs too, and a
+product change is just as often a renamed request field as a moved button.
+
+**The combined `03-explore.json` is what the server polls**, not either half.
+Keying a shared step on one half — as authoring does with `02-validate-web.json` —
+means a run that only exercised the other half never completes the step.
+
+---
+
+## What makes this safe
+
+### 1. Freeze the contract before editing
+
+`02_scope.py` measures what every in-scope test proves — every assertion reachable
+through the whole helper call graph, not just the ones visible in the test file —
+and writes it into `02-scope.json`. Every later guard compares against **that
+stored copy**.
+
+Re-deriving the contract after the edit would describe the edited code, and a
+conservation check against that approves whatever the edit just did. There is a
+test for exactly this (`tests/unit/test_intent.py`).
+
+### 2. Guess, then measure, then edit — never guess then edit
+
+Step 02 nominates page objects by name similarity. That is cheap, usually right,
+and still a guess: two modules can both own a `LoginPage`, and a page object stops
+matching its own name long before it stops being the right file.
+
+So once exploration has reported what is on each page, step 03 **measures** which
+page object each observed page actually is — with
+`page_identity.page_object_coverage`, the same rule the healing agent applies to a
+failure DOM, so both agents answer "is this that page?" the same way. Step 04 then
+orders its candidates by the measurement and tells the model which file goes with
+which observed page.
+
+It measures against every page object in scope, not only the ones the noun filter
+nominated: narrowing the measurement to the guess would leave a page whose page
+object the guess missed with nothing to match against, which is the failure the
+step exists to remove.
+
+The honest limit: an inventory is a bounded sample of a page, so a zero means
+*not observed*, not *absent*. Every report carries `sampled: true`, and the
+mapping ranks candidates rather than ruling one out. A page the browser helpers
+counted the page objects' own locators on is not sampled (`sampled: false`,
+`live: true`). A zero there means the locator matched nothing on the page.
+
+### 3. Transcribe, do not invent
+
+Every interaction an edit **adds** must correspond to a step in the flow map that
+exploration actually observed, matched on the element's name. A flow-map step
+whose selector could not be verified unique justifies nothing — `unverified` is not
+`yes`.
+
+The adapt step is shown each step's name, selector and typed value
+(`flow_map.describe(selectors=True)`), and a locator it adds for a step's control
+is that selector. Shown the control's label alone, it had nothing to write a new
+control's locator from but its own guess.
+
+Selector uniqueness is never taken from the model. The model's own count is kept
+as `claimed_by_model` and used for nothing. What decides it, best first:
+
+1. **A live count.** The preloaded browser helpers (`page.qa`, see "Measured
+   evidence" below) counted that exact selector on that page: `counted_against:
+   "live"`, unique only at total 1 and visible 1. Rich syntax and iframe chains are
+   verified this way too, which an inventory recount cannot do.
+2. **An inventory recount** in Python, against every element inventory recorded
+   for the page.
+
+### Measured evidence — the explorer names the page, the helpers measure it
+
+Across 15 explorer runs, 31 of 87 step selectors (36%) were never verified, and 30
+of them for one reason: the model never typed a `PAGE_STATE` inventory for that
+page, so Python had nothing to recount against. The same inventories were also
+most of the model's output.
+
+Now the helpers that `shared/mcp_config.py` preloads into the MCP browser
+(`shared/browser/qa-page.js`) write what they measure to a file as they measure
+it: `03-explore-evidence-<attempt>.jsonl`, one line per settled page state. The
+model calls `page.qa.step(action, {page: '<pageId>'})` once per step. It still
+emits `PAGE_ENTER` and `FLOW_STEP`, and `PAGE_STATE` is optional.
+
+**The action names its selector.** A step is written as what it does to which
+selector, `page.qa.step({ click: '<selector>' }, …)` or
+`{ fill: '<selector>', value: '…' }`, or a list of them for the fields of one form.
+The helper counts that selector the moment before it uses it and files the count
+with the step's evidence, so the selector a step reports is the one that was
+measured and the one that worked. An action passed as a function is counted only
+when the explorer asks (`before`, `check`), and a walk left a third of its steps
+unverified by not asking. A call that only fills hands back no harvest: the page
+is still measured for the evidence file, and the model is not sent a form it has
+just read.
+
+**A selector has to say which element, not which position.** Made to pass a
+selector that matches one element, a walk met two buttons under one selector,
+took the second with `>> nth=1`, and it was the other section's: the page said it
+had saved and kept nothing that was typed. It had not been offered a selector for
+either: a harvest lists the first 60 elements of a page, and on a page with a
+menu, tabs and a long form the buttons were past the cut, with nothing to say
+so. Four things answer that:
+
+- a harvest cut at its limit says how many elements it left out (`unlisted`), and
+  the explorer asks again with a `scope` for the section it is working in;
+- the harvest tells apart controls that share a label by the section they sit in
+  (the nearest form, fieldset, dialog or region, named by its first legend,
+  heading or label), so each is offered a selector that matches it alone;
+- the explorer is shown the locators the tests use today, by page object
+  (`03_explore_web.locators_section`), and told to act through them where one
+  fits: the control a test already reaches is then the one the walk uses;
+- a selector that picks by position (`flow_map.positional`) is never verified
+  unique, whatever it counted, and is never the selector a control becomes known
+  by. A step reported under one takes a counted selector that says which element
+  when there is one, and stays unverified when there is not.
+
+`flow_map.apply_evidence` folds each line in before verification:
+
+| Evidence | Becomes |
+|---|---|
+| the page's inventory, every frame (identity elements too: headings, header, nav, title-like classes) | that page's inventory, a union with any `PAGE_STATE` the model typed |
+| counts of the selectors a step harvested or asked to `check` | live verification of step selectors (a 1/1 reading is kept) |
+| live counts of every locator in `03-known-locators.json` | per page object, which of its locators resolve on this page and which are broken (0). Those matching several are listed as `several`, not as a fault, because a list locator is meant to |
+| every click and keystroke, with a count of the control at the moment it was used | live verification of the step that used it, filed under the page the step lands on. Only a use on exactly one visible element counts. A tab, a close icon or the button that opens the next screen is gone by the time the step's own count is taken, and read "not unique" there |
+
+`03-known-locators.json` is extracted from every in-scope page object before
+exploring, with the framework plugin's `extract_locators()`. Each goes in as the
+selector the browser can count, which the plugin decides (`live_selector`): a
+framework whose selector syntax the browser understands is counted as written.
+Reduced to plain CSS first, a page object written with text selectors had most of
+its locators left out, and what was counted stood for the whole of it. Only exact
+locators go in: a literal the code finishes at runtime (`"#item-" + n`, a format
+template) is marked `approx` and left out, because counted as written it matches
+nothing and would read as broken. A locator no field declares is marked `inline`,
+and one of those that matched nothing is reported as not shown during the walk,
+not as broken: inline is how a page object asks whether something is there now.
+
+When known counts exist, `measure_page_objects` ranks page objects first by how
+many of their locators **first show on that page** — visible there and not on the
+page the walk came from — then by the share showing, and step 04's prompt lists
+the broken ones by name. A form left on screen behind an overlay keeps every one
+of its locators, so by share alone it outranked the page object of the overlay in
+front of it. The page the walk came from is the one it was on just before
+(`_page_walk`, a page named again on each return): a dialog opened on the walk's
+third visit to a list is compared with the list, not with the form visited in
+between. Without known counts it falls back to the inventory coverage below.
+
+**A screen that closes by itself is a page like any other.** A result, a
+confirmation or a redirect notice is gone before a second call can look at it, so
+the only call that can measure it is the one that records it,
+`page.qa.record(action, ms, { page: '<pageId>' })`. Named, each state it shows is
+measured the way a step's page is — inventory and known-locator counts, marked
+`brief` — at the moment it appears, which is the only moment it can be. What is
+filed is decided when the recording ends, because only then is it known what the
+screen was:
+
+- the states that **came and went** and lasted at least a second;
+- not the flicker before them, and not the page left showing at the end: that is
+  the next page, and the explorer measures it with the step after the recording;
+- when nothing came and went, what is still showing — the screen never closed.
+
+Nothing past a change of address is measured. Recorded without a name the screen
+has no inventory; the call's result says so, and nothing is filed, because a row
+placed by address lands on whichever page shares it.
+
+A page the walk entered but no helper call named has no inventory. That is a
+warning, and it earns a second attempt only when a step acted on that page.
+
+**A change item with no evidence earns one too.** After each walk,
+`03_explore_web.uncovered_items` asks, for every item whose kind adds a control
+(`check_changes.ADDITIVE`), whether a step with a verified selector acted on a
+control the item names (`flow_map.evidence_for`, the item's nouns against each
+step's names, a noun that is a page left out). An item with none is all step 04
+can decline, so the walk is done again and told which items, which steps went
+uncounted and what the browser recorded with no step for it. The walk that proved
+more of the note is the one kept. Not when the walk was stopped by a refusal: a
+second one stops at the same control.
+
+**Two accounts of one walk.** The step list is typed by the model. The helpers'
+record of every click and keystroke is not: a row is written the moment the
+browser dispatches the event. After each walk the two are compared
+(`flow_map.unreported_actions`), and what the browser recorded that no step
+reports is kept in the flow map and listed in the audit report and the PR.
+
+- A step accounts for an action when it names the same selector, or one the
+  helpers counted at the same element.
+- **The two are joined before anything is verified** (`flow_map.join_record`), in
+  the order the walk happened: by element; then by what the page said (the one
+  control whose text is the step's accessible name, the one field given the value
+  the step typed); then by position (the only unmatched step between two matched
+  ones and the only action of its kind between theirs). A matched step whose own
+  selector nothing counted takes the selector the control is known by, and keeps
+  what the model typed as `reported_selector`. A click reported under a spelling
+  of the model's own used to be listed twice, as an unverified step and as an
+  unreported action.
+- A step whose control a page object's own locator resolved to, on the same
+  element, is marked `modelled_by`. That is how "the tests already make this step"
+  is known; names decide nothing, since an explorer makes its own up.
+- Only an action on exactly one visible element is listed; the hidden input behind
+  a label fires its own click and is not a second action. The helpers mark that
+  click as arriving `via` the label, so it is one action even where a styled
+  checkbox's input only looks hidden. A field's change event arriving late with the
+  value it already had is not a second typing.
+- A selector never includes a class that names a passing state (`--focus`,
+  `is-active`): a field's keystrokes were recorded under its focus class, unique
+  for as long as it was typed into.
+- They are **shown, not steps**. An explorer also clicks to look around, and a
+  step is what an edit may be justified by, so step 04 neither sees them nor may
+  cite them.
+- The record has limits of its own: it has nothing for a step that only looks or
+  waits, and a field with no unique selector of its own is recorded without one.
+
+**The step list is still typed by the model**, and a walk can drive the whole flow
+and report none of it. Two things cover that. A step written as its bare object,
+with no `FLOW_STEP:` before it, is read as a step (a marked step is never replaced
+by an unmarked recap of it). And a walk that measured pages but reported no step
+at all earns a second attempt, told to write a line after every action. A
+page the run only passed through (the start page, opened with a saved session)
+has no selector to verify, and a whole attempt was once spent on exactly that.
+
+The evidence never passes through the model's context, so it costs no tokens and
+cannot be misreported. It is appended as it is measured, so an attempt that times
+out still leaves what it saw. Password inputs are never read: the helpers report
+the field with an empty text.
+
+### 4. Read the entry path; do not derive it
+
+The agent edits an **existing** test, and that test already states how it signs
+itself in. Exploration used to ignore that and reconstruct login from repo-wide
+convention — and the framework contradicts every convention it relied on:
+
+| assumed | actual |
+|---|---|
+| the login page object is `LoginPage` | `LoginPage` twice, `NaukriLoginPage` once |
+| the URL key is `{module}.url` | `saucedemo.url`, `naukari.url` — but `githubUrl` |
+| a module logs in one way | `GitHubLoginTest` does both, in one file |
+| a session exists if tests pass | `storeSession()` is keyed on the `ProjectName` enum (GitHub, SauceDemo, FullSuite) and has one caller |
+
+So `02_scope.py` runs `shared/entry_path.extract()` over the test it is about to
+verify and records one of three modes:
+
+- **`stored_session`** — the test loads a storage state. Reuse *that file*. If it
+  is missing, name the test that writes it; do not invent one.
+- **`credential`** — the test reads named properties and calls a login method.
+  Run *that method* with *those keys*, through `automation.core.SessionMinter`.
+- **`none`** — the test loads no session and none can be minted. Either it never
+  signs in, or it signs in through a helper that holds its own login
+  (`login_call`): then signing in is one of the test's steps, walked with the
+  values that helper types. Explore from a signed-out browser rather than
+  hard-stopping for a session the flow was never going to use.
+
+`SessionMinter` receives property **keys** and resolves them inside the JVM, so
+no credential crosses a command line — a password in `-Dexec.args` is a password
+in `ps` and in every parent process's log.
+
+Running the real login means the module's own navigation, post-submit steps and
+page-object assertions all happen, so verification is the framework's own rather
+than a heuristic. Two consequences worth knowing:
+
+- **A login method that throws may still have authenticated.** Login helpers end
+  by constructing a destination page object that asserts itself loaded, so a
+  destination that changed fails the whole call. Refusing the session then is
+  circular — that page is what the agent was going to look at. The state is kept,
+  flagged `degraded`, and the post-login error is reported as evidence.
+- **A bounce is not a session.** A rejected or raced login redirects back to the
+  login form with cookies already set, which looks authenticated and is not.
+  `mint_session._bounced()` compares the landed URL's path against the module's
+  configured entry URL and refuses. Minting writes to a staging file and promotes
+  it only on success, so a failed attempt can never delete a session that worked.
+
+### 5. The explorer walks the test's own flow
+
+The same reading gives the explorer what else the test already states.
+`entry_path.test_walk()` records, in `02-scope.json` as `test_walks`:
+
+- the test's **logged steps**, in call order;
+- the **data row** it loads by a literal key, in the test method or a method of its
+  class that it calls, every column of it: a login is test data like the rest.
+  No row is sent unless exactly one file of that name and exactly one row match;
+- the fields of each **object it builds** (`built_values`): the builder's literal
+  defaults, with the literals the test's own chain replaces. A value made up when
+  the test runs is left out;
+- what **its helper's login types** (`login_values`), for a test that signs in
+  through a call that takes no credentials: a row the helper looks up, or the
+  values it hands its login page, as literals or read from the framework's
+  properties, each named after the parameter it is passed as.
+
+Step 03 puts both in the prompt, with the start URL: the note's `URL:`, else the
+URL the framework is configured with for the module (`mint_session.entry_url`,
+tried with the note's module and the test's package). An explorer given none of
+these found the site by guessing, chose its own order for a flow the test spells
+out, and typed values that left a form invalid — which then read as a broken
+locator. One given the steps without what the test builds left out a value and
+reported the check on it as failing; one given no login got past a sign-in only
+because it happened to know the site's.
+
+Where the change note gives a new value for one of these, the note's value is the
+one typed: that is the change being walked.
+
+## Destructive actions and the sandbox assertion
+
+Two things guard a walk through a real product. The explorer is told to refuse
+anything irreversible. Afterwards `flow_map.detect_refusals` checks every step it
+acted on by the control's **name**: one containing a word in
+`flow_map.DESTRUCTIVE_WORDS` that was not refused is a violation, the exploration
+is `unsafe`, and nothing is adapted.
+
+The name check cannot tell a button that pays from one that opens the next screen.
+So the explorer is given the same word list and refuses up front, and the run stops
+at that control and names it. When nothing at all was walked, `04_adapt.py` stops
+before any model call.
+
+The check does not rest on the step list alone. Every click the helpers recorded
+is judged too, by the text of the control it landed on, whatever a step says about
+it: not reported, reported as refused, or reported as only looked at. A walk that
+reported nothing used to read as empty however far it had clicked. Such a walk is
+not walked a second time, since it would click the same controls again.
+
+`ADAPTATION_SANDBOX=true` with `ADAPTATION_SANDBOX_NOTE` is the operator asserting
+the environment is disposable. It covers the whole walk, on every module:
+
+- the explorer is told to complete the flow it was given, final action included,
+  and still to take no irreversible action that neither the test's steps nor the
+  note call for;
+- flagged words are recorded on the steps and raise no violation;
+- the note is reproduced in the PR body.
+
+Without the note the switch is ignored, and the log says so. The step-03 cache is
+kept per sandbox state, so an exploration that stopped on a refusal is not restored
+once the assertion is made.
+
+## Changing a check
+
+A check may be removed or changed only when all of these hold, and each is decided
+in Python (`lib/check_changes.py`), never by the model:
+
+1. the item's kind is one of the five above, or `test_data` under the narrower
+   rule below;
+2. the model declared it in `check_changes` — the id of a listed check, `remove` or
+   `change` with the new expected values, and why;
+3. what the edit did equals the declaration. Two measurements, both taken just
+   before and just after **this item's** edit (`assertion_graph.delta`): the checks
+   every in-scope test reaches through the call graph, and the assertions written in
+   every edited file. The second catches `@BeforeMethod`, data providers and methods
+   no in-scope test reaches;
+4. no enabled test outside the run makes the check — a changed helper would
+   silently change what those tests check. "Outside" means not in the verify set:
+   a test measured but not re-run (a same-class sibling, or shared surface under
+   `named_only`) counts as outside;
+5. nothing the explorer reported contradicts it. The explorer judges the named web
+   tests' checks on the new flow (`OUTCOME_OBSERVED: <id>|pass|fail|gone|<seen>`);
+   a contradiction refuses, no report is allowed and flagged ⚠️, a
+   `coverage_changed` removal is flagged 🧪 test-only, and `api_contract` changes
+   are always ⚠️ (exploration only GETs and only sees top-level keys). A changed
+   value is judged against the text the page displayed whenever the explorer wrote
+   that down by itself (the `<shown>` of its `VALUE_CHECK` for the check), and
+   against the report's wording only when it did not. A report is a sentence, and
+   "blank; had it saved it would show B" names B: read as text, that was B
+   confirmed.
+
+**A value the test types takes its check with it** (`check_changes.VALUE_FOLLOWING`,
+today `test_data`). "Pick B instead of A, and expect B where it is validated"
+changes test data, and where the test asserts the literal A the only possible edit
+changes a check, so the item could never be adapted. It may now `change` a
+declared check's expected value, held to more than the five kinds are:
+
+- only `change`: never `remove`, never `relax`;
+- every value it moves to must be found in the item's own text
+  (`check_changes.stated`, compared on letters and digits);
+- the browser must have been seen showing the new value: the explorer's
+  `VALUE_CHECK` for that check has to show it. With no `VALUE_CHECK` there is
+  nothing that says what the page displayed, and the change is refused; the five
+  kinds are let through unconfirmed with a ⚠️;
+- everything else above still holds: declared, equal to what the edit did, and made
+  by no test outside the run. In apply mode the adapted test is then run, and an
+  assertion on a value the page does not show fails and rolls the item back.
+
+Weakening a check or wrapping it in a condition is refused whatever is declared,
+with one exception: **`relax`**. A page often renders an expected value its own
+way: a one-word name with a default last name appended, a cart total of `20,000` as
+`Rp20.000`, a phone normalised to `+62`. The explorer writes down both sides of
+each comparison it judges (`VALUE_CHECK: <id>|<element>|<shown>|<source>|<expected>`,
+parsed into `value_checks`), and `shared/value_match.py` measures the relation between
+them in Python. A check listed with a relation (`formatting`, `numeric`, `phone`,
+`words`) may be declared `{"action": "relax", "relation": …}`. It is accepted only when:
+
+- the item's kind is one of the five that may change checks;
+- the edit changed that assertion's comparison and nothing else. It stands at the
+  same place, with the same message, still passes every expression and expected
+  value it compared, and is no more conditional (`assertion_graph.relaxes`);
+- the relation is confirmed by a measurement: the explorer's VALUE_CHECK for that
+  check, or a verify run that failed on it. A verify failure that is only a
+  rendering difference is recorded in the attempt's fix history (`value_mismatches`),
+  named in the rollback reason, and shown to the next attempt.
+
+The PR table lists it as "comparison relaxed to **words**", with what the page showed.
+Every other weakening is refused exactly as before. A check the model **adds**
+compares with the relation its VALUE_CHECK shows. Its expected side comes from a
+typed value, a value read earlier, or the note, and is never a new literal.
+
+Adding, moving and rewording checks is always allowed and is listed.
+
+`delta` pairs checks as multisets — same message first — so the right one of two
+identical-looking checks is named, and a moved check stays a move. It is used only
+here; `conserved` is unchanged for the other agents. Constructors are followed
+(`fingerprints(follow_constructors=True)`) so a page-object constructor's page-load
+check is measured. Where two classes share a simple name (both `LoginPage`s),
+the name is resolved as Java does — the mentioning file's import, then its
+package — for every agent; only when neither decides is it reported as ambiguous
+(PLAUSIBLE) rather than guessed at. Each check carries its class's full name
+(`owner`), so the two `LoginPage` constructors' identical checks stay apart.
+
+Other tests in the named test's class share its fields, setup and helpers, so the
+blast radius puts them in the shared surface ("same class as a named test"): their
+contracts are frozen and measured, and under `named_only` they are not re-run —
+so a check they reach cannot change (rule 4).
+
+What cannot be measured is listed instead: a check's expected value held in a
+variable, a constant or a data file (identifiers are not part of a fingerprint).
+The analysis is Java only.
+
+Once outcome and content changes became actionable, escalation and
+`items_adapted` numbers shift — expect that on dashboards.
+
+## Guards
+
+Run over the combined diff of one change item, before anything compiles:
+
+| guard | rejects |
+|---|---|
+| `validate_fix` | oversized diffs, emptied files, lost methods |
+| `check_changes` | an assertion removed or changed without being declared, or declared but not changed; one changed by a kind that may not; a `test_data` item doing more than moving a value, moving it to a value its text does not state, or to one the browser was not seen showing; one also made by a test outside the run; one the browser contradicts; any weakened or made conditional — **anywhere in the call graph and in every edited file** — except a declared `relax` a measurement confirms. Fails closed when it cannot measure |
+| `no_new_swallowing` | empty catch, `Thread.sleep`, `@Ignore`, `enabled=false`, `assumeTrue`, `SkipException` |
+| `wrapper_compliance` | raw driver calls — Selenium (`driver.findElement`, `.sendKeys()`, `new WebDriverWait`) and Playwright (`locator.click()/fill()/…`, `page.navigate()`, `page.waitForTimeout()`) |
+| `logstep_present` | an interaction added to a test class with no `logStep` — `Element.*` / BasePage wrapper calls, or a helper/page-object call that is not a pure read |
+| `steps_justified` | an interaction matching nothing exploration observed |
+| `matches_negative` | an anchor that also matches the logged-out or error page — the negatives are the flow map's own inventories for pages whose identity reads as login/error, so this guard finally has data to compare against |
+| `diagnosis_fit` | a selector edit the captured DOM contradicts (the healing guard, per edited file) |
+| `no_hardcoded_url` | a literal URL added to Java — routes belong in `parameters/*.properties` |
+| `wrapper_changed` | an item marked `interaction` whose added code uses none of the observed control types' wrappers |
+| `shared_default_covered` | a changed shared Data/Builder default while some dependent tests are outside the verify set |
+| `cluster_diff_budget`, `total_diff_budget`, `file_budget` | an item over its per-kind line budget, `ADAPTATION_MAX_TOTAL_DIFF_LINES`, or `ADAPTATION_MAX_FILES_PER_RUN` |
+
+The last one is the anti-tautology check: a selector that matches the logged-out
+page is not proof of a successful login.
+
+**Propose-only is verified too.** `ADAPTATION_APPLY=false` is the default, and it
+used to end at the guards above — so the diff a human was asked to trust had never
+been compiled and never been measured against the frozen contracts. It now writes
+the edit, compiles it, runs assertion conservation, and rolls every file back
+whatever the answer was. "Nothing is written" still holds at the end of the step;
+what changed is that a proposal which does not build, or which drops an assertion,
+is rejected before anyone reads it. Test verification stays apply-only: running the
+suite to judge an edit nobody is keeping costs minutes for an answer the compiler
+and the contracts already gave.
+
+## The change-item transaction
+
+Work is organised by change item, **not by file**. One item routinely spans a new
+page object, a helper method and a call site; applying those one at a time leaves
+the repo uncompilable between writes and makes rollback ambiguous.
+
+```
+snapshot every target → apply all edits → guards → compile → verify
+                      → on ANY failure, restore EVERY file
+```
+
+**Compiling before running anything is not an optimisation.** `00_reproduce.py`
+classifies `cannot find symbol` as `INFRA_BUILD`, which routes to *skip, don't
+call the model* — right when the repo arrived broken, and completely wrong when
+our own edit broke it. Compiling straight after the edit tells the two apart.
+
+`run.sh`'s ERR trap restores the snapshots too: a crash must not leave the shared
+automation checkout in a state that is neither the original nor a working change.
+
+## The automation repo
+
+Cloned if absent, exactly as the other two agents do — healing in Python,
+authoring in its run.sh. All three now share one implementation,
+`shared/workspace.py`, taking healing's version because `git clone` persists
+whatever URL it was handed into `.git/config`: authoring's leaves the token there
+for the life of the checkout, healing's strips it back out.
+
+**Syncing is a fetch, never a reset.** authoring follows its clone with a forced
+base checkout (`shared.workspace prepare-base --checkout`, i.e. `checkout -f -B`),
+which is right for an agent that only adds new files and
+wrong here: this agent refuses to start on a dirty tree precisely so nobody's
+uncommitted work is swept into its commit, and a force-checkout would destroy
+exactly what that gate protects. So it fetches, reports how far behind the
+checkout is, and leaves HEAD alone.
+
+## Escalate — never attempt
+
+- the classifier could not place an item (`unclassified`);
+- `unexplained_failures` is non-empty — a failure no line of the note accounts
+  for. A human asserted change A; that says nothing about an unrelated defect B.
+  **This is the change-vs-bug gate**;
+- `UNREACHABLE_STATE` covers the changed area;
+- the test's declared entry path cannot produce a session — a stored session
+  file that is missing, or a login that runs but lands back on the login form.
+  When the login the test itself uses does not authenticate, that is a finding
+  about the module, not a reason to sign in some other way;
+- the flow's terminal action is destructive, or a control on the way to the change
+  is named as one, and the sandbox assertion has not been made (see "Destructive
+  actions and the sandbox assertion");
+- an **existing** page object would need regenerating wholesale;
+- a check would have to change without the note saying so, or be weakened, to
+  make the test green;
+- the blast radius exceeds `ADAPTATION_BLAST_MAX_TESTS` — bigger than one agent run;
+- a changed expected string that the browser does not show.
+
+## Two ways in
+
+**GUI** — `POST /agents/test-adaptation-agent/run {"module": "checkout"}`. The
+change note is editable over `GET/POST /agents/test-adaptation-agent/queue`, the
+same writable `.txt` queue the authoring agent uses.
+
+**CLI**
+
+```bash
+./scripts/run-adaptation-agent.sh checkout
+EXPLORE_ONLY=true ./scripts/run-adaptation-agent.sh checkout
+ADAPTATION_APPLY=false ./scripts/run-adaptation-agent.sh checkout   # propose only
+START_FROM_STEP=4 SESSION_ID=<sid> ./scripts/run-adaptation-agent.sh  # resume
+```
+
+Resume matters more here than anywhere else in this repo: exploration is the
+expensive half, and a failed edit must never cost a second thirty-minute browser
+run. `CACHE_STEPS=true` (the default) caches steps 01 and 03 under
+`cache/<user>/<module>/`; step 02 always runs again, since the contracts it freezes
+must describe the code as it is now. Editing the change note's content invalidates
+that cache.
+
+## Elements inside iframes
+
+The explorer measures inside iframes and reports an element there as a chain,
+`#checkout >> internal:control=enter-frame >> #amount`. Its inventory entry carries
+the iframe prefix as `"frame"`, which the helpers compute (`page.qa.prefix`, using
+the rule in `shared/frames.py`). A live count checks every hop of a chain on its
+own. `flow_map.count_in_inventory`
+recounts a chain only against that frame's entries, and a plain selector only
+against the top document's, so a frame element can neither vouch for a top-level
+selector nor be missed by its own. The adapt step writes it with the repo's frame
+API (`config/skills/automation-repo.md`).
+
+## Locator baselines are committed with the edits
+
+The fingerprints under `src/main/resources/baselines/` describe what each locator matched
+on the page as it was. Adaptation is the case where leaving them behind hurts most: the
+product moved, the tests were adapted to follow it, and a PR without the refreshed
+baselines leaves the repo describing the page as it used to be — so the next drift is
+diagnosed against a record that is already wrong.
+
+Ship now adds a final path-scoped commit for the baselines whose substance changed
+(`shared/baseline.py`, `recordedAt` excluded from the comparison). Same rule as the item
+commits above: only the paths that changed, never `git add -A`.
+
+Two things had to be true for that commit to ever appear. `shared/test_runner.run_test`
+pins `-Dbaseline.dir` to an absolute path inside the workspace being committed, because
+`baselineDir` is relative and `Baseline.java` resolves it against the JVM's working
+directory — so a verification run could record fingerprints in a different checkout than
+the one ship reads. And an empty result is now logged rather than passed over: baselines
+on disk that match HEAD is the ordinary no-op, none on disk at all names the directory
+that was searched.
+
+
+## Gate Values
+
+**`.fix-passed`** — `true` (something applied and verified) / `false` (applied
+with tests still failing, or an edit a guard stopped that another attempt may get
+right) / `skipped` (nothing eligible, or propose-only). An attempt whose every
+item was declined or escalated, with nothing on disk, is `skipped` with
+`.skip-reason=escalate`: there is nothing to retry and nothing failing.
+
+**`.verdict`** — always `NEEDS-REVIEW`. Asserted in `05_ship.py`, not computed:
+an agent that may change test *steps* always needs a human, and a branch could
+drift.
+
+**`.skip-reason`** — `infra` (leave the note queued) / `no-work` / `escalate` /
+`unsafe` / `no-session` / `unreachable` / `explore-only` / `stuck`.
+
+`infra` includes a note whose `Tests:`/`Affects:` match nothing on the branch that
+was searched: nothing was looked at, so it is not a decision about the change. The
+message names the branch and the branches where the test class does exist.
+`Module:` is the fallback only for a note that gives neither header — a note that
+names tests is never widened to the whole module.
+
+How a finished run counts — in History, on the live badge and in Analytics — is one
+rule, `qa_agents_server.analytics.run_status`, read from these files.
+
+## Audit Trail
+
+`agents/test-adaptation-agent/audit/$SESSION_ID/`
+
+| File | Purpose |
+|---|---|
+| `00-session-init.md` | session metadata |
+| `01-parse-change.json` + `.md` | classified change items |
+| `02-scope.json` + `.md` | blast radius, cost estimate, **frozen intent contracts** |
+| `03-explore-api.json`, `03-explore-web.json` | per-interface exploration |
+| `03-explore.json` + `.md` | combined flow map — the file the server polls |
+| `03-known-locators.json` | every exact locator of the in-scope page objects, as the browser can count it, counted live by the browser helpers on each page |
+| `03-explore-evidence-<attempt>.jsonl` | what the browser helpers measured, one line per settled page state: inventory, counts, known-locator counts |
+| `04-adapt.json` + `.md` | per-item diffs, guard results, the checks each item changes |
+| `05-ship.json` + `.md` | PR URL, verdict, escalations |
+| `.snapshots.json` | transient; the ERR trap's rollback source |
+| `.check-changes.json` | every applied check change with its why and evidence. Only feeds the PR table's why column — the table itself is measured — so it is never cleared |
+| `.fix-history.json` | every attempt: proposed-edit hashes, guard rejections, outcome. Feeds the next attempt's prompt and the stop rule. Cleared when a resume re-runs Adapt, or an explicitly requested retry would refuse to start |
+
+## Key Rules
+
+1. **The mechanism is mutable; the proof changes only as declared.** A check
+   survives unless the note allows it and the item declares it — measured per
+   item, and reported in the PR against the snapshot frozen in step 02.
+2. **Freeze the contract before editing.** Never re-derive it afterwards.
+3. **Transcribe, do not invent.** Every added step maps to an observed one.
+4. **`storage_state` for the entry login.** The browser starts signed in the way
+   the test's own login leaves it. An expired session is a hard stop — exploring
+   with one lands on a login page and "discovers" that the entire flow changed.
+   The session itself comes from the entry path the test declares, never from a
+   reconstructed login. A sign-in that is one of the test's own steps is walked
+   like any other step, with the values in the test's data row.
+5. **Refusing is a correct outcome.** Escalation is the design working. But an
+   item that an earlier item *of the same attempt* already did — applied, with
+   verified tests — is `covered`, not escalated. The model's `covered_by` claim is
+   checked in Python (`covering_item`), never trusted: with edits attached, or
+   naming an item that was not applied and verified, it is ignored.
+6. **Compile before verifying**, so our own broken edit is never misread as infra.
+7. **All-or-nothing per change item**, including on crash.
+8. **The PR is always NEEDS-REVIEW.**
+9. **Every attempt is recorded, and the loop stops when it can prove nothing new
+   is coming.** `.fix-history.json` holds each attempt's proposed-edit hashes and
+   guard rejections (`shared/fix_history.py`, shared with the authoring agent).
+   `04-adapt.json` is overwritten per attempt, so reading that back showed attempt
+   three only what attempt two did and left it free to re-propose what attempt one
+   had already had rejected. An item the model declined is not asked again in a
+   later attempt unless an item has been applied since: it would be shown the same
+   flow map and the same files, and a decline says those are not enough. Three stops: the model returned no edits, the same
+   guard rejected everything twice running, or this attempt proposed only edits an
+   earlier one already made. All three write `.skip-reason=stuck`, which ships for
+   review and alerts a human rather than burning the remaining budget.
+   What an earlier attempt applied stays on disk, so `finish()` carries those items
+   into each later `04-adapt.json` (`carry_forward`, tagged `attempt`) unless the
+   later attempt re-applied them — otherwise ship would commit only the last
+   attempt's items, and a retry that stopped early would raise no PR at all. A run
+   that ships with verified tests still failing goes to the alert channel.
