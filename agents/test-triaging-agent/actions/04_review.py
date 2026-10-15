@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → lib.*
 
 from shared.log import log as _log
+from shared import lessons
 def log(msg): _log("review", msg)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -183,7 +184,8 @@ def main():
         log(f"Review round {round_num}/{MAX_ROUNDS}...")
 
         # ── Reviewer challenge ─────────────────────────────────────────────────
-        reviewer_prompt = build_reviewer_prompt(classify_data, round_num)
+        reviewer_prompt = build_reviewer_prompt(classify_data, round_num) \
+            + lessons.block("test-triaging-agent", log=log)
         challenge_response = call_claude(reviewer_prompt)
 
         if not challenge_response:

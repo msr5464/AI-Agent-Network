@@ -32,7 +32,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shared import baseline
-from shared.git import run_git
+from shared.feedback import BASELINE_JOB
+from shared.git import run_git, with_agent_trailer
 
 BASELINE_PATH = baseline.REPO_SUBPATH
 
@@ -74,11 +75,11 @@ def main() -> int:
         return 0
 
     ok, _, err = run_git(
-        ["commit", "-m",
+        ["commit", "-m", with_agent_trailer(
          f"chore(baselines): refresh {len(changed)} locator fingerprint(s)\n\n"
          f"Recorded from a passing suite. Fingerprints describe what each page\n"
          f"object locator matched while it worked, so a later drift can be\n"
-         f"diagnosed by comparison rather than by guesswork."],
+         f"diagnosed by comparison rather than by guesswork.", BASELINE_JOB)],
         workspace)
     if not ok:
         print(f"nothing committed: {err}")

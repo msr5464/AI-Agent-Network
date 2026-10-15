@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → pl
 
 from shared import workspace as workspace_helper
 
-from shared import browser_mode
+from shared import browser_mode, feedback, lessons, precedents
 from shared.test_runner import _pin_baseline_dir
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -688,6 +688,10 @@ def apply_fix(files_map: dict, edits_map: dict = None,
         if not ok and FORCE:
             log(f"  {reason}")
             log("  FORCE=true — applying it anyway")
+            feedback.record_quietly([feedback.override(
+                "test-authoring-agent", os.environ.get("SESSION_ID", AUDIT_DIR.name),
+                "assertion conservation", "applied", test=f"{test_class}#{test_method}",
+                detail=reason)])
         elif not ok:
             log(f"  REJECTED whole fix — {reason}")
             log("  A test that proves less is not a fixed test. If the assertion "
@@ -2017,7 +2021,8 @@ another checkout.
 {value_mismatch_section(mismatch, web_validation.get("inputs_used")) or typed_shape_section(prev_failure_message or prev_output, web_validation.get("inputs_used"))}{retry_section}
 """
 
-    fix_response = call_claude(prompt)
+    fix_response = call_claude(prompt + lessons.block("test-authoring-agent", log=log)
+                               + precedents.block("test-authoring-agent", log=log))
     fix_map = extract_json(fix_response)
     root_cause, confidence, files_map, edits_map, defect_matched = extract_fix_response(fix_map)
 

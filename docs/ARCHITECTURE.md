@@ -56,6 +56,11 @@ Each agent runs on its own, from the CLI (`scripts/run-<agent>-agent.sh`) or thr
 - **Server:** `qa_agents_server` queues and schedules runs, but adds no logic
   between agents — see [Server execution model](#server-execution-model).
 
+**Learning-agent.** A fifth agent tests nothing. It reads what people said about and
+did to the other agents' work, and proposes **lessons** for them as a PR to this repo
+(`make learn`). Nothing reaches an agent until a person merges that PR. See
+[Human feedback](#human-feedback).
+
 **Framework plugins.** The agents are framework-agnostic. They reach the target
 automation repo through `shared/frameworks/` (Playwright and Selenium plugins),
 which is chosen by detecting the repo's build files. See
@@ -365,6 +370,7 @@ Grouped by concern; each module's docstring explains its rules.
 | What a test proves | `intent.py`, `assertion_graph.py`, `logstep_narration.py`, `step_provenance.py`, `check_provenance.py`, `edit_guards.py`, `fix_history.py` |
 | Adaptation | `blast_radius.py`, `flow_map.py`, `entry_path.py`, `session_state.py`, `mint_session.py`, `adaptation_handoff.py` |
 | Session plumbing | `load_env.sh`, `session.sh` (`log`, `run_step`, `fmt_duration`), `log.py`, `audit.py`, `run_artifacts.py`, `metrics.py`, `slack.py`, `verdict_feedback.py` |
+| Human feedback (below) | `feedback.py` (the store and its events), `slack_feedback.py` (Slack replies), `lessons.py` (lessons into prompts), `precedents.py` (accepted fixes as examples) |
 
 ---
 
@@ -373,10 +379,170 @@ Grouped by concern; each module's docstring explains its rules.
 | File | Agent | Purpose |
 |------|-------|---------|
 | `feedback/skip-buildtags.json` | Triaging | Builds already analysed (appended automatically by step 05) plus any you add by hand. Scout skips them |
-| `feedback/known-issues.json` | Healing | Patterns that must never be auto-fixed |
-| `feedback/proposals.json` | Adaptation | Edits proposed (not applied) by step 04, awaiting a human verdict. How often they are accepted verbatim is the evidence for turning `ADAPTATION_APPLY` on |
+| `feedback/known-issues.json` | Healing | Patterns that must never be auto-fixed, and diagnoses that proved wrong: a forced fix that verified (a false stop), or a fix its reviewer rejected as the wrong flow or page (a false `LOCATOR_STALE`) |
+| `feedback/proposals.json` | Adaptation | Edits proposed (not applied) by step 04, awaiting a human verdict (`make verdict`). How often they are accepted verbatim is the evidence for turning `ADAPTATION_APPLY` on |
 
 ```bash
 make feedback AGENT=test-triaging-agent         # print
 make clear-feedback AGENT=test-triaging-agent   # reset — every build becomes eligible for re-analysis
 ```
+
+---
+
+## Human feedback
+
+What people do with the agents' work is the evidence for improving them. It is
+captured in one append-only store, `qa_agents_server/storage/feedback.jsonl`
+(`shared/feedback.py`), one event per line. The learning-agent reads it and
+proposes lessons ([Learning from it](#learning-from-it)). Nothing changes how an
+agent behaves until a person approves the change.
+
+**Where it comes from**
+
+| Channel | How | Event |
+|---|---|---|
+| The reviewer verdict block at the end of every agent PR (added by `shared/github.create_pr`) | The reviewer ticks *Accept as is*, *Accept after my edits* or *Reject*, plus any reasons from a fixed list. Unticked means not reviewed, never rejected | `verdict` |
+| A PR comment that starts with `/lesson` | The reviewer teaches the agent in one line | `lesson` |
+| Other PR comments and reviews | | `comment`, `review` |
+| A commit a person adds to an agent's branch after the agent's last commit | Every agent commit carries an `Agent:` trailer beside its `Session:` one (`shared/git.with_agent_trailer`); a commit without one is a person's. It says whether it touched a file the agent wrote | `human_commit` |
+| A revert of an agent's commit | Kept with the revert's own message | `revert` |
+| A person's change to a merged PR's files within 14 days | | `post_merge_edit` |
+| Merged or closed | | `pr_outcome` |
+| `make verdict` | For a run with no PR to tick: a CI or dry run, or adaptation's proposals | `verdict` |
+| `make reclassify` | A person corrects (or confirms) how triaging classified a failure; recorded beside what the agent said. Every triage report ends with the command for its build | `reclassification` |
+| `FORCE=true` | A person told the agent to go past its own refusal: healing's reproduce step (not locator-shaped) and fix step (a stop verdict), authoring's assertion conservation. The outcome is recorded with it: `verified`, `advanced`, `failed`, or `proceeded`/`applied` when the run's own result says how it ended | `override` |
+| An input rewritten before the next run | Authoring's and adaptation's step 01 compare the input with the previous run's copy in `queue/…/processed/`, and record how that run ended | `input_edit` |
+| A draft an agent wrote, edited by a person | Healing stores the change note it drafts (`draft`); adaptation's step 01 compares the note it is given with it, and the edit is attributed to healing | `draft_edit` |
+| Cancel or retry in the Studio | The server records the step a run was on, or the step it is retried from, and how it had ended | `cancel`, `retry` |
+| *Your verdict* in a Studio session detail | The same choices and reasons as the PR block, plus a note; the same recording as `make verdict` (`POST …/sessions/<id>/verdict`) | `verdict` |
+| Requirements → Tests in the Studio | When a run completes, the tests it offered (`generation`); when a person pushes an AI-written case to TestRail, the AI's text beside the pushed text (`test_push`, accepted as is or edited, with the diff). Matching the two by target says which tests were never pushed | `generation`, `test_push` |
+| A reply in the thread of an agent's Slack message | `lesson: <what to do next time>`, `verdict: reject wrong-flow — <note>`, or anything else (kept as a comment). Each run remembers the messages it posted (`slack-messages.json` in its audit dir), and `shared/slack_feedback.py` reads their threads. A Slack message can't start with `/`, so these use plain words. The bot needs `channels:history` (`groups:history` for a private channel); without it, collecting says so and skips Slack | `lesson`, `verdict`, `comment` |
+
+The PR verdict, `/lesson`, comments, `make verdict`, the Studio verdict,
+`make reclassify`, `FORCE`, a pushed test case and Slack replies are explicit: a
+person said something about the agent's work. The rest are
+inferred, kept with `explicit: false`, and are never evidence on their own that an
+agent was wrong. A closed PR is as often a discarded trial run, the one revert of
+an agent's fix on record undid it on purpose to stage a failure for testing, and a
+rewritten input may be a new request rather than a correction. Corrections to what
+an agent wrote (`human_commit`, `draft_edit`) carry their diff, which is what makes
+them usable later.
+
+**Collecting**
+
+```bash
+make collect-feedback                          # read the agents' PRs into the store (read-only on GitHub)
+make collect-feedback REPORT=reports/feedback.md   # and summarise what was found
+make verdict AGENT=test-adaptation-agent SESSION=<id> VERDICT=edited REASON=convention,no-reuse
+make reclassify BUILD_TAG=<tag> TEST=CartTest#checkout AS=PRODUCT_BUG CATEGORY=ASSERTION_FAILURE
+```
+
+The collector is idempotent: the same record always gets the same id, so a run
+adds only what is new. A PR whose history cannot be read (a deleted base branch, a
+GitHub error) is reported, never silently skipped. PRs from before the overview
+table named the agent are recognised by their own heading or title, and commits
+from before the `Agent:` trailer by their fixed subjects. GitHub errors that clear
+on their own (a 5xx, a timeout) are tried again twice. A merged PR whose base branch
+was deleted is followed on the default branch when its merge reached it, and listed
+as not followed when it did not. `scripts/commit_baselines.py` signs its commits too
+(`Agent: commit-baselines`), so a fingerprint refresh is never read as a person's
+edit.
+
+`make verdict` also writes where an agent already looks: it marks adaptation's
+proposals judged, and a healing run rejected as the wrong flow or page is recorded
+in healing's `known-issues.json` as a false `LOCATOR_STALE`. The collector does the
+same for a ticked verdict.
+
+Recording inside a run, or in the server, never fails or stops it
+(`feedback.record_quietly`).
+
+The store is git-ignored runtime data like the analytics store. Everything that
+came from GitHub can be collected again; what runs, the server and the `make`
+commands record exists only here. A live test run of an agent should set
+`FEEDBACK_FILE` to a scratch file, as it sets `RUN_ANALYTICS_FILE`.
+
+### Learning from it
+
+```bash
+make learn                       # collect, propose lessons, write a report; changes nothing
+AUTO_PUSH=true make learn        # and open the lesson PR
+```
+
+**The learning-agent** ([agents/learning-agent/CLAUDE.md](../agents/learning-agent/CLAUDE.md))
+collects from GitHub and Slack, then sorts each event:
+
+- **Evidence** is a person saying something or changing what an agent wrote.
+- **Context** is a revert or a rewritten input. The model reads it but it never
+  counts.
+
+The agent tags what each correction was about (a locator, an assertion, a wait,
+test data…) and guesses where a lesson would apply. Then one model call proposes
+adding, updating or retiring lessons, one at a time. Python checks every proposal
+and refuses any that fails a rule:
+
+- **Evidence.** A new lesson needs a `/lesson` (or Slack `lesson:`), or two
+  independent pieces of work pointing the same way.
+- **Generic text.** No session ids, PR numbers or links in a statement.
+- **Never relaxes.** No statement that reads as skipping, weakening or removing a
+  check.
+
+Before the PR, `LEARNING_REPLAY_LIMIT` lessons are replayed. The model call a lesson
+is for is re-sent with and without it, and the two answers are compared on how many
+of the person's added lines each reproduces. With no evidence, it calls no model.
+
+**Lessons** live in `config/lessons/<agent>.yaml`, one sentence each, with a scope:
+
+- the agent's steps, and optionally the automation repo, framework, module, page
+  object or diagnosis verdict
+- the evidence ids
+- a review date
+
+A lesson is active once its PR is merged, and stays editable by hand.
+`shared/lessons.py` puts the active ones whose scope fits in front of the step they
+are for, most specific first, within `LESSONS_MAX_CHARS`:
+
+- authoring: parse, generate, run-and-fix
+- healing: fix
+- adaptation: explore, adapt
+- triaging: classify, review
+- the Studio's Requirements → Tests: it fetches them from `GET /lessons/test-design-agent`
+
+`LESSONS_MODE` in `config/.env` decides what happens:
+
+| Mode | Effect |
+|---|---|
+| `off` | Nothing |
+| `shadow` | Each step records which lessons matched but its prompt gets none |
+| `on` | The lessons are put in the prompt |
+
+Each session's `00-lessons.json` and its analytics row (`lessons`) say which lessons
+it was given. The console says so once per step.
+
+A lesson's lever says where it belongs:
+
+| Lever | Where it belongs |
+|---|---|
+| `lesson` | A prompt, through `shared/lessons.py` |
+| `convention` | The automation repo's `CLAUDE.md`, which the learning-agent proposes as a second PR when pushing. Every agent and every person reads it already |
+| guard candidate | A lesson people still correct the same thing under, after `LEARNING_GUARD_AFTER` runs. It is listed in the report for a person to turn into a code check (`shared/edit_guards.py`). A prompt cannot enforce it |
+
+**Precedents** (`shared/precedents.py`) are single pieces of work a person explicitly
+accepted, shown as examples under `LESSONS_MODE=on`:
+
+- **Healing's fix step:** a verified locator fix for the same page object or
+  diagnosis verdict.
+- **Authoring's run-and-fix step:** a passing fix for the same module.
+
+When the person accepted the work after their own edits, their diff is the example.
+
+**Review outcomes.** `GET /feedback/summary` (the Studio's Analytics page, *Review
+Outcomes*) counts the same runs as Analytics. For each agent, it gives the newest
+verdict each run got: accepted, accepted after edits, rejected, or not reviewed. It
+also shows:
+
+- for each lesson, how the runs it was given were received, which is the evidence a
+  retirement must cite
+- for test design, how many tests were offered and how many were pushed, as is or
+  edited
+- which channels the explicit feedback came from
+

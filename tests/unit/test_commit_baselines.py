@@ -266,3 +266,15 @@ def test_no_agent_reports_an_empty_baseline_result_silently():
                      "agents/test-authoring-agent/actions/05_ship.py"):
         source = (REPO / relative).read_text()
         assert "none changed" in source, f"{relative} cannot explain an empty result"
+
+
+def test_its_commit_is_signed_so_it_never_reads_as_a_person_s(repo):
+    """The feedback collector counts an unsigned commit on an agent PR's files as a
+    reviewer's edit; a fingerprint refresh is not one."""
+    from shared import feedback
+    _rewrite(repo, fingerprints={"loginButton": {"tag": "a"}})
+    subprocess.run([sys.executable, str(REPO / "scripts/commit_baselines.py"), str(repo)],
+                   capture_output=True, text=True, check=True)
+    message = subprocess.run(["git", "log", "-1", "--format=%B"], cwd=repo,
+                             capture_output=True, text=True).stdout
+    assert feedback.agent_of_commit(message) == feedback.BASELINE_JOB

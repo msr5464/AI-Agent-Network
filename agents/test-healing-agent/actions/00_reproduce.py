@@ -41,7 +41,7 @@ from shared import workspace as workspace_helper
 from shared.git import run_git
 from shared import failure_context as _failure_context
 from shared import baseline as baseline_store
-from shared import narration, run_artifacts
+from shared import feedback, narration, run_artifacts
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -567,6 +567,11 @@ def main():
 
     if FORCE and any(shape != "LOCATOR" for _, shape, _ in shapes):
         log("FORCE=true — attempting a fix despite the failure not looking locator-shaped")
+        session = os.environ.get("SESSION_ID", AUDIT_DIR.name)
+        feedback.record_quietly([
+            feedback.override("test-healing-agent", session, shape, "proceeded", test=name,
+                              detail=f"FORCE=true past a {shape} failure: {reason}")
+            for name, shape, reason in shapes if shape != "LOCATOR"])
 
     # ── Write the handoff ─────────────────────────────────────────────────────
     safe = re.sub(r"[^a-zA-Z0-9_-]", "-", f"{class_simple}-{method}" if method else class_simple)

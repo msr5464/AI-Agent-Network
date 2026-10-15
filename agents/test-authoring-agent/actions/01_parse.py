@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → pl
 
 from shared import workspace as workspace_helper
 from shared.credential_extraction import extract_credentials, mentions_login
-from shared import check_provenance, module_index
+from shared import check_provenance, feedback, lessons, module_index
 from shared.repo_config import load_repo_config
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -289,9 +289,22 @@ def _flow_summary(plan: dict, notes: dict) -> list:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _note_input_change() -> None:
+    """Record how this input differs from the last run's (shared/feedback.py)."""
+    noted = feedback.note_input("test-authoring-agent",
+                                os.environ.get("SESSION_ID", AUDIT_DIR.name),
+                                INPUT_FILE, AUDIT_DIR.parent)
+    if noted:
+        log(f"Input changed since the last run of {INPUT_FILE.name}"
+            + (f" ({noted['artifact']['previous_session']})"
+               if noted["artifact"].get("previous_session") else "")
+            + " — recorded as feedback")
+
+
 def main() -> None:
     log(f"Reading input: {INPUT_FILE}")
     raw_text = INPUT_FILE.read_text()
+    _note_input_change()
 
     # The automation repo's CLAUDE.md, whole: the single source of truth for its
     # conventions. It used to be cut at its first ```java block to keep this prompt
@@ -680,7 +693,7 @@ Rules:
 """
 
     log("Calling Claude to parse input...")
-    response = call_claude(prompt)
+    response = call_claude(prompt + lessons.block("test-authoring-agent", log=log))
     plan = extract_json(response)
 
     if not plan:

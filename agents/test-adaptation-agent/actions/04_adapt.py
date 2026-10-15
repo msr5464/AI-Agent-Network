@@ -43,6 +43,7 @@ def log(msg): _log("adapt", msg)
 from shared import (assertion_graph, code_analyzer, edit_guards, fix_history,
                     flow_map, url_properties, value_match, verdict_feedback)
 from shared.claude import call_claude_ex as _call_claude_ex
+from shared import lessons
 from shared.code_analyzer import invalidate_file, read_source
 from shared.test_runner import run_test
 
@@ -898,7 +899,8 @@ def main():
         log("  asking the model…")
         prompt = build_adapt_prompt(item, plan, scope, flow, workspace, rules,
                                     retry_note + done_section(done),
-                                    checks=before["checks"])
+                                    checks=before["checks"]) \
+            + lessons.block("test-adaptation-agent", log=log)
         call = _call_claude_ex(prompt=prompt, model=MODEL, effort=EFFORT, cwd=str(REPO_ROOT),
                                timeout=900, log_dir=str(AUDIT_DIR),
                                system_prompt_file=(str(SYSTEM_PROMPT)

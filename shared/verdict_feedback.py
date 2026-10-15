@@ -6,8 +6,11 @@ point in opposite directions and are invisible unless someone writes them down:
   * a **false stop** — the agent refused to attempt a fix that would have worked.
     Visible when a human passes FORCE=true and the forced fix then verifies.
   * a **false LOCATOR_STALE** — the agent edited a selector on a page the test
-    never reached. Visible when a shipped fix is later reverted, or when the same
-    test fails again on the same element straight after a "successful" fix.
+    never reached. Visible when a reviewer rejects the fix as the wrong flow or
+    page (`from_review`), or when the same test fails again on the same element
+    straight after a "successful" fix. Not when a fix is reverted: a revert looks
+    like the same evidence and is not, since reverts also put a broken locator
+    back on purpose, to stage a failure for testing.
 
 Both are appended to the agent's existing `feedback/known-issues.json`, which has
 sat empty since it was created. This only records; nothing reads it back
@@ -105,6 +108,38 @@ def record_proposal(path, session_id: str, module: str, item: int, kind: str,
     target.write_text(json.dumps(entries[-_MAX_ENTRIES:], indent=2))
 
 
+def judge_proposals(path, session_id: str, verdict: str,
+                    item: Optional[int] = None) -> int:
+    """Record a human's verdict on a session's proposals. Returns how many it judged.
+
+    `verdict` is "accept", "edited" or "reject". Only "accept" sets `accepted` to
+    True: the promotion criterion is proposals accepted *verbatim*, and one a person
+    had to change first was not. The verdict itself is kept beside it.
+
+    An item proposed on several attempts is judged once, on its latest proposal:
+    that is the one a person read. With no `item`, every item of the session is.
+    """
+    if verdict not in ("accept", "edited", "reject"):
+        raise ValueError(f"unknown verdict: {verdict!r}")
+    target = Path(path)
+    entries = _load(target)
+    latest: Dict[int, int] = {}
+    for index, entry in enumerate(entries):
+        if entry.get("kind") != "adaptation_proposal" or entry.get("session_id") != session_id:
+            continue
+        if item is not None and entry.get("item") != item:
+            continue
+        latest[entry.get("item")] = index
+    for index in latest.values():
+        entries[index]["accepted"] = verdict == "accept"
+        entries[index]["verdict"] = verdict
+        entries[index]["judged_at"] = (datetime.now(timezone.utc).isoformat()
+                                       .replace("+00:00", "Z"))
+    if latest:
+        target.write_text(json.dumps(entries[-_MAX_ENTRIES:], indent=2))
+    return len(latest)
+
+
 def proposal_acceptance(path) -> Dict:
     """How proposals have been received so far. Read by a human, not by a gate."""
     entries = [e for e in _load(Path(path))
@@ -124,3 +159,22 @@ def proposal_acceptance(path) -> Dict:
         "rate": (len(accepted) / len(judged)) if judged else None,
         "by_kind": by_kind,
     }
+
+
+# ── A reviewer's verdict on a PR ──────────────────────────────────────────────
+
+def from_review(feedback_file, agent: str, verdict: Optional[str], reasons,
+                test_name: str, session: str = "", detail: str = "") -> bool:
+    """Record what a reviewer's verdict says about a diagnosis, if anything.
+
+    One verdict maps onto the kinds above: a healing PR rejected as the wrong flow
+    or page is a false LOCATOR_STALE, an edit to a selector while the test was
+    somewhere else. A wrong *locator* is a bad repair of a right diagnosis, so it
+    stays in the feedback store (shared/feedback.py) for the learning loop.
+    """
+    if agent != "test-healing-agent" or verdict != "reject":
+        return False
+    if "wrong-flow" not in (reasons or ()):
+        return False
+    return record(feedback_file, "false_locator_fix", test_name, "LOCATOR_STALE",
+                  detail=detail, session=session)

@@ -41,7 +41,7 @@ from shared.log import log as _log
 from shared import workspace as workspace_helper
 def log(msg): _log("explore-web", msg)
 
-from shared import browser_mode, entry_path, flow_map, mint_session, session_state
+from shared import browser_mode, entry_path, flow_map, lessons, mint_session, session_state
 from shared.code_analyzer import read_source
 from shared.claude import call_claude_ex
 from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools, CAPTURE_RULES
@@ -379,7 +379,8 @@ def run_attempt(plan: dict, rules: str, notes: str, mcp_path: Path,
 
     log("  Sending to Claude for exploration...")
     result = call_claude_ex(
-        prompt=build_prompt(plan, rules, notes, stop_before, scope, start, known),
+        prompt=build_prompt(plan, rules, notes, stop_before, scope, start, known)
+        + lessons.block("test-adaptation-agent", log=log),
         model=MODEL, effort=EFFORT, cwd=str(REPO_ROOT), timeout=TIMEOUT_S,
         on_output=on_output, log_dir=str(AUDIT_DIR),
         allowed_tools=mcp_allowed_tools(),

@@ -31,7 +31,7 @@ from shared.log import blocked
 from shared import baseline as baseline_store
 from shared import module_index, properties_file
 from shared.slack import send_slack as _send_slack
-from shared.git import run_git as _run_git
+from shared.git import run_git as _run_git, with_agent_trailer
 from shared.github import create_pr
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -139,7 +139,8 @@ def _stage_and_commit(contents: dict, message: str) -> bool:
     rc, staged, _ = git(["diff", "--cached", "--name-only"], AUTOMATION_FRAMEWORK_DIR)
     if not staged.strip():
         return False
-    rc, _, err = git(["commit", "-m", message], AUTOMATION_FRAMEWORK_DIR)
+    rc, _, err = git(["commit", "-m", with_agent_trailer(message, "test-authoring-agent")],
+                     AUTOMATION_FRAMEWORK_DIR)
     if rc != 0:
         log(blocked(f"commit failed ({err.strip()[:160]})",
                     "no PR will be raised; the generated files stay in the "

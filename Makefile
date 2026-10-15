@@ -113,6 +113,35 @@ clear-feedback:
 	@echo '[]' > "$(AGENTS_DIR)/$(AGENT)/feedback/skip-buildtags.json"
 	@echo "Cleared skip-buildtags.json"
 
+# ── Human feedback (docs/ARCHITECTURE.md, "Human feedback") ──────────────────────
+# A verdict on one run reviewed outside GitHub, and the collector that reads the
+# verdicts, comments and corrections people left on the agents' PRs.
+.PHONY: verdict
+verdict:
+	@if [ -z "$(SESSION)" ] || [ -z "$(VERDICT)" ]; then \
+		echo "Usage: make verdict AGENT=<agent> SESSION=<id> VERDICT=accept|edited|reject [REASON=wrong-locator,convention] [ITEM=n] [NOTE=\"...\"]"; \
+		exit 1; fi
+	@$(PY) scripts/record_verdict.py --agent "$(AGENT)" --session "$(SESSION)" \
+		--verdict "$(VERDICT)" $(if $(REASON),--reason "$(REASON)") $(if $(ITEM),--item "$(ITEM)") \
+		--note "$(NOTE)"
+
+.PHONY: reclassify
+reclassify:
+	@if [ -z "$(BUILD_TAG)" ] || [ -z "$(TEST)" ] || [ -z "$(AS)" ]; then \
+		echo "Usage: make reclassify BUILD_TAG=<tag> TEST=<Class#method> AS=PRODUCT_BUG|AUTOMATION_ISSUE|UNKNOWN [CATEGORY=...] [NOTE=\"...\"]"; \
+		exit 1; fi
+	@$(PY) scripts/reclassify.py --build-tag "$(BUILD_TAG)" --test "$(TEST)" --as "$(AS)" \
+		--category "$(CATEGORY)" --note "$(NOTE)"
+
+.PHONY: learn
+learn:
+	@bash scripts/run-learning-agent.sh
+
+.PHONY: collect-feedback
+collect-feedback:
+	@REPO_ROOT="$(CURDIR)" AGENT_DIR="$(CURDIR)/scripts" bash -c \
+		'source shared/load_env.sh && "$(PY)" scripts/collect_feedback.py $(if $(REPORT),--report "$(REPORT)")'
+
 # ── Help ───────────────────────────────────────────────────────────────────────
 .PHONY: help
 help:
@@ -137,6 +166,12 @@ help:
 	@echo "  make audit AGENT=test-triaging-agent SESSION=...       View specific session"
 	@echo "  make feedback AGENT=test-triaging-agent                Show feedback files"
 	@echo "  make clear-feedback AGENT=test-triaging-agent          Clear skip-buildtags.json"
+	@echo ""
+	@echo "  make verdict AGENT=... SESSION=... VERDICT=accept|edited|reject [REASON=...] [ITEM=n]"
+	@echo "                                                     Record a reviewer's verdict on one run"
+	@echo "  make reclassify BUILD_TAG=... TEST=... AS=PRODUCT_BUG|AUTOMATION_ISSUE   Correct a triage classification"
+	@echo "  make collect-feedback [REPORT=feedback.md]         Read verdicts, comments and corrections off agent PRs"
+	@echo "  make learn                                         Propose lessons from that feedback (AUTO_PUSH=true opens the PR)"
 	@echo ""
 	@echo "  make run AGENT=test-authoring-agent MODULE=payments       Create from queue/payments.txt"
 	@echo "  AUTO_PUSH=false make run AGENT=test-authoring-agent      Dry-run (generates + tests, no PR)"

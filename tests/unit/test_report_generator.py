@@ -82,6 +82,11 @@ class TestReportGeneratorGenerateHtmlReport:
         assert "<!DOCTYPE html>" in html_content or "<html" in html_content
         assert "AI-Generated" in html_content or "Automation Report" in html_content
 
+    def test_the_footer_says_how_to_correct_a_classification(self):
+        html_content, _ = ReportGenerator().generate_html_report(
+            _minimal_summary(), [], "TestReport-1", report_dir=self._REPORT_DIR)
+        assert "make reclassify BUILD_TAG=TestReport-1" in html_content
+
     def test_generate_html_report_includes_flaky_section_with_recurring_failures(self):
         gen = ReportGenerator()
         summary = _minimal_summary()

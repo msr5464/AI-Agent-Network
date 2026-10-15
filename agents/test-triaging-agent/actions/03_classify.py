@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # agent dir → lib.*
 
 from shared.log import log as _log
-from shared import diagnosis
+from shared import diagnosis, lessons
 from shared import workspace as workspace_helper
 from lib.root_cause_groups import (group_failures, pick_representative,
                                     is_groupable, signature as cause_signature)
@@ -363,7 +363,7 @@ def main():
 
     for batch_num, batch in enumerate(batches, 1):
         log(f"Batch {batch_num}/{len(batches)} ({len(batch)} failures)...")
-        prompt = build_batch_prompt(batch)
+        prompt = build_batch_prompt(batch) + lessons.block("test-triaging-agent", log=log)
         response = call_claude(prompt)
 
         if not response:

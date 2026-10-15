@@ -41,7 +41,7 @@ def log(msg): _log("ship", msg)
 from shared import assertion_graph
 from shared import baseline as baseline_store
 from shared import flow_map
-from shared.git import run_git
+from shared.git import run_git, with_agent_trailer
 from shared.github import create_pr
 from shared.slack import send_slack
 
@@ -472,7 +472,8 @@ def main():
                            + (f"Also covers item(s) {', '.join(map(str, also))}\n\n" if also else "")
                            + f"Change note: {plan.get('module','')}\n\n"
                            f"Session: {SESSION_ID}")
-                run_git(["commit", "-m", message], workspace)
+                run_git(["commit", "-m", with_agent_trailer(message, "test-adaptation-agent")],
+                        workspace)
                 log(f"  committed item {item['index']}")
 
             # The fingerprints the verification run recorded belong in the same
@@ -487,13 +488,13 @@ def main():
                 run_git(["add", "--"] + sorted(baselines), workspace)
                 ok, staged, _ = run_git(["diff", "--cached", "--name-only"], workspace)
                 if staged.strip():
-                    run_git(["commit", "-m",
+                    run_git(["commit", "-m", with_agent_trailer(
                              f"adaptation: refresh {len(baselines)} locator baseline(s) for {MODULE}\n\n"
                              f"Element fingerprints recorded while the adapted tests were\n"
                              f"verified. They describe what each locator matched on the\n"
                              f"changed page, so the next drift is diagnosed against the\n"
                              f"page as it is now rather than as it used to be.\n\n"
-                             f"Session: {SESSION_ID}"], workspace)
+                             f"Session: {SESSION_ID}", "test-adaptation-agent")], workspace)
                     log(f"  committed {len(baselines)} locator baseline(s)")
                     result["baselines_committed"] = sorted(baselines)
             else:

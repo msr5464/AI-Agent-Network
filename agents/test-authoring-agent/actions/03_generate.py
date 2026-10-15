@@ -36,7 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root → platform.*
 
 from shared import workspace as workspace_helper
-from shared import module_index
+from shared import lessons, module_index
 from shared.logstep_narration import BODY_LINES_GUIDELINE
 from shared.repo_config import load_repo_config
 
@@ -2223,7 +2223,8 @@ Return ONLY a JSON object, no prose:
         # this is how a test class ends up calling a helper method that the
         # helper batch never generated.
         response = call_claude(
-            build_prompt(batch_files, _generated_context(files_map)),
+            build_prompt(batch_files, _generated_context(files_map))
+            + lessons.block("test-authoring-agent", log=log),
             label=f" {tag}",
         )
         batch_map = extract_json(response)

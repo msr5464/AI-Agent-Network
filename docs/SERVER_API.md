@@ -301,7 +301,20 @@ GET /agents/<agent>/sessions/<session_id>
 ```
 The summary fields plus `init_md` (`00-session-init.md`), `steps` (each step's
 parsed JSON, keyed by step) and `reports` (each step's `.md`, same keys), and
-`metrics` when recorded.
+`metrics` when recorded. `reviewer_verdict` is the newest verdict a person gave
+the run (below), or null; `verdict` stays the agent's own.
+
+```
+GET  /agents/<agent>/sessions/<session_id>/verdict
+POST /agents/<agent>/sessions/<session_id>/verdict
+     {"verdict": "accept"|"edited"|"reject", "reasons": ["wrong-locator", …], "note": "…", "item": 2}
+```
+A person's verdict on a run (`shared/feedback.py`), the same recording as
+`make verdict`: adaptation's proposals for the session are judged, and a healing
+run rejected as `wrong-flow` is also a false `LOCATOR_STALE`. → 201
+`{verdict, judged_proposals, wrong_diagnosis}`; 400 on an unknown verdict or
+reason, 404 for an unknown session. GET returns `{verdict}`, the newest from the
+PR, the CLI or the Studio.
 
 ```
 GET /agents/<agent>/sessions/<session_id>/metrics
@@ -339,6 +352,49 @@ DELETE /analytics/clear?window=7d&user_id=&from=&to=
 sessions' audit directories** for runs started in the window (same `window`/`from`/`to`
 rules as the summary). Admins may name any user (or none = everyone);
 members clear only their own; anonymous callers get 403.
+
+### Test design feedback (the Studio's backend only)
+
+```
+POST /feedback/test-design
+     {"kind": "generation", "session": "<run id>", "tests": [{target, title, priority}], "updates": [{req_id, testrail_id, title}],
+      "lessons": ["L-design-001", …]}
+     {"kind": "test_push", "session": "<run id>", "action": "created"|"updated", "testrail_id": "…",
+      "source": "generated"|"suggested_update"|"improved", "target": {…}, "original": {case}, "final": {case}}
+```
+Records what a Requirements → Tests run offered (and the lessons its prompts were
+given), and an AI-written case a person pushed, as `test-design-agent` events. Not
+under `/agents/`, so the Studio's browser proxy cannot reach it; 403 without the
+proxy secret when one is set. → 201.
+
+### Review outcomes and lessons
+
+```
+GET /feedback/summary?window=7d&user_id=&from=&to=
+```
+How people received the agents' work (`qa_agents_server/review_outcomes.py`). It
+takes the same parameters and user scoping as `/analytics/summary` and counts the
+same runs. Returns:
+
+- `by_agent`: for each agent, the runs and the newest verdict each got (`accept`,
+  `edited`, `reject`, `not_reviewed`) and its active lessons. `test-design-agent`
+  also has `tests_offered`, `pushed_as_is` and `pushed_after_edits`.
+- `lessons`: for each lesson, the runs it was given and their verdicts.
+- `explicit_by_source`: where explicit feedback came from.
+
+400 on a bad window. The Studio's Analytics page shows it as *Review Outcomes*.
+
+```
+GET /lessons/<agent>?step=generate&repo=&framework=&module=&page=&failure=
+```
+The lessons a step of `<agent>` gets now, chosen by `shared/lessons.py`, for a
+caller outside this repo. The Studio's Requirements → Tests asks for
+`test-design-agent`. Returns `{mode, ids, block}`:
+
+- `ids`: the lessons chosen. Empty under `LESSONS_MODE=off`.
+- `block`: the text to put in the prompt. Empty unless the mode is `on`.
+
+404 for an agent with no lessons.
 
 ### Agent settings (admin only)
 

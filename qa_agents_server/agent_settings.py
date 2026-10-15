@@ -707,12 +707,89 @@ SETTINGS_SCHEMA: List[Dict[str, Any]] = [
         "default": "/tmp/qa-runs",
         "sensitive": False,
     },
+    # ── Lessons and learning ─────────────────────────────────────────────────
+    {
+        "key": "lessons_mode",
+        "env_var": "LESSONS_MODE",
+        "label": "Lessons Mode",
+        "description": "Whether agents are given the lessons in config/lessons/ "
+                       "(learned from people's reviews, merged as PRs). Shadow records in "
+                       "each session which lessons would apply and puts none in a prompt.",
+        "type": "select",
+        "category": "learning",
+        "default": "",
+        "sensitive": False,
+        "options": [{"value": "", "label": "Not set (off)"},
+                    {"value": "off", "label": "off"},
+                    {"value": "shadow", "label": "shadow — record only"},
+                    {"value": "on", "label": "on — put them in prompts"}],
+    },
+    {
+        "key": "lessons_max_chars",
+        "env_var": "LESSONS_MAX_CHARS",
+        "label": "Lessons Size Cap",
+        "description": "Most characters of lessons one prompt may receive; the most "
+                       "specific lessons come first",
+        "type": "number",
+        "category": "learning",
+        "default": "",
+        "sensitive": False,
+        "min": 0,
+        "max": 20000,
+    },
+    {
+        "key": "learning_model",
+        "env_var": "LEARNING_MODEL",
+        "label": "Claude Model",
+        "description": "Model the learning-agent proposes lessons with. Required to run it.",
+        "type": "text",
+        "category": "learning",
+        "default": "",
+        "sensitive": False,
+    },
+    {
+        "key": "learning_effort",
+        "env_var": "LEARNING_EFFORT",
+        "label": "Reasoning Effort",
+        "description": "Reasoning effort for proposing lessons",
+        "type": "select",
+        "category": "learning",
+        "default": "",
+        "sensitive": False,
+        "options": _EFFORT_OPTIONS,
+    },
+    {
+        "key": "learning_replay_limit",
+        "env_var": "LEARNING_REPLAY_LIMIT",
+        "label": "Replay Checks",
+        "description": "Proposed lessons to check by replaying the prompt they are for, "
+                       "with and without the lesson (two model calls each). 0 = none",
+        "type": "number",
+        "category": "learning",
+        "default": "",
+        "sensitive": False,
+        "min": 0,
+        "max": 20,
+    },
+    {
+        "key": "learning_guard_after",
+        "env_var": "LEARNING_GUARD_AFTER",
+        "label": "Guard Candidate After",
+        "description": "An active lesson whose runs are still corrected for the same "
+                       "thing this many times is reported as needing a code check",
+        "type": "number",
+        "category": "learning",
+        "default": "",
+        "sensitive": False,
+        "min": 1,
+        "max": 20,
+    },
 ]
 
 _SCHEMA_BY_KEY: Dict[str, Dict[str, Any]] = {s["key"]: s for s in SETTINGS_SCHEMA}
 
 CATEGORIES: List[str] = ["common", "authoring", "healing", "adaptation",
-                         "triaging"]
+                         "triaging", "learning"]
 
 
 class SettingsValidationError(Exception):

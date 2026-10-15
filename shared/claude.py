@@ -568,7 +568,10 @@ def call_claude_ex(
             start_new_session=True,
         )
         if log_file:
-            log_file.write(f"cwd: {cwd}\ncommand: {shlex.join(cmd)}\n\n")
+            # step: the run_step key, so a later reader (the learning-agent's
+            # replay) can tell which step a call belonged to.
+            log_file.write(f"cwd: {cwd}\nstep: {os.environ.get('STEP_KEY', '')}\n"
+                           f"command: {shlex.join(cmd)}\n\n")
             log_file.flush()
 
         def _kill_group(sig=signal.SIGKILL):

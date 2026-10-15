@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from qa_agents_server.paths import AGENTS_DIR
+from shared import lessons as _lessons
 from shared import metrics as _metrics
 from shared import workspace as _workspace
 
@@ -339,6 +340,9 @@ def build_record(audit_dir: Path, agent: str = "", status: str = "",
         "by_model": session.get("by_model") or {},
         "outcomes": outcomes,
         "pr_url": _pr_url(d),
+        # The lessons this run's prompts were given (shared/lessons.py), so how
+        # each lesson's runs were received outlives the audit dir.
+        "lessons": _lessons.applied_ids(d),
         "stages": [{"key": s.get("key"), "duration_s": s.get("duration_s"),
                     "cost_usd": s.get("cost_usd"), "llm_calls": s.get("llm_calls"),
                     "attempts": s.get("attempts")}
@@ -454,25 +458,16 @@ def _accumulate(target: Dict[str, Any], row: Dict[str, Any]) -> None:
             target[key] += int(value or 0)
 
 
-def query(window: str = "7d", agent: Optional[str] = None,
-          since: Optional[float] = None, until: Optional[float] = None,
-          user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Rollups over a time window.
-
-    Returns raw counts, cost and duration only. Time-saved is deliberately NOT
-    computed here — the baselines live in the Studio's settings, so the Studio
-    applies them uniformly across every flow it reports on.
-    """
-    rows = _dedupe(_read_all())
+def select_rows(window: str = "7d", agent: Optional[str] = None,
+                since: Optional[float] = None, until: Optional[float] = None,
+                user_id: Optional[str] = None, rows: Optional[List[Dict[str, Any]]] = None):
+    """(rows in the window that count, since, until): the one selection every view uses."""
+    rows = _dedupe(_read_all()) if rows is None else rows
     user_id = canonical_user_id(user_id) if user_id else None
     now = time.time()
     if since is None and window in WINDOWS and WINDOWS[window] is not None:
         since = now - WINDOWS[window]
     until = until or now
-
-    data_since = min((float(r.get("started_at") or 0) for r in rows
-                      if r.get("started_at")), default=None)
-
     selected = []
     for row in rows:
         started = float(row.get("started_at") or 0)
@@ -487,6 +482,22 @@ def query(window: str = "7d", agent: Optional[str] = None,
         if _did_nothing(row):
             continue
         selected.append(row)
+    return selected, since, until
+
+
+def query(window: str = "7d", agent: Optional[str] = None,
+          since: Optional[float] = None, until: Optional[float] = None,
+          user_id: Optional[str] = None) -> Dict[str, Any]:
+    """Rollups over a time window.
+
+    Returns raw counts, cost and duration only. Time-saved is deliberately NOT
+    computed here — the baselines live in the Studio's settings, so the Studio
+    applies them uniformly across every flow it reports on.
+    """
+    rows = _dedupe(_read_all())
+    data_since = min((float(r.get("started_at") or 0) for r in rows
+                      if r.get("started_at")), default=None)
+    selected, since, until = select_rows(window, agent, since, until, user_id, rows=rows)
 
     overall = _blank_rollup()
     by_agent: Dict[str, Dict[str, Any]] = {}

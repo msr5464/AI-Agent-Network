@@ -11,6 +11,7 @@ not find them — hence this table.
 | `review.md` | `agents/test-triaging-agent/actions/04_review.py` |
 | `explore.md` | `agents/test-adaptation-agent/actions/03_explore_web.py` |
 | `adapt.md` | `agents/test-adaptation-agent/actions/04_adapt.py` |
+| `learn.md` | `agents/learning-agent/actions/04_propose.py` |
 
 **There is no authoring prompt here.** It is the `build_prompt()` f-string in
 `agents/test-authoring-agent/actions/03_generate.py`. There used to be an

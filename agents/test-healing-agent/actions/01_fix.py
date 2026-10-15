@@ -189,7 +189,7 @@ def is_known_issue(test_name: str, known_issues: list) -> bool:
 
 
 from shared.claude import call_claude as _call_claude
-from shared.git import run_git
+from shared.git import run_git, with_agent_trailer
 
 try:
     from shared.mcp_config import write_mcp_config, allowed_tools as mcp_allowed_tools
@@ -202,7 +202,7 @@ from shared.dom_snapshot import (distill as distill_dom,
                                 load_fingerprints, parse_header,
                                 candidates_from_fingerprints)
 from shared import (adaptation_handoff, baseline, diagnosis, failure_context,
-                    failure_identity, locator_patch, narration, run_artifacts,
+                    failure_identity, feedback, lessons, locator_patch, narration, precedents, run_artifacts,
                     verdict_feedback, workspace as workspace_helper)
 from shared.telemetry import read_actions, format_for_prompt as format_trace
 
@@ -1500,6 +1500,16 @@ def build_located_fix(resolution: dict, ctx: dict, workspace: Path):
     }, ""
 
 
+def _record_override(ctx: dict, outcome: str) -> None:
+    """A person forced this fix past a stop verdict; what came of it (shared/feedback.py)."""
+    overridden = ctx.get("_forced_over_verdict")
+    if overridden:
+        feedback.record_quietly([feedback.override(
+            "test-healing-agent", SESSION_ID, overridden, outcome,
+            test=ctx.get("test_name", ""),
+            detail=f"FORCE=true past the {overridden} diagnosis")])
+
+
 def _refresh_baseline_after_heal(ctx: dict, workspace: Path) -> None:
     """Re-record the healed locator's fingerprint, if this was a located fix.
 
@@ -2364,11 +2374,11 @@ def _commit_baselines(workspace, build_tag: str) -> list:
         log(f"Warning: could not stage baselines: {err.strip()[:120]}")
         return []
     ok, out, err = run_git(
-        ["commit", "-m",
+        ["commit", "-m", with_agent_trailer(
          f"healing: refresh {len(paths)} locator baseline(s) for {build_tag}\n\n"
          f"Element fingerprints recorded while the healed tests were verified,\n"
          f"so the next drift is diagnosed against the page as it is now.\n\n"
-         f"Session: {SESSION_ID}"],
+         f"Session: {SESSION_ID}", "test-healing-agent")],
         workspace)
     if not ok and "nothing to commit" not in f"{out}{err}".lower():
         log(f"Warning: baseline commit failed: {(err or out).strip()[:120]}")
@@ -2705,6 +2715,11 @@ def main():
                         f"the last good run.")
                     log(f"  Drafted a change note for test-adaptation-agent: "
                         f"{drafted.name} — review it before running that agent.")
+                    # Kept as written, so the person's edits to it can be measured
+                    # when adaptation runs the note (feedback.note_input).
+                    feedback.record_quietly([feedback.draft(
+                        drafted.name, drafted.read_text(encoding="utf-8"), SESSION_ID,
+                        issue.get("test_name", ""))])
                 else:
                     log("  Page looks rebuilt; a draft change note is already queued.")
 
@@ -2835,7 +2850,11 @@ def main():
         ctx_slim = {k: v for k, v in ctx.items() if k != "repo_conventions"}
 
         if fix_json is None:
-            prompt = build_fix_prompt(ctx, fix_rules)
+            scope = {"page": Path((ctx.get("page_objects") or [{}])[0].get("path", "")).stem,
+                     "failure": (ctx.get("diagnosis") or {}).get("verdict", "")}
+            prompt = (build_fix_prompt(ctx, fix_rules)
+                      + lessons.block("test-healing-agent", log=log, **scope)
+                      + precedents.block("test-healing-agent", log=log, **scope))
             log("  Calling Claude for fix...")
             response = call_claude(prompt, workspace,
                                    artifact_dir=(str(Path(ctx["screenshot"]).parent)
@@ -3005,6 +3024,7 @@ def main():
             advanced_fixes.append({**record, "status": "advanced",
                                    "verified": False, "test_passed": False,
                                    "test_names": [m[0] for m in advanced]})
+            _record_override(ctx, "advanced")
             continue
 
         if not passed and not unverified:
@@ -3036,6 +3056,7 @@ def main():
                 failed_fixes.append(_reverted_record(
                     member, member_output, cluster, target_file,
                     fix_description, fix_diff))
+            _record_override(ctx, "failed")
             continue
 
         if passed:
@@ -3052,6 +3073,7 @@ def main():
                     session=os.environ.get("SESSION_ID", ""))
                 log(f"  Recorded a false stop for {overridden} in "
                     f"feedback/known-issues.json")
+                _record_override(ctx, "verified")
             # The locator moved, so the fingerprint describing it is now stale.
             # The next green run would re-record it anyway, but leaving it behind
             # means the PR carries a baseline that describes the element the test
@@ -3129,7 +3151,8 @@ def main():
             f"Fixed: {fixed_names}\n\n"
             f"Session: {SESSION_ID}"
         )
-        ok, out, err = run_git(["commit", "-m", commit_msg], workspace)
+        ok, out, err = run_git(
+            ["commit", "-m", with_agent_trailer(commit_msg, "test-healing-agent")], workspace)
         if ok:
             log(f"Committed {len(applied)} fix(es) to {branch_name}")
             pr_branch = branch_name

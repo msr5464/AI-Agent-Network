@@ -240,4 +240,28 @@ Each script's docstring or header has its options.
   (written automatically; add known-bad builds by hand). `make feedback
   AGENT=test-triaging-agent` prints it.
 - `agents/test-healing-agent/feedback/known-issues.json` — test patterns healing
-  must never auto-fix.
+  must never auto-fix, plus diagnoses that proved wrong (a forced fix that
+  verified; a fix its reviewer rejected as the wrong flow or page).
+- `agents/test-adaptation-agent/feedback/proposals.json` — edits adaptation
+  proposed without applying them, and whether a person accepted each one
+  (`make verdict`).
+- `qa_agents_server/storage/feedback.jsonl` — everything people said about and
+  did to the agents' work, one event per line. See
+  [ARCHITECTURE.md](ARCHITECTURE.md#human-feedback).
+
+```bash
+make collect-feedback REPORT=reports/feedback.md   # read verdicts, comments and corrections off agent PRs
+make verdict AGENT=test-healing-agent SESSION=<id> VERDICT=reject REASON=wrong-flow
+make reclassify BUILD_TAG=<tag> TEST=CartTest#checkout AS=PRODUCT_BUG
+make learn                                         # propose lessons from the store; AUTO_PUSH=true opens the PR
+```
+
+A live test run of an agent records feedback too (input edits, FORCE overrides):
+point `FEEDBACK_FILE` at a scratch file for it, as you do `RUN_ANALYTICS_FILE`.
+A test run of the learning-agent also needs `LESSONS_DIR` pointed at a scratch
+copy of `config/lessons/`.
+
+`config/lessons/<agent>.yaml` holds the lessons the learning-agent proposed and a
+person merged. `LESSONS_MODE` decides whether they reach prompts (`off`, `shadow`,
+`on`). Each session's `00-lessons.json` says which lessons each step was given. The
+unit tests run with `LESSONS_MODE=off` and an empty `LESSONS_DIR` (`tests/conftest.py`).

@@ -32,8 +32,8 @@ from flask import (Blueprint, Response, jsonify, request, send_file,
                    stream_with_context)
 
 from qa_agents_server import agent_settings, audit_reader, feature_files, runner
-from qa_agents_server import analytics, metrics_reader
-from shared import assertion_graph, code_analyzer, intent, test_catalog
+from qa_agents_server import analytics, metrics_reader, review_outcomes
+from shared import assertion_graph, code_analyzer, feedback, intent, lessons, test_catalog
 from shared import workspace as workspace_helper
 from shared.git import run_git
 from qa_agents_server.agents import (AgentConfigError, DEFAULT_AGENT,
@@ -794,6 +794,18 @@ def run_active(agent: str):
                     **summarise(primary, full=True)})
 
 
+def _record_run_action(kind: str, agent: str, session_id: str, key=(), **artifact) -> None:
+    """A person cancelled or retried a run: inferred feedback (shared/feedback.py).
+
+    Inferred, because neither says what was wrong. Both say where a person gave up
+    on a run, or did not trust a step's output, which is worth counting per step.
+    """
+    feedback.record_quietly([feedback.event(
+        kind, source="studio", explicit=False, key=(agent, session_id, *key),
+        agent=agent, session=session_id, artifact=artifact,
+        who=current_user_id(), at=feedback.now())])
+
+
 @qa_bp.route(f"{_BASE}/run/<session_id>/cancel", methods=["POST"])
 @owns_session
 def run_cancel(agent: str, session_id: str):
@@ -805,9 +817,14 @@ def run_cancel(agent: str, session_id: str):
         return jsonify({
             "error": f"session {session_id} belongs to {run.agent}, not {spec.name}"
         }), 409
+    step = next((key for key, state in (run.step_progress if run else {}).items()
+                 if state == "running"), "")
     ok = runner.cancel_run(session_id)
     if not ok:
         return jsonify({"error": "run not found or already finished"}), 404
+    _record_run_action("cancel", spec.name, session_id, step=step,
+                       module=run.module if run else "",
+                       after_s=round(time.time() - run.started_at) if run else None)
     return jsonify({"status": "cancelling", "session_id": session_id})
 
 
@@ -867,11 +884,18 @@ def session_retry(agent: str, session_id: str):
         payload["base_branch"] = original_base
 
     user_id = current_user_id()
+    # Read before the retry starts: resuming clears the markers of the steps it reruns.
+    previous = feedback.ended(spec.audit_dir / session_id)
+
+    def record_retry() -> None:
+        _record_run_action("retry", spec.name, session_id, key=(from_step, time.time()),
+                           from_step=from_step, previous_ended=previous)
 
     try:
         run = runner.start_run(payload, agent=spec.name,
                                session_id=session_id, start_from_step=from_step, user_id=user_id)
     except runner._QueuedNotification as q:
+        record_retry()
         return jsonify({
             "queued": True,
             "position": q.position,
@@ -880,6 +904,7 @@ def session_retry(agent: str, session_id: str):
         }), 202
     except runner.RunnerError as e:
         return jsonify({"error": str(e)}), e.status
+    record_retry()
     return jsonify({
         "queued": False,
         "session_id": run.session_id,
@@ -1066,7 +1091,45 @@ def sessions_get(agent: str, session_id: str):
     session = audit_reader.get_session(session_id, agent=spec.name)
     if session is None:
         return jsonify({"error": "session not found"}), 404
+    # The newest verdict a person gave this run, from its PR, the CLI or the Studio.
+    # Not `verdict`: that is the agent's own (APPROVED / NEEDS-REVIEW).
+    session["reviewer_verdict"] = feedback.latest_verdict(spec.name, session_id)
     return jsonify(session)
+
+
+@qa_bp.route(f"{_BASE}/sessions/<session_id>/verdict", methods=["GET", "POST"])
+@owns_session
+def session_verdict(agent: str, session_id: str):
+    """A person's verdict on one run, given in the Studio (shared/feedback.py).
+
+    POST {"verdict": "accept"|"edited"|"reject", "reasons": [...], "note": "...",
+    "item": n (adaptation, optional)}. The same recording as `make verdict`.
+    """
+    spec, err = _resolve(agent)
+    if err:
+        return err
+    if request.method == "GET":
+        return jsonify({"verdict": feedback.latest_verdict(spec.name, session_id)})
+    if not (spec.audit_dir / session_id).is_dir():
+        return jsonify({"error": "session not found"}), 404
+    body = request.get_json(silent=True) or {}
+    reasons = body.get("reasons") or []
+    item = body.get("item")
+    if not isinstance(reasons, list) or (item is not None and not isinstance(item, int)):
+        return jsonify({"error": "reasons must be a list and item a number"}), 400
+    test = ""
+    if spec.name == "test-healing-agent":
+        test = (audit_reader.get_session(session_id, agent=spec.name) or {}).get("test_name") or ""
+    try:
+        result = feedback.person_verdict(
+            spec.name, session_id, str(body.get("verdict") or ""), [str(r) for r in reasons],
+            item=item, note=str(body.get("note") or "")[:2000], who=current_user_id(),
+            source="studio", test=test)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"verdict": feedback.latest_verdict(spec.name, session_id),
+                    "judged_proposals": result["judged_proposals"],
+                    "wrong_diagnosis": result["wrong_diagnosis"]}), 201
 
 
 @qa_bp.route(f"{_BASE}/sessions/<session_id>/metrics", methods=["GET"])
@@ -1089,6 +1152,38 @@ def session_metrics(agent: str, session_id: str):
         "totals": metrics_reader.totals(data),
         "stages": metrics_reader.stage_list(data),
     })
+
+
+# ── Test design feedback, from the Studio's backend ───────────────────────────
+@qa_bp.route("/feedback/test-design", methods=["POST"])
+def test_design_feedback():
+    """What the Studio's Requirements → Tests generated, and what a person pushed.
+
+    The Studio's backend calls this directly; its browser proxy forwards only
+    /agents/<agent>/… paths, so a page cannot reach it. The feedback store lives
+    here so that every agent's feedback is in one place.
+    """
+    if not _from_trusted_proxy():
+        return jsonify({"error": "forbidden"}), 403
+    body = request.get_json(silent=True) or {}
+    session_id = str(body.get("session") or "")[:120]
+    kind = body.get("kind")
+    if kind == "generation":
+        built = feedback.design_generation(session_id, body.get("tests") or [],
+                                           body.get("updates") or [], who=current_user_id(),
+                                           lessons=body.get("lessons") or [])
+    elif kind == "test_push":
+        built = feedback.design_push(
+            session_id, str(body.get("action") or "")[:20], str(body.get("testrail_id") or ""),
+            str(body.get("source") or "")[:40], body.get("original"), body.get("final"),
+            target=body.get("target"), who=current_user_id(), at=feedback.now())
+    else:
+        return jsonify({"error": "kind must be generation or test_push"}), 400
+    try:
+        written = feedback.append([built])
+    except OSError as e:
+        return jsonify({"error": f"could not record: {e}"}), 500
+    return jsonify({"recorded": len(written)}), 201
 
 
 # ── Analytics (spans agents, so deliberately not under /agents/<agent>/) ───────
@@ -1187,6 +1282,40 @@ def analytics_summary():
         since=since, until=until,
         user_id=query_user_id
     ))
+
+
+@qa_bp.route("/feedback/summary", methods=["GET"])
+def feedback_summary():
+    """How people received the agents' work over a window (qa_agents_server/review_outcomes).
+
+    Same parameters and the same user scoping as /analytics/summary.
+    """
+    try:
+        window, since, until = _window_range()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    user_id = (request.args.get("user_id") or "").strip() or None
+    if not _is_admin():
+        user_id = current_user_id()
+    return jsonify(review_outcomes.summary(window, since, until, user_id))
+
+
+@qa_bp.route("/lessons/<agent>", methods=["GET"])
+def lessons_for(agent: str):
+    """The lessons a step of `agent` should be given now (shared/lessons.py).
+
+    For a caller outside this repo — the Studio's Requirements → Tests asks with
+    agent=test-design-agent. `block` is empty unless LESSONS_MODE is on; `ids`
+    names what was chosen either way, for the caller to record with its run.
+    """
+    if agent not in lessons.INJECTION_STEPS:
+        return jsonify({"error": f"no lessons for {agent}"}), 404
+    step = (request.args.get("step") or "").strip()
+    context = {key: (request.args.get(key) or "").strip() for key in lessons.SCOPE_KEYS}
+    chosen = lessons.select(agent, step, context)
+    current = lessons.mode()
+    return jsonify({"mode": current, "ids": [l["id"] for l in chosen] if current != "off" else [],
+                    "block": lessons.render(chosen) if current == "on" else ""})
 
 
 # ── Agent settings (server-wide, not per-agent) ───────────────────────────────

@@ -59,6 +59,16 @@ def isolated_run_analytics(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def isolated_feedback_store(monkeypatch, tmp_path):
+    """Keep feedback events out of qa_agents_server/storage/feedback.jsonl.
+
+    That file is the record of what people said about the agents' work; an event
+    a test wrote there would read as a reviewer's verdict.
+    """
+    monkeypatch.setenv("FEEDBACK_FILE", str(tmp_path / "feedback.jsonl"))
+
+
+@pytest.fixture(autouse=True)
 def isolated_worktree_root(monkeypatch, tmp_path):
     """Keep every test away from the real /tmp/qa-runs.
 
@@ -71,3 +81,16 @@ def isolated_worktree_root(monkeypatch, tmp_path):
     worktree root set their own.
     """
     monkeypatch.setenv("QA_WORKTREE_TEMP_DIR", str(tmp_path / "qa-runs"))
+
+
+@pytest.fixture(autouse=True)
+def isolated_lessons(monkeypatch, tmp_path):
+    """No test reads config/lessons/ or gets lessons in a prompt unless it asks.
+
+    Tests that run an agent's run.sh source config/.env, whose LESSONS_MODE would
+    otherwise decide what those prompts carry.
+    """
+    from shared import lessons
+    monkeypatch.setenv("LESSONS_DIR", str(tmp_path / "lessons"))
+    monkeypatch.setenv("LESSONS_MODE", "off")
+    lessons._ASKED.clear()

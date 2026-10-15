@@ -325,6 +325,29 @@ checks, and proves them with a test run:
 
 ![Agent 4 run](docs/adaptation-agent-run.png)
 
+### Learning from reviews
+
+The agents learn from what people say about their work and what people change in
+it:
+
+- the verdict block at the end of every agent PR, and `/lesson` comments
+- commits a person adds to an agent's branch
+- `make verdict` and `make reclassify`
+- the Studio's *Your verdict*
+- replies in the thread of an agent's Slack message (`lesson: …`, `verdict: reject wrong-flow — …`)
+
+```bash
+make collect-feedback            # read the agents' PRs into the feedback store
+make learn                       # propose lessons from it and write a report
+AUTO_PUSH=true make learn        # and open the lesson PR
+```
+
+A lesson is one sentence that is put in front of the step it is for. It lives in
+`config/lessons/<agent>.yaml`, and becomes active only once a person merges its PR.
+`LESSONS_MODE` in `config/.env` controls lessons: `off`, `shadow` (record which would
+apply, but inject none) or `on`. See
+[Human feedback](docs/ARCHITECTURE.md#human-feedback).
+
 ---
 
 ## Slack Notifications
@@ -333,7 +356,7 @@ All four agents post through the Slack Bot API (`chat.postMessage`). Without
 `SLACK_BOT_TOKEN`, Slack is skipped silently.
 
 1. [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → From scratch
-2. **OAuth & Permissions** → Bot Token Scopes → add `chat:write`
+2. **OAuth & Permissions** → Bot Token Scopes → add `chat:write`. For replies to be read back as feedback (`make learn`), also add `channels:history`, plus `groups:history` for private channels
 3. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-...`) into `SLACK_BOT_TOKEN`
 4. In each target channel, run `/invite @your-bot-name`
 
@@ -395,10 +418,11 @@ QA-Agent-Network/
 │   ├── test-authoring-agent/   # run.sh, actions/01–05, CLAUDE.md, queue/, audit/
 │   ├── test-triaging-agent/    # run.sh, actions/01–05, lib/, feedback/
 │   ├── test-healing-agent/     # run.sh, actions/00–02, lib/, queue/
-│   └── test-adaptation-agent/  # run.sh, actions/01–05, lib/, queue/
+│   ├── test-adaptation-agent/  # run.sh, actions/01–05, lib/, queue/
+│   └── learning-agent/         # run.sh, actions/01–06, lib/: feedback → lesson PRs
 ├── shared/                     # helpers used by every agent (claude, git, diagnosis, locator engine, frameworks/, …)
 ├── qa_agents_server/           # HTTP + SSE server for AI-Test-Studio
-├── config/                     # .env.example, prompts/, skills/, locator.yaml, repo-map.json
+├── config/                     # .env.example, prompts/, skills/, lessons/, locator.yaml, repo-map.json
 ├── connectors/mcp/             # MCP server configs used by scripts/setup-mcp.sh
 ├── scripts/                    # setup, run-*, run-server, audit viewer, maintenance tools
 ├── docs/                       # these docs + examples/queue/

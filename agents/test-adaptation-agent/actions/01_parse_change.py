@@ -36,6 +36,7 @@ def log(msg): _log("parse-change", msg)
 from shared.claude import call_claude_ex as _call_claude_ex
 from shared.flow_map import destructive_token
 from shared.json_extract import extract_json
+from shared import feedback
 
 AUDIT_DIR = Path(os.environ["AUDIT_DIR"])
 REPO_ROOT = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[3]))
@@ -227,6 +228,13 @@ def main():
         sys.exit(1)
 
     note = INPUT_FILE.read_text(encoding="utf-8", errors="ignore")
+    noted = feedback.note_input("test-adaptation-agent",
+                                os.environ.get("SESSION_ID", AUDIT_DIR.name), INPUT_FILE,
+                                AUDIT_DIR.parent)
+    if noted:
+        log(("A person edited the draft test-healing-agent wrote for this note"
+             if noted["kind"] == "draft_edit" else
+             "The note changed since its last run") + " — recorded as feedback")
     headers = parse_headers(note)
     items = parse_items(note)
 

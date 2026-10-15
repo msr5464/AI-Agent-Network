@@ -5,6 +5,28 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
+from shared.feedback import AGENT_TRAILER, SESSION_TRAILER, trailers
+
+
+def with_agent_trailer(message: str, agent: str) -> str:
+    """The commit message, signed with an `Agent: <agent>` trailer.
+
+    A commit on an agent's branch that carries no such trailer, made after the
+    agent's last one, was made by a person: that is how the feedback collector
+    tells a reviewer's correction from the agent's own work. Authorship cannot,
+    because the agents push with the same token as the people reviewing them.
+
+    Every agent message already ends with `Session: <id>`, which git reads as a
+    trailer, so the agent line joins that paragraph. Idempotent.
+    """
+    text = (message or "").rstrip()
+    if trailers(text).get(AGENT_TRAILER):
+        return text
+    lines = text.split("\n")
+    if len(lines) > 2 and lines[-1].startswith(f"{SESSION_TRAILER}: ") and not lines[-2].strip():
+        return "\n".join(lines[:-1] + [f"{AGENT_TRAILER}: {agent}", lines[-1]])
+    return f"{text}\n\n{AGENT_TRAILER}: {agent}"
+
 
 def run_git(args: list, cwd: Path, timeout: int = 60, push_url: Optional[str] = None) -> Tuple[bool, str, str]:
     """

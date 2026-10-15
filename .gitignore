@@ -73,6 +73,11 @@ qa_agents_server/storage/agent_runs.json
 # Append-only analytics store — runtime data, grows per run, never pruned.
 qa_agents_server/storage/run_analytics.jsonl
 
+# Append-only feedback store (shared/feedback.py) — what people said about and did
+# to the agents' work. Runtime data like the analytics store; `make collect-feedback`
+# rebuilds what came from PRs, but a `make verdict` lives only here.
+qa_agents_server/storage/feedback.jsonl
+
 # Personal, machine-specific Claude Code permissions.
 .claude/settings.local.json
 

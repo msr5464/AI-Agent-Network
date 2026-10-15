@@ -1,0 +1,23 @@
+# Lessons for test-healing-agent, learned from people's reviews of its work.
+#
+# Proposed by the learning-agent as a PR (agents/learning-agent); a lesson is
+# active once that PR is merged. Edit, retire or add by hand at any time.
+# Read only by shared/lessons.py, which puts the active ones whose scope fits in
+# front of the step they are for (LESSONS_MODE in config/.env).
+#
+#   - id: L-healing-001
+#     status: active              # active | retired
+#     lever: lesson               # lesson (prompt) | convention | guard-candidate
+#     statement: >-
+#       One sentence: what to do next time. Generic: no session ids, PR numbers or links.
+#     scope:
+#       steps: [fix]          # empty = all of: fix
+#       repo: ""                  # optional: only for this automation repo
+#       framework: ""             # optional: playwright | selenium
+#       module: ""                # optional
+#       page: ""                  # optional: a page object
+#       failure: ""               # optional: a diagnosis verdict, e.g. LOCATOR_STALE
+#     evidence: []                # feedback event ids (qa_agents_server/storage/feedback.jsonl)
+#     added: "YYYY-MM-DD"
+#     review_by: "YYYY-MM-DD"     # look again by then: does it still help?
+lessons: []

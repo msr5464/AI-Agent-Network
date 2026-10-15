@@ -4,6 +4,27 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from shared.feedback import verdict_block
+
+# GitHub refuses a PR body longer than this, and `gh pr create` fails outright.
+MAX_BODY_CHARS = 65536
+
+
+def with_verdict_block(body: str) -> str:
+    """The PR body with the reviewer verdict block at the end.
+
+    The block is what turns a review into something the agents can learn from
+    (shared/feedback.py). It always survives: an over-long body is cut before it,
+    never through it.
+    """
+    block = verdict_block()
+    room = MAX_BODY_CHARS - len(block) - 2
+    text = (body or "").rstrip()
+    if len(text) > room:
+        note = "\n\n_(PR description truncated to fit GitHub's limit.)_"
+        text = text[:room - len(note)].rstrip() + note
+    return f"{text}\n\n{block}"
+
 
 def create_pr(
     workspace: Path,
@@ -28,7 +49,7 @@ def create_pr(
         "gh", "pr", "create",
         "--repo", full_repo,
         "--title", title,
-        "--body", body,
+        "--body", with_verdict_block(body),
         "--base", base,
         "--head", branch,
     ]
