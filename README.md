@@ -9,10 +9,10 @@
 
 **🌐 [msr5464.github.io/ai-agent-network](https://msr5464.github.io/ai-agent-network.html)**
 
-*An AI-driven multi-agent system for end-to-end QA automation — authoring tests, triaging failures, healing broken locators, and adapting tests when the product changes.*
+*An AI-driven multi-agent system for end-to-end QA automation: authoring tests, triaging failures, healing broken locators, and adapting tests when the product changes.*
 
 It works on a separate Java automation repo (the *automation repo*, named by
-`GITHUB_REPO_AUTOMATION` — e.g. [Playwright-Automation-Framework](https://github.com/msr5464/Playwright-Automation-Framework))
+`GITHUB_REPO_AUTOMATION`, e.g. [Playwright-Automation-Framework](https://github.com/msr5464/Playwright-Automation-Framework))
 and opens GitHub PRs against it. Run the agents from the CLI, from CI, or from the
 [AI-Test-Studio](https://github.com/msr5464/AI-Test-Studio) web UI.
 
@@ -106,7 +106,7 @@ A human learns the product changed (before anything goes red)
   A PR ships for whatever passed.
 - **Adaptation** updates tests when the *product* changes, driven by a change
   note. Because an edit may add or remove steps, "the test passes" is not enough
-  evidence — each test's **intent contract** (what it proves) is frozen before
+  evidence: each test's **intent contract** (what it proves) is frozen before
   any edit and checked afterwards.
 
 See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
@@ -118,7 +118,7 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
 | Tool | Why |
 |------|-----|
 | Python **3.10+** | The agents and server |
-| [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`), signed in (`claude auth login`) | Every model call goes through it |
+| [Claude Code CLI](https://code.claude.com/docs) (`claude`), signed in (`claude auth login`) | Every model call goes through it |
 | Node.js 18+ with `npx` | The Playwright MCP server (browser validation and exploration) |
 | Chromium for Python Playwright (`python -m playwright install chromium`) | The locator engine |
 | GitHub CLI (`gh`) | Opening PRs (it uses `GITHUB_TOKEN`) |
@@ -133,7 +133,7 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
 ### 1. Install
 
 ```bash
-git clone https://github.com/msr5464/QA-AI-Agent.git QA-Agent-Network
+git clone https://github.com/msr5464/AI-Agent-Network.git QA-Agent-Network
 cd QA-Agent-Network
 
 ./scripts/setup.sh          # macOS / Linux: .venv, dependencies, config/.env
@@ -150,7 +150,7 @@ Edit `config/.env`. [`config/.env.example`](config/.env.example) documents every
 setting and is the reference; these are the ones you must set:
 
 ```bash
-# Where the automation repo lives — one of:
+# Where the automation repo lives (set one of these):
 WORKSPACE_DIR=/path/to/parent          # repo at $WORKSPACE_DIR/$GITHUB_REPO_AUTOMATION (cloned if absent)
 # FRAMEWORK_DIR=/path/to/the/checkout  # or point at the checkout directly
 
@@ -198,7 +198,7 @@ module. Authoring, healing and adaptation ran with `AUTO_PUSH=false`, so none of
 them opened a PR. Build output and some routine lines are folded, and each fold
 says how many lines it hides.
 
-### Agent 1 — Test Authoring
+### Agent 1: Test Authoring
 
 ```bash
 ./scripts/run-authoring-agent.sh payments                     # queue/payments.txt; steps 01–02 come from the cache when it is unchanged
@@ -229,7 +229,7 @@ and the generated test passes on its first run:
 
 ![Agent 1 run](docs/authoring-agent-run.png)
 
-### Agent 2 — Test Triaging
+### Agent 2: Test Triaging
 
 ```bash
 ./scripts/run-triaging-agent.sh                             # scout: most recent unanalysed build
@@ -250,7 +250,7 @@ likely location and the recommended action:
 
 ![Agent 2 triage report](docs/triaging-agent-report.png)
 
-### Agent 3 — Test Healing
+### Agent 3: Test Healing
 
 ```bash
 # From a triaging handoff
@@ -276,9 +276,9 @@ Both are located deterministically, with no model call:
 
 ![Agent 3 run](docs/healing-agent-run.png)
 
-### Agent 4 — Test Adaptation
+### Agent 4: Test Adaptation
 
-Healing asks "why did this fail?". Adaptation asks "the product changed — what
+Healing asks "why did this fail?". Adaptation asks "the product changed, so what
 should the tests do now?".
 
 ```bash
@@ -305,7 +305,7 @@ Expected outcome unchanged: an order is placed and a confirmation number is show
 
 Output:
 - A blast radius: the named tests, the tests that pass today but share the changed
-  surface, and what was excluded as framework infrastructure — with the cost of
+  surface, and what was excluded as framework infrastructure, with the cost of
   verifying them.
 - An ordered flow map of what a browser actually observed, with every selector
   re-counted in Python rather than taken on the model's word.
@@ -417,7 +417,7 @@ always the session's audit folder: `agents/<agent>/audit/<session-id>/`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT (see [LICENSE](LICENSE))
 
 ## Creator
 

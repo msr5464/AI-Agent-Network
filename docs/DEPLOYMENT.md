@@ -21,7 +21,7 @@ A Linux or macOS host (Windows works through Git Bash or WSL — the agents are
   MySQL results database.
 
 ```bash
-git clone https://github.com/msr5464/QA-AI-Agent.git QA-Agent-Network
+git clone https://github.com/msr5464/AI-Agent-Network.git QA-Agent-Network
 cd QA-Agent-Network
 ./scripts/setup.sh
 .venv/bin/python -m playwright install chromium
