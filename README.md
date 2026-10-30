@@ -1,11 +1,7 @@
-<div>
-  <img src="https://raw.githubusercontent.com/msr5464/Basic-Automation-Framework/refs/heads/master/Logo-full.png" height="50">
+# <a href="https://www.linkedin.com/in/mukesh-rajput/"><img align="right" src="https://raw.githubusercontent.com/msr5464/Selenium-Automation-Framework/refs/heads/master/Logo-full.png" alt="Mukesh" height="40"></a> QA Agent Network
 
-  # QA Agent Network
-
-  [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-  [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-</div>
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 **🌐 [msr5464.github.io/ai-agent-network](https://msr5464.github.io/ai-agent-network.html)**
 
@@ -419,8 +415,16 @@ always the session's audit folder: `agents/<agent>/audit/<session-id>/`.
 
 MIT (see [LICENSE](LICENSE))
 
-## Creator
+---
+---
 
-**Mukesh Rajput** · [LinkedIn](https://www.linkedin.com/in/mukesh-rajput/)
+<div align="center">
 
-<div align="center"><strong>Made with ❤️ for the Engineering Team</strong></div>
+**Mukesh Rajput** · [LinkedIn](https://www.linkedin.com/in/mukesh-rajput/) · [Portfolio](https://msr5464.github.io/)
+
+<sub>Made with ❤️ for the Engineering Team</sub>
+
+</div>
+
+---
+---
