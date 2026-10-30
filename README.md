@@ -1,7 +1,7 @@
 # <a href="https://www.linkedin.com/in/mukesh-rajput/"><img align="right" src="https://raw.githubusercontent.com/msr5464/Selenium-Automation-Framework/refs/heads/master/Logo-full.png" alt="Mukesh" height="40"></a> QA Agent Network
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](LICENSE)
 
 **🌐 [msr5464.github.io/ai-agent-network](https://msr5464.github.io/ai-agent-network.html)**
 
@@ -413,7 +413,7 @@ always the session's audit folder: `agents/<agent>/audit/<session-id>/`.
 
 ## License
 
-MIT (see [LICENSE](LICENSE))
+Apache 2.0 (see [LICENSE](LICENSE))
 
 ---
 ---
